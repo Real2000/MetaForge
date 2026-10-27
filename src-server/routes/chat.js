@@ -723,7 +723,7 @@ router.post('/stream', async (req, res) => {
     if (!agent) {
       system += `\n\n【四大核心场景】你是能干可靠的 AI 办公搭子，用户请求按场景选路径执行（不必自我设限）：
 ◆ 整理文件：📎 附件（PDF/DOCX/XLSX/CSV/TXT/MD）自动解析为文本（Excel 为 Markdown 表格）——提取关键信息、汇总摘要、输出脑图大纲（markdown 层级列表）或整理成新文档。
-◆ 深度调研：用 web_search 检索 + web_fetch 抓取原文，多源交叉整理行业资讯/竞品动向；用户要"持续/定时监控"时建议其在「任务管理」页创建定时任务并给出建议配置。
+◆ 深度调研：用 web_search 检索 + web_fetch 抓取原文，多源交叉整理行业资讯/竞品动向；用户要"持续监控/定时推送/每天提醒"时，直接用 create_task 工具创建定时任务（把监控对象、信息源要求与输出格式写成自包含指令；创建前会弹确认卡，向用户展示中文计划预览）。
 ◆ 文档PPT：报告/公文/总结直接撰写；用户要 Word 文档时**必须用 export_word 工具**（title+markdown 参数，勿用 run_code 拼 XML）；PPT 走「📊 PPT生成」技能。
 ◆ 代码应用：数据计算/转换/批量处理用 run_code 沙箱执行（fs 为全局）；生成演示页面/小工具时让沙箱产出 .html 文件并给用户预览链接。
 
@@ -769,9 +769,10 @@ router.post('/stream', async (req, res) => {
     try { agentTools = JSON.parse(agent?.tools || '[]'); } catch { agentTools = []; }
     // P5.27c 首页 AI 助手默认工具集：无 agent（首页/新建会话）时不再"裸聊"——
     // 挂上本地操控(local_exec)+沙箱(run_code)+查询计算类，让「帮我在桌面建文件夹」这类请求在任意入口都能真执行。
-    // 权限闸门兜底：local_exec/run_code 归 medium/high，默认权限下执行前仍弹确认卡。
+    // P5.31 新增 create_task：定时/持续监控场景对话内直接创建（high 风险，默认权限下弹确认卡）。
+    // 权限闸门兑底：local_exec/run_code 归 medium/high，默认权限下执行前仍弹确认卡。
     if (!agent) {
-      agentTools = ['get_datetime', 'calculator', 'web_search', 'db_query', 'run_code', 'local_exec'];
+      agentTools = ['get_datetime', 'calculator', 'web_search', 'db_query', 'run_code', 'local_exec', 'create_task'];
     }
     // P3 @技能携带的工具并入（去重；技能工具经 buildTools 走同一 function calling 循环）
     for (const s of usedSkills) {

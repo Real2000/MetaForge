@@ -1110,4 +1110,93 @@ const run_code = {
   },
 };
 
-module.exports = { db_query, db_chart, web_search, web_fetch, stock_quote, export_word, tts, doc_review, run_code, local_exec, sanitizeSelectSql, fileIdOf };
+/* =============== ⑪ create_task：对话内一键创建定时任务（P5.31） ===============
+ * 动机：README 遗留 backlog——「持续监控」场景此前只能引导用户去任务页手工建，对话闭环断裂。
+ * 用户在对话中说「每天早上9点帮我监控XX」→ 模型换算 cron 并调用本工具 →（默认权限下先弹确认卡，
+ * 含中文计划预览）→ 批准后落库 tasks（username 归属），30s 调度器自动接管执行。
+ *
+ * 安全设计（工具级 high 风险，默认权限必走 P5.25 确认卡）：
+ *  - 归属：ctx.username 必填，任务记在当前用户名下（任务页仅本人/管理员可见可管）
+ *  - cron 白名单校验：parseCron + nextFire（永不触发的表达式如「2月31日」直接拒绝）
+ *  - 数量配额：非管理员启用中任务上限 20（防提示词注入批量造任务烧 token）
+ *  - agent_id 可选：指定时校验 published + canView（与对话链路同权限）；未指定绑定系统「定时任务执行助手」
+ */
+const MAX_USER_TASKS = 20;
+const SYS_TASK_AGENT_NAME = '定时任务执行助手';
+
+const create_task = {
+  schema: {
+    type: 'function',
+    function: {
+      name: 'create_task',
+      description: '为当前用户创建定时任务（Cron 周期执行，结果可在「任务管理」页查看）。用户表达「定时/每天/每周/工作日/持续监控/定期提醒/每天早上」等意图时使用。schedule 必须是标准五段 cron（分 时 日 月 周）：「每天早上9点」→"0 9 * * *"；「工作日9点」→"0 9 * * 1-5"；「每周一9点半」→"30 9 * * 1"。任务会按计划自动执行 prompt 描述的完整指令。创建前会请求用户确认。',
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: '任务名称（≤30 字，如「每日科技资讯监控」）' },
+          schedule: { type: 'string', description: '五段 cron 表达式（分 时 日 月 周），如 "0 9 * * *"' },
+          schedule_desc: { type: 'string', description: '执行计划的中文描述（如「每天 09:00」「工作日 09:00」），展示在确认卡中' },
+          prompt: { type: 'string', description: '任务执行时发送给 AI 的完整自包含指令：写清监控/处理对象、信息来源要求、输出格式（摘要要点+来源），任务执行时看不到本次对话上下文' },
+          agent_id: { type: 'number', description: '可选：绑定的智能体 id（不填用系统「定时任务执行助手」，自带联网检索/计算/Word 导出能力）' },
+        },
+        required: ['name', 'schedule', 'prompt'],
+      },
+    },
+  },
+  run: async (args, ctx = {}) => {
+    const username = ctx.username;
+    if (!username) return '⛔ 缺少用户上下文，无法创建任务';
+    const name = String(args.name || '').trim().slice(0, 40);
+    const schedule = String(args.schedule || '').trim();
+    const prompt = String(args.prompt || '').trim();
+    const scheduleDesc = String(args.schedule_desc || '').trim().slice(0, 60);
+    const agentId = Number(args.agent_id) || 0;
+    if (!name) return '⛔ 缺少任务名称（name）';
+    if (!prompt) return '⛔ 缺少任务执行指令（prompt）——任务执行时看不到当前对话，指令必须自包含';
+    if (prompt.length > 4000) return '⛔ 任务指令过长（>4000 字），请精简';
+    const { parseCron, nextFire, describeCron } = require('./cron');
+    if (!parseCron(schedule)) {
+      return `⛔ 定时计划不合法："${schedule}"。schedule 必须是五段 cron（分 时 日 月 周），如 "0 9 * * *"（每天 09:00）、"30 9 * * 1-5"（工作日 09:30）。请把用户的时间描述换算后重试。`;
+    }
+    const nextTs = nextFire(schedule);
+    if (!nextTs) return `⛔ 该计划在一年内不会触发（如「2 月 30 日」类无效日期组合），请修正 schedule。`;
+    // 用户行（角色判断 + 权限校验用）
+    const me = db.prepare('SELECT id, username, nickname, role, dept FROM users WHERE username=? AND status=1').get(username);
+    if (!me) return '⛔ 当前账号不可用，无法创建任务';
+    // 数量配额（管理员不受限）
+    if (me.role !== 'admin') {
+      const cnt = db.prepare('SELECT COUNT(*) c FROM tasks WHERE username=? AND enabled=1').get(username).c;
+      if (cnt >= MAX_USER_TASKS) {
+        return `⛔ 已达任务数量上限（启用中 ${MAX_USER_TASKS} 个）。请先在「任务管理」页停用或删除不需要的任务后再创建。`;
+      }
+    }
+    // 执行主体：显式指定 → 校验可见性（与对话链路 canView 同权限）；未指定 → 系统智能体
+    let agent = null;
+    if (agentId) {
+      agent = db.prepare("SELECT * FROM agents WHERE id=? AND status='published'").get(agentId);
+      if (!agent) return `⛔ 指定的智能体（id=${agentId}）不存在或未发布，请改用其他智能体或留空`;
+      const { canView } = require('./agent-access');
+      if (!canView(agent, me)) return `⛔ 无权绑定智能体「${agent.name}」（未对你开放）`;
+    } else {
+      agent = db.prepare('SELECT * FROM agents WHERE name=? AND status=?').get(SYS_TASK_AGENT_NAME, 'published');
+      if (!agent) return '⛔ 系统执行智能体未初始化，请联系管理员重启服务后重试';
+    }
+    const info = db.prepare(`INSERT INTO tasks (name,target_type,target_id,exec_type,cron,params,enabled,username,created_at)
+      VALUES (?,?,?,?,?,?,1,?,datetime('now','localtime'))`)
+      .run(name, 'agent', agent.id, 'cron', schedule, JSON.stringify({ input: prompt.slice(0, 4000) }), username);
+    const planText = scheduleDesc || describeCron(schedule);
+    const nextText = new Date(nextTs).toLocaleString('sv-SE', { timeZone: 'Asia/Shanghai' }).replace('T', ' ').slice(0, 16);
+    return [
+      `✅ 定时任务已创建（id=${info.lastInsertRowid}）`,
+      `・名称：${name}`,
+      `・计划：${planText}（cron：${schedule}）`,
+      `・下次执行：${nextText}`,
+      `・执行主体：${agent.name}`,
+      `・执行指令：${prompt.slice(0, 120)}${prompt.length > 120 ? '…' : ''}`,
+      '',
+      `请向用户确认以上信息；任务可在「任务管理」页查看执行记录、停用或删除。`,
+    ].join('\n');
+  },
+};
+
+module.exports = { db_query, db_chart, web_search, web_fetch, stock_quote, export_word, tts, doc_review, run_code, local_exec, create_task, sanitizeSelectSql, fileIdOf };

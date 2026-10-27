@@ -864,18 +864,58 @@ async function runAgent(agent, input, ctx = {}) {
       }
     } catch { /* kb 检索失败不阻塞主流程 */ }
   }
+  // P5.31：智能体配置了工具（如系统「定时任务执行助手」的 web_search/export_word）→ 走 chat() 完整工具循环
+  // （真实执行 function calling，防 LLM 编造工具输出；与 chat.js runChildAgent 的 P3 模式同构），否则保持纯文本一次调用。
+  // 定时/Webhook/API 触发属可信执行路径，无对话确认卡（P5.25 权限闸门仅对话链路）。
+  let agentToolIds = [];
+  try { agentToolIds = JSON.parse((agent && agent.tools) || '[]'); } catch { agentToolIds = []; }
+  const agentMcpTools = agent ? loadMcpToolsForRun(agent.mcp_servers || '[]') : [];
+  const toolSchemas = buildToolsForRun(agentToolIds, agentMcpTools, []);
+  const baseOpts = {
+    model: agent && agent.model, temperature: (agent && agent.temperature) ?? 0.5, top_p: agent && agent.top_p,
+    max_reply: Math.min((agent && agent.max_reply) || 1024, 2048), agentName: agent && agent.name,
+    username: ctx.username, // P5.31：任务归属者（用户自有模型优先路由；无值走平台默认）
+  };
+  if (toolSchemas.length) {
+    const { chat } = require('./llm');
+    const gen = chat([
+      { role: 'system', content: system },
+      { role: 'user', content: taskText.slice(0, 4000) },
+    ], {
+      ...baseOpts,
+      tools: toolSchemas,
+      executeTool: (name, argsJson) => runToolForRun(name, argsJson, { kbId: (agent && agent.kb_id) || null, mcpServers: (agent && agent.mcp_servers) || '[]', username: ctx.username }),
+    });
+    let full = '';
+    let usage = null;
+    while (true) {
+      const r = await gen.next();
+      if (r.done) { full = r.value.full || ''; usage = r.value.usage || null; break; }
+    }
+    const u = usage || {};
+    const c = calcCost(agent && agent.model, u.prompt_tokens, u.completion_tokens);
+    return { text: String(full).trim(), mode: 'form-tools', usage: { totalTokens: u.total_tokens ?? 0, tokensIn: u.prompt_tokens ?? 0, tokensOut: u.completion_tokens ?? 0, costCny: +c.total.toFixed(6), priced: c.priced, nodes: [{ title: '单次调用（含工具循环）', type: 'llm', tokens: u.total_tokens ?? 0, costCny: +c.total.toFixed(6), model: (agent && agent.model) || '' }] } };
+  }
   const r = await chatOnce([
     { role: 'system', content: system },
     { role: 'user', content: taskText.slice(0, 4000) },
-  ], {
-    model: agent && agent.model, temperature: (agent && agent.temperature) ?? 0.5, top_p: agent && agent.top_p,
-    max_reply: Math.min((agent && agent.max_reply) || 1024, 2048), agentName: agent && agent.name,
-  });
+  ], baseOpts);
   // P5.13：form 模式单次调用 usage
   const u = r.usage || {};
   const c = calcCost(agent && agent.model, u.prompt_tokens, u.completion_tokens);
   return { text: (r.full || '').trim(), mode: 'form',
     usage: { totalTokens: u.total_tokens ?? 0, tokensIn: u.prompt_tokens ?? 0, tokensOut: u.completion_tokens ?? 0, costCny: +c.total.toFixed(6), priced: c.priced, nodes: [{ title: '单次调用', type: 'llm', tokens: u.total_tokens ?? 0, costCny: +c.total.toFixed(6), model: (agent && agent.model) || '' }] } };
+}
+
+// P5.31 工具循环依赖（延迟 require，避免 tools.js ↔ workflow.js 循环依赖在模块加载期爆栈）
+function loadMcpToolsForRun(mcpServersJson) {
+  try { return require('./tools').loadMcpTools(mcpServersJson); } catch { return []; }
+}
+function buildToolsForRun(toolIds, mcpTools, childTools) {
+  try { return require('./tools').buildTools(toolIds, mcpTools, childTools); } catch { return []; }
+}
+async function runToolForRun(name, argsJson, ctx) {
+  try { return await require('./tools').runTool(name, argsJson, ctx); } catch (e) { return `工具执行失败：${e.message}`; }
 }
 
 module.exports = { runWorkflow, runAgent, runGraph, render, topologicalSort, evaluateConditions, evalCondition, computeActive, resolveInputs, resolveRefRaw, NODE_EXECUTORS, buildClassifyPrompt, parseClassifyReply, flattenToolResult, buildLlmMessages };

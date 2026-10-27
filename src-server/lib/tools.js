@@ -100,18 +100,19 @@ const TOOL_DEFS = {
 
 // P3 扩展工具（2026-10-22）：Text2SQL / 图表 / 联网 / 行情 / Word 导出 / TTS / 文档评审（tools-extra.js 注册合并；只取工具定义，忽略其导出的辅助函数）
 const _extra = require('./tools-extra');
-for (const _k of ['db_query', 'db_chart', 'web_search', 'web_fetch', 'stock_quote', 'export_word', 'tts', 'doc_review', 'run_code', 'local_exec']) {
+for (const _k of ['db_query', 'db_chart', 'web_search', 'web_fetch', 'stock_quote', 'export_word', 'tts', 'doc_review', 'run_code', 'local_exec', 'create_task']) {
   if (_extra[_k] && _extra[_k].schema) TOOL_DEFS[_k] = _extra[_k];
 }
 
 // P5.25 工具风险分级（对话权限「默认权限/全自动执行」的判定依据）：
 //  - low（默认）：纯读/纯算，执行无副作用——get_datetime/calculator/kb_search/db_query/db_chart/web_search/web_fetch/stock_quote/doc_review
 //  - medium：产出外部可见产物或花费 token 较多——image_gen/export_word/tts/子智能体调用 agent_call_*
-//  - high：MCP 任意工具（能力不可枚举，可能含写操作/对外发送）——按 mcp_ 前缀整体归 high
+//  - high：持久化自动执行实体（create_task，P5.31）与 MCP 任意工具（能力不可枚举，可能含写操作/对外发送）——按 mcp_ 前缀整体归 high
 // 「默认权限」下 medium/high 执行前需用户确认；「全自动执行」全部放行；low 永不拦截（确认疲劳无意义）。
 const TOOL_RISK = {
   low: ['get_datetime', 'calculator', 'kb_search', 'db_query', 'db_chart', 'web_search', 'web_fetch', 'stock_quote', 'doc_review'],
   medium: ['image_gen', 'export_word', 'tts', 'run_code'],
+  high: ['create_task'], // P5.31：定时任务 = 持久化自动执行实体，提示词注入最想拿到的能力，必弹确认卡
 };
 function toolRiskOf(name) {
   if (name.startsWith('mcp_') || name.startsWith('agent_call_') || name.startsWith('local_')) return 'high';

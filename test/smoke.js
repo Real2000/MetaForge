@@ -394,11 +394,12 @@ function t(name, fn) {
     r = String(await extra.local_exec.run({ op: 'mkdir', target: 'Desktop/x' }, { username: 'tester-no-device' }));
     assert.ok(r.includes('还没有配对') && r.includes('助手'), '未配对应给安装引导');
   });
-  await t('扩展工具注册：TOOL_DEFS 合并后共 14 个（P5.26 run_code + P5.27 local_exec）', () => {
-    const need = ['db_query', 'db_chart', 'web_search', 'web_fetch', 'stock_quote', 'export_word', 'tts', 'doc_review', 'run_code', 'local_exec'];
+  await t('扩展工具注册：TOOL_DEFS 合并后共 15 个（P5.26 run_code + P5.27 local_exec + P5.31 create_task）', () => {
+    const need = ['db_query', 'db_chart', 'web_search', 'web_fetch', 'stock_quote', 'export_word', 'tts', 'doc_review', 'run_code', 'local_exec', 'create_task'];
     need.forEach(n => assert.ok(tools.TOOL_DEFS[n], `缺少工具 ${n}`));
-    assert.strictEqual(Object.keys(tools.TOOL_DEFS).length, 14);
+    assert.strictEqual(Object.keys(tools.TOOL_DEFS).length, 15);
     need.forEach(n => assert.strictEqual(tools.TOOL_DEFS[n].schema.function.name, n, `schema 名不匹配 ${n}`));
+    assert.strictEqual(tools.toolRiskOf('create_task'), 'high', 'create_task 应归 high（默认权限必弹确认卡）');
   });
   await t('sanitizeSelectSql：合法 SELECT 通过并强制 LIMIT（无 LIMIT 追加 / 超大 LIMIT 收敛）', () => {
     const r1 = extra.sanitizeSelectSql('SELECT COUNT(*) FROM agents');
@@ -2104,6 +2105,27 @@ function t(name, fn) {
           const del = await jfetch(`/api/knowledge/${kbid}`, { method: 'DELETE' }, tok2);
           assert.strictEqual(del.j && del.j.code, 403, '非创建者删除应 403：' + JSON.stringify(del.j));
         });
+        await t('HTTP：任务归属——创建者自有，他人不可见不可删（P5.31）', async () => {
+          const aid = db.prepare(`SELECT id FROM users WHERE username='httpadmin'`).get().id;
+          const tokA2 = sign({ uid: aid, exp: Date.now() + 3600000 });
+          const sysAgent = db.prepare(`SELECT id FROM agents WHERE name='定时任务执行助手'`).get();
+          assert.ok(sysAgent, '系统执行智能体应已种子');
+          const bad = await jfetch('/api/tasks', { method: 'POST', body: JSON.stringify({ name: '坏cron', target_id: sysAgent.id, exec_type: 'cron', cron: '99 9 * * *' }) }, tok1);
+          assert.strictEqual(bad.j && bad.j.code, 400, '非法 cron 应 400：' + JSON.stringify(bad.j));
+          const c = await jfetch('/api/tasks', { method: 'POST', body: JSON.stringify({ name: 'u1的监控任务', target_id: sysAgent.id, exec_type: 'cron', cron: '0 9 * * *', params: JSON.stringify({ input: '监控测试' }) }) }, tok1);
+          assert.ok(c.j && c.j.code === 0, 'u1 创建任务应成功：' + JSON.stringify(c.j).slice(0, 120));
+          const tid = c.j.data.id;
+          const list2 = await jfetch('/api/tasks', {}, tok2);
+          assert.ok(!(list2.j.data || []).some(x => x.id === tid), 'u2 列表不应看到 u1 的任务');
+          const list1 = await jfetch('/api/tasks', {}, tok1);
+          assert.ok((list1.j.data || []).some(x => x.id === tid && x.username === 'httpu1'), 'u1 应看到自己的任务且带归属');
+          const del2 = await jfetch(`/api/tasks/${tid}`, { method: 'DELETE' }, tok2);
+          assert.strictEqual(del2.j && del2.j.code, 403, 'u2 删除 u1 任务应 403：' + JSON.stringify(del2.j));
+          const runs2 = await jfetch(`/api/tasks/${tid}/runs`, {}, tok2);
+          assert.strictEqual(runs2.j && runs2.j.code, 403, 'u2 查看 u1 任务执行记录应 403：' + JSON.stringify(runs2.j));
+          const adminList = await jfetch('/api/tasks', {}, tokA2);
+          assert.ok((adminList.j.data || []).some(x => x.id === tid), '管理员应能看到全部任务');
+        });
       } else {
         failed++; console.error('  ❌ HTTP 测试服务未就绪，本组用例跳过');
       }
@@ -2112,6 +2134,62 @@ function t(name, fn) {
       await new Promise(r2 => setTimeout(r2, 600));
       try { child.kill('SIGKILL'); } catch { }
     }
+  }
+
+  console.log('【N+1】P5.31 对话内定时任务：cron 增强 + create_task 工具');
+  {
+    const { parseCron, nextFire, describeCron, lastFire } = require('../src-server/lib/cron');
+    await t('nextFire：每天/工作日/每月计划均可算出未来触发点', () => {
+      const now = new Date('2026-10-27T10:00:00+08:00').getTime();
+      const n1 = nextFire('0 9 * * *', now);
+      assert.ok(n1 && new Date(n1).getHours() === 9 && n1 > now, '每天 9 点的下次触发应在未来且为 9 点');
+      const n2 = nextFire('0 9 * * 1-5', new Date('2026-10-27T10:00:00+08:00').getTime()); // 周二
+      const d2 = new Date(n2);
+      assert.ok(d2.getDay() >= 1 && d2.getDay() <= 5, '工作日计划的下次触发应落在周一至周五');
+      assert.strictEqual(nextFire('0 9 30 2 *', now), null, '2 月 30 日永不触发应返回 null');
+      assert.strictEqual(nextFire('bad cron', now), null, '非法表达式应返回 null');
+    });
+    await t('describeCron：常见形态中文语义化', () => {
+      assert.strictEqual(describeCron('0 9 * * *'), '每天 09:00 执行');
+      assert.strictEqual(describeCron('30 9 * * 1'), '每周一 09:30 执行');
+      assert.strictEqual(describeCron('*/5 * * * *'), '每 5 分钟执行一次');
+      assert.strictEqual(describeCron('0 9 1 * *'), '每月 1 号 09:00 执行');
+      assert.strictEqual(describeCron('0 9 * * 1-5'), '每周一、周二、周三、周四、周五 09:00 执行');
+    });
+    const { create_task } = require('../src-server/lib/tools-extra');
+    await t('create_task：无归属拒绝 / 非法 cron 拒绝 / 合法创建落库带归属', async () => {
+      let r = String(await create_task.run({ name: 'x', schedule: '0 9 * * *', prompt: 'p' }, {}));
+      assert.ok(r.includes('缺少用户上下文'), '无 ctx.username 应拒绝');
+      r = String(await create_task.run({ name: 'x', schedule: '0 25 * * *', prompt: 'p' }, { username: 'httpu1' }));
+      assert.ok(r.includes('不合法'), '非法 cron 应拒绝');
+      r = String(await create_task.run({ name: 'x', schedule: '0 9 30 2 *', prompt: 'p' }, { username: 'httpu1' }));
+      assert.ok(r.includes('不会触发'), '永不触发的表达式应拒绝');
+      r = String(await create_task.run({ name: '', schedule: '0 9 * * *', prompt: 'p' }, { username: 'httpu1' }));
+      assert.ok(r.includes('任务名称'), '缺名称应拒绝');
+      r = String(await create_task.run({ name: '每日资讯', schedule: '0 9 * * *', schedule_desc: '每天 09:00', prompt: '搜索今日科技新闻并摘要' }, { username: 'httpu1' }));
+      assert.ok(r.includes('✅') && r.includes('每天 09:00') && r.includes('下次执行'), '合法创建应返回成功+计划+下次执行：' + r.slice(0, 100));
+      const row = db.prepare("SELECT * FROM tasks WHERE name='每日资讯'").get();
+      assert.ok(row && row.username === 'httpu1' && row.exec_type === 'cron' && row.cron === '0 9 * * *' && row.enabled === 1, '落库应带归属/类型/计划/启用');
+      const params = JSON.parse(row.params || '{}');
+      assert.ok(params.input.includes('科技新闻'), 'params.input 应为任务指令');
+      const agent = db.prepare('SELECT name FROM agents WHERE id=?').get(row.target_id);
+      assert.strictEqual(agent.name, '定时任务执行助手', '未指定 agent_id 应绑定系统执行智能体');
+    });
+    await t('create_task：非管理员任务数配额 + 受限智能体绑定拒绝', async () => {
+      // 配额：为 httpu2 造 20 个启用任务后再创建应被拒
+      const ins = db.prepare(`INSERT INTO tasks (name,target_type,target_id,exec_type,cron,params,enabled,username,created_at) VALUES (?,?,(SELECT id FROM agents WHERE name='定时任务执行助手'),'cron','0 9 * * *','{}',1,?,datetime('now','localtime'))`);
+      for (let i = 0; i < 20; i++) ins.run('配额填充' + i, 'agent', 'httpu2');
+      let r = String(await create_task.run({ name: '超限任务', schedule: '0 9 * * *', prompt: 'p' }, { username: 'httpu2' }));
+      assert.ok(r.includes('上限'), '第 21 个任务应被配额拒绝');
+      // 受限智能体：draft 状态 agent 对非管理员不可绑定
+      db.prepare(`INSERT INTO agents (name,description,type,category,prompt,status,source,created_at,updated_at) VALUES ('草稿智能体','受限测试','enterprise','测试','p','draft','self',datetime('now','localtime'),datetime('now','localtime'))`).run();
+      const draftId = db.prepare("SELECT id FROM agents WHERE name='草稿智能体'").get().id;
+      r = String(await create_task.run({ name: 'x', schedule: '0 9 * * *', prompt: 'p', agent_id: draftId }, { username: 'httpu1' }));
+      assert.ok(r.includes('不存在或未发布'), '非管理员绑定草稿智能体应被拒：' + r.slice(0, 80));
+      // 清理：删掉配额填充与草稿 agent，避免影响后续用例
+      db.prepare("DELETE FROM tasks WHERE username='httpu2' AND name LIKE '配额填充%'").run();
+      db.prepare("DELETE FROM agents WHERE name='草稿智能体'").run();
+    });
   }
 
   // 收尾：关闭库并清理临时目录

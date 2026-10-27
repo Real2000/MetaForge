@@ -2,14 +2,15 @@
 import { api } from '../api.js';
 import { esc, toast, modal, confirmBox } from '../ui.js';
 
-export async function render(el) {
-  let tasks = [];
-  let agents = [];
+  export async function render(el) {
+    let tasks = [];
+    let agents = [];
+    let me = null;
 
-  el.innerHTML = `
+    el.innerHTML = `
     <div class="page-head">
       <h2>任务管理</h2>
-      <div class="desc">对智能体创建「立即执行」或「Cron 定时」任务，支持动态输入参数、启用停用与执行记录追溯。</div>
+      <div class="desc">对智能体创建「立即执行」或「Cron 定时」任务，支持动态输入参数、启用停用与执行记录追溯。💡 也可以直接在首页对话中说「每天早上9点帮我监控…」，AI 会帮你创建定时任务（确认后自动出现在这里）。</div>
     </div>
     <div class="card">
       <div class="toolbar">
@@ -37,7 +38,7 @@ export async function render(el) {
     el.querySelector('.toolbar span').textContent = `共 ${tasks.length} 个任务`;
     el.querySelector('#tbody').innerHTML = tasks.map(t => `
       <tr>
-        <td><b>${esc(t.name)}</b></td>
+        <td><b>${esc(t.name)}</b>${t.username && me && t.username !== me.username ? ` <span class="tag gray" style="font-size:10px">@${esc(t.username)}</span>` : ''}</td>
         <td>🤖 ${esc(t.agent_name || '-')}</td>
         <td>${t.exec_type === 'cron' ? `<span class="tag purple">定时</span> <span class="mono">${esc(t.cron)}</span><br><span style="font-size:11px;color:var(--text-3)">${cronDesc(t.cron)}</span>` : t.exec_type === 'webhook' ? '<span class="tag green">Webhook</span>' : '<span class="tag blue">单次</span>'}</td>
         <td><span class="badge-dot ${t.enabled ? 'on' : 'off'}"></span>${t.enabled ? '启用' : '停用'}</td>
@@ -49,7 +50,7 @@ export async function render(el) {
           <button class="btn link" data-tg="${t.id}">${t.enabled ? '停用' : '启用'}</button>
           <button class="btn link" style="color:var(--danger)" data-del="${t.id}">删除</button>
         </td>
-      </tr>`).join('') || '<tr><td colspan="7" class="empty">暂无任务，点击右上角创建</td></tr>';
+      </tr>`).join('') || '<tr><td colspan="7" class="empty">暂无任务，点击右上角创建，或在首页对话中让 AI 帮你创建（如“每天 9 点帮我监控科技新闻”)</td></tr>';
 
     el.querySelectorAll('[data-run]').forEach(b => b.onclick = async () => {
       b.disabled = true; b.textContent = '执行中…';
@@ -217,8 +218,8 @@ export async function render(el) {
   }
 
   async function load() {
-    const [jt, ja] = await Promise.all([api('/tasks'), api('/agents')]);
-    tasks = jt.data; agents = ja.data;
+    const [jt, ja, jm] = await Promise.all([api('/tasks'), api('/agents'), api('/auth/me').catch(() => ({ data: null }))]);
+    tasks = jt.data; agents = ja.data; me = jm.data;
     renderRows();
   }
 

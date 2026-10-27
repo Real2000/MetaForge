@@ -650,6 +650,23 @@ db.exec(`CREATE INDEX IF NOT EXISTS idx_wf_runs_agent ON workflow_runs(agent_id,
     console.log('[db] tasks 表已迁移：新增 webhook_token 字段（Webhook 触发）');
   }
 }
+// P5.31 对话内一键创建定时任务：tasks 归属列（username；'' = 历史管理员创建的存量任务，仅管理员可见可管）
+{
+  const taskCols = db.prepare('PRAGMA table_info(tasks)').all().map(c => c.name);
+  if (!taskCols.includes('username')) {
+    db.exec('ALTER TABLE tasks ADD COLUMN username TEXT DEFAULT \'\'');
+    console.log('[db] tasks 表已迁移：新增 username 归属字段（对话内创建定时任务）');
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS idx_tasks_owner ON tasks(username, enabled)'); // 用户任务列表/配额计数索引
+}
+// P5.32 MCP 细粒度风险分级：服务级信任开关（trusted=1 才允许按工具注解/启发式降级；默认 0 = 整类 high）
+{
+  const mcpCols = db.prepare('PRAGMA table_info(mcp_servers)').all().map(c => c.name);
+  if (!mcpCols.includes('trusted')) {
+    db.exec('ALTER TABLE mcp_servers ADD COLUMN trusted INTEGER DEFAULT 0');
+    console.log('[db] mcp_servers 表已迁移：新增 trusted 信任字段（工具风险分级白名单）');
+  }
+}
 // P5.14 文件一等变量：工作流文件表（上传原文+解析文本；变量值传 fileId，运行时注入内容/下载链接）
 // content_b64 仅 ≤8MB 文件保留（供原文下载）；text_content 为解析全文（PDF/DOCX/TXT/MD）
 db.exec(`CREATE TABLE IF NOT EXISTS wf_files (
@@ -743,6 +760,26 @@ db.exec(`CREATE TABLE IF NOT EXISTS mcp_tokens (
 {
   const cols = db.prepare('PRAGMA table_info(providers)').all().map(c => c.name);
   if (!cols.includes('model_types')) db.exec(`ALTER TABLE providers ADD COLUMN model_types TEXT DEFAULT '{}'`);
+}
+
+// ---------------- P5.31 系统智能体：定时任务执行助手（幂等自种——存量库迁移补齐 + 新库种子；对话内
+// create_task 未指定 agent_id 时绑定它；带联网检索/计算/Word 导出工具，定时任务具备真实执行能力） ----------------
+{
+  const SYS_TASK_AGENT = '定时任务执行助手';
+  const exists = db.prepare('SELECT id FROM agents WHERE name=?').get(SYS_TASK_AGENT);
+  if (!exists) {
+    db.prepare(`INSERT INTO agents
+      (name,description,type,space_id,category,prompt,model,temperature,context_rounds,max_reply,opening,opening_questions,kb_id,tools,status,source,source_name,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(
+        SYS_TASK_AGENT, '系统内置执行引擎：对话中创建的定时任务默认由它执行（也可手动绑定）。按任务指令自主完成检索、计算与文档产出。',
+        'digital', null, '系统',
+        '你是定时任务执行助手，负责自主完成交给你的定时任务指令（如资讯监控、数据汇总、报告生成）。\n工作方式：\n1. 需要外部信息时必须调用 web_search / web_fetch 真实检索，禁止凭记忆编造；\n2. 涉及计算用 calculator 保证准确；\n3. 用户要报告/文档时用 export_word 生成可下载的 Word 交付；\n4. 输出结构化摘要（要点+来源），指明信息时效；\n5. 无法完成的步骤如实说明，不要虚构结果。',
+        '', 0.3, 0, 2048, '', '[]', null,
+        JSON.stringify(['web_search', 'web_fetch', 'get_datetime', 'calculator', 'export_word']),
+        'published', 'self', '系统内置', now(), now());
+    console.log('[db] 已种子系统智能体「' + SYS_TASK_AGENT + '」（create_task 默认执行主体）');
+  }
 }
 
 // ---------------- 种子数据（仅首次） ----------------

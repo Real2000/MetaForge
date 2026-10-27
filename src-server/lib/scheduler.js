@@ -6,6 +6,7 @@ const { db, now } = require('../db');
 const { runAgent } = require('./workflow');
 const { lastFire } = require('./cron');
 const ops = require('./ops');
+const { addUsage } = require('./quota'); // P5.31：定时任务 token 记归属者配额
 
 const fireMarks = new Map(); // task_id -> last fired ts
 
@@ -14,12 +15,15 @@ async function runTask(task) {
   const agent = db.prepare('SELECT * FROM agents WHERE id=?').get(task.target_id);
   let output = '';
   let status = 'success';
+  let usage = null;
   try {
     if (!agent) throw new Error('目标智能体不存在');
     const params = JSON.parse(task.params || '{}');
     // P5.8 #11：经统一入口 runAgent——画布模式按编排图执行，表单模式走提示词+知识库（定时任务也能跑画布工作流）
-    const r = await runAgent(agent, params.input || '（无输入参数）请执行默认任务。', { triggerType: 'schedule' });
+    // P5.31：透传任务归属者 username（用户自有模型优先路由 + 产出 token 记归属者配额）
+    const r = await runAgent(agent, params.input || '（无输入参数）请执行默认任务。', { triggerType: 'schedule', username: task.username || undefined });
     output = r.text;
+    usage = r.usage || null;
     if (!output) throw new Error('智能体无返回');
   } catch (e) {
     status = 'fail';
@@ -30,6 +34,11 @@ async function runTask(task) {
   db.prepare('INSERT INTO task_runs (task_id,status,started_at,finished_at,output) VALUES (?,?,?,?,?)')
     .run(task.id, status, started, finished, output);
   db.prepare('UPDATE tasks SET last_run_at=?, last_result=? WHERE id=?').run(finished, status, task.id);
+  // P5.31 配额记账：定时任务的 token 消耗记到任务归属者（此前不记任何人；管理员建的历史任务 username='' 不记）
+  try {
+    const tokens = usage?.totalTokens || 0;
+    if (task.username && tokens > 0) addUsage(task.username, tokens);
+  } catch { /* 记账失败不影响任务执行 */ }
   return { status, output };
 }
 
