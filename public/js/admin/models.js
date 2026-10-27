@@ -143,8 +143,8 @@ export async function render(el) {
         <div class="form-item"><label>OpenAI 兼容服务地址<span class="req">*</span></label><input class="input mono" id="pv_url" value="${esc(p.base_url)}" placeholder="https://api.deepseek.com"></div>
       </div>
       <div class="form-item"><label>API Key</label>
-        <input class="input mono" id="pv_key" value="${esc(p.api_key || '')}" placeholder="sk-...">
-        <div class="hint">填写后该供应商即可真实调用；默认供应商将驱动全平台对话。Key 仅存于本地数据库。</div>
+        <input class="input mono" id="pv_key" value="" placeholder="${id && p.api_key ? '已配置（留空不修改，输入新 Key 可覆盖）' : 'sk-...'}" autocomplete="new-password">
+        <div class="hint">填写后该供应商即可真实调用；默认供应商将驱动全平台对话。P5.30 起列表不再回显完整 Key（仅前 3 后 4 位），留空即保持原 Key。</div>
       </div>
       <div class="form-item"><label>模型列表（逗号分隔）</label>
         <input class="input mono" id="pv_models" value="${esc(models.join(', '))}" placeholder="deepseek-chat, deepseek-reasoner">
@@ -158,16 +158,17 @@ export async function render(el) {
         mask.querySelector('[data-cancel]').onclick = close;
         mask.querySelector('[data-save]').onclick = async () => {
           try {
+            const keyVal = mask.querySelector('#pv_key').value.trim(); // P5.30：留空=不修改 Key（后端掩码防御兑底）
             const payload = {
               name: mask.querySelector('#pv_name').value.trim(),
               base_url: mask.querySelector('#pv_url').value.trim(),
-              api_key: mask.querySelector('#pv_key').value.trim(),
               models: mask.querySelector('#pv_models').value,
               remark: mask.querySelector('#pv_remark').value,
             };
+            if (keyVal) payload.api_key = keyVal;
             if (id) await api('/providers/' + id, { method: 'PUT', body: payload });
             else await api('/providers', { method: 'POST', body: payload });
-            toast('已保存' + (payload.api_key ? '（已启用真实调用）' : '')); close(); load();
+            toast('已保存' + (keyVal ? '（已启用真实调用）' : '')); close(); load();
           } catch (e) { toast(e.message, 'err'); }
         };
       },

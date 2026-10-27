@@ -882,7 +882,9 @@ async function reviewBody(doc, args) {
  *
  * 安全边界（执行前静态拦截 + 运行时硬限制双层）：
  *  - 静态 DENY：require/import 动态模块、process.exit/kill、child_process、fs 写沙箱外路径、
- *    网络调用（http/https/net/dns/fetch）、eval/Function 构造器——防逃逸与横向移动
+ *    网络调用（http/https/net/dns/fetch）、eval/Function 构造器、构造器链/globalThis/原型攀爬（P5.30）——防逃逸与横向移动
+ *  - P5.30 运行时加固：沙箱上下文关闭字符串代码生成（eval/new Function 失效）+ 抹平注入宿主对象的 constructor 跳板；
+ *    ⚠️ 已知边界：node:vm 非安全边界（官方文档明示），对不可信用户完全隔离需迁移子进程（中期项）
  *  - 运行时：子进程 10s 超时杀进程；stdout+stderr 各截 8KB；工作目录 = .temp/sandbox-<id>（一次性）
  *  - fs 读写代理：只允许工作目录内路径（resolve 后前缀校验），读文件额外放行 /uploads 与项目内只读
  *  - 产物：沙箱目录内新文件 → 拷贝到 public/uploads/sandbox/ 供下载，回复中给链接
@@ -896,6 +898,12 @@ const SANDBOX_DENY_PATTERNS = [
   { re: /process\s*\.\s*(?:env|execPath|pid)\b/gi, msg: '禁止读取 process.env / execPath（密钥与宿主信息）' },
   { re: /\beval\s*\(|new\s+Function\s*\(|require\s*\.main|module\s*\.\s*(?:constructor|exports\s*=\s*require)/i, msg: '禁止 eval / new Function / 动态 require（逃逸向量）' },
   { re: /fetch\s*\(|XMLHttpRequest|WebSocket\s*\(/i, msg: '禁止网络请求（沙箱离线运行）' },
+  // P5.30 安全止血（对齐工作流 code 节点 CODE_FORBIDDEN_RE）：堵构造器链逃逸向量。
+  // 此前缺少以下规则，Buffer.constructor.constructor('return process')() 可拿到宿主 process（进而读 process.env/require）
+  { re: /\.constructor\s*[.(]/i, msg: '禁止构造器链调用（.constructor( 或 .constructor[ 为已知逃逸向量）' },
+  { re: /\bglobalThis\b/i, msg: '禁止访问 globalThis（宿主全局逃逸向量）' },
+  { re: /__proto__|getPrototypeOf|setPrototypeOf/i, msg: '禁止原型链攀爬（__proto__/getPrototypeOf 为逃逸向量）' },
+  { re: /\bWebAssembly\b/i, msg: '禁止 WebAssembly（逃逸向量）' },
 ];
 const SANDBOX_ALLOWED_READ_PREFIXES = ['/uploads/']; // 相对项目根的额外只读区
 
@@ -1032,12 +1040,26 @@ const run_code = {
       URLSearchParams,
     };
     sandbox.globalThis = sandbox;
+    // P5.30 安全止血：抹平注入的宿主对象及其方法的自身 constructor（打断 Buffer.constructor → 宿主 Function 的逃逸跳板；
+    // 与静态拦截、codeGeneration:false 三层防护叠加。注：不影响实例的 prototype.constructor，平台自身代码不依赖全局构造器的 .constructor）
+    const shadowCtor = (obj, depth) => {
+      if (!obj || typeof obj !== 'object' || depth > 1) return;
+      for (const v of Object.values(obj)) {
+        if (typeof v === 'function') { try { Object.defineProperty(v, 'constructor', { value: undefined, writable: true, configurable: true }); } catch { } }
+        else if (v && typeof v === 'object') shadowCtor(v, depth + 1);
+      }
+    };
+    for (const v of Object.values(sandbox)) {
+      if (typeof v === 'function') { try { Object.defineProperty(v, 'constructor', { value: undefined, writable: true, configurable: true }); } catch { } }
+      else if (v && typeof v === 'object' && v !== sandbox) shadowCtor(v, 1);
+    }
     const out = [];
     const err = [];
     let timedOut = false;
     try {
       const script = new vm.Script(code, { filename: `sandbox-${sbId}.js` });
-      const ctx = vm.createContext(sandbox);
+      // P5.30 安全止血：codeGeneration.strings=false —— 沙箱上下文内 eval/new Function 直接抛 EvalError（运行时层堵逃逸）
+      const ctx = vm.createContext(sandbox, { codeGeneration: { strings: false, wasm: false } });
       const timer = setTimeout(() => { timedOut = true; }, SANDBOX_TIMEOUT_MS);
       const start = Date.now();
       // runInContext 同步执行——长循环靠脚本超时器标记 + 主进程事件循环外强制手段：

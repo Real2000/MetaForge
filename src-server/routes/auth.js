@@ -2,10 +2,14 @@
 const express = require('express');
 const { db, hashPwd, verifyPwd, now } = require('../db');
 const { sign, auth, TOKEN_TTL_MS } = require('../lib/auth');
+const { createLimiter, clientIp } = require('../lib/rate-limit');
 
 const router = express.Router();
 
-router.post('/login', (req, res) => {
+// P5.30 安全止血：登录接口按 IP 限流（此前可无限暴力尝试；与 share/openapi 同一套滑动窗口实现，10 次/分钟/IP）
+const loginLimiter = createLimiter({ name: 'login', windowMs: 60000, max: 10, keyFn: clientIp, msg: '登录尝试过于频繁，请 1 分钟后再试' });
+
+router.post('/login', loginLimiter, (req, res) => {
   const { username, password } = req.body || {};
   const ip = req.ip;
   if (!username || !password) return res.json({ code: 400, msg: '请输入账号和密码' });

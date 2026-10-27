@@ -1990,3 +1990,41 @@ agent-platform/
 - 停止时机在模型思考期（无 delta）时 partial 为空——仅落库标记，前端显示「尚未输出内容」，符合预期
 
 > AI生成
+
+## P5.30 安全止血包：换机后首轮加固（2026-10-27）
+
+> 动因：换机交接时三位专家（架构/前端/测试）并行勘察，发现 2 个实锤正确性/安全 bug（会话 IDOR、技能路径配额双重记账）与 4 处安全短板。本轮以最小改动收口，同时补齐项目缺失的版本控制与 HTTP 级回归测试。
+
+### 基建
+
+- **git 版本控制**：`git init` + `.gitignore`（node_modules / data（含密钥）/ uploads / downloads / .temp / server.log / *.tar.gz 不入库），首次提交 = 换机恢复基线（P5.29 完成态），本轮修复为第二个提交——此后所有改动可 diff、可回滚
+
+### 修复内容（6 项）
+
+1. **技能路径配额双重记账**（`routes/chat.js`）：技能分流块连续两行相同 `addUsage` → 图片/视频/PPT/语音技能对话用量被双倍扣减。删重复行；加源码级 tripwire 测试（技能块 addUsage 恰好 1 处）
+2. **会话越权读写 IDOR**（`routes/chat.js`）：`GET /sessions/:id/messages` 与 `/stream` 全链路仅按 session_id 查询、不校验归属——任何登录用户可读取他人全部对话、向他人会话注入消息并污染其模型上下文。两处补归属校验（对齐评价类路由模式；**stream 校验必须放在 writeHead(SSE) 之前**，否则 403 发不出去）；管理端查用户会话走 `/api/stats/*`（本有 adminOnly 全局防护），不受影响
+3. **登录无限流**（`routes/auth.js`）：`/api/auth/login` 套用现成 `createLimiter`（10 次/分钟/IP，与 share/openapi 同一套滑动窗口实现）
+4. **供应商 Key 明文回显**（`routes/providers.js` + `public/js/admin/models.js`）：GET 列表不再回传完整 Key（前 3 后 4 脱敏）；前端编辑框改「留空不修改」（对齐 MCP 管理页既有模式）；PUT 侧防御掩码值回写（空值或含 `****` 一律视为不修改）。**三件套缺一不可**——只改后端会把掩码串存回真 Key（旧前端 SW 缓存窗口尤其危险）
+5. **run_code 沙箱逃逸向量**（`lib/tools-extra.js`）：补静态拦截（`.constructor` 链调用 / globalThis / `__proto__` / getPrototypeOf / WebAssembly，对齐工作流 code 节点 `CODE_FORBIDDEN_RE`）+ 运行时双层加固（`vm.createContext` 的 `codeGeneration.strings=false` 关闭沙箱内 eval/Function；抹平注入宿主对象的自身 constructor 跳板，断 `Buffer.constructor` → 宿主 Function 的逃逸链）。⚠️ node:vm 非安全边界（官方文档明示），对不可信用户的完全隔离需迁移子进程（中期项）
+6. **知识库越权写**（`routes/knowledge.js`）：PUT / DELETE / 上传 / 删文件 / 重解析补归属校验（owner 命中创建者昵称或用户名 + 管理员放行）。owner 列存昵称为历史设计，改存 username 为中期项
+
+### 回归测试（140 → 150）
+
+- run_code 逃逸向量 5 组全拦截 + 「字符串拼接绕过静态拦截」时运行时层抹平验证
+- quota 单元测试首次覆盖（0=不限额 / 记账累计 / 超限拦截 / 负值忽略）
+- **HTTP 集成测试组（项目首次）**：smoke.js spawn 子进程服务（临时库 + 随机端口，与父进程共享 WAL 临时库）——健康检查 / 会话 IDOR 读取与写入双向拦截 / 本人链路不误伤（SSE done）/ 登录第 11 次 429 / providers Key 脱敏 / 知识库非创建者改删 403
+- 结果：**150 通过 / 0 失败**
+
+### 踩坑实录
+
+- **addUsage 注释与实现不符**：注释称「允许负值修正」，实际守卫 `tokens <= 0` 直接 return——负值是 no-op。新用例按真实语义锁定（负值忽略），修正口径留待中期统一
+- **登录限流断言不能只看 HTTP 状态**：login 业务失败返回 HTTP 200 + body code 401（平台惯例），仅限流走真 429——断言需区分两类状态
+- **脱敏三件套联动**：单独改后端 GET 会把掩码串存回真 Key；旧前端 Service Worker 缓存窗口靠 PUT 侧掩码防御兜底
+
+### 遗留（衔接后续路线图）
+
+- 密码哈希仍为静态盐 sha256（切 scrypt + per-user salt）；Token 不可吊销（改密/停用后旧 token 仍有效）；数据库密钥明文存储（AES-GCM 封装）——均为中期项
+- run_code 完整隔离（子进程）；kb owner 列改存 username——中期项
+- HTTP 集成组后续扩黄金路径：files 上传安全 / openapi 协议冒烟 / 工具确认卡五态
+
+> AI生成

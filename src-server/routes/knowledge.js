@@ -7,6 +7,16 @@ const { retrieve } = require('../lib/retriever');
 const router = express.Router();
 router.use(auth);
 
+// P5.30 安全止血：写操作归属校验——此前 PUT/DELETE/上传对任何登录用户放行（可改删他人知识库、向他人知识库注入内容）。
+// kbs.owner 存的是创建者昵称或用户名（历史设计，创建时写入 nickname||username），两者任一命中 + 管理员放行。
+// 彻底方案（owner 列改存 username）为中期项，届时需迁移存量数据
+function denyIfNotAllowed(kb, user) {
+  if (!kb) return { code: 404, msg: '知识库不存在' };
+  if (user.role === 'admin') return null;
+  if (kb.owner === user.username || (user.nickname && kb.owner === user.nickname)) return null;
+  return { code: 403, msg: '无权管理该知识库（仅创建者或管理员）' };
+}
+
 router.get('/', (req, res) => {
   const rows = db.prepare(`
     SELECT k.*, (SELECT COUNT(*) FROM kb_files f WHERE f.kb_id=k.id) AS file_count
@@ -26,7 +36,8 @@ router.post('/', (req, res) => {
 router.put('/:id', (req, res) => {
   const { name, description, enabled } = req.body || {};
   const old = db.prepare('SELECT * FROM kbs WHERE id=?').get(req.params.id);
-  if (!old) return res.json({ code: 404, msg: '知识库不存在' });
+  const deny = denyIfNotAllowed(old, req.user);
+  if (deny) return res.json(deny);
   db.prepare('UPDATE kbs SET name=?,description=?,enabled=? WHERE id=?')
     .run(name || old.name, description ?? old.description, enabled ?? old.enabled, old.id);
   res.json({ code: 0, msg: '已保存' });
@@ -34,6 +45,8 @@ router.put('/:id', (req, res) => {
 
 router.delete('/:id', (req, res) => {
   const old = db.prepare('SELECT * FROM kbs WHERE id=?').get(req.params.id);
+  const deny = denyIfNotAllowed(old, req.user);
+  if (deny) return res.json(deny);
   db.prepare('DELETE FROM kb_chunks WHERE kb_id=?').run(req.params.id);
   db.prepare('DELETE FROM kb_files WHERE kb_id=?').run(req.params.id);
   db.prepare('DELETE FROM kbs WHERE id=?').run(req.params.id);
@@ -53,6 +66,8 @@ router.get('/:id/files', (req, res) => {
 router.post('/:id/files', async (req, res) => {
   const kb = db.prepare('SELECT * FROM kbs WHERE id=?').get(req.params.id);
   if (!kb) return res.json({ code: 404, msg: '知识库不存在' });
+  const deny = denyIfNotAllowed(kb, req.user); // P5.30：防向他人知识库注入内容
+  if (deny) return res.json(deny);
   const { name, content, file_b64 } = req.body || {};
   if (!name) return res.json({ code: 400, msg: '请提供文件名' });
 
@@ -102,6 +117,10 @@ router.post('/:id/files', async (req, res) => {
 });
 
 router.delete('/files/:fileId', (req, res) => {
+  const f = db.prepare('SELECT * FROM kb_files WHERE id=?').get(req.params.fileId);
+  const kb = f ? db.prepare('SELECT * FROM kbs WHERE id=?').get(f.kb_id) : null;
+  const deny = denyIfNotAllowed(kb, req.user); // P5.30：文件级写操作同样校验库归属
+  if (deny) return res.json(deny);
   db.prepare('DELETE FROM kb_chunks WHERE file_id=?').run(req.params.fileId);
   db.prepare('DELETE FROM kb_files WHERE id=?').run(req.params.fileId);
   res.json({ code: 0, msg: '已删除' });
@@ -111,6 +130,9 @@ router.delete('/files/:fileId', (req, res) => {
 router.post('/files/:fileId/reparse', (req, res) => {
   const f = db.prepare('SELECT * FROM kb_files WHERE id=?').get(req.params.fileId);
   if (!f) return res.json({ code: 404, msg: '文件不存在' });
+  const kb = db.prepare('SELECT * FROM kbs WHERE id=?').get(f.kb_id);
+  const deny = denyIfNotAllowed(kb, req.user); // P5.30：同上
+  if (deny) return res.json(deny);
   db.prepare('UPDATE kb_files SET status="success" WHERE id=?').run(f.id);
   res.json({ code: 0, msg: '重新解析完成' });
 });

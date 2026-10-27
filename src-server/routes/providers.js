@@ -18,8 +18,17 @@ function ensureTypes(ms, typesObj) {
   return out;
 }
 
+/** P5.30 安全止血：API Key 脱敏展示（保留前 3 后 4）——此前 GET /api/providers 把完整 Key 明文回传浏览器，
+ *  XSS 或浏览器缓存泄露即丢全网关 Key。编辑语义改为「留空不修改」（前端 models.js 同步适配，PUT 侧另有掩码防御） */
+function maskKey(key) {
+  const k = String(key || '');
+  if (!k) return '';
+  if (k.length <= 8) return '****';
+  return k.slice(0, 3) + '****' + k.slice(-4);
+}
+
 router.get('/', (req, res) => {
-  const rows = db.prepare('SELECT * FROM providers ORDER BY id').all().map(p => ({ ...p, model_types: parseTypes(p.model_types) }));
+  const rows = db.prepare('SELECT * FROM providers ORDER BY id').all().map(p => ({ ...p, api_key: maskKey(p.api_key), model_types: parseTypes(p.model_types) }));
   res.json({ code: 0, data: rows });
 });
 
@@ -47,9 +56,12 @@ router.put('/:id', (req, res) => {
   if (Array.isArray(models)) ms = models;
   else if (typeof models === 'string' && models) ms = models.split(/[,，\s]+/).filter(Boolean);
   else ms = JSON.parse(old.models || '[]');
-  const configured = base_url && api_key ? 1 : old.configured;
+  // P5.30 安全止血：api_key 为空或含掩码（旧前端缓存的脱敏回显值）一律视为「不修改」，防掩码串覆盖真 Key
+  const keyIn = typeof api_key === 'string' ? api_key.trim() : '';
+  const nextKey = keyIn && !keyIn.includes('****') ? keyIn : old.api_key;
+  const configured = base_url && nextKey ? 1 : old.configured;
   db.prepare('UPDATE providers SET name=?,base_url=?,api_key=?,models=?,configured=?,remark=? WHERE id=?')
-    .run(name || old.name, base_url ?? old.base_url, api_key ?? old.api_key, JSON.stringify(ms), configured, remark ?? old.remark, old.id);
+    .run(name || old.name, base_url ?? old.base_url, nextKey, JSON.stringify(ms), configured, remark ?? old.remark, old.id);
   db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)').run(req.user.username, '配置模型供应商', name || old.name, req.ip, now());
   res.json({ code: 0, msg: '已保存' });
 });

@@ -96,7 +96,12 @@ router.get('/sessions', (req, res) => {
 });
 
 // 会话消息（关联 chat_traces 回填引用来源与工具调用，历史消息同样可见；含追问建议）
+// P5.30 安全止血：此前仅按 session_id 查询、不校验归属——任何登录用户可凭他人会话 id 读取全部对话内容（IDOR）。
+// 对齐评价类路由的归属校验模式；管理端查用户会话走 /api/stats/*（已有 adminOnly 防护），本路由保持仅本人可读
 router.get('/sessions/:id/messages', (req, res) => {
+  const sess = db.prepare('SELECT username FROM sessions WHERE id=?').get(req.params.id);
+  if (!sess) return res.json({ code: 404, msg: '会话不存在' });
+  if (sess.username !== req.user.username) return res.json({ code: 403, msg: '无权访问该会话' });
   const rows = db.prepare('SELECT * FROM messages WHERE session_id=? ORDER BY id').all(req.params.id);
   const traceStmt = db.prepare('SELECT kb_hits, tool_calls, suggestions FROM chat_traces WHERE message_id=? ORDER BY id DESC LIMIT 1');
   const out = rows.map(m => {
@@ -336,6 +341,12 @@ router.post('/stream', async (req, res) => {
   const input = (content || '').trim();
   const attachCount = (Array.isArray(attachments) ? attachments : []).length;
   if (!input && !attachCount) return res.status(400).json({ code: 400, msg: '消息不能为空' }); // P5.14：纯附件消息可发送
+  // P5.30 安全止血：会话归属校验必须在 writeHead(SSE) 之前——stream 链路的消息落库/会话更新/历史上下文读取
+  // 全部以 session_id 为键（不校验归属），任何登录用户可向他人会话写入消息并污染其模型上下文（IDOR）
+  if (session_id) {
+    const own = db.prepare('SELECT id FROM sessions WHERE id=? AND username=?').get(session_id, req.user.username);
+    if (!own) return res.status(403).json({ code: 403, msg: '无权访问该会话' });
+  }
   res.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
     'Cache-Control': 'no-cache',
@@ -435,8 +446,7 @@ router.post('/stream', async (req, res) => {
         const out = mask(reply);
         const msgInfo = db.prepare('INSERT INTO messages (session_id,role,content,tokens,created_at) VALUES (?,?,?,?,?)')
           .run(session_id, 'assistant', out, Math.ceil(out.length * 0.6), now());
-        addUsage(req.user.username, Math.ceil(out.length * 0.6)); // P2 配额记账（技能消耗）
-        addUsage(req.user.username, Math.ceil(out.length * 0.6)); // P2 配额记账（技能消耗）
+        addUsage(req.user.username, Math.ceil(out.length * 0.6)); // P2 配额记账（技能消耗）——P5.30 修复：此前连续两行重复记账，技能路径用量被双倍扣减
         db.prepare('UPDATE sessions SET updated_at=? WHERE id=?').run(now(), session_id);
         db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
           .run(req.user.username, 'AI创作', `技能 ${skill}：${input.slice(0, 50)}`, req.ip, now());

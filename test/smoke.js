@@ -274,6 +274,48 @@ function t(name, fn) {
     r = String(await run_code.run({ code: 'while(true){}' }));
     assert.ok(r.includes('超时') || r.includes('timed out') || r.includes('timeout'), '死循环应触发超时保护：' + r.slice(0, 80));
   });
+
+  // ===== P5.30 安全止血回归组 =====
+  await t('run_code：P5.30 逃逸向量全拦截（构造器链/globalThis/原型攀爬）', async () => {
+    const { run_code } = require('../src-server/lib/tools-extra');
+    const vectors = [
+      ['Buffer.constructor.constructor("return process")()', 'Buffer 构造器链'],
+      ['({}).constructor.constructor("return process")()', '对象字面量构造器链'],
+      ['globalThis.process', 'globalThis'],
+      ['Object.getPrototypeOf(Buffer)("return process")()', 'getPrototypeOf 攀爬'],
+      ['({}).__proto__.constructor.constructor("return process")()', '__proto__ 攀爬'],
+    ];
+    for (const [code, tag] of vectors) {
+      const r = String(await run_code.run({ code }));
+      assert.ok(r.includes('安全检查'), `逃逸向量「${tag}」应被静态拦截，实际：${r.slice(0, 100)}`);
+    }
+    // 运行时层：字符串拼接绕过静态拦截时，宿主 Function 跳板应已被抹平（输出 undefined 而非 function）
+    const r2 = String(await run_code.run({ code: 'console.log(typeof Buffer["con"+"structor"])' }));
+    assert.ok(r2.includes('undefined'), '拼接绕过静态时宿主 Function 跳板应被运行时层抹平：' + r2.slice(0, 120));
+  });
+
+  await t('quota：0=不限额 / 记账累计 / 超限拦截 / 负值修正（P2 体系首次覆盖）', () => {
+    const { quotaOf, checkQuota, addUsage, resetQuotaAlert } = require('../src-server/lib/quota');
+    db.prepare(`INSERT INTO users (username,password,nickname,role,status,must_change_pwd,quota_total,quota_used,created_at) VALUES ('quota-u',?,'配额测试','user',1,0,100,0,datetime('now','localtime'))`).run(hashPwd('quota-pass-1'));
+    assert.ok(quotaOf('no-such-user-x').unlimited, '不存在用户按不限额兑底（不崩）');
+    addUsage('quota-u', 30);
+    assert.strictEqual(quotaOf('quota-u').used, 30, '记账应累计到 30');
+    assert.strictEqual(checkQuota('quota-u'), null, '未超限应放行');
+    addUsage('quota-u', 80);
+    assert.ok(String(checkQuota('quota-u')).includes('配额已用完'), '超限（110/100）应返回拦截文案');
+    addUsage('quota-u', -40);
+    assert.strictEqual(quotaOf('quota-u').used, 110, '负值增量应被忽略（addUsage 仅接受正数，修正需直改库）');
+    resetQuotaAlert('quota-u');
+  });
+
+  await t('P5.30 tripwire：chat.js 技能路径 addUsage 恰好 1 处（双重记账回归）', () => {
+    const src = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'routes', 'chat.js'), 'utf8');
+    const start = src.indexOf("skill === 'image'");
+    const end = src.indexOf('const agent = agent_id ?');
+    assert.ok(start > 0 && end > start, '技能块定位成功');
+    const hits = src.slice(start, end).match(/addUsage\(/g) || [];
+    assert.strictEqual(hits.length, 1, '技能路径 addUsage 应恰好 1 次（此前重复两行导致双倍扣减）：实际 ' + hits.length);
+  });
   await t('buildCandidates：用户自有模型源优先，且只精确匹配指定模型', () => {
     db.prepare(`INSERT INTO user_providers (username,name,base_url,api_key,models,status,created_at) VALUES (?,?,?,?,?,1,datetime('now','localtime'))`)
       .run('tester', '个人网关', 'http://my.test/v1', 'sk-my-key', JSON.stringify(['good-a1', 'my-own']));
@@ -1969,6 +2011,107 @@ function t(name, fn) {
       const r = await gen.next();
       assert.ok(r.done || r.value !== undefined, 'generator 语义正常（mock/real 均可迭代）');
     });
+  }
+
+  console.log('【N】P5.30 安全止血回归：HTTP 集成（会话归属 IDOR / 登录限流 / Key 脱敏 / 知识库权限）');
+  {
+    const { spawn } = require('child_process');
+    const { sign } = require('../src-server/lib/auth');
+    // 直接经父进程库句柄造测试用户（不走 HTTP 登录，不占用登录限流窗口）；子进程共享同一临时库（WAL 多连接）
+    db.prepare(`INSERT INTO users (username,password,nickname,role,status,must_change_pwd,created_at) VALUES ('httpu1',?,'测试用户一','user',1,0,datetime('now','localtime'))`).run(hashPwd('http-pass-123'));
+    db.prepare(`INSERT INTO users (username,password,nickname,role,status,must_change_pwd,created_at) VALUES ('httpu2',?,'测试用户二','user',1,0,datetime('now','localtime'))`).run(hashPwd('http-pass-123'));
+    const uid1 = db.prepare(`SELECT id FROM users WHERE username='httpu1'`).get().id;
+    const uid2 = db.prepare(`SELECT id FROM users WHERE username='httpu2'`).get().id;
+    const tok1 = sign({ uid: uid1, exp: Date.now() + 3600000 });
+    const tok2 = sign({ uid: uid2, exp: Date.now() + 3600000 });
+
+    const port = 33000 + Math.floor(Math.random() * 2000);
+    const base = `http://127.0.0.1:${port}`;
+    const child = spawn(process.execPath, ['server.js'], {
+      cwd: path.join(__dirname, '..'),
+      env: { ...process.env, PORT: String(port), AGENT_DATA_DIR: process.env.AGENT_DATA_DIR },
+      stdio: 'ignore',
+    });
+    const jfetch = async (p, opts = {}, tok) => {
+      const r = await fetch(base + p, { ...opts, headers: { 'Content-Type': 'application/json', ...(tok ? { Authorization: 'Bearer ' + tok } : {}) } });
+      let j = null; try { j = await r.json(); } catch { }
+      return { status: r.status, j };
+    };
+    try {
+      // 等服务就绪（最多 10s）
+      let up = false;
+      for (let i = 0; i < 50 && !up; i++) {
+        await new Promise(r2 => setTimeout(r2, 200));
+        try { up = (await fetch(base + '/api/health')).ok; } catch { }
+      }
+      await t('HTTP：子进程服务启动与健康检查（临时库+随机端口）', async () => {
+        assert.ok(up, 'server 应在 10s 内就绪');
+      });
+      if (up) {
+        await t('HTTP：会话归属——他人会话读取被拒（GET messages IDOR 回归）', async () => {
+          const c = await jfetch('/api/chat/sessions', { method: 'POST', body: JSON.stringify({ title: '归属测试' }) }, tok1);
+          assert.ok(c.j && c.j.code === 0, 'u1 创建会话应成功：' + JSON.stringify(c.j).slice(0, 120));
+          const sid = c.j.data.id;
+          const own = await jfetch(`/api/chat/sessions/${sid}/messages`, {}, tok1);
+          assert.ok(own.j && own.j.code === 0, '本人读取自己会话应放行：' + JSON.stringify(own.j).slice(0, 120));
+          const other = await jfetch(`/api/chat/sessions/${sid}/messages`, {}, tok2);
+          assert.strictEqual(other.j && other.j.code, 403, '他人读取应 403：' + JSON.stringify(other.j));
+        });
+        await t('HTTP：会话归属——向他人会话发起对话被拒（stream 入口 IDOR 回归）', async () => {
+          const c = await jfetch('/api/chat/sessions', { method: 'POST', body: JSON.stringify({ title: 'u1s2' }) }, tok1);
+          const sid = c.j.data.id;
+          const r = await fetch(base + '/api/chat/stream', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + tok2 }, body: JSON.stringify({ session_id: sid, content: 'hi' }) });
+          const bodyText = await r.text().catch(() => '');
+          assert.strictEqual(r.status, 403, `他人会话 stream 应 403，实际 ${r.status}：${bodyText.slice(0, 120)}`);
+        });
+        await t('HTTP：归属校验不误伤——本人会话正常对话（SSE done）', async () => {
+          const c = await jfetch('/api/chat/sessions', { method: 'POST', body: JSON.stringify({ title: 'u1s3' }) }, tok1);
+          const sid = c.j.data.id;
+          const r = await fetch(base + '/api/chat/stream', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + tok1 }, body: JSON.stringify({ session_id: sid, content: '一句话介绍你自己' }) });
+          assert.strictEqual(r.status, 200, '本人 stream 应 200，实际 ' + r.status);
+          const text = await r.text();
+          assert.ok(text.includes('event: done'), 'SSE 应有 done 事件（无供应商环境走内置模拟）：' + text.slice(0, 200));
+        });
+        await t('HTTP：登录限流——同 IP 第 11 次尝试 429（此前可无限暴力尝试）', async () => {
+          const out = [];
+          for (let i = 0; i < 11; i++) {
+            const r = await fetch(base + '/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: 'httpu1', password: 'wrong-' + i }) });
+            let j = null; try { j = await r.json(); } catch { }
+            out.push(r.status + '/' + (j && j.code));
+          }
+          assert.ok(out[9].endsWith('/401'), '第 10 次应返回业务码 401（密码错误），实际：' + out.join(','));
+          assert.ok(out[10].startsWith('429'), '第 11 次应被限流 HTTP 429，实际：' + out.join(','));
+        });
+        await t('HTTP：providers 列表 API Key 脱敏回显（P5.30）', async () => {
+          db.prepare(`INSERT INTO users (username,password,nickname,role,status,must_change_pwd,created_at) VALUES ('httpadmin',?,'测试管理员','admin',1,0,datetime('now','localtime'))`).run(hashPwd('http-pass-123'));
+          const aid = db.prepare(`SELECT id FROM users WHERE username='httpadmin'`).get().id;
+          const tokA = sign({ uid: aid, exp: Date.now() + 3600000 });
+          db.prepare(`INSERT INTO providers (name,base_url,api_key,models,configured,is_default,remark,created_at) VALUES ('脱敏测试供应商','http://x.test','sk-secret-1234567890abcd','[]',1,0,'',datetime('now','localtime'))`).run();
+          const r = await jfetch('/api/providers', {}, tokA);
+          assert.ok(r.j && r.j.code === 0, '管理员获取列表应成功');
+          const p = (r.j.data || []).find(x => x.name === '脱敏测试供应商');
+          assert.ok(p, '测试供应商应在列表中');
+          assert.strictEqual(p.api_key, 'sk-****abcd', 'Key 应脱敏为前 3 后 4：' + p.api_key);
+          assert.ok(!JSON.stringify(r.j).includes('sk-secret-1234567890abcd'), '响应中不应出现完整 Key');
+        });
+        await t('HTTP：知识库写权限——非创建者改删被拒（P5.30）', async () => {
+          db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('归属测试库','',1,'测试用户一',datetime('now','localtime'))`).run();
+          const kbid = db.prepare(`SELECT id FROM kbs WHERE name='归属测试库'`).get().id;
+          const put = await jfetch(`/api/knowledge/${kbid}`, { method: 'PUT', body: JSON.stringify({ name: '改名' }) }, tok2);
+          assert.strictEqual(put.j && put.j.code, 403, '非创建者改名应 403：' + JSON.stringify(put.j));
+          const own = await jfetch(`/api/knowledge/${kbid}`, { method: 'PUT', body: JSON.stringify({ name: '归属测试库改名' }) }, tok1);
+          assert.ok(own.j && own.j.code === 0, '创建者（owner 为其昵称）应放行：' + JSON.stringify(own.j));
+          const del = await jfetch(`/api/knowledge/${kbid}`, { method: 'DELETE' }, tok2);
+          assert.strictEqual(del.j && del.j.code, 403, '非创建者删除应 403：' + JSON.stringify(del.j));
+        });
+      } else {
+        failed++; console.error('  ❌ HTTP 测试服务未就绪，本组用例跳过');
+      }
+    } finally {
+      try { child.kill('SIGTERM'); } catch { }
+      await new Promise(r2 => setTimeout(r2, 600));
+      try { child.kill('SIGKILL'); } catch { }
+    }
   }
 
   // 收尾：关闭库并清理临时目录
