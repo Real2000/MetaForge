@@ -2085,3 +2085,29 @@ agent-platform/
 - 存量服务器需点一次「刷新工具」才会带 risk 字段；此前全部按 high，行为不变（零回归风险上线）
 
 > AI生成
+
+## P5.33 chat.js 管道化重构第一步：ConversationSink 统一收尾（2026-10-27）
+
+> 动因：换机勘察时架构师报告的头号结构债——chat.js 的四条链路（创作技能 / Dify 转发 / Coze 工作流 / Coze 对话）各自复制了一份约 120 行的「脱敏 → 落库 → 会话更新 → 记账 → 审计 → trace → SSE done」尾部代码，P5.30 修的「技能路径 addUsage 双重记账」正是这种复制粘贴的直接产物（修一处漏一处的结构性风险）。
+
+### 实现内容
+
+- **lib/chat-sink.js（新）**：`finishExternalTurn(opts)` 统一收尾——脱敏（命中计数 + notice）/ assistant 落库 / 会话更新（extConvId 可选回写）/ 配额记账（**唯一记账点**）/ op_logs 审计 / chat_traces 全链路追踪 / SSE done，一次成型
+- **差异参数化**（逐一保持四链路既有行为）：`tokens`（外部 usage 优先，0 视为缺省按脱敏后内容估算——与原 `||` 语义一致）/ `maskOutput`（Coze 工作流传 false 不过滤）/ `billUsage`（Coze 工作流传 false 不记账，保持原行为）/ `extConvId !== undefined`（Dify/Coze 对话回写外部会话 id）/ `opDetail` 可为函数（以最终 tokens 为参，覆盖含 token 数的审计文案）
+- **chat.js 四段尾部替换为 sink 调用**：1107 → 1088 行，四份复制粘贴收敛为 90 行独立可测模块
+- **一处有意的行为改进（记录备查）**：技能路径原本脱敏是静默的（mask 无 notice 无计数），统一后与其他链路一致会发 notice + 计数——静默篡改用户内容本属缺陷级体验
+- **内部链路（含 PII/假图防御/建议/标题/记忆等独有逻辑）不动**：本轮只收敛外部/技能链路；内部链路的管道化（P5.25 确认闸门 + 工作流路由 + 分类器的编排器抽取）留待后续迭代，先让 sink 模式跑稳
+
+### 验证（冒烟 160/160）
+
+- sink 单测（项目首批对收尾逻辑的直接覆盖）：脱敏/notice/落库/ext 会话回写/记账恰好一次/审计/trace（mode/model/latency/prompt_chars）/done 事件全字段断言；参数化分支（显式 tokens/不记账/不过滤/函数明细）
+- P5.30 双记 tripwire 升级：技能块零直呼 addUsage + sink 内唯一记账点（结构性防复发）
+- 既有 HTTP 集成与全量 158 用例回归通过（行为保持的旁证）
+
+### 后续（衔接架构路线图）
+
+- 内部链路编排器抽取（executeTool 确认闸门 → lib/tool-confirm.js 可单测）
+- Dify/Coze 转发体本身抽 handler（当前只收敛了尾部；转发循环仍是两份近似代码）
+- 死代码清理：chat.js 内 `isChatModel` 已无调用方（P5.33 勘察发现，留待下轮顺手清）
+
+> AI生成

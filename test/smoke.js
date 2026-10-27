@@ -308,13 +308,16 @@ function t(name, fn) {
     resetQuotaAlert('quota-u');
   });
 
-  await t('P5.30 tripwire：chat.js 技能路径 addUsage 恰好 1 处（双重记账回归）', () => {
+  await t('P5.30 tripwire：技能路径零直呼 addUsage + ConversationSink 唯一记账点（双记回归）', () => {
     const src = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'routes', 'chat.js'), 'utf8');
     const start = src.indexOf("skill === 'image'");
     const end = src.indexOf('const agent = agent_id ?');
     assert.ok(start > 0 && end > start, '技能块定位成功');
     const hits = src.slice(start, end).match(/addUsage\(/g) || [];
-    assert.strictEqual(hits.length, 1, '技能路径 addUsage 应恰好 1 次（此前重复两行导致双倍扣减）：实际 ' + hits.length);
+    assert.strictEqual(hits.length, 0, '技能路径应零直呼 addUsage（P5.33 起收尾统一经 ConversationSink）：实际 ' + hits.length);
+    const sinkSrc = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'lib', 'chat-sink.js'), 'utf8');
+    const sinkHits = sinkSrc.match(/addUsage\(/g) || [];
+    assert.strictEqual(sinkHits.filter(x => x).length, 1, 'ConversationSink 应恰好 1 处记账点（结构性防双记）：实际 ' + sinkHits.length);
   });
   await t('buildCandidates：用户自有模型源优先，且只精确匹配指定模型', () => {
     db.prepare(`INSERT INTO user_providers (username,name,base_url,api_key,models,status,created_at) VALUES (?,?,?,?,?,1,datetime('now','localtime'))`)
@@ -2242,6 +2245,68 @@ function t(name, fn) {
       // 分级字段随 tools_cache 透传（loadMcpTools）
       const loaded = loadMcpTools(JSON.stringify([aId]));
       assert.ok(loaded[0].risk === 'low' && loaded[0].server.trusted === 1, 'loadMcpTools 应透传 risk 与 server.trusted');
+    });
+  }
+
+  console.log('【N+3】P5.33 ConversationSink：外部/技能链路统一收尾');
+  {
+    const { finishExternalTurn } = require('../src-server/lib/chat-sink');
+    // 造会话与输出敏感词（sink 的 mask/notice 路径）
+    const ts = new Date().toISOString().replace('T', ' ').slice(0, 19);
+    const sessInfo = db.prepare('INSERT INTO sessions (agent_id,title,username,created_at,updated_at) VALUES (NULL,?,?,?,?)').run('sink测试', 'httpu1', ts, ts);
+    const sid = Number(sessInfo.lastInsertRowid);
+    db.prepare('INSERT INTO words (category_id,word,input_block,output_block,hit_count,created_at) VALUES (NULL,?,0,1,0,?)').run('绝密黑词', ts);
+    const events = [];
+    const send = (event, data) => events.push({ event, data });
+    const baseQuota = db.prepare('SELECT quota_used FROM users WHERE username=?').get('httpu1').quota_used;
+    await t('finishExternalTurn：脱敏/notice/落库/记账/审计/trace/done 一次成型', async () => {
+      const r = finishExternalTurn({
+        send, sessionId: sid, username: 'httpu1', ip: '1.2.3.4',
+        input: '看看这段内容', full: '回复中包含绝密黑词的部分。',
+        modelLabel: 'test-model', modeLabel: 'dify', tStart: Date.now() - 50,
+        extConvId: 'ext-conv-1',
+        opDetail: (pt) => `测试转发（${pt} tokens）`,
+      });
+      const masked = '回复中包含****的部分。';
+      assert.strictEqual(r.content, masked, '内容应脱敏：' + r.content);
+      const msg = db.prepare('SELECT * FROM messages WHERE id=?').get(r.mid);
+      assert.ok(msg && msg.role === 'assistant' && msg.content === masked, 'assistant 消息应落库且为脱敏后内容');
+      assert.strictEqual(msg.tokens, Math.ceil(masked.length * 0.6), 'tokens 缺省应按脱敏后内容估算');
+      const sess = db.prepare('SELECT ext_conversation_id FROM sessions WHERE id=?').get(sid);
+      assert.strictEqual(sess.ext_conversation_id, 'ext-conv-1', 'extConvId 应回写会话');
+      const trace = db.prepare('SELECT * FROM chat_traces WHERE message_id=?').get(r.mid);
+      assert.ok(trace && trace.mode === 'dify' && trace.model === 'test-model' && trace.prompt_chars === '看看这段内容'.length, 'trace 应含 mode/model/prompt_chars');
+      assert.ok(trace.latency_ms >= 50, 'latency 应基于 tStart');
+      const op = db.prepare("SELECT * FROM op_logs WHERE username='httpu1' AND detail LIKE '测试转发%' ORDER BY id DESC").get();
+      assert.ok(op, 'op_logs 应落一条审计');
+      assert.ok(op.detail.includes(`${msg.tokens} tokens`), 'opDetail 函数应以最终 tokens 为参：' + op.detail);
+      const quota = db.prepare('SELECT quota_used FROM users WHERE username=?').get('httpu1').quota_used;
+      assert.strictEqual(quota - baseQuota, msg.tokens, '配额应恰好记一次账（结构性防双记）');
+      const word = db.prepare("SELECT hit_count FROM words WHERE word='绝密黑词'").get();
+      assert.strictEqual(word.hit_count, 1, '敏感词命中应计数 +1');
+      assert.ok(events.some(e => e.event === 'notice' && /脱敏/.test(e.data.msg)), '脱敏应发 notice 事件');
+      const done = events.find(e => e.event === 'done');
+      assert.ok(done && done.data.content === masked && done.data.tokens === msg.tokens, 'done 事件应带脱敏内容与 tokens');
+    });
+    await t('finishExternalTurn：显式 tokens / 不记账 / 不过滤 / 函数明细 参数化', () => {
+      const ev2 = [];
+      const r2 = finishExternalTurn({
+        send: (e, d) => ev2.push({ e, d }), sessionId: sid, username: 'httpu1', ip: '1.2.3.4',
+        input: 'x', full: '包含绝密黑词但不过滤', modelLabel: 'wf', modeLabel: 'coze-workflow',
+        tStart: Date.now(), tokens: 42, maskOutput: false, billUsage: false,
+        opAction: 'AI创作', opDetail: '静态明细',
+      });
+      assert.strictEqual(r2.tokens, 42, '显式 tokens 应直用');
+      assert.strictEqual(r2.content, '包含绝密黑词但不过滤', 'maskOutput=false 应原样保留');
+      const msg2 = db.prepare('SELECT * FROM messages WHERE id=?').get(r2.mid);
+      assert.strictEqual(msg2.tokens, 42, '落库 tokens 应为显式值');
+      assert.ok(!ev2.some(e => e.e === 'notice'), '不过滤时不应发 notice');
+      const op2 = db.prepare("SELECT * FROM op_logs WHERE detail='静态明细' ORDER BY id DESC").get();
+      assert.ok(op2 && op2.action === 'AI创作', 'opAction 应可定制');
+      const quota2 = db.prepare('SELECT quota_used FROM users WHERE username=?').get('httpu1').quota_used;
+      // 上一用例已记一次；本次 billUsage=false → 不应再增长
+      const msg1tokens = Math.ceil('回复中包含****的部分。'.length * 0.6);
+      assert.strictEqual(quota2 - baseQuota, msg1tokens, 'billUsage=false 不应记账');
     });
   }
 

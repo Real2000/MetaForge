@@ -14,6 +14,7 @@ const skills = require('../lib/skills');
 const { checkQuota, addUsage } = require('../lib/quota');
 const { parseSkillMentions, parseAgentMentions } = require('../lib/skill-mention');
 const { canView } = require('../lib/agent-access');
+const { finishExternalTurn } = require('../lib/chat-sink'); // P5.33：外部/技能链路统一收尾（唯一记账/落库/审计点）
 
 const router = express.Router();
 
@@ -443,16 +444,14 @@ router.post('/stream', async (req, res) => {
           const r = await skills.genTTS(input);
           reply = `语音已合成（昇腾 Qwen3-TTS·${r.source === 'ascend' ? '自有算力' : '备用源'}）：\n\n[AUDIO:${r.url}]`;
         }
-        const out = mask(reply);
-        const msgInfo = db.prepare('INSERT INTO messages (session_id,role,content,tokens,created_at) VALUES (?,?,?,?,?)')
-          .run(session_id, 'assistant', out, Math.ceil(out.length * 0.6), now());
-        addUsage(req.user.username, Math.ceil(out.length * 0.6)); // P2 配额记账（技能消耗）——P5.30 修复：此前连续两行重复记账，技能路径用量被双倍扣减
-        db.prepare('UPDATE sessions SET updated_at=? WHERE id=?').run(now(), session_id);
-        db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-          .run(req.user.username, 'AI创作', `技能 ${skill}：${input.slice(0, 50)}`, req.ip, now());
-        db.prepare('INSERT INTO chat_traces (session_id,message_id,agent_id,model,mode,latency_ms,tokens,prompt_chars,kb_hits,tool_calls,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
-          .run(session_id, msgInfo.lastInsertRowid, null, skill, `skill:${skill}`, Date.now() - t0, Math.ceil(out.length * 0.6), input.length, '[]', '[]', now());
-        send('done', { content: out, tokens: Math.ceil(out.length * 0.6) });
+        // P5.33：统一收尾（脱敏/落库/记账/审计/trace/done）经 ConversationSink——唯一记账点，
+        // P5.30 修的「双记 bug」此后结构性不可能复发；tokens 缺省按脱敏后内容估算（与原逻辑一致）
+        finishExternalTurn({
+          send, sessionId: session_id, username: req.user.username, ip: req.ip,
+          input, full: reply, agent: null,
+          modelLabel: skill, modeLabel: `skill:${skill}`, tStart: t0,
+          opAction: 'AI创作', opDetail: `技能 ${skill}：${input.slice(0, 50)}`,
+        });
       } catch (e) {
         db.prepare('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)').run('skill', `${skill} 生成失败：${e.message}`, now());
         send('error', { msg: `生成失败：${e.message}` });
@@ -507,25 +506,16 @@ router.post('/stream', async (req, res) => {
         return res.end();
       }
 
-      // 输出敏感词过滤（与内部链路一致）
-      const outMasked = mask(full);
-      if (outMasked !== full) {
-        countHits(check(full, 'output').words);
-        send('notice', { msg: '回复内容包含违规词汇，已自动脱敏处理。' });
-      }
-
-      const pt = usage?.total_tokens || Math.ceil(outMasked.length * 0.6);
-      const tEnd = Date.now();
-      const msgInfo = db.prepare('INSERT INTO messages (session_id,role,content,tokens,created_at) VALUES (?,?,?,?,?)')
-        .run(session_id, 'assistant', outMasked, pt, now());
-      if (session_id) {
-        db.prepare('UPDATE sessions SET updated_at=?, ext_conversation_id=? WHERE id=?').run(now(), extConvId, session_id);
-      }
-      db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-        .run(req.user.username, '对话调用', `与「${agent.name}」对话（Dify 真实转发，${pt} tokens）`, req.ip, now());
-      db.prepare('INSERT INTO chat_traces (session_id,message_id,agent_id,model,mode,latency_ms,tokens,prompt_chars,kb_hits,tool_calls,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
-        .run(session_id, msgInfo.lastInsertRowid, agent.id, agent.model || 'dify-app', 'dify', tEnd - tStart, pt, input.length, '[]', '[]', now());
-      send('done', { content: outMasked, tokens: pt });
+      // P5.33：统一收尾经 ConversationSink（脱敏/落库/ext会话回写/记账/审计/trace/done）；
+      // tokens 外部 usage 优先（0 视为缺省按内容估算，与原 || 语义一致）
+      finishExternalTurn({
+        send, sessionId: session_id, username: req.user.username, ip: req.ip,
+        input, full, agent,
+        modelLabel: agent.model || 'dify-app', modeLabel: 'dify', tStart,
+        tokens: usage?.total_tokens || undefined,
+        extConvId,
+        opDetail: (pt) => `与「${agent.name}」对话（Dify 真实转发，${pt} tokens）`,
+      });
       return res.end();
     }
 
@@ -568,16 +558,16 @@ router.post('/stream', async (req, res) => {
           } else {
             reply = `工作流执行完成（耗时 ${Math.round((Date.now() - t0) / 1000)} 秒），但未返回视频链接。返回内容：\n\n${JSON.stringify(d).slice(0, 800)}`;
           }
-          const pt = Math.ceil((input.length + reply.length) * 0.6);
-          const msgInfo = db.prepare('INSERT INTO messages (session_id,role,content,tokens,created_at) VALUES (?,?,?,?,?)')
-            .run(session_id, 'assistant', reply, pt, now());
-          if (session_id) db.prepare('UPDATE sessions SET updated_at=? WHERE id=?').run(now(), session_id);
-          db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-            .run(req.user.username, '对话调用', `与「${agent.name}」对话（Coze 工作流真实调用，${pt} tokens，耗时 ${Math.round((Date.now() - t0) / 1000)}s）`, req.ip, now());
-          db.prepare('INSERT INTO chat_traces (session_id,message_id,agent_id,model,mode,latency_ms,tokens,prompt_chars,kb_hits,tool_calls,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
-            .run(session_id, msgInfo.lastInsertRowid, agent.id, agent.model || 'coze-workflow', 'coze-workflow', Date.now() - tStart, pt, input.length, '[]', '[]', now());
+          // P5.33：统一收尾经 ConversationSink——Coze 工作流链路保持原差异：不过滤输出、不记账、tokens 按输入+输出估算
           send('delta', { text: reply });
-          send('done', { content: reply, tokens: pt });
+          finishExternalTurn({
+            send, sessionId: session_id, username: req.user.username, ip: req.ip,
+            input, full: reply, agent,
+            modelLabel: agent.model || 'coze-workflow', modeLabel: 'coze-workflow', tStart,
+            tokens: Math.ceil((input.length + reply.length) * 0.6),
+            maskOutput: false, billUsage: false,
+            opDetail: (pt) => `与「${agent.name}」对话（Coze 工作流真实调用，${pt} tokens，耗时 ${Math.round((Date.now() - t0) / 1000)}s）`,
+          });
           return res.end();
         } catch (e) {
           console.error('[chat] Coze 工作流调用异常：', e);
@@ -619,24 +609,15 @@ router.post('/stream', async (req, res) => {
         return res.end();
       }
 
-      const outMasked = mask(full);
-      if (outMasked !== full) {
-        countHits(check(full, 'output').words);
-        send('notice', { msg: '回复内容包含违规词汇，已自动脱敏处理。' });
-      }
-
-      const pt = usage?.total_tokens || Math.ceil(outMasked.length * 0.6);
-      const tEnd = Date.now();
-      const msgInfo = db.prepare('INSERT INTO messages (session_id,role,content,tokens,created_at) VALUES (?,?,?,?,?)')
-        .run(session_id, 'assistant', outMasked, pt, now());
-      if (session_id) {
-        db.prepare('UPDATE sessions SET updated_at=?, ext_conversation_id=? WHERE id=?').run(now(), extConvId, session_id);
-      }
-      db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-        .run(req.user.username, '对话调用', `与「${agent.name}」对话（Coze 真实转发，${pt} tokens）`, req.ip, now());
-      db.prepare('INSERT INTO chat_traces (session_id,message_id,agent_id,model,mode,latency_ms,tokens,prompt_chars,kb_hits,tool_calls,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
-        .run(session_id, msgInfo.lastInsertRowid, agent.id, agent.model || 'coze-bot', 'coze', tEnd - tStart, pt, input.length, '[]', '[]', now());
-      send('done', { content: outMasked, tokens: pt });
+      // P5.33：统一收尾经 ConversationSink（同 Dify：脱敏/ext会话回写/usage 优先记账）
+      finishExternalTurn({
+        send, sessionId: session_id, username: req.user.username, ip: req.ip,
+        input, full, agent,
+        modelLabel: agent.model || 'coze-bot', modeLabel: 'coze', tStart,
+        tokens: usage?.total_tokens || undefined,
+        extConvId,
+        opDetail: (pt) => `与「${agent.name}」对话（Coze 真实转发，${pt} tokens）`,
+      });
       return res.end();
     }
 
