@@ -1,0 +1,753 @@
+/** 后台-智能体管理：列表（卡片/表格）+ 空间 + 测评 + 外挂搭建 */
+import { api, getToken } from '../api.js';
+import { esc, toast, modal, confirmBox } from '../ui.js';
+
+export async function render(el) {
+  let agents = [], spaces = [], evals = [], models = [], kbs = [], platforms = [], mcpServers = [];
+  let tab = 'list';
+
+  el.innerHTML = `
+    <div class="page-head"><h2>智能体管理</h2><div class="desc">智能体全生命周期管理：列表（发布/下架/编辑）、空间（企业-部门-个人三级）、AI 自动测评；复杂编排可经「外挂搭建」跳转 Coze/Dify 等专业平台搭建后同步回来统一纳管。</div></div>
+    <div class="tabs" id="tabs">
+      <div class="tab active" data-t="list">智能体列表</div>
+      <div class="tab" data-t="space">空间管理</div>
+      <div class="tab" data-t="eval">智能体测评</div>
+      <div class="tab" data-t="external">外挂搭建</div>
+    </div>
+    <div id="pane"></div>`;
+
+  const pane = el.querySelector('#pane');
+  const typeName = { enterprise: '企业智能体', digital: '数字员工', dept: '部门AI助理', other: '其他' };
+
+  // ---------- 列表 ----------
+  function renderList() {
+    pane.innerHTML = `
+      <div class="card">
+        <div class="toolbar">
+          <div class="filters">
+            <select class="input" id="f_status"><option value="">全部状态</option><option value="published">已发布</option><option value="draft">草稿/下架</option></select>
+            <select class="input" id="f_type"><option value="">全部类型</option><option value="enterprise">企业智能体</option><option value="digital">数字员工</option><option value="dept">部门AI助理</option><option value="other">其他</option></select>
+            <input class="input" id="f_kw" placeholder="🔍 搜索名称">
+          </div>
+          <div style="display:flex;gap:8px">
+            <button class="btn" id="fromTpl">📚 从模板创建</button>
+            <button class="btn" id="importCfg">📥 导入配置</button>
+            <button class="btn primary" id="createAgent">＋ 创建智能体</button>
+          </div>
+        </div>
+        <div class="table-wrap"><table class="tbl">
+          <thead><tr><th>名称</th><th>类型</th><th>模型</th><th>知识库</th><th>来源</th><th>状态</th><th>更新时间</th><th>操作</th></tr></thead>
+          <tbody id="tbody"></tbody>
+        </table></div>
+      </div>`;
+
+    function rows() {
+      const st = pane.querySelector('#f_status').value, tp = pane.querySelector('#f_type').value, kw = pane.querySelector('#f_kw').value.trim();
+      const shown = agents.filter(a =>
+        (!st || a.status === st) && (!tp || a.type === tp) && (!kw || a.name.includes(kw)));
+      pane.querySelector('#tbody').innerHTML = shown.map(a => `
+        <tr>
+          <td><b>${a.icon ? a.icon + ' ' : ''}${esc(a.name)}</b><div style="font-size:11px;color:var(--text-3)">${esc(a.description || '')}</div></td>
+          <td><span class="tag ${a.type === 'enterprise' ? 'blue' : a.type === 'dept' ? 'purple' : a.type === 'other' ? 'gray' : 'green'}">${typeName[a.type] || a.type}</span></td>
+          <td class="mono">${esc(a.model || '-')}</td>
+          <td>${a.kb_id ? '📚 ' + esc(kbs.find(k => k.id === a.kb_id)?.name || '已关联') : '<span style="color:var(--text-3)">-</span>'}</td>
+          <td>${a.source === 'self' ? '<span class="tag gray">自建</span>' : `<span class="tag orange">${esc(a.source_name || a.source)}</span>`}</td>
+          <td>${a.status === 'published' ? '<span class="tag green">已发布</span>' : '<span class="tag gray">草稿</span>'}</td>
+          <td style="color:var(--text-3);font-size:12px">${esc((a.updated_at || '').slice(0, 16))}</td>
+          <td>
+            <button class="btn link" data-pb="${a.id}">${a.status === 'published' ? '下架' : '发布'}</button>
+            <button class="btn link" data-ed="${a.id}">编排</button>
+            <button class="btn link" data-analytics="${a.id}">分析</button>
+            <button class="btn link" data-apidoc="${a.id}" title="接口文档：参数/输出/调用示例由画布 Start/End 节点自动生成">文档</button>
+            <button class="btn link" data-api="${a.id}">API</button>
+            <button class="btn link" data-share="${a.id}">${a.share_enabled ? '分享中' : '分享'}</button>
+            <button class="btn link" data-export="${a.id}">导出</button>
+            <button class="btn link" style="color:var(--danger)" data-del="${a.id}">删除</button>
+          </td>
+        </tr>`).join('') || '<tr><td colspan="8" class="empty">暂无数据</td></tr>';
+
+      pane.querySelectorAll('[data-pb]').forEach(b => b.onclick = async () => {
+        const j = await api(`/agents/${b.dataset.pb}/publish`, { method: 'POST' });
+        toast(j.msg); load();
+      });
+      pane.querySelectorAll('[data-ed]').forEach(b => b.onclick = () => { location.hash = '#/admin/studio/' + b.dataset.ed; });
+      pane.querySelectorAll('[data-apidoc]').forEach(b => b.onclick = () => openApiDoc(+b.dataset.apidoc));
+      pane.querySelectorAll('[data-api]').forEach(b => b.onclick = () => openApiKeys(+b.dataset.api));
+      pane.querySelectorAll('[data-analytics]').forEach(b => b.onclick = () => openAnalytics(+b.dataset.analytics));
+      pane.querySelectorAll('[data-export]').forEach(b => b.onclick = () => exportAgent(+b.dataset.export));
+      pane.querySelectorAll('[data-share]').forEach(b => b.onclick = () => openShare(+b.dataset.share));
+      pane.querySelectorAll('[data-del]').forEach(b => b.onclick = async () => {
+        if (!await confirmBox('删除该智能体？关联会话将保留但无法继续对话。')) return;
+        await api(`/agents/${b.dataset.del}`, { method: 'DELETE' });
+        toast('已删除'); load();
+      });
+    }
+    ['#f_status', '#f_type'].forEach(s => pane.querySelector(s).onchange = rows);
+    pane.querySelector('#f_kw').oninput = rows;
+    pane.querySelector('#createAgent').onclick = openCreate;
+    pane.querySelector('#fromTpl').onclick = openTemplates;
+    pane.querySelector('#importCfg').onclick = importAgentCfg;
+    rows();
+  }
+
+  // ---------- P5.16 API 文档自动生成（Swagger 风格，Start/End 节点 → 参数/输出/调用示例，发布即有零手写） ----------
+  async function openApiDoc(id) {
+    const j = await api(`/agents/${id}/apidoc`);
+    if (j.code !== 0) return toast(j.msg || '文档生成失败', 'err');
+    const d = j.data, c = d.contract;
+    const typeTag = (tp) => tp === 'file' ? '<span class="tag orange">📄 file-id</span>'
+      : tp === 'array[file]' ? '<span class="tag orange">📄 file-id[]</span>'
+      : tp === 'number' ? '<span class="tag blue">number</span>'
+      : tp === 'array' ? '<span class="tag blue">array</span>'
+      : '<span class="tag gray">string</span>';
+    const paramRow = (p) => `<tr>
+      <td class="mono">${esc(p.name)}${p.type === 'file' || p.type === 'array[file]' ? ' 📄' : ''}</td>
+      <td>${typeTag(p.type)}</td>
+      <td>${p.required ? '<b style="color:var(--danger)">必填</b>' : '<span style="color:var(--text-3)">可选</span>'}</td>
+      <td>${esc(p.label || '')}${p.default ? ` <span style="color:var(--text-3)">默认 ${esc(String(p.default).slice(0, 20))}</span>` : ''}</td>
+      <td style="color:var(--text-3)">${esc(p.hint || '')}</td></tr>`;
+    const outRow = (o) => `<tr>
+      <td class="mono">${esc(o.name)}</td>
+      <td>${typeTag(o.type)}</td>
+      <td style="color:var(--text-3)">${esc(o.desc || '')}</td>
+      <td style="color:var(--text-3)">${esc(o.source || '')}</td></tr>`;
+    const chanBlock = (ch) => `<div class="api-ep">
+      <div class="api-ep-head"><span class="m">POST</span><span class="mono url">${esc(ch.endpoint)}</span><span style="flex:1"></span>${ch.key === 'mcp' ? '<span class="tag green">推荐 · 完整参数</span>' : '<span class="tag gray">对话式</span>'}</div>
+      <div style="font-size:12px;color:var(--text-2);margin:6px 0 2px">${esc(ch.name)} · ${esc(ch.protocol || '')}</div>
+      <div style="font-size:11.5px;color:var(--text-3)">🔐 ${esc(ch.auth || '')}</div>
+      ${ch.tool ? `<div style="font-size:11.5px;color:var(--text-3);margin-top:2px">🧰 工具名：<span class="mono">${esc(ch.tool)}</span>${ch.model ? ` · model：<span class="mono">${esc(ch.model)}</span>` : ''}</div>` : ''}
+      ${(ch.steps || []).length ? `<div style="font-size:11.5px;color:var(--text-3);margin-top:4px">${ch.steps.map((s, i) => `${i + 1}. ${esc(s)}`).join('　')}</div>` : ''}
+      ${ch.note ? `<div style="font-size:11.5px;color:var(--text-3);margin-top:4px">ℹ️ ${esc(ch.note)}</div>` : ''}
+      <pre class="api-curl" data-copy="${esc(ch.curl)}">${esc(ch.curl)}</pre>
+    </div>`;
+    const body = `<div style="font-size:12.5px;line-height:1.7">
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
+        <b style="font-size:14px">${esc(d.agent.name)} 接口文档</b>
+        ${d.agent.status === 'published' ? '<span class="tag green">已发布</span>' : '<span class="tag orange">草稿（文档预览）</span>'}
+        ${c.isCanvas ? `<span class="tag blue">${c.flowType === 'chatflow' ? 'Chatflow 多轮' : 'Workflow 一次性'}</span>` : '<span class="tag gray">表单模式</span>'}
+        <span style="flex:1"></span>
+        <span style="font-size:11px;color:var(--text-3)">由画布 Start/End 节点自动生成 · 改画布即同步 · 无需手写</span>
+      </div>
+      <div style="color:var(--text-2);margin-bottom:10px">${esc(d.agent.description || '')}</div>
+      <div class="api-sec">📥 请求参数（Start 节点变量）</div>
+      <table class="tbl api-tbl"><thead><tr><th>字段</th><th>类型</th><th>必填</th><th>说明</th><th>备注</th></tr></thead>
+        <tbody>${c.input.map(paramRow).join('')}</tbody></table>
+      <div class="api-sec">📤 响应字段（End / 直接回复节点）</div>
+      <table class="tbl api-tbl"><thead><tr><th>字段</th><th>类型</th><th>说明</th><th>来源</th></tr></thead>
+        <tbody>${c.output.map(outRow).join('')}</tbody></table>
+      ${d.fileUpload ? `<div class="api-sec">📎 文件参数上传（file 类型先取 ID）</div>
+        <div style="font-size:12px;color:var(--text-2);line-height:1.8">
+          <span class="mono">${esc(d.fileUpload.endpoint)}</span>　${esc(d.fileUpload.returns)}<br>
+          <span style="color:var(--text-3)">body：${esc(d.fileUpload.body)}</span></div>` : ''}
+      <div class="api-sec">🔌 调用通道</div>
+      ${d.channels.map(chanBlock).join('')}
+      <div class="api-sec">📜 OpenAPI 3.0 规范（JSON）</div>
+      <details style="margin-top:2px"><summary style="cursor:pointer;font-size:12px;color:var(--brand,#2563eb)">展开查看 / 复制完整 OpenAPI JSON（可导入 Swagger Editor / Apifox）</summary>
+        <pre class="api-curl" data-copy="${esc(JSON.stringify(d.openapi, null, 2))}" style="max-height:340px">${esc(JSON.stringify(d.openapi, null, 2))}</pre></details>
+    </div>`;
+    modal({ title: `📄 接口文档：${esc(d.agent.name)}`, body, wide: true, noFooter: true });
+    // 复制按钮：每个 pre 右上角浮出（curl / OpenAPI JSON）
+    setTimeout(() => {
+      document.querySelectorAll('.api-curl[data-copy]').forEach(pre => {
+        const btn = document.createElement('button');
+        btn.className = 'btn sm'; btn.textContent = '复制';
+        btn.style.cssText = 'position:absolute;top:6px;right:8px;opacity:.75';
+        pre.style.position = 'relative';
+        pre.appendChild(btn);
+        btn.onclick = async () => {
+          const raw = pre.getAttribute('data-copy') || '';
+          try { await navigator.clipboard.writeText(raw); toast('已复制到剪贴板'); } catch { toast('复制失败，请手动选择', 'err'); }
+        };
+      });
+    }, 50);
+  }
+
+  // ---------- 导出 / 导入配置（借鉴 SinguX：备份、迁移、招投标交付） ----------
+  async function exportAgent(id) {
+    const a = agents.find(x => x.id === id);
+    if (!a) return;
+    const res = await fetch(`/api/agents/${id}/export`, { headers: { Authorization: 'Bearer ' + getToken() } });
+    if (!res.ok) return toast('导出失败', 'err');
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `agent-${id}-${a.name}.json`;
+    link.click();
+    URL.revokeObjectURL(url);
+    toast('配置已导出为 JSON');
+  }
+
+  function importAgentCfg() {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.json';
+    input.onchange = async () => {
+      const file = input.files[0];
+      if (!file) return;
+      try {
+        const cfg = JSON.parse(await file.text());
+        if (!cfg.agent) return toast('不是有效的智能体配置文件（缺少 agent 字段）', 'err');
+        const nameOverride = cfg.agent.name || file.name.replace(/\.json$/i, '');
+        const j = await api('/agents/import', { method: 'POST', body: { config: cfg, name_override: nameOverride } });
+        toast(j.msg || '已导入'); load();
+      } catch (e) { toast('导入失败：' + e.message, 'err'); }
+    };
+    input.click();
+  }
+
+  // ---------- 智能体数据分析（借鉴 SinguX「分析」） ----------
+  async function openAnalytics(id) {
+    const a = agents.find(x => x.id === id);
+    if (!a) return;
+    const j = await api(`/agents/${id}/analytics`);
+    const { overview, trend, recent } = j.data;
+    const maxC = Math.max(1, ...trend.map(t => t.count));
+    const cards = [
+      ['💬 会话数', overview.sessions, '内部会话'],
+      ['👥 使用人数', overview.users, '去重用户'],
+      ['✉️ 消息数', overview.messages, '含分享 ' + overview.share_sessions + ' 次'],
+      ['🎯 Token 消耗', overview.tokens, '累计'],
+      ['⚡ 平均响应', (overview.avg_latency / 1000).toFixed(1) + 's', '全链路'],
+    ];
+    const body = `
+      <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:16px">
+        ${cards.map(([t, v, s]) => `
+          <div class="card" style="box-shadow:none;border:1px solid var(--border);padding:12px;text-align:center">
+            <div style="font-size:12px;color:var(--text-3)">${t}</div>
+            <div style="font-size:22px;font-weight:700;color:var(--brand);margin:4px 0">${v}</div>
+            <div style="font-size:11px;color:var(--text-3)">${s}</div>
+          </div>`).join('')}
+      </div>
+      <div style="font-weight:600;margin-bottom:8px">📈 近 14 天会话趋势</div>
+      <div style="display:flex;align-items:flex-end;gap:4px;height:90px;margin-bottom:16px;padding:0 4px">
+        ${trend.length ? trend.map(t => `
+          <div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:3px" title="${t.day}：${t.count} 个会话">
+            <div style="font-size:10px;color:var(--text-3)">${t.count || ''}</div>
+            <div style="width:100%;background:linear-gradient(180deg,#3b82f6,#2563eb);border-radius:3px 3px 0 0;height:${Math.max(6, t.count / maxC * 60)}px"></div>
+            <div style="font-size:9px;color:var(--text-3);transform:scale(.85)">${t.day.slice(5)}</div>
+          </div>`).join('') : '<div style="color:var(--text-3);font-size:12px;padding:20px 0">近 14 天暂无会话</div>'}
+      </div>
+      <div style="font-weight:600;margin-bottom:8px">🕘 最近会话（${recent.length}）</div>
+      <div class="table-wrap"><table class="tbl">
+        <thead><tr><th>会话</th><th>用户</th><th>消息数</th><th>最近活跃</th></tr></thead>
+        <tbody>${recent.map(s => `
+          <tr><td>${esc(s.title || '#' + s.id)}</td><td>${esc(s.nickname || '-')}</td><td>${s.msg_count}</td><td style="font-size:12px;color:var(--text-3)">${esc((s.updated_at || '').slice(0, 16))}</td></tr>`).join('') || '<tr><td colspan="4" class="empty">暂无会话记录</td></tr>'}
+        </tbody>
+      </table></div>`;
+    modal({ title: `数据分析 - ${a.name}`, body, wide: true });
+  }
+
+  // ---------- SinguX 式轻量创建：类型选择 → 名称/介绍/图标 → 创建后直接进入编排页 ----------
+  const CREATE_TYPES = [
+    { k: 'enterprise', icon: '🏢', label: '企业智能体', desc: '面向全员的企业级问答与业务助手' },
+    { k: 'digital', icon: '👤', label: '数字员工', desc: '承担岗位化重复工作的 AI 员工' },
+    { k: 'dept', icon: '🧑‍💼', label: '部门 AI 助理', desc: '面向部门的专项事务助理' },
+    { k: 'other', icon: '🧩', label: '其他', desc: '通用助手或不属于上述类型的智能体' },
+  ];
+  const CREATE_ICONS = ['🤖', '🎯', '📝', '💡', '📊', '🛠️', '🌐', '📚', '✍️', '🧩', '🧠', '💼', '🛡️', '📈', '🎨', '🎬', '⚖️', '🏦', '💬', '🔍'];
+  function openCreate() {
+    let selType = 'enterprise', selIcon = '🤖';
+    const body = `
+      <div style="margin-bottom:14px">
+        <div style="font-size:12px;font-weight:600;color:var(--text-2);margin-bottom:8px">选择类型</div>
+        <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px">
+          ${CREATE_TYPES.map(t => `
+            <div class="ctype-card" data-ct="${t.k}" style="border:1.5px solid ${selType === t.k ? 'var(--brand)' : 'var(--border)'};border-radius:10px;padding:12px 10px;text-align:center;cursor:pointer;background:${selType === t.k ? '#f0f7ff' : '#fff'}">
+              <div style="font-size:24px">${t.icon}</div>
+              <div style="font-size:13px;font-weight:600;margin:4px 0 2px">${t.label}</div>
+              <div style="font-size:10px;color:var(--text-3);line-height:1.4">${t.desc}</div>
+            </div>`).join('')}
+        </div>
+      </div>
+      <div class="form-item"><label>智能体名称<span class="req">*</span></label>
+        <input class="input" id="c_name" maxlength="50" placeholder="给智能体起一个独一无二的名字">
+        <div class="hint" id="c_cnt">0 / 50</div></div>
+      <div class="form-item"><label>智能体功能介绍</label>
+        <textarea class="input" id="c_desc" rows="2" placeholder="介绍智能体的功能，将会展示给智能体的用户"></textarea></div>
+      <div class="form-item"><label>图标</label>
+        <div id="c_icons" style="display:grid;grid-template-columns:repeat(10,1fr);gap:4px">
+          ${CREATE_ICONS.map(ic => `<span data-ci="${ic}" style="font-size:18px;text-align:center;padding:5px 0;border-radius:6px;cursor:pointer;${ic === selIcon ? 'background:var(--brand);color:#fff' : ''}">${ic}</span>`).join('')}
+        </div></div>
+      <div class="hint" style="background:#f0f9ff;border:1px dashed #93c5fd;border-radius:8px;padding:10px 12px;line-height:1.7">
+        💡 创建后自动进入<b>编排页</b>：提示词、工具、知识库、记忆、开场白等全部在那里配置（修改实时生效，右侧可直接调试对话）。
+      </div>`;
+    modal({
+      title: '创建智能体', body,
+      foot: '<button class="btn" data-cancel>取消</button><button class="btn primary" data-save>创建并进入编排</button>',
+      onMount(mask, close) {
+        const nameEl = mask.querySelector('#c_name');
+        const cnt = mask.querySelector('#c_cnt');
+        nameEl.oninput = () => { cnt.textContent = `${nameEl.value.length} / 50`; };
+        mask.querySelectorAll('[data-ct]').forEach(card => card.onclick = () => {
+          selType = card.dataset.ct;
+          mask.querySelectorAll('[data-ct]').forEach(x => {
+            const on = x === card;
+            x.style.borderColor = on ? 'var(--brand)' : 'var(--border)';
+            x.style.background = on ? '#f0f7ff' : '#fff';
+          });
+        });
+        mask.querySelectorAll('[data-ci]').forEach(sp => sp.onclick = () => {
+          selIcon = sp.dataset.ci;
+          mask.querySelectorAll('[data-ci]').forEach(x => {
+            x.style.background = x === sp ? 'var(--brand)' : '';
+            x.style.color = x === sp ? '#fff' : '';
+          });
+        });
+        mask.querySelector('[data-cancel]').onclick = close;
+        mask.querySelector('[data-save]').onclick = async () => {
+          const name = nameEl.value.trim();
+          if (!name) return toast('请填写智能体名称', 'err');
+          const btn = mask.querySelector('[data-save]');
+          btn.disabled = true;
+          try {
+            const j = await api('/agents', { method: 'POST', body: {
+              name, description: mask.querySelector('#c_desc').value.trim(), type: selType, icon: selIcon,
+            } });
+            toast('创建成功，正在进入编排页…');
+            close();
+            location.hash = '#/admin/studio/' + j.data.id;
+          } catch (e) {
+            // 商业化：免费版智能体数达上限 → 升级引导弹窗（直达价格页）
+            if (e.code === 402 || /免费版最多/.test(e.message || '')) {
+              close();
+              modal({
+                title: '🚀 升级解锁更多智能体',
+                body: `<div style="font-size:13px;line-height:1.9;color:var(--text-2)">${esc(e.message)}<br><br>专业版（¥199/月）可创建 <b style="color:var(--text)">20 个智能体</b>、每月 <b style="color:var(--text)">500 万 Tokens</b>、10 个知识库与 API 开放接口。</div>`,
+                foot: `<button class="btn" data-close>暂不升级</button><a class="btn primary" href="#/pricing" id="goPricing" style="text-decoration:none">查看套餐并升级 →</a>`,
+                onMount(mask2, close2) { mask2.querySelector('[data-close]').onclick = close2; },
+              });
+            } else { toast(e.message, 'err'); btn.disabled = false; }
+          }
+        };
+      },
+    });
+  }
+
+  // ---------- 行业模板库 ----------
+  async function openTemplates() {
+    const j = await api('/templates');
+    const tpls = j.data;
+    const body = `
+      <div class="hint" style="margin-bottom:12px">📚 金融行业预置模板：一键创建开箱即用的专业智能体（提示词/工具/开场白已预配置，创建后可再编辑）</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+        ${tpls.map(t => `
+          <div class="card" style="box-shadow:none;border:1px solid var(--border);padding:14px">
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+              <span style="font-size:22px">${t.icon}</span>
+              <div><b>${esc(t.name)}</b><div style="font-size:11px;color:var(--text-3)">${esc(t.industry)} · ${t.type === 'digital' ? '数字员工' : '企业智能体'}</div></div>
+            </div>
+            <div style="font-size:12px;color:var(--text-2);line-height:1.6;margin-bottom:8px">${esc(t.description)}</div>
+            <div style="font-size:11px;color:var(--text-3);margin-bottom:10px">工具：${t.tools.length ? t.tools.join('、') : '无'}${t.opening_questions?.length ? '｜预置问题 ' + t.opening_questions.length + ' 条' : ''}</div>
+            <button class="btn primary" data-tpl="${t.id}" style="padding:4px 14px;font-size:12px">从此模板创建</button>
+          </div>`).join('')}
+      </div>`;
+    modal({ title: '行业模板库', body, wide: true, onMount(mask) {
+      mask.querySelectorAll('[data-tpl]').forEach(b => b.onclick = async () => {
+        try {
+          const j2 = await api(`/templates/${b.dataset.tpl}/create`, { method: 'POST', body: { kb_id: kbs[0]?.id || null } });
+          toast(`已创建「${j2.data.name}」，可在列表中编辑`); load();
+        } catch (e) { toast(e.message, 'err'); }
+      });
+    } });
+  }
+
+  // ---------- API 发布（OpenAI 兼容密钥管理） ----------
+  function openApiKeys(id) {
+    const a = agents.find(x => x.id === id);
+    const modelId = `agent-${a.id}-${a.name}`;
+    loadKeys().then(keys => {
+      const body = `
+        <div class="hint" style="background:#f0f9ff;border:1px dashed #93c5fd;border-radius:8px;padding:10px 12px;line-height:1.8;margin-bottom:12px">
+          🔌 <b>OpenAI 兼容接口</b>：外部系统可直接调用该智能体。<br>
+          端点：<span class="mono" style="word-break:break-all">POST ${location.origin}/openapi/v1/chat/completions</span><br>
+          模型名：<span class="mono">${esc(modelId)}</span>（先 GET /openapi/v1/models 可列出全部可用智能体）
+        </div>
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+          <b>API 密钥（${keys.length}）</b>
+          <button class="btn primary" id="akNew" style="padding:4px 12px;font-size:12px">＋ 创建密钥</button>
+        </div>
+        <div class="table-wrap"><table class="tbl">
+          <thead><tr><th>名称</th><th>密钥</th><th>状态</th><th>最近调用</th><th>操作</th></tr></thead>
+          <tbody id="akBody">${keys.map(k => `
+            <tr>
+              <td>${esc(k.name)}</td>
+              <td class="mono" style="font-size:12px">${esc(k.key.slice(0, 14))}…<button class="btn link" data-copy="${esc(k.key)}">复制</button></td>
+              <td>${k.status ? '<span class="tag green">启用</span>' : '<span class="tag gray">停用</span>'}</td>
+              <td style="font-size:12px;color:var(--text-3)">${esc(k.last_used_at || '-')}</td>
+              <td>
+                <button class="btn link" data-tg="${k.id}">${k.status ? '停用' : '启用'}</button>
+                <button class="btn link" style="color:var(--danger)" data-dk="${k.id}">删除</button>
+              </td>
+            </tr>`).join('') || '<tr><td colspan="5" class="empty">暂无密钥，点击右上角创建</td></tr>'}
+          </tbody>
+        </table></div>`;
+      modal({ title: `API 发布 - ${a.name}`, body, wide: true, onMount(mask, close) {
+        bindRows(mask);
+        mask.querySelector('#akNew').onclick = async () => {
+          const j = await api(`/agents/${id}/api-keys`, { method: 'POST', body: {} });
+          copyText(j.data.key);
+          modal({ title: '密钥已创建（已复制）', body: `<div class="form-item"><label>请立即保存，仅此一次完整展示</label><textarea class="input mono" readonly style="min-height:70px">${esc(j.data.key)}</textarea></div>` });
+          close(); openApiKeys(id);
+        };
+      } });
+      async function loadKeys() { const j = await api(`/agents/${id}/api-keys`); return j.data; }
+      function bindRows(mask) {
+        mask.querySelectorAll('[data-copy]').forEach(b => b.onclick = () => copyText(b.dataset.copy));
+        mask.querySelectorAll('[data-tg]').forEach(b => b.onclick = async () => {
+          const j = await api(`/agents/${id}/api-keys/${b.dataset.tg}/toggle`, { method: 'POST' });
+          toast(j.msg); close(); openApiKeys(id);
+        });
+        mask.querySelectorAll('[data-dk]').forEach(b => b.onclick = async () => {
+          if (!confirm('删除该密钥？使用中的调用将立即失效。')) return;
+          await api(`/agents/${id}/api-keys/${b.dataset.dk}`, { method: 'DELETE' });
+          toast('已删除'); close(); openApiKeys(id);
+        });
+      }
+    });
+  }
+
+  function copyText(t) {
+    navigator.clipboard?.writeText(t).then(() => toast('已复制到剪贴板'), () => { });
+  }
+
+  // ---------- 分享链接 ----------
+  function openShare(id) {
+    const a = agents.find(x => x.id === id);
+    if (a.share_enabled) {
+      const url = `${location.origin}/share/${a.share_token}`;
+      const iframe = `&lt;iframe src="${url}" width="100%" height="600" frameborder="0"&gt;&lt;/iframe&gt;`;
+      const expText = a.share_expires_at
+        ? `<span class="tag orange">⏳ 有效期至 ${esc(a.share_expires_at)}</span>`
+        : '<span class="tag green">♾ 永久有效</span>';
+      modal({
+        title: `分享中 - ${a.name}`, wide: true,
+        body: `
+          <div class="form-item"><label>分享链接（免登录，任何人可访问）</label>
+            <div style="display:flex;gap:8px"><input class="input mono" readonly value="${esc(url)}"><button class="btn" id="cpUrl">复制</button><a class="btn" href="${esc(url)}" target="_blank" style="text-decoration:none">打开</a></div>
+            <div style="margin-top:6px">${expText}</div>
+          </div>
+          <div class="form-item"><label>调整有效期（借鉴临时会话：到期自动失效）</label>
+            <div style="display:flex;gap:8px;align-items:center">
+              <select class="input" id="expSel" style="width:160px">
+                <option value="1">1 天（临时试用）</option>
+                <option value="7">7 天（短期分享）</option>
+                <option value="30">30 天（项目周期）</option>
+                <option value="0" selected>永久有效</option>
+              </select>
+              <button class="btn" id="expApply">应用</button>
+            </div>
+          </div>
+          <div class="form-item"><label>网页嵌入（iframe 挂件）</label>
+            <textarea class="input mono" readonly style="min-height:64px">${iframe}</textarea>
+          </div>
+          <div class="hint">⚠ 关闭分享或到期后链接立即失效；对话仍经过平台安全合规检测（敏感词双向拦截）。</div>`,
+        foot: '<button class="btn" data-cancel>关闭</button><button class="btn" style="color:var(--danger)" data-off>停止分享</button>',
+        onMount(mask, close) {
+          mask.querySelector('[data-cancel]').onclick = close;
+          mask.querySelector('#cpUrl').onclick = () => copyText(url);
+          mask.querySelector('#expApply').onclick = async () => {
+            await api(`/agents/${id}/share`, { method: 'POST', body: { enable: true, expires_days: +mask.querySelector('#expSel').value } });
+            toast('有效期已更新'); close(); load();
+          };
+          mask.querySelector('[data-off]').onclick = async () => {
+            await api(`/agents/${id}/share`, { method: 'POST', body: { enable: false } });
+            toast('已停止分享'); close(); load();
+          };
+        },
+      });
+    } else {
+      modal({
+        title: `开启分享 - ${a.name}`,
+        body: `<div class="hint" style="line-height:1.8">🔗 开启后生成免登录分享链接：<br>· 可直接发给同事/客户在浏览器中对话<br>· 可用 iframe 嵌入任意内部网页<br>· 对话仍受平台安全合规策略保护（敏感词拦截与脱敏）<br>· 仅已发布状态的智能体可分享</div>
+          <div class="form-item" style="margin-top:10px"><label>有效期</label>
+            <select class="input" id="expSel">
+              <option value="7">7 天（短期分享，到期自动失效）</option>
+              <option value="1">1 天（临时试用）</option>
+              <option value="30">30 天（项目周期）</option>
+              <option value="0">永久有效</option>
+            </select>
+          </div>`,
+        foot: '<button class="btn" data-cancel>取消</button><button class="btn primary" data-on>开启分享</button>',
+        onMount(mask, close) {
+          mask.querySelector('[data-cancel]').onclick = close;
+          mask.querySelector('[data-on]').onclick = async () => {
+            if (a.status !== 'published') return toast('请先发布该智能体', 'err');
+            await api(`/agents/${id}/share`, { method: 'POST', body: { enable: true, expires_days: +mask.querySelector('#expSel').value } });
+            toast('分享已开启'); close(); load();
+          };
+        },
+      });
+    }
+  }
+
+  // ---------- 空间 ----------
+  function renderSpace() {
+    const t = { enterprise: '企业空间', dept: '部门空间', personal: '个人空间' };
+    pane.innerHTML = `
+      <div class="card">
+        <div class="toolbar">
+          <span style="color:var(--text-2)">空间是智能体的承载单元，决定可见范围与权限（当前 ${spaces.length} 个）</span>
+          <button class="btn primary" id="newSpace">＋ 新建空间</button>
+        </div>
+        <div class="table-wrap"><table class="tbl">
+          <thead><tr><th>空间名称</th><th>类型</th><th>所有者</th><th>成员数</th><th>智能体数</th><th>创建时间</th><th>操作</th></tr></thead>
+          <tbody>${spaces.map(s => `
+            <tr>
+              <td><b>${esc(s.name)}</b></td>
+              <td><span class="tag ${s.type === 'enterprise' ? 'blue' : s.type === 'dept' ? 'purple' : 'gray'}">${t[s.type]}</span></td>
+              <td>${esc(s.owner || '-')}</td>
+              <td>${s.members}</td>
+              <td>${agents.filter(a => a.space_id === s.id).length}</td>
+              <td style="color:var(--text-3);font-size:12px">${esc(s.created_at)}</td>
+              <td>
+                <button class="btn link" data-ed="${s.id}">编辑</button>
+                <button class="btn link" style="color:var(--danger)" data-del="${s.id}">删除</button>
+              </td>
+            </tr>`).join('')}
+          </tbody>
+        </table></div>
+      </div>`;
+    pane.querySelector('#newSpace').onclick = openSpace(null);
+    pane.querySelectorAll('[data-ed]').forEach(b => b.onclick = openSpace(+b.dataset.ed));
+    pane.querySelectorAll('[data-del]').forEach(b => b.onclick = async () => {
+      if (!await confirmBox('删除该空间？')) return;
+      await api('/agents/spaces/' + b.dataset.del, { method: 'DELETE' });
+      toast('已删除'); load();
+    });
+
+    function openSpace(id) {
+      const s = id ? spaces.find(x => x.id === id) : { name: '', type: 'dept', owner: '', members: 1 };
+      const body = `
+        <div class="form-item"><label>空间名称<span class="req">*</span></label><input class="input" id="s_name" value="${esc(s.name)}"></div>
+        <div class="form-row">
+          <div class="form-item"><label>类型</label><select class="input" id="s_type">${Object.entries(t).map(([k, v]) => `<option value="${k}" ${s.type === k ? 'selected' : ''}>${v}</option>`).join('')}</select></div>
+          <div class="form-item"><label>所有者</label><input class="input" id="s_owner" value="${esc(s.owner || '')}"></div>
+        </div>
+        <div class="form-item"><label>成员数</label><input class="input" id="s_members" type="number" min="1" value="${s.members}"></div>`;
+      return () => modal({
+        title: id ? '编辑空间' : '新建空间', body,
+        foot: '<button class="btn" data-cancel>取消</button><button class="btn primary" data-save>保存</button>',
+        onMount(mask, close) {
+          mask.querySelector('[data-cancel]').onclick = close;
+          mask.querySelector('[data-save]').onclick = async () => {
+            try {
+              const payload = { name: mask.querySelector('#s_name').value, type: mask.querySelector('#s_type').value, owner: mask.querySelector('#s_owner').value, members: +mask.querySelector('#s_members').value };
+              if (id) await api('/agents/spaces/' + id, { method: 'PUT', body: payload });
+              else await api('/agents/spaces', { method: 'POST', body: payload });
+              toast('已保存'); close(); load();
+            } catch (e) { toast(e.message, 'err'); }
+          };
+        },
+      });
+    }
+  }
+
+  // ---------- 测评 ----------
+  function renderEval() {
+    pane.innerHTML = `
+      <div class="card">
+        <div class="toolbar">
+          <span style="color:var(--text-2)">规则提示词 + 数据集 → AI 批量自动测评并打分</span>
+          <button class="btn primary" id="newEval">＋ 新建测评</button>
+        </div>
+        <div class="table-wrap"><table class="tbl">
+          <thead><tr><th>测评名称</th><th>评测对象</th><th>得分</th><th>时间</th><th>操作</th></tr></thead>
+          <tbody>${evals.map(e => `
+            <tr>
+              <td><b>${esc(e.name)}</b></td>
+              <td>🤖 ${esc(e.agent_name || '-')}</td>
+              <td><b style="color:${e.score >= 80 ? 'var(--success)' : e.score >= 60 ? 'var(--warning)' : 'var(--danger)'}">${e.score}</b> / 100</td>
+              <td style="color:var(--text-3);font-size:12px">${esc(e.created_at)}</td>
+              <td>
+                <button class="btn link" data-view="${e.id}">查看结果</button>
+                <button class="btn link" style="color:var(--danger)" data-del="${e.id}">删除</button>
+              </td>
+            </tr>`).join('') || '<tr><td colspan="5" class="empty">暂无测评任务</td></tr>'}
+          </tbody>
+        </table></div>
+      </div>`;
+    pane.querySelector('#newEval').onclick = () => {
+      const body = `
+        <div class="form-item"><label>测评名称<span class="req">*</span></label><input class="input" id="v_name" placeholder="如：制度问答准确性测评"></div>
+        <div class="form-item"><label>评测对象<span class="req">*</span></label>
+          <select class="input" id="v_agent">${agents.map(a => `<option value="${a.id}">${esc(a.name)}</option>`).join('')}</select></div>
+        <div class="form-item"><label>规则提示词</label>
+          <textarea class="input" id="v_rule" placeholder="评分规则，如：与参考答案语义一致得 1 分，部分正确 0.5 分，编造 0 分">若回答与参考答案语义一致得 1 分，答非所问或编造得 0 分，部分正确得 0.5 分。</textarea></div>
+        <div class="form-item"><label>数据集（JSON 数组：问题 + 参考答案）<span class="req">*</span></label>
+          <textarea class="input mono" id="v_data" style="min-height:130px">[
+  {"q": "一线城市住宿报销上限是多少？", "expect": "500元/晚"},
+  {"q": "年假怎么申请？", "expect": "提前三天 OA 申请"}
+]</textarea>
+          <div class="hint">演示评分逻辑：按参考答案关键词命中率自动打分</div>
+        </div>`;
+      modal({
+        title: '新建测评', body, wide: true,
+        foot: '<button class="btn" data-cancel>取消</button><button class="btn primary" data-run>开始测评</button>',
+        onMount(mask, close) {
+          mask.querySelector('[data-cancel]').onclick = close;
+          mask.querySelector('[data-run]').onclick = async () => {
+            const btn = mask.querySelector('[data-run]');
+            btn.disabled = true; btn.textContent = '测评执行中…';
+            try {
+              const j = await api('/agents/evaluations', {
+                method: 'POST',
+                body: {
+                  name: mask.querySelector('#v_name').value.trim(),
+                  agent_id: +mask.querySelector('#v_agent').value,
+                  rule_prompt: mask.querySelector('#v_rule').value,
+                  dataset: mask.querySelector('#v_data').value,
+                },
+              });
+              toast(`测评完成，得分 ${j.data.score}`);
+              close(); load();
+            } catch (e) { toast(e.message, 'err'); btn.disabled = false; btn.textContent = '开始测评'; }
+          };
+        },
+      });
+    };
+    pane.querySelectorAll('[data-view]').forEach(b => b.onclick = () => {
+      const e = evals.find(x => x.id === +b.dataset.view);
+      let results = [];
+      try { results = JSON.parse(e.result || '[]'); } catch { }
+      modal({
+        title: `测评结果 - ${e.name}（${e.score} 分）`,
+        body: results.map(r => `
+          <div class="card" style="box-shadow:none;border:1px solid var(--border);margin-bottom:10px">
+            <div style="display:flex;justify-content:space-between;margin-bottom:6px">
+              <b>Q：${esc(r.q)}</b><span class="tag ${r.score >= 1 ? 'green' : r.score > 0 ? 'orange' : 'red'}">${r.score * 100}分</span>
+            </div>
+            <div style="font-size:13px;color:var(--text-2)">期望：${esc(r.expect || '-')}</div>
+            <div style="font-size:13px;margin-top:4px">回答：${esc(r.got)}</div>
+          </div>`).join(''),
+      });
+    });
+    pane.querySelectorAll('[data-del]').forEach(b => b.onclick = async () => {
+      if (!await confirmBox('删除该测评记录？')) return;
+      await api('/agents/evaluations/' + b.dataset.del, { method: 'DELETE' });
+      toast('已删除'); load();
+    });
+  }
+
+  // ---------- 外挂搭建 ----------
+  const TYPE_META = {
+    coze: { label: 'Coze 扣子', tag: 'blue', icon: '🧩', tip: '适合工作流编排、插件生态丰富的智能体' },
+    dify: { label: 'Dify', tag: 'purple', icon: '🔧', tip: '适合 RAG 应用、Agent 编排与私有化部署' },
+    custom: { label: '自定义平台', tag: 'gray', icon: '🌐', tip: '任意支持 API 的智能体平台' },
+  };
+
+  /** 演示占位/不可达地址识别（与后端 jump 校验同规则） */
+  function isDemoUrl(u) {
+    if (!u) return false;
+    try { const h = new URL(u).hostname; return /(^|\.)example\.(com|org|net)$|\.invalid$|\.test$|^your-dify\./i.test(h); }
+    catch { return /example\.(com|org|net)$|\.invalid$|\.test$/i.test(u); }
+  }
+
+  function renderExternal() {
+    const enabled = platforms.filter(p => p.status);
+    pane.innerHTML = `
+      <div class="card" style="margin-bottom:16px;border-left:4px solid var(--brand)">
+        <h3 style="margin-bottom:10px">🚀 外挂搭建引导</h3>
+        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:6px">
+          ${[
+      { n: '1', t: '前往外部平台搭建', d: '点击下方平台卡片的「前往搭建」，跳转到 Coze / Dify 的编排工作台，利用其工作流、插件、多智能体能力完成搭建' },
+      { n: '2', t: '回到本平台同步', d: '搭建并发布后，点击卡片上的「同步智能体」（或前往接入管理），把外部智能体同步到本平台' },
+      { n: '3', t: '统一纳管使用', d: '同步的智能体出现在智能体列表（来源标记为外部平台），与内置智能体一样对话、统计与管理' },
+    ].map(s => `
+            <div style="background:#f8faff;border:1px solid var(--brand-light);border-radius:10px;padding:14px">
+              <div style="font-weight:600;color:var(--brand-dark);margin-bottom:6px">${s.n}. ${s.t}</div>
+              <div style="font-size:12px;color:var(--text-2);line-height:1.7">${s.d}</div>
+            </div>`).join('')}
+        </div>
+      </div>
+      <div class="grid-2" style="align-items:stretch">
+        ${enabled.map(p => {
+      const meta = TYPE_META[p.type] || TYPE_META.custom;
+      return `
+          <div class="card" style="display:flex;flex-direction:column">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+              <h3 style="margin:0">${meta.icon} ${esc(p.name)}
+                <span class="tag ${meta.tag}">${meta.label}</span>
+                ${p.status ? '<span class="tag green">已启用</span>' : '<span class="tag gray">停用</span>'}
+              </h3>
+              <span style="font-size:11px;color:var(--text-3)">已同步 ${p.synced} 个智能体</span>
+            </div>
+            <div class="kv" style="margin-bottom:6px">
+              <span class="k">API 服务地址</span><span class="mono" style="word-break:break-all">${esc(p.endpoint || '-')}</span>
+              <span class="k">搭建页地址</span><span class="mono" style="word-break:break-all;${isDemoUrl(p.build_url) ? 'color:var(--danger);font-weight:600' : ''}">${esc(p.build_url || '未配置（点「配置」填写）')}${isDemoUrl(p.build_url) ? ' ⚠ 演示占位，请点「配置」改为真实地址' : ''}</span>
+              <span class="k">适用场景</span><span style="color:var(--text-2);font-size:12px">${meta.tip}</span>
+              <span class="k">最近同步</span><span style="color:var(--text-3);font-size:12px">${esc(p.last_sync_at || '-')}</span>
+            </div>
+            <div style="display:flex;gap:8px;margin-top:auto;padding-top:14px;flex-wrap:wrap">
+              <button class="btn primary" data-jump="${p.id}">🚀 前往搭建</button>
+              <button class="btn" data-sync="${p.id}">🔄 同步智能体</button>
+              <button class="btn" data-cfg="${p.id}">配置</button>
+              <a class="btn" href="#/admin/access" style="text-decoration:none">接入管理 →</a>
+            </div>
+          </div>`;
+    }).join('') || '<div class="empty-box" style="grid-column:1/-1"><div class="big">🔌</div>暂无已启用的外部平台，请先前往「接入管理」配置 Coze / Dify</div>'}
+      </div>`;
+
+    pane.querySelectorAll('[data-jump]').forEach(b => b.onclick = async () => {
+      const p = platforms.find(x => x.id === +b.dataset.jump);
+      try {
+        const j = await api(`/platforms/${p.id}/jump`, { method: 'POST' });
+        window.open(j.data.url, '_blank', 'noopener');
+        toast(`已跳转到 ${p.name} 搭建页，完成后回来点「同步智能体」`, 'info');
+      } catch (e) { toast(e.message, 'err'); }
+    });
+    pane.querySelectorAll('[data-sync]').forEach(b => b.onclick = async () => {
+      b.disabled = true; b.textContent = '同步中…';
+      try {
+        const j = await api(`/platforms/${b.dataset.sync}/sync`, { method: 'POST' });
+        toast(`同步完成：新增 ${j.data.added} 个智能体，已进入智能体列表`);
+        load();
+      } catch (e) { toast(e.message, 'err'); b.disabled = false; b.textContent = '🔄 同步智能体'; }
+    });
+    pane.querySelectorAll('[data-cfg]').forEach(b => b.onclick = () => {
+      const p = platforms.find(x => x.id === +b.dataset.cfg);
+      const meta = TYPE_META[p.type] || TYPE_META.custom;
+      const body = `
+        <div class="form-item"><label>搭建页地址（Web 工作台）<span class="req">*</span></label>
+          <input class="input mono" id="ex_url" value="${esc(p.build_url || '')}" placeholder="${p.type === 'coze' ? 'https://www.coze.cn/space' : p.type === 'dify' ? 'https://your-dify.com/apps' : 'https://…'}">
+          <div class="hint">浏览器打开的搭建工作台地址（与 API 服务地址不同）。${p.type === 'coze' ? '官方默认：https://www.coze.cn/space，团队版私有化部署请填自己的域名' : p.type === 'dify' ? '官方中文站 https://dify.ai/zh（国内可达）；自部署填 http://你的域名/apps' : ''}</div>
+        </div>
+        <div class="form-item"><label>说明</label><div class="hint" style="font-size:13px;color:var(--text)">${meta.icon} ${esc(p.name)} · ${meta.label} · ${meta.tip}<br>如需修改 API 服务地址 / Token / 启停，请前往「接入管理」。</div></div>`;
+      modal({
+        title: `配置搭建入口 - ${p.name}`, body,
+        foot: '<button class="btn" data-cancel>取消</button><button class="btn primary" data-save>保存</button>',
+        onMount(mask, close) {
+          mask.querySelector('[data-cancel]').onclick = close;
+          mask.querySelector('[data-save]').onclick = async () => {
+            const url = mask.querySelector('#ex_url').value.trim();
+            if (!url) return toast('请填写搭建页地址', 'err');
+            try {
+              await api(`/platforms/${p.id}`, { method: 'PUT', body: { build_url: url } });
+              toast('已保存'); close(); load();
+            } catch (e) { toast(e.message, 'err'); }
+          };
+        },
+      });
+    });
+  }
+
+  el.querySelectorAll('#tabs .tab').forEach(t => t.onclick = () => {
+    el.querySelectorAll('#tabs .tab').forEach(x => x.classList.remove('active'));
+    t.classList.add('active');
+    tab = t.dataset.t;
+    renderCurrent();
+  });
+
+  function renderCurrent() {
+    tab === 'list' ? renderList() : tab === 'space' ? renderSpace() : tab === 'eval' ? renderEval() : renderExternal();
+  }
+
+  async function load() {
+    const [ja, js, je, jm, jk, jp, jmcp] = await Promise.all([
+      api('/agents'), api('/agents/spaces/list'), api('/agents/evaluations'), api('/chat/models'), api('/knowledge'), api('/platforms'), api('/mcp'),
+    ]);
+    agents = ja.data; spaces = js.data; evals = je.data; models = jm.data; kbs = jk.data; platforms = jp.data; mcpServers = jmcp.data;
+    renderCurrent();
+  }
+  await load();
+}

@@ -1,0 +1,15 @@
+# 依赖与运行时产物
+node_modules/
+.temp/
+server.log
+
+# 业务数据与密钥（严禁入库）
+data/
+
+# 用户生成产物与客户端安装包（体积大且非源码）
+public/uploads/
+public/downloads/
+
+# 备份归档与系统文件
+*.tar.gz
+.DS_Store

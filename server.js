@@ -1,0 +1,100 @@
+/**
+ * 企业级智能体平台 - 服务入口
+ * 前台：首页对话 / 智能体 / 知识库 / 任务管理
+ * 后台：数据看板 / 智能体管理 / 用户管理 / 知识库管理 / 接入管理 / 模型接入 / 安全合规 / 用量与配额 / 系统监控 / 运营监控
+ */
+const express = require('express');
+const path = require('path');
+const { startScheduler } = require('./src-server/lib/scheduler');
+
+const app = express();
+const PORT = process.env.PORT || 3210;
+
+app.use(express.json({ limit: '20mb' })); // 知识库支持 PDF/DOCX base64 上传
+app.use(express.static(path.join(__dirname, 'public')));
+
+// API 路由
+app.use('/api/auth', require('./src-server/routes/auth'));
+app.use('/api/agents', require('./src-server/routes/agents'));
+app.use('/api/chat', require('./src-server/routes/chat'));
+app.use('/api/knowledge', require('./src-server/routes/knowledge'));
+app.use('/api/tasks', require('./src-server/routes/tasks'));
+app.use('/api/providers', require('./src-server/routes/providers'));
+app.use('/api/platforms', require('./src-server/routes/platforms'));
+app.use('/api/security', require('./src-server/routes/security'));
+app.use('/api/monitor', require('./src-server/routes/logs'));
+app.use('/api/stats', require('./src-server/routes/stats'));
+// API 发布（OpenAI 兼容，密钥自鉴权）与分享链接（免登录）
+app.use('/openapi', require('./src-server/routes/openapi'));
+app.use('/api/share', require('./src-server/routes/share'));
+// P5.14 文件一等变量：工作流文件上传/下载（画布 file 变量 + 聊天附件共用）
+app.use('/api/files', require('./src-server/routes/files'));
+// MCP 服务管理与行业模板库（P2）
+app.use('/api/mcp', require('./src-server/routes/mcp'));
+app.use('/api/templates', require('./src-server/routes/templates'));
+app.use('/api/wf-templates', require('./src-server/routes/wf-templates')); // P5.17 工作流模板库
+// 通知中心（铃铛消息：发布上架广播 / 系统公告）
+app.use('/api/notify', require('./src-server/routes/notify'));
+// 用量报表与配额管理（P2）
+app.use('/api/quota', require('./src-server/routes/quota'));
+// 用户自有模型源（P3）：自带 Key 接入个人 OpenAI 兼容服务，仅本人可见可用
+app.use('/api/usermodels', require('./src-server/routes/usermodels'));
+// 技能资产（P3）：提示词+工具组合资产化，对话中 @技能名 调用
+app.use('/api/skillassets', require('./src-server/routes/skillassets'));
+// 用户管理：管理员对用户的增删改查/角色管理/重置密码/启停
+app.use('/api/users', require('./src-server/routes/users'));
+// 意见反馈（帮助体系）：全站反馈通道 + 管理员闭环处理（站内信回告提交者）
+app.use('/api/feedback', require('./src-server/routes/feedback'));
+// P5.27 本地桥（桌面操控客户端服务）：设备配对 + 任务队列（轮询模式，桥端 device_token 鉴权）
+app.use('/api/localbridge', require('./src-server/routes/localbridge').router);
+// 商业化（2026-10-20）：套餐定价/企业线索/账单发票/客户成功洞察（plans 与 lead 免登录）
+app.use('/api/biz', require('./src-server/routes/biz'));
+// P5.5 通用密钥管理（画布 {{env.XXX}} 占位符数据源；仅管理员）
+app.use('/api/secrets', require('./src-server/routes/secrets'));
+// P3 MCP Server（2026-10-22 ⑤）：已发布智能体暴露为 MCP 工具（Streamable HTTP + Bearer 令牌；管理端 /api/mcp-server）
+app.use('/mcp', require('./src-server/routes/mcp-server'));
+app.use('/api/mcp-server', require('./src-server/routes/mcp-server'));
+
+// 健康检查
+app.get('/api/health', (req, res) => res.json({ code: 0, data: { ok: true, ts: Date.now() } }));
+
+// 分享页面（/share/:token → share.html，前端自解析 token）
+app.get('/share/*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'share.html')));
+
+// SPA 兑底
+app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
+
+// 全局异常兜底 → 异常日志
+const { db, now } = require('./src-server/db');
+app.use((err, req, res, next) => {
+  console.error('[server]', err.message);
+  try { db.prepare('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)').run('http', `${req.method} ${req.url}: ${err.message}`, now()); } catch { }
+  res.status(500).json({ code: 500, msg: '服务内部错误：' + err.message });
+});
+
+const server = app.listen(PORT, () => {
+  console.log('==============================================');
+  console.log('  智能体平台已启动');
+  console.log(`  前台入口:  http://localhost:${PORT}/`);
+  console.log('  默认账号:  admin（首次登录强制改密）');
+  console.log('             demo（首次登录强制改密）');
+  console.log('==============================================');
+  startScheduler();
+});
+
+// 优雅停机（2026-10-20 P1）：SIGTERM/SIGINT 时停止接新连接、等待存量请求收尾、数据库落盘
+// 悬挂的 SSE 长连接由 5 秒兜底强退处理，避免卡死重启流程
+function shutdown(signal) {
+  console.log(`\n[server] 收到 ${signal}，优雅停机中（停止接新连接，等待请求收尾）…`);
+  server.close(() => {
+    try { db.close(); console.log('[server] 数据库已落盘关闭'); } catch { }
+    console.log('[server] 停机完成');
+    process.exit(0);
+  });
+  setTimeout(() => {
+    console.log('[server] 等待超时（可能有长连接），强制退出');
+    process.exit(0);
+  }, 5000).unref();
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));

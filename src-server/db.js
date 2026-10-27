@@ -1,0 +1,963 @@
+/**
+ * 数据库初始化：Schema + 种子数据（首次运行自动灌入）
+ */
+const path = require('path');
+const fs = require('fs');
+const crypto = require('crypto');
+const Database = require('better-sqlite3');
+
+// 数据目录：默认 <项目>/data；测试可用 AGENT_DATA_DIR 指向隔离目录（不污染生产库）
+const DATA_DIR = process.env.AGENT_DATA_DIR || path.join(__dirname, '..', 'data');
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+
+const db = new Database(path.join(DATA_DIR, 'platform.db'));
+db.pragma('journal_mode = WAL');
+
+// 密码哈希 SALT（2026-10-20 P0 安全加固）：优先环境变量，其次 data/secrets.json（与 JWT 密钥同文件，
+// 首次启动自动生成），兜底旧版硬编码值（保证存量用户密码不失效）。兼容策略：验证时依次尝试新/旧 SALT。
+const SALT_FILE = path.join(DATA_DIR, 'secrets.json');
+const LEGACY_SALT = 'agent-platform-salt-v1';
+function loadSalt() {
+  if (process.env.AGENT_PWD_SALT && process.env.AGENT_PWD_SALT.length >= 8) return process.env.AGENT_PWD_SALT;
+  try {
+    if (fs.existsSync(SALT_FILE)) {
+      const j = JSON.parse(fs.readFileSync(SALT_FILE, 'utf8'));
+      if (j.pwd_salt && j.pwd_salt.length >= 8) return j.pwd_salt;
+    }
+  } catch { }
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    // 与 auth.js 共用同一文件：保留已有字段（如 jwt_secret），只补 pwd_salt
+    const j = fs.existsSync(SALT_FILE) ? JSON.parse(fs.readFileSync(SALT_FILE, 'utf8')) : {};
+    if (!j.pwd_salt) {
+      j.pwd_salt = crypto.randomBytes(32).toString('hex');
+      j.generated_at = new Date().toISOString();
+      fs.writeFileSync(SALT_FILE, JSON.stringify(j, null, 2), { mode: 0o600 });
+    }
+    return j.pwd_salt;
+  } catch { }
+  return LEGACY_SALT;
+}
+const SALT = loadSalt();
+function hashPwd(pwd) {
+  return crypto.createHash('sha256').update(SALT + pwd).digest('hex');
+}
+/** 兼容旧 SALT 的验证（老密码一次登录后即换新哈希，平滑迁移） */
+function verifyPwd(pwd, stored) {
+  if (stored === hashPwd(pwd)) return { ok: true, legacy: false };
+  const legacyHash = crypto.createHash('sha256').update(LEGACY_SALT + pwd).digest('hex');
+  return { ok: stored === legacyHash, legacy: stored === legacyHash };
+}
+function now() {
+  return new Date().toLocaleString('sv-SE', { timeZone: 'Asia/Shanghai' });
+}
+function daysAgo(n, hour = 10, min = 0) {
+  const d = new Date(Date.now() - n * 86400000);
+  d.setHours(hour, min, 0, 0);
+  return d.toLocaleString('sv-SE', { timeZone: 'Asia/Shanghai' });
+}
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  username TEXT UNIQUE NOT NULL,
+  password TEXT NOT NULL,
+  nickname TEXT,
+  role TEXT DEFAULT 'user',
+  dept TEXT,
+  status INTEGER DEFAULT 1,
+  must_change_pwd INTEGER DEFAULT 0,
+  quota_total INTEGER DEFAULT 0,
+  quota_used INTEGER DEFAULT 0,
+  created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS spaces (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  type TEXT NOT NULL,
+  owner TEXT,
+  members INTEGER DEFAULT 0,
+  created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS agents (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  description TEXT DEFAULT '',
+  type TEXT DEFAULT 'digital',
+  space_id INTEGER,
+  category TEXT DEFAULT '未分类',
+  prompt TEXT DEFAULT '',
+  model TEXT,
+  temperature REAL DEFAULT 0.7,
+  context_rounds INTEGER DEFAULT 10,
+  max_reply INTEGER DEFAULT 1024,
+  opening TEXT DEFAULT '',
+  opening_questions TEXT DEFAULT '[]',
+  kb_id INTEGER,
+  status TEXT DEFAULT 'draft',
+  source TEXT DEFAULT 'self',
+  source_name TEXT DEFAULT '',
+  created_at TEXT,
+  updated_at TEXT
+);
+CREATE TABLE IF NOT EXISTS kbs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  description TEXT DEFAULT '',
+  enabled INTEGER DEFAULT 1,
+  owner TEXT,
+  created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS kb_files (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kb_id INTEGER NOT NULL,
+  name TEXT,
+  size INTEGER DEFAULT 0,
+  status TEXT DEFAULT 'success',
+  chunk_count INTEGER DEFAULT 0,
+  created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS kb_chunks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  file_id INTEGER,
+  kb_id INTEGER,
+  content TEXT
+);
+CREATE TABLE IF NOT EXISTS sessions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  agent_id INTEGER,
+  title TEXT,
+  username TEXT,
+  created_at TEXT,
+  updated_at TEXT
+);
+CREATE TABLE IF NOT EXISTS messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id INTEGER,
+  role TEXT,
+  content TEXT,
+  tokens INTEGER DEFAULT 0,
+  created_at TEXT
+);`);
+// messages 补充对话质量反馈列（2026-10-20 体验优化）：
+// rating：0 未评 / 1 👍 / -1 👎（消息级好坏反馈）
+// solved：0 未评 / 1 已解决 / 2 未解决（「这个回答解决你的问题了吗」二选一调研）
+{
+  const msgCols = db.prepare('PRAGMA table_info(messages)').all().map(c => c.name);
+  if (!msgCols.includes('rating')) {
+    db.exec('ALTER TABLE messages ADD COLUMN rating INTEGER DEFAULT 0');
+    console.log('[db] messages 表已迁移：新增 rating 字段');
+  }
+  if (!msgCols.includes('solved')) {
+    db.exec('ALTER TABLE messages ADD COLUMN solved INTEGER DEFAULT 0');
+    console.log('[db] messages 表已迁移：新增 solved 字段');
+  }
+}
+db.exec(`CREATE TABLE IF NOT EXISTS tasks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  target_type TEXT DEFAULT 'agent',
+  target_id INTEGER,
+  exec_type TEXT DEFAULT 'once',
+  cron TEXT,
+  params TEXT DEFAULT '{}',
+  enabled INTEGER DEFAULT 1,
+  last_run_at TEXT,
+  last_result TEXT,
+  created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS task_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id INTEGER,
+  status TEXT,
+  started_at TEXT,
+  finished_at TEXT,
+  output TEXT
+);
+CREATE TABLE IF NOT EXISTS providers (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  base_url TEXT DEFAULT '',
+  api_key TEXT DEFAULT '',
+  models TEXT DEFAULT '[]',
+  configured INTEGER DEFAULT 0,
+  is_default INTEGER DEFAULT 0,
+  remark TEXT DEFAULT '',
+  created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS platforms (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  type TEXT DEFAULT 'coze',
+  endpoint TEXT DEFAULT '',
+  token TEXT DEFAULT '',
+  build_url TEXT DEFAULT '',
+  status INTEGER DEFAULT 1,
+  synced INTEGER DEFAULT 0,
+  last_sync_at TEXT,
+  created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS word_categories (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS words (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  category_id INTEGER,
+  word TEXT NOT NULL,
+  input_block INTEGER DEFAULT 0,
+  output_block INTEGER DEFAULT 0,
+  hit_count INTEGER DEFAULT 0,
+  created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS op_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  username TEXT,
+  action TEXT,
+  detail TEXT DEFAULT '',
+  ip TEXT,
+  created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS err_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source TEXT,
+  message TEXT,
+  created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS evaluations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  agent_id INTEGER,
+  rule_prompt TEXT DEFAULT '',
+  dataset TEXT DEFAULT '[]',
+  status TEXT DEFAULT 'done',
+  score REAL DEFAULT 0,
+  result TEXT DEFAULT '[]',
+  created_at TEXT
+);
+`);
+
+// ---------------- 供应商默认唯一性防护（2026-10-14 修复双默认 bug） ----------------
+// 根因：providers.js 设默认路由「清空其他默认」语句漏 .run() 从未执行，历史遗留多个 is_default=1 并存。
+// 此处幂等归一化（保留最新创建的一个默认）+ 部分唯一索引，数据库层杜绝复发（含直接改库）。
+{
+  const dupDefaults = db.prepare('SELECT id FROM providers WHERE is_default=1 ORDER BY created_at DESC, id DESC').all();
+  if (dupDefaults.length > 1) {
+    const keep = dupDefaults[0].id; // 保留最新创建的（用户最近的意图）
+    db.prepare('UPDATE providers SET is_default=0 WHERE is_default=1 AND id != ?').run(keep);
+    console.log(`[db] 供应商默认归一化：保留 #${keep}，清除其余 ${dupDefaults.length - 1} 个默认标志`);
+  }
+  // 部分唯一索引：is_default=1 的行全局最多一个（归一化之后才能建成功）
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_providers_single_default ON providers(is_default) WHERE is_default=1`);
+}
+
+// ---------------- 存量库迁移（幂等） ----------------
+// users 表补充配额字段（2026-10-20 P2：用户级 Token 配额，0=不限制）
+{
+  const userCols = db.prepare('PRAGMA table_info(users)').all().map(c => c.name);
+  if (!userCols.includes('quota_total')) {
+    db.exec('ALTER TABLE users ADD COLUMN quota_total INTEGER DEFAULT 0');
+    db.exec('ALTER TABLE users ADD COLUMN quota_used INTEGER DEFAULT 0');
+    console.log('[db] users 表已迁移：新增 quota_total / quota_used 字段');
+  }
+  // 存量用户用量回填：按 messages 表 token 累计（含分享页/API 调用归到 admin 创建者）
+  const hasUsage = db.prepare('SELECT COUNT(*) c FROM users WHERE quota_used > 0').get().c;
+  if (!hasUsage) {
+    db.exec(`UPDATE users SET quota_used = COALESCE((
+      SELECT SUM(m.tokens) FROM messages m
+      JOIN sessions s ON s.id = m.session_id
+      WHERE s.username = users.username
+    ), 0)`);
+    console.log('[db] users.quota_used 已按历史对话 token 回填');
+  }
+}
+// agents 表补充 owner（2026-10-20 P2：分享页/openapi 消耗记账归属到智能体发布者）
+{
+  const agentCols2 = db.prepare('PRAGMA table_info(agents)').all().map(c => c.name);
+  if (!agentCols2.includes('owner')) {
+    db.exec("ALTER TABLE agents ADD COLUMN owner TEXT DEFAULT ''");
+    console.log('[db] agents 表已迁移：新增 owner 字段');
+    // 存量归属：外部同步的归 admin，自建的也归 admin（当前用户就是唯一创建者）
+    db.exec("UPDATE agents SET owner='admin' WHERE COALESCE(owner,'')=''");
+  }
+}
+// users 表补充 must_change_pwd（2026-10-20 P0 弱口令治理：标记需强制改密的账号）
+{
+  const userCols = db.prepare('PRAGMA table_info(users)').all().map(c => c.name);
+  if (!userCols.includes('must_change_pwd')) {
+    db.exec('ALTER TABLE users ADD COLUMN must_change_pwd INTEGER DEFAULT 0');
+    console.log('[db] users 表已迁移：新增 must_change_pwd 字段');
+  }
+  // 存量弱口令账号一次性打标（检测真实哈希是否对应常见默认口令；改密后标记清除）
+  const WEAK = ['admin123', '123456', 'demo123', 'password', '111111', '000000', 'abc123'];
+  const users = db.prepare('SELECT id, password, must_change_pwd FROM users').all();
+  const mark = db.prepare('UPDATE users SET must_change_pwd=1 WHERE id=?');
+  const unmark = db.prepare('UPDATE users SET must_change_pwd=0 WHERE id=?');
+  for (const u of users) {
+    if (u.must_change_pwd) continue;
+    const isWeak = WEAK.some(w => u.password === hashPwd(w) || u.password === crypto.createHash('sha256').update(LEGACY_SALT + w).digest('hex'));
+    if (isWeak) { mark.run(u.id); console.log(`[db] 弱口令账号已标记强制改密：#${u.id}`); }
+    else unmark.run(u.id);
+  }
+}
+// users 表补充 onboarded（2026-10-20 帮助体系：新手引导完成标记，0=未看过 3 步引导）
+// 与 quota_alert_level（用量预警已提醒档位：0=未提醒 1=已提醒80% 2=已提醒90%，防重复站内信）
+{
+  const userCols2 = db.prepare('PRAGMA table_info(users)').all().map(c => c.name);
+  if (!userCols2.includes('onboarded')) {
+    db.exec('ALTER TABLE users ADD COLUMN onboarded INTEGER DEFAULT 0');
+    console.log('[db] users 表已迁移：新增 onboarded 字段');
+  }
+  if (!userCols2.includes('quota_alert_level')) {
+    db.exec('ALTER TABLE users ADD COLUMN quota_alert_level INTEGER DEFAULT 0');
+    console.log('[db] users 表已迁移：新增 quota_alert_level 字段');
+  }
+}
+// users 补充 plan（2026-10-20 商业化）：套餐档位 free/pro/enterprise，默认 free；
+// 套餐额度与权益定义见 lib/plans.js（静态配置，不入库）
+{
+  const userCols3 = db.prepare('PRAGMA table_info(users)').all().map(c => c.name);
+  if (!userCols3.includes('plan')) {
+    db.exec("ALTER TABLE users ADD COLUMN plan TEXT DEFAULT 'free'");
+    console.log('[db] users 表已迁移：新增 plan 字段');
+  }
+}
+// 企业定制线索表（2026-10-20 商业化）：对外价格页「联系销售」表单收集，免登录提交
+db.exec(`CREATE TABLE IF NOT EXISTS enterprise_leads (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  company TEXT NOT NULL,
+  contact_name TEXT NOT NULL,
+  phone TEXT DEFAULT '',
+  email TEXT DEFAULT '',
+  scale TEXT DEFAULT '',
+  demand TEXT DEFAULT '',
+  status TEXT DEFAULT 'new',
+  handler TEXT DEFAULT '',
+  note TEXT DEFAULT '',
+  created_at TEXT
+);`);
+// 发票申请表（2026-10-20 商业化）：用户在线提交开票信息，管理员处理
+db.exec(`CREATE TABLE IF NOT EXISTS invoices (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  username TEXT NOT NULL,
+  title TEXT NOT NULL,
+  tax_no TEXT DEFAULT '',
+  amount_type TEXT DEFAULT 'plan',
+  month TEXT NOT NULL,
+  tokens INTEGER DEFAULT 0,
+  email TEXT DEFAULT '',
+  note TEXT DEFAULT '',
+  status TEXT DEFAULT 'pending',
+  handler TEXT DEFAULT '',
+  handled_at TEXT,
+  created_at TEXT
+);`);
+// platforms 表补充 build_url（外部平台搭建页地址）
+const platCols = db.prepare('PRAGMA table_info(platforms)').all().map(c => c.name);
+if (!platCols.includes('build_url')) {
+  db.exec(`ALTER TABLE platforms ADD COLUMN build_url TEXT DEFAULT ''`);
+  // 按类型补默认搭建页地址
+  db.prepare(`UPDATE platforms SET build_url='https://www.coze.cn/workbench' WHERE type='coze'`).run();
+  const difyRows = db.prepare('SELECT id, endpoint FROM platforms WHERE type=?').all('dify');
+  difyRows.forEach(r => {
+    const base = (r.endpoint || '').replace(/\/v1\/?$/, '').replace(/\/+$/, '');
+    if (base) db.prepare('UPDATE platforms SET build_url=? WHERE id=?').run(base + '/apps', r.id);
+  });
+  console.log('[db] platforms 表已迁移：新增 build_url 字段');
+}
+// platforms 表补充 console_email / console_password（Dify 控制台凭据，真同步用）
+if (!platCols.includes('console_email')) {
+  db.exec(`ALTER TABLE platforms ADD COLUMN console_email TEXT DEFAULT ''`);
+  db.exec(`ALTER TABLE platforms ADD COLUMN console_password TEXT DEFAULT ''`);
+  console.log('[db] platforms 表已迁移：新增 console_email / console_password 字段');
+}
+// agents 表补充外部应用映射与分享字段
+const agentCols = db.prepare('PRAGMA table_info(agents)').all().map(c => c.name);
+if (!agentCols.includes('external_app_id')) {
+  db.exec(`ALTER TABLE agents ADD COLUMN external_app_id TEXT DEFAULT ''`);
+  db.exec(`ALTER TABLE agents ADD COLUMN external_api_key TEXT DEFAULT ''`);
+  db.exec(`ALTER TABLE agents ADD COLUMN external_mode TEXT DEFAULT ''`);
+  console.log('[db] agents 表已迁移：新增 external_app_id / external_api_key / external_mode 字段');
+}
+if (!agentCols.includes('share_token')) {
+  db.exec(`ALTER TABLE agents ADD COLUMN share_token TEXT DEFAULT ''`);
+  db.exec(`ALTER TABLE agents ADD COLUMN share_enabled INTEGER DEFAULT 0`);
+  console.log('[db] agents 表已迁移：新增 share_token / share_enabled 字段');
+}
+// sessions 表补充外部平台会话 ID（Dify conversation_id，多轮对话必需）
+const sessCols = db.prepare('PRAGMA table_info(sessions)').all().map(c => c.name);
+if (!sessCols.includes('ext_conversation_id')) {
+  db.exec(`ALTER TABLE sessions ADD COLUMN ext_conversation_id TEXT DEFAULT ''`);
+  console.log('[db] sessions 表已迁移：新增 ext_conversation_id 字段');
+}
+// P5.7 会话变量（Chatflow 跨轮次持久）：按会话存画布 start.session_vars 的当前值（JSON {name:value}）
+if (!sessCols.includes('wf_vars')) {
+  db.exec(`ALTER TABLE sessions ADD COLUMN wf_vars TEXT DEFAULT ''`);
+  console.log('[db] sessions 表已迁移：新增 wf_vars 字段（会话变量）');
+}
+// API 发布密钥表
+db.exec(`CREATE TABLE IF NOT EXISTS agent_api_keys (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  agent_id INTEGER NOT NULL,
+  key TEXT UNIQUE NOT NULL,
+  name TEXT DEFAULT '',
+  status INTEGER DEFAULT 1,
+  created_at TEXT,
+  last_used_at TEXT
+);`);
+// 分享会话表（免登录访问，与内部 sessions 隔离）
+db.exec(`CREATE TABLE IF NOT EXISTS share_sessions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  share_token TEXT NOT NULL,
+  title TEXT DEFAULT '分享对话',
+  ext_conversation_id TEXT DEFAULT '',
+  created_at TEXT,
+  updated_at TEXT
+);`);
+// agents 表补充 tools（内置工具开关，JSON 数组）
+if (!agentCols.includes('tools')) {
+  db.exec(`ALTER TABLE agents ADD COLUMN tools TEXT DEFAULT '[]'`);
+  console.log('[db] agents 表已迁移：新增 tools 字段');
+}
+// agents 表补充 mcp_servers（挂载的 MCP 服务 ID，JSON 数组）
+if (!agentCols.includes('mcp_servers')) {
+  db.exec(`ALTER TABLE agents ADD COLUMN mcp_servers TEXT DEFAULT '[]'`);
+  console.log('[db] agents 表已迁移：新增 mcp_servers 字段');
+}
+// agents 表补充 share_expires_at（分享链接有效期，NULL=永久）
+if (!agentCols.includes('share_expires_at')) {
+  db.exec(`ALTER TABLE agents ADD COLUMN share_expires_at TEXT DEFAULT NULL`);
+  console.log('[db] agents 表已迁移：新增 share_expires_at 字段');
+}
+// agents 表补充 SinguX 式编排配置（2026-10-14：编排页升级）
+const STUDIO_COLS = [
+  ['user_prompt', `TEXT DEFAULT ''`],            // 用户提示词（预置指令，注入对话输入框）
+  ['top_p', `REAL DEFAULT 0.7`],                  // Top p（生成多样性参数）
+  ['diversity_mode', `TEXT DEFAULT 'balanced'`], // 生成多样性模式：precise/balanced/creative/custom
+  ['icon', `TEXT DEFAULT ''`],                    // 图标（emoji）
+  ['long_memory', `INTEGER DEFAULT 0`],           // 长期记忆开关（跨会话记住用户特征）
+  ['allow_user_model', `INTEGER DEFAULT 1`],      // 允许用户选择自有模型
+  ['suggest_enabled', `INTEGER DEFAULT 1`],       // 用户问题建议开关
+  ['variables', `TEXT DEFAULT '[]'`],             // 自定义变量（JSON：[{name,desc}]）
+];
+for (const [col, def] of STUDIO_COLS) {
+  if (!agentCols.includes(col)) {
+    db.exec(`ALTER TABLE agents ADD COLUMN ${col} ${def}`);
+    console.log(`[db] agents 表已迁移：新增 ${col} 字段`);
+  }
+}
+// agents 表补充广场与子智能体编排字段（2026-10-14 第二批：广场/发布体系/子智能体）
+const PLAZA_COLS = [
+  ['child_ids', `TEXT DEFAULT '[]'`],        // 子智能体编排（JSON：[id]，主智能体经 function calling 路由）
+  ['is_official', `INTEGER DEFAULT 0`],      // 官方智能体标识（广场官方筛选）
+  ['publish_record', `TEXT DEFAULT ''`],     // 发布记录（本次发布说明，≤200 字）
+  ['allow_copy', `INTEGER DEFAULT 1`],       // 允许复制为模板（广场一键复制创建）
+  ['fav_count', `INTEGER DEFAULT 0`],        // 收藏数（冗余计数，收藏/取消时同步）
+  ['use_count', `INTEGER DEFAULT 0`],        // 使用数（创建会话时 +1，广场统计）
+];
+for (const [col, def] of PLAZA_COLS) {
+  if (!agentCols.includes(col)) {
+    db.exec(`ALTER TABLE agents ADD COLUMN ${col} ${def}`);
+    console.log(`[db] agents 表已迁移：新增 ${col} 字段`);
+  }
+}
+// P5.9 版本管理：草稿与发布分离——agents.published_workflow 存发布快照
+// （草稿在 workflow 字段，发布时复制；运行时优先快照，编辑草稿不影响线上；无快照的存量画布回退草稿）
+if (!agentCols.includes('published_workflow')) {
+  db.exec(`ALTER TABLE agents ADD COLUMN published_workflow TEXT DEFAULT NULL`);
+  console.log('[db] agents 表已迁移：新增 published_workflow 字段（发布快照）');
+}
+// P5.9 发布历史表：每次发布存一条（版本号/快照 JSON/发布说明），支持一键回滚
+db.exec(`CREATE TABLE IF NOT EXISTS agent_publish_history (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  agent_id INTEGER NOT NULL,
+  version INTEGER NOT NULL,
+  workflow TEXT,
+  note TEXT DEFAULT '',
+  nodes INTEGER DEFAULT 0,
+  published_by TEXT,
+  created_at TEXT
+);`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_pub_history_agent ON agent_publish_history(agent_id, version DESC);`);
+// agents 表补充协作与可见性字段（2026-10-22 P3 协作与团队功能）
+// visibility: public 全员可见（默认，存量不受影响）/ restricted 受限可见
+// visible_depts / visible_members: restricted 时的可见部门/成员名单（JSON 数组）
+// collaborators: 协作编辑者名单（JSON 数组，username，含草稿编辑权；企业版权益）
+const COLLAB_COLS = [
+  ['visibility', `TEXT DEFAULT 'public'`],
+  ['visible_depts', `TEXT DEFAULT '[]'`],
+  ['visible_members', `TEXT DEFAULT '[]'`],
+  ['collaborators', `TEXT DEFAULT '[]'`],
+];
+for (const [col, def] of COLLAB_COLS) {
+  if (!agentCols.includes(col)) {
+    db.exec(`ALTER TABLE agents ADD COLUMN ${col} ${def}`);
+    console.log(`[db] agents 表已迁移：新增 ${col} 字段`);
+  }
+}
+// agents 表补充画布工作流字段（2026-10-22 P5 画布编排；P5.1 升级 V2 数据模型）
+// workflow: V2 结构 JSON（{nodes:[{id:"node_N",type,position:{x,y},data:{...}}], edges:[{id,source,target,sourceHandle}], viewport}）
+// edit_mode: 编辑模式独立字段 form 表单（默认）/ canvas 画布（不再依赖 routing_mode 推断）
+if (!agentCols.includes('workflow')) {
+  db.exec(`ALTER TABLE agents ADD COLUMN workflow TEXT DEFAULT NULL`);
+  console.log('[db] agents 表已迁移：新增 workflow 字段（画布编排）');
+}
+if (!agentCols.includes('edit_mode')) {
+  db.exec(`ALTER TABLE agents ADD COLUMN edit_mode TEXT DEFAULT 'form'`);
+  console.log('[db] agents 表已迁移：新增 edit_mode 字段（form/canvas）');
+}
+// 存量 V1 画布数据自动升级 V2（id 数字→node_N、x/y→position、config→data、from/to/branch→source/target/sourceHandle）
+{
+  const { migrateWorkflowData } = require('./lib/workflow-schema');
+  const rows = db.prepare(`SELECT id, workflow FROM agents WHERE workflow IS NOT NULL`).all();
+  let migrated = 0;
+  for (const r of rows) {
+    try {
+      const wf = JSON.parse(r.workflow);
+      if (wf && Array.isArray(wf.nodes) && wf.nodes.length && wf.nodes[0].config !== undefined) {
+        db.prepare('UPDATE agents SET workflow=? WHERE id=?').run(JSON.stringify(migrateWorkflowData(wf)), r.id);
+        migrated++;
+      }
+    } catch { /* 损坏数据跳过 */ }
+  }
+  if (migrated) console.log(`[db] agents.workflow 已完成 V1→V2 数据迁移：${migrated} 条`);
+}
+// 存量数据回填：use_count 按历史会话数初始化（广场统计口径）
+{
+  const hasCount = db.prepare(`SELECT COUNT(*) c FROM agents WHERE COALESCE(use_count,0) > 0`).get().c;
+  if (!hasCount) {
+    db.exec(`UPDATE agents SET use_count = (SELECT COUNT(*) FROM sessions WHERE sessions.agent_id = agents.id)`);
+    console.log('[db] agents.use_count 已按历史会话数回填');
+  }
+  // 种子官方智能体：企业级前两个设为官方（管理员发布）
+  db.exec(`UPDATE agents SET is_official=1 WHERE id IN (SELECT id FROM agents WHERE source='self' ORDER BY id LIMIT 2) AND is_official=0`);
+}
+// 智能体收藏表（广场 ⭐ 收藏，username+agent_id 唯一）
+db.exec(`CREATE TABLE IF NOT EXISTS favorites (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  username TEXT NOT NULL,
+  agent_id INTEGER NOT NULL,
+  created_at TEXT,
+  UNIQUE(username, agent_id)
+);`);
+// 站内通知表（发布上架/系统公告，铃铛消息中心）
+db.exec(`CREATE TABLE IF NOT EXISTS notifications (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  username TEXT NOT NULL DEFAULT '*',      -- '*' = 全员广播，否则指定用户
+  title TEXT NOT NULL,
+  content TEXT DEFAULT '',
+  type TEXT DEFAULT 'system',              -- system/agent_publish/agent_fav
+  link TEXT DEFAULT '',
+  is_read INTEGER DEFAULT 0,
+  created_at TEXT
+);`);
+// 通知已读标记（广播通知每人独立已读）
+db.exec(`CREATE TABLE IF NOT EXISTS notification_reads (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  username TEXT NOT NULL,
+  notification_id INTEGER NOT NULL,
+  read_at TEXT,
+  UNIQUE(username, notification_id)
+);`);
+// 智能体长期记忆表（long_memory 开启时，对话后异步提取的用户特征事实，跨会话注入）
+db.exec(`CREATE TABLE IF NOT EXISTS agent_memories (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  agent_id INTEGER NOT NULL,
+  username TEXT NOT NULL,
+  fact TEXT NOT NULL,
+  created_at TEXT
+);`);
+// 通知种子（仅首次有该表时插一条欢迎广播）
+{
+  const nCount = db.prepare('SELECT COUNT(*) c FROM notifications').get().c;
+  if (nCount === 0) {
+    db.prepare(`INSERT INTO notifications (username,title,content,type,link,is_read,created_at) VALUES ('*','欢迎使用智能体广场','智能体平台已上线「广场」：已发布的智能体在此集中展示，支持分类浏览、搜索、收藏与一键复制创建。','system','#/square',0,?)`).run(now());
+  }
+};
+// kb_chunks 表补充 embedding（本地向量缓存，JSON 数组，懒计算）
+const chunkCols = db.prepare('PRAGMA table_info(kb_chunks)').all().map(c => c.name);
+if (!chunkCols.includes('embedding')) {
+  db.exec(`ALTER TABLE kb_chunks ADD COLUMN embedding TEXT DEFAULT ''`);
+  console.log('[db] kb_chunks 表已迁移：新增 embedding 字段');
+}
+// 全链路追踪表
+db.exec(`CREATE TABLE IF NOT EXISTS chat_traces (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id INTEGER,
+  message_id INTEGER,
+  agent_id INTEGER,
+  model TEXT,
+  mode TEXT,
+  latency_ms INTEGER,
+  tokens INTEGER,
+  prompt_chars INTEGER,
+  kb_hits TEXT DEFAULT '[]',
+  tool_calls TEXT DEFAULT '[]',
+  blocked TEXT DEFAULT '',
+  created_at TEXT
+);`);
+// chat_traces 表补充 suggestions（用户问题建议，JSON 数组，异步生成后回填）
+const traceCols = db.prepare('PRAGMA table_info(chat_traces)').all().map(c => c.name);
+if (!traceCols.includes('suggestions')) {
+  db.exec(`ALTER TABLE chat_traces ADD COLUMN suggestions TEXT DEFAULT '[]'`);
+  console.log('[db] chat_traces 表已迁移：新增 suggestions 字段');
+}
+// MCP 服务注册表（Streamable HTTP / SSE 传输）
+db.exec(`CREATE TABLE IF NOT EXISTS mcp_servers (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  url TEXT NOT NULL,
+  api_key TEXT DEFAULT '',
+  transport TEXT DEFAULT 'http',
+  status INTEGER DEFAULT 1,
+  tools_cache TEXT DEFAULT '[]',
+  last_check_at TEXT DEFAULT '',
+  last_error TEXT DEFAULT '',
+  created_at TEXT
+);`);
+// P5.5 工作流运行实例表（生产可观测：每次画布运行落一条完整记录，节点级 Trace 可回溯）
+// trigger_type: manual（运行测试）/ chat（对话触发）/ api / webhook / schedule（预留）
+// node_logs: [{nodeId,status,duration,inputs,output,outputFull,error,retries}] JSON（env 密钥已脱敏）
+db.exec(`CREATE TABLE IF NOT EXISTS workflow_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  agent_id INTEGER NOT NULL,
+  trigger_type TEXT DEFAULT 'manual',
+  status TEXT DEFAULT 'running',
+  inputs TEXT,
+  outputs TEXT,
+  node_logs TEXT,
+  total_tokens INTEGER DEFAULT 0,
+  total_duration_ms INTEGER DEFAULT 0,
+  error TEXT,
+  started_at TEXT,
+  finished_at TEXT
+);`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_wf_runs_agent ON workflow_runs(agent_id, id DESC);`);
+// P5.8 差异化能力 #9：workflow_runs 支持 parent_run_id（子智能体节点调用关联父 run，画布下钻调试）
+{
+  const wfRunCols = db.prepare('PRAGMA table_info(workflow_runs)').all().map(c => c.name);
+  if (!wfRunCols.includes('parent_run_id')) {
+    db.exec('ALTER TABLE workflow_runs ADD COLUMN parent_run_id INTEGER DEFAULT NULL');
+    console.log('[db] workflow_runs 表已迁移：新增 parent_run_id 字段（子智能体下钻）');
+  }
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_wf_runs_parent ON workflow_runs(parent_run_id) WHERE parent_run_id IS NOT NULL;`); // 索引在列迁移之后（新库 CREATE TABLE 无此列）
+}
+// P5.8 差异化能力 #11：tasks 表支持 Webhook 触发（exec_type='webhook' + webhook_token 路由鉴权）
+{
+  const taskCols = db.prepare('PRAGMA table_info(tasks)').all().map(c => c.name);
+  if (!taskCols.includes('webhook_token')) {
+    db.exec('ALTER TABLE tasks ADD COLUMN webhook_token TEXT DEFAULT \'\''); // SQL 值用单引号（双引号在 SQLite 是标识符引用）
+    console.log('[db] tasks 表已迁移：新增 webhook_token 字段（Webhook 触发）');
+  }
+}
+// P5.14 文件一等变量：工作流文件表（上传原文+解析文本；变量值传 fileId，运行时注入内容/下载链接）
+// content_b64 仅 ≤8MB 文件保留（供原文下载）；text_content 为解析全文（PDF/DOCX/TXT/MD）
+db.exec(`CREATE TABLE IF NOT EXISTS wf_files (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  ext TEXT DEFAULT '',
+  size INTEGER DEFAULT 0,
+  text_content TEXT DEFAULT '',
+  content_b64 TEXT DEFAULT '',
+  source TEXT DEFAULT 'manual',
+  created_by TEXT DEFAULT '',
+  created_at TEXT
+);`);
+// P5.5 通用密钥表（画布 {{env.XXX}} 占位符运行时注入；值仅管理员可写，任何接口不回读明文）
+db.exec(`CREATE TABLE IF NOT EXISTS secrets (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL UNIQUE,
+  value TEXT NOT NULL,
+  remark TEXT DEFAULT '',
+  created_at TEXT,
+  updated_at TEXT
+);`);
+// 安全事件表（PII 命中 / 提示词注入检测）
+db.exec(`CREATE TABLE IF NOT EXISTS security_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  type TEXT NOT NULL,
+  detail TEXT DEFAULT '',
+  action TEXT DEFAULT '',
+  source TEXT DEFAULT '',
+  created_at TEXT
+);`);
+// 用户自有模型供应商表（2026-10-20 P3：用户自带 API Key 接入 OpenAI 兼容模型源，与平台供应商隔离，仅本人可见可用）
+db.exec(`CREATE TABLE IF NOT EXISTS user_providers (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  username TEXT NOT NULL,
+  name TEXT NOT NULL,
+  base_url TEXT DEFAULT '',
+  api_key TEXT DEFAULT '',
+  models TEXT DEFAULT '[]',
+  status INTEGER DEFAULT 1,
+  created_at TEXT
+);`);
+// 技能资产表（2026-10-20 P3 技能资产化：可复用的「提示词+工具」组合，对话中 @技能名 调用；
+// status=1 已发布（他人可见可引用），status=0 私有（仅本人）。owner+name 唯一防重名混淆）
+db.exec(`CREATE TABLE IF NOT EXISTS skill_assets (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  owner TEXT NOT NULL,
+  name TEXT NOT NULL,
+  description TEXT DEFAULT '',
+  icon TEXT DEFAULT '✨',
+  prompt TEXT DEFAULT '',
+  tools TEXT DEFAULT '[]',
+  status INTEGER DEFAULT 1,
+  created_at TEXT,
+  UNIQUE(owner, name)
+);`);
+// 意见反馈表（2026-10-20 帮助体系）：用户提交 → 管理员处理（回复）→ 站内信闭环通知
+// type: bug/suggest/consult；status: pending 待处理 / processed 已处理
+db.exec(`CREATE TABLE IF NOT EXISTS feedbacks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  username TEXT NOT NULL,
+  type TEXT NOT NULL,
+  content TEXT NOT NULL,
+  contact TEXT DEFAULT '',
+  status TEXT DEFAULT 'pending',
+  reply TEXT DEFAULT '',
+  handler TEXT DEFAULT '',
+  handled_at TEXT,
+  created_at TEXT
+);`);
+
+// ---------------- P3 扩展迁移（2026-10-22）----------------
+// ⑦ 分类器路由：agents.routing_mode（function 默认 function calling 编排 / classifier 分类器直达子智能体）
+{
+  const cols = db.prepare('PRAGMA table_info(agents)').all().map(c => c.name);
+  if (!cols.includes('routing_mode')) db.exec(`ALTER TABLE agents ADD COLUMN routing_mode TEXT DEFAULT 'function'`);
+}
+// ⑤ MCP Server：独立访问令牌（把已发布智能体暴露为 MCP 工具，Bearer 鉴权 + 调用计数）
+db.exec(`CREATE TABLE IF NOT EXISTS mcp_tokens (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  token TEXT NOT NULL UNIQUE,
+  name TEXT DEFAULT '',
+  status INTEGER DEFAULT 1,
+  calls INTEGER DEFAULT 0,
+  last_used_at TEXT,
+  created_at TEXT
+);`);
+
+// ---------------- P4 扩展迁移（2026-10-22）----------------
+// 模型类型标注：providers.model_types 存 {模型名: chat/image/video/tts/embedding} 映射（后台展示与按类型校验；前台实时分类）
+{
+  const cols = db.prepare('PRAGMA table_info(providers)').all().map(c => c.name);
+  if (!cols.includes('model_types')) db.exec(`ALTER TABLE providers ADD COLUMN model_types TEXT DEFAULT '{}'`);
+}
+
+// ---------------- 种子数据（仅首次） ----------------
+const userCount = db.prepare('SELECT COUNT(*) c FROM users').get().c;
+if (userCount === 0) {
+  const insUser = db.prepare('INSERT INTO users (username,password,nickname,role,dept,status,created_at) VALUES (?,?,?,?,?,1,?)');
+  insUser.run('admin', hashPwd('admin123'), '管理员', 'admin', '信息部', daysAgo(30));
+  insUser.run('zhangsan', hashPwd('123456'), '张三', 'user', '产品部', daysAgo(25));
+  insUser.run('lisi', hashPwd('123456'), '李四', 'user', '研发部', daysAgo(20));
+  insUser.run('wangwu', hashPwd('123456'), '王五', 'user', '市场部', daysAgo(12));
+  insUser.run('demo', hashPwd('demo123'), '演示账号', 'user', '综合部', daysAgo(5));
+
+  const insSpace = db.prepare('INSERT INTO spaces (name,type,owner,members,created_at) VALUES (?,?,?,?,?)');
+  insSpace.run('企业空间', 'enterprise', 'admin', 5, daysAgo(30));
+  insSpace.run('产品部空间', 'dept', '张三', 2, daysAgo(25));
+  insSpace.run('研发部空间', 'dept', '李四', 1, daysAgo(22));
+  insSpace.run('admin 的个人空间', 'personal', 'admin', 1, daysAgo(28));
+
+  const insKb = db.prepare('INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES (?,?,1,?,?)');
+  insKb.run('公司制度知识库', '考勤、报销、保密等公司制度文件', 'admin', daysAgo(28));
+  insKb.run('产品手册知识库', '平台产品功能说明与常见问题', 'admin', daysAgo(20));
+  const insKbFile = db.prepare('INSERT INTO kb_files (kb_id,name,size,status,chunk_count,created_at) VALUES (?,?,?,?,?,?)');
+  insKbFile.run(1, '员工考勤管理制度.txt', 2048, 'success', 3, daysAgo(28));
+  insKbFile.run(1, '差旅报销管理办法.txt', 3072, 'success', 3, daysAgo(27));
+  insKbFile.run(2, '平台功能介绍.md', 4096, 'success', 4, daysAgo(20));
+  insKbFile.run(2, '常见问题FAQ.txt', 1536, 'success', 2, daysAgo(19));
+
+  const insChunk = db.prepare('INSERT INTO kb_chunks (file_id,kb_id,content) VALUES (?,?,?)');
+  const chunks = [
+    [1, 1, '考勤制度：公司实行标准工时制，工作时间为周一至周五 9:00-18:00，其中 12:00-13:30 为午休时间。'],
+    [1, 1, '迟到早退：月度累计迟到三次以内且每次不超过 30 分钟的，予以口头提醒；超过三次的，每次扣除绩效分 2 分。'],
+    [1, 1, '请假流程：事假需提前一天在 OA 系统提交申请，病假需在返岗后两个工作日内补交证明，年假需提前三天申请。'],
+    [2, 1, '差旅报销：员工出差需事先填写出差申请单，经部门负责人审批后方可出行。'],
+    [2, 1, '报销标准：一线城市住宿上限 500 元/晚，其他城市 400 元/晚；市内交通实报实销，打车需注明事由。'],
+    [2, 1, '报销时限：差旅费用需在返程后 15 个工作日内提交报销单，逾期财务部不再受理。'],
+    [3, 2, '智能体平台提供前台与管理后台两部分：前台含首页对话、智能体、知识库、任务管理四大模块。'],
+    [3, 2, '智能体分为企业智能体、数字员工、部门AI助理及其他类型，支持提示词、模型参数、开场白等完整配置。'],
+    [3, 2, '知识库支持文件上传、分片解析与召回测试，可在对话中作为检索增强上下文使用。'],
+    [3, 2, '任务管理支持对智能体创建立即执行或 Cron 定时执行的任务，并留存执行记录。'],
+    [4, 2, '常见问题：如何创建智能体？进入前台「智能体」模块，切换到数字员工视图，点击新增智能体，按三步配置完成创建。'],
+    [4, 2, '常见问题：忘记密码怎么办？请联系管理员在后台「用户管理」中重置密码。'],
+  ];
+  chunks.forEach(c => insChunk.run(...c));
+
+  const insAgent = db.prepare(`INSERT INTO agents
+    (name,description,type,space_id,category,prompt,model,temperature,context_rounds,max_reply,opening,opening_questions,kb_id,status,source,source_name,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+  insAgent.run('公司制度问答助手', '解答考勤、报销、请假等公司制度问题', 'enterprise', 1, '工作',
+    '你是公司制度问答助手。请严格根据知识库内容回答员工关于考勤、报销、请假等制度问题；知识库没有的内容请如实告知无法回答，不要编造。回答保持简洁、分点。',
+    'qwen-plus', 0.3, 10, 1024, '您好，我是公司制度问答助手，可以解答考勤、报销、请假等制度问题，请问有什么可以帮您？',
+    '["年假有多少天？","出差住宿报销标准是多少？","迟到会怎么处理？"]', 1, 'published', 'self', '', daysAgo(26), daysAgo(10));
+  insAgent.run('产品客服助手', '介绍平台功能并解答使用问题', 'enterprise', 1, '工作',
+    '你是平台产品客服助手，负责介绍智能体平台的功能与解答使用问题。回答基于知识库产品手册内容，语言亲切、分点清晰。',
+    'qwen-plus', 0.5, 10, 1024, '您好！我是产品客服助手，有什么关于平台使用的问题都可以问我~',
+    '["如何创建智能体？","知识库怎么用？","任务怎么定时执行？"]', 2, 'published', 'self', '', daysAgo(22), daysAgo(8));
+  insAgent.run('智能翻译助手', '中英互译的专业翻译', 'enterprise', 1, '通用',
+    '你是一位专业、精准的翻译助手。将用户输入的中文翻译成英文，或英文翻译成中文。译文需准确传达原意、表达自然流畅。只输出译文本身。',
+    'qwen-max', 0.3, 10, 2048, '您好，请发送需要翻译的内容，我会为您在中英之间互译。', '[]', null, 'published', 'self', '', daysAgo(18), daysAgo(18));
+  insAgent.run('营销文案大师', '生成营销推广文案与活动方案', 'enterprise', 1, '市场',
+    '你是资深营销专家，擅长撰写营销文案、活动方案与推广策略。根据用户的产品或需求，输出有创意、有卖点的方案，结构化呈现。',
+    'qwen-plus', 0.8, 10, 2048, '您好，告诉我您的产品或活动需求，我来帮您打造吸睛的营销文案！', '["帮我写一条朋友圈广告","新品发布会活动方案"]', null, 'published', 'self', '', daysAgo(15), daysAgo(15));
+  insAgent.run('公文写作专家', '撰写通知、请示、纪要等公文', 'dept', 2, '办公',
+    '你是公文写作专家，熟悉企业行政公文的规范格式。根据用户需求撰写通知、请示、会议纪要、通报等文体，格式规范、用语严谨。',
+    'qwen-plus', 0.5, 10, 2048, '您好，我是公文写作专家，请告诉我需要撰写的公文类型和核心内容。', '[]', null, 'published', 'self', '', daysAgo(14), daysAgo(14));
+  insAgent.run('代码评审助理', '审查代码并给出改进建议', 'digital', 3, '研发',
+    '你是资深代码评审助理。用户粘贴代码后，你从可读性、健壮性、性能、安全四个维度给出评审意见和改进示例。',
+    'qwen-coder-plus', 0.4, 10, 2048, '把需要评审的代码发给我吧，我会从多个维度给出建议。', '[]', null, 'published', 'self', '', daysAgo(10), daysAgo(10));
+  insAgent.run('会议纪要整理员', '把会议记录整理成规范纪要', 'digital', null, '办公',
+    '你是会议纪要整理员。用户输入会议速记或录音转写文字后，你整理为含「会议主题、参会人、决议事项、待办与负责人」的规范纪要。',
+    'qwen-plus', 0.3, 10, 2048, '您好，把会议记录原文发给我，我来整理成规范纪要。', '[]', null, 'published', 'self', '', daysAgo(6), daysAgo(6));
+  insAgent.run('周报生成器', '根据工作要点生成工作周报', 'digital', null, '办公',
+    '你是周报生成器。用户输入本周工作要点后，你输出结构化周报，包含「本周完成、数据成果、问题与风险、下周计划」四部分。',
+    'qwen-plus', 0.6, 10, 2048, '您好，列出本周的工作要点，我来帮您生成一份漂亮的工作周报。', '[]', null, 'published', 'self', '', daysAgo(3), daysAgo(3));
+  insAgent.run('数据分析师', '解读数据并输出分析结论', 'digital', null, '数据',
+    '你是数据分析专家。用户给出数据或业务问题后，你输出「数据概览、关键发现、原因分析、行动建议」四段式分析结论。',
+    'qwen-max', 0.5, 10, 2048, '您好，把数据发给我，我来帮您做解读分析。', '[]', null, 'draft', 'self', '', daysAgo(1), daysAgo(1));
+  insAgent.run('外部扣子智能体-天气查询', '经接入管理同步自外部平台', 'enterprise', 1, '生活',
+    '天气查询智能体（示例：经第三方平台接入）', 'qwen-plus', 0.5, 10, 1024, '您好，请问想查询哪个城市的天气？', '[]', null, 'published', 'coze', '字节扣子团队版', daysAgo(9), daysAgo(9));
+
+  const insTask = db.prepare('INSERT INTO tasks (name,target_type,target_id,exec_type,cron,params,enabled,last_run_at,last_result,created_at) VALUES (?,?,?,?,?,?,1,?,?,?)');
+  insTask.run('每日晨间资讯摘要', 'agent', 2, 'cron', '0 9 * * *', JSON.stringify({ input: '请生成一份今日科技行业晨间资讯摘要。' }), daysAgo(1, 9, 0), 'success', daysAgo(12));
+  insTask.run('每周市场舆情汇总', 'agent', 4, 'cron', '0 18 * * 5', JSON.stringify({ input: '请生成本周市场舆情汇总周报。' }), daysAgo(2, 18, 0), 'success', daysAgo(13));
+  insTask.run('制度知识库巡检', 'agent', 1, 'once', null, JSON.stringify({ input: '请检查考勤制度中关于迟到处理的规定并复述要点。' }), daysAgo(0, 10, 30), 'success', daysAgo(11));
+
+  const insProvider = db.prepare('INSERT INTO providers (name,base_url,api_key,models,configured,is_default,remark,created_at) VALUES (?,?,?,?,?,?,?,?)');
+  insProvider.run('魔芋AI', '', '', '[]', 0, 0, '平台自营额度账户，可兑换或充值', daysAgo(29));
+  insProvider.run('阿里百炼', 'https://dashscope.aliyuncs.com/compatible-mode', '',
+    JSON.stringify(['qwen-plus', 'qwen-max', 'qwen-flash', 'qwen-turbo', 'qwen-coder-plus', 'text-embedding-v3']), 1, 1, '已配置 6 个模型；未填 API Key 时对话自动降级为模拟回复', daysAgo(28));
+  insProvider.run('火山引擎', 'https://ark.cn-beijing.volces.com/api/v3', '',
+    JSON.stringify(['doubao-seed-1-6-pro-32k', 'doubao-seed-1-6-flash-32k', 'doubao-embedding']), 1, 0, '已配置 3 个模型', daysAgo(24));
+  insProvider.run('深度求索', 'https://api.deepseek.com', '', '[]', 0, 0, '待配置：填写 API Key 后可添加模型', daysAgo(24));
+  insProvider.run('OpenAI', 'https://api.openai.com', '', '[]', 0, 0, '待配置：填写 API Key 后可添加模型', daysAgo(24));
+
+  const insPlatform = db.prepare('INSERT INTO platforms (name,type,endpoint,token,build_url,status,synced,last_sync_at,created_at) VALUES (?,?,?,?,?,?,?,?,?)');
+  // 修复（2026-10-20）：加 build_url 列时漏补 run 参数（9 列 8 参数），全新库首次建表会抛「参数不足」；生产库为增量升级未暴露
+  insPlatform.run('字节扣子团队版', 'coze', 'https://api.coze.cn', '已配置', 'https://www.coze.cn/workbench', 2, 1, daysAgo(9), daysAgo(24));
+  insPlatform.run('Dify 社区版', 'dify', 'https://dify.example.com/v1', '已配置', 'https://dify.example.com/apps', 0, 0, null, daysAgo(20));
+
+  const insCate = db.prepare('INSERT INTO word_categories (name) VALUES (?)');
+  insCate.run('涉黄词汇'); insCate.run('暴力词汇'); insCate.run('辱骂词汇');
+  const insWord = db.prepare('INSERT INTO words (category_id,word,input_block,output_block,hit_count,created_at) VALUES (?,?,?,?,?,?)');
+  insWord.run(1, '色情内容', 1, 1, 3, daysAgo(25));
+  insWord.run(2, '砍死你', 1, 1, 1, daysAgo(25));
+  insWord.run(3, '傻逼', 1, 1, 14, daysAgo(25));
+  insWord.run(3, '滚蛋', 1, 0, 6, daysAgo(24));
+  insWord.run(3, '废物', 0, 1, 2, daysAgo(24));
+
+  // 历史会话与消息（近 7 天，供看板趋势/运营监控使用）
+  const insSession = db.prepare('INSERT INTO sessions (agent_id,title,username,created_at,updated_at) VALUES (?,?,?,?,?)');
+  const insMsg = db.prepare('INSERT INTO messages (session_id,role,content,tokens,created_at) VALUES (?,?,?,?,?)');
+  const histUsers = ['admin', 'zhangsan', 'lisi', 'wangwu', 'demo'];
+  const qaPairs = [
+    ['年假有多少天？', '根据公司制度知识库：年假需提前三天申请。关于年假天数的具体规定，知识库暂未收录，建议咨询人力资源部。'],
+    ['出差住宿报销标准是多少？', '根据《差旅报销管理办法》：一线城市住宿上限 500 元/晚，其他城市 400 元/晚。'],
+    ['迟到会怎么处理？', '月度累计迟到三次以内且每次不超过 30 分钟，口头提醒；超过三次，每次扣除绩效分 2 分。'],
+    ['帮我写一条新品咖啡的朋友圈文案', '☕ 新品上市 | 一口唤醒清晨\n甄选埃塞俄比亚原生豆，低温慢烘，果香入喉。\n今日下单立减 10 元，办公室摸鱼续命神器，冲！'],
+    ['如何创建智能体？', '进入前台「智能体」模块 → 数字员工视图 → 点击新增智能体，依次完成基本配置、AI 模型配置、页面配置三步即可。'],
+    ['把这段话翻译成英文：会议纪要已发送，请查收。', 'The meeting minutes have been sent. Please check.'],
+    ['整理周报要点：完成登录改造、修复3个bug、上线活动页', '【本周完成】登录模块改造上线；修复 3 个线上缺陷；活动页面按期发布。\n【问题与风险】无重大风险。\n【下周计划】启动性能优化专项。'],
+    ['知识库怎么用？', '在前台「知识库」模块创建知识库并上传文件，解析完成后可在召回测试中验证效果；智能体关联知识库后对话会自动检索增强。'],
+  ];
+  let qIdx = 0;
+  for (let d = 7; d >= 1; d--) {
+    const sessionsToday = 2 + ((d * 7) % 3); // 2~4 条/天
+    for (let s = 0; s < sessionsToday; s++) {
+      const [q, a] = qaPairs[qIdx++ % qaPairs.length];
+      const u = histUsers[(d + s) % histUsers.length];
+      const t = daysAgo(d, 9 + s * 2, (s * 17) % 60);
+      const sid = insSession.run(1 + ((d + s) % 3), q.slice(0, 16), u, t, t).lastInsertRowid;
+      insMsg.run(sid, 'user', q, Math.ceil(q.length * 0.6), t);
+      insMsg.run(sid, 'assistant', a, Math.ceil(a.length * 0.6), t);
+    }
+  }
+
+  const insOp = db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)');
+  const opSeeds = [
+    ['admin', '登录系统', '密码登录成功', '192.168.1.10'],
+    ['admin', '创建智能体', '公司制度问答助手', '192.168.1.10'],
+    ['admin', '发布智能体', '产品客服助手', '192.168.1.10'],
+    ['zhangsan', '登录系统', '密码登录成功', '192.168.1.22'],
+    ['zhangsan', '创建知识库', '产品手册知识库', '192.168.1.22'],
+    ['lisi', '对话调用', '与 智能翻译助手 对话', '192.168.1.33'],
+    ['admin', '配置模型供应商', '阿里百炼', '192.168.1.10'],
+    ['admin', '新增敏感词', '傻逼', '192.168.1.10'],
+    ['wangwu', '创建任务', '每日晨间资讯摘要', '192.168.1.44'],
+  ];
+  opSeeds.forEach((o, i) => insOp.run(...o, daysAgo(7 - i, 10 + i, (i * 13) % 60)));
+
+  db.prepare('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)')
+    .run('chat-service', '模型调用超时（示例历史记录），已自动重试成功', daysAgo(3, 14, 22));
+  db.prepare('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)')
+    .run('kb-parser', '文件解析失败：损坏的PDF（示例历史记录）', daysAgo(5, 16, 40));
+
+  db.prepare('INSERT INTO evaluations (name,agent_id,rule_prompt,dataset,status,score,result,created_at) VALUES (?,?,?,?,?,?,?,?)').run(
+    '制度问答准确性测评', 1,
+    '若回答与参考答案语义一致得 1 分，答非所问或编造得 0 分，部分正确得 0.5 分。',
+    JSON.stringify([
+      { q: '一线城市住宿报销上限？', expect: '500元/晚' },
+      { q: '年假怎么申请？', expect: '提前三天申请' },
+    ]),
+    'done', 100,
+    JSON.stringify([{ q: '一线城市住宿报销上限？', got: '500 元/晚', score: 1 }, { q: '年假怎么申请？', got: '需提前三天在 OA 系统申请', score: 1 }]),
+    daysAgo(2, 15, 0)
+  );
+
+  console.log('[db] 种子数据已初始化');
+}
+
+// ---------------- P5.17 工作流模板库（2026-10-26）----------------
+// 画布工作流模板：预配置 workflow JSON + 场景说明，一键复用（广场展示 + 编排页导入/存为模板）
+db.exec(`CREATE TABLE IF NOT EXISTS workflow_templates (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  slug TEXT UNIQUE,
+  name TEXT NOT NULL,
+  icon TEXT DEFAULT '🎨',
+  category TEXT DEFAULT '通用',
+  description TEXT DEFAULT '',
+  scene TEXT DEFAULT '',
+  workflow TEXT NOT NULL,
+  builtin INTEGER DEFAULT 0,
+  use_count INTEGER DEFAULT 0,
+  created_by TEXT DEFAULT '',
+  created_at TEXT
+);`);
+// 内置模板幂等 seed（slug 已存在跳过；用户后续可存自定义变体）
+{
+  const ins = db.prepare(`INSERT OR IGNORE INTO workflow_templates (slug,name,icon,category,description,scene,workflow,builtin,use_count,created_by,created_at)
+    VALUES (?,?,?,?,?,?,?,?,0,'platform',datetime('now','localtime'))`);
+  for (const s of require('./lib/wf-template-seed').SEEDS) {
+    ins.run(s.slug, s.name, s.icon, s.category, s.description, s.scene, JSON.stringify(s.workflow), 1);
+  }
+}
+
+module.exports = { db, hashPwd, verifyPwd, now, daysAgo };
+
+// ---------------- P5.27 本地桥设备与任务队列（2026-10-27）----------------
+// 轮询模式：网页对话发 local_exec → 任务入队 → 本地桥 daemon poll 拉取执行 → result 回推
+db.exec(`CREATE TABLE IF NOT EXISTS localbridge_devices (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  username TEXT NOT NULL,            -- 配对绑定的平台用户
+  device_token TEXT NOT NULL UNIQUE, -- 桥端生成的 32hex 随机令牌（claim 时由配对码换绑）
+  device_name TEXT DEFAULT '',
+  platform TEXT DEFAULT '',
+  is_default INTEGER DEFAULT 1,      -- 首台绑定为默认设备；多台后续可切换
+  last_seen TEXT,                    -- 心跳/poll 时间（在线判定）
+  created_at TEXT
+);`);
+db.exec(`CREATE TABLE IF NOT EXISTS localbridge_tasks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  device_id INTEGER NOT NULL,
+  username TEXT NOT NULL,
+  op TEXT NOT NULL,                  -- mkdir / list_dir / open_app / notify（桥端白名单强制）
+  params TEXT DEFAULT '{}',
+  status TEXT DEFAULT 'pending',     -- pending → running → done / failed
+  result TEXT DEFAULT '',
+  created_at TEXT,
+  updated_at TEXT
+);`);
