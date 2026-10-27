@@ -878,13 +878,22 @@ async function runAgent(agent, input, ctx = {}) {
   };
   if (toolSchemas.length) {
     const { chat } = require('./llm');
+    // P5.33 审查修复（F1）：runAgent 执行源（定时/Webhook/手动执行/MCP Server/子智能体）均无确认卡交互——
+    // create_task（任务造任务的自我复制持久化链）与 local_exec（无人值守桌面操作）在此上下文一律拒绝，
+    // 无论智能体如何配置。对话链路不受影响（chat.js 有 P5.25 确认卡 + high 风险闸门）。
+    const UNATTENDED_DENY = new Set(['create_task', 'local_exec']);
     const gen = chat([
       { role: 'system', content: system },
       { role: 'user', content: taskText.slice(0, 4000) },
     ], {
       ...baseOpts,
       tools: toolSchemas,
-      executeTool: (name, argsJson) => runToolForRun(name, argsJson, { kbId: (agent && agent.kb_id) || null, mcpServers: (agent && agent.mcp_servers) || '[]', username: ctx.username }),
+      executeTool: (name, argsJson) => {
+        if (UNATTENDED_DENY.has(name)) {
+          return `⛔ 工具 ${name} 不允许在任务执行（定时/Webhook/子智能体）上下文中调用——请直接完成当前任务，不要尝试创建新任务或操作本地设备。`;
+        }
+        return runToolForRun(name, argsJson, { kbId: (agent && agent.kb_id) || null, mcpServers: (agent && agent.mcp_servers) || '[]', username: ctx.username });
+      },
     });
     let full = '';
     let usage = null;

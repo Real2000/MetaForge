@@ -46,8 +46,8 @@ function finishExternalTurn(opts) {
     content = masked;
   }
 
-  // 2. token 数：显式值优先；缺省按脱敏后内容长度估算（与各链路原逻辑一致）
-  const finalTokens = (Number.isFinite(+tokens) && +tokens >= 0) ? Math.ceil(+tokens) : Math.ceil(content.length * 0.6);
+  // 2. token 数：显式正值优先；0/null/undefined 均视为缺省按内容估算（P5.33 审查修复 Y2：与调用方 `|| undefined` 预处理及注释口径对齐）
+  const finalTokens = (Number.isFinite(+tokens) && +tokens > 0) ? Math.ceil(+tokens) : Math.ceil(content.length * 0.6);
 
   // 3. assistant 消息落库 + 会话更新（extConvId 有定义时回写外部会话 id）
   const msgInfo = db.prepare('INSERT INTO messages (session_id,role,content,tokens,created_at) VALUES (?,?,?,?,?)')
@@ -63,14 +63,18 @@ function finishExternalTurn(opts) {
   // 4. 配额记账（唯一记账点；billUsage=false 保留 Coze 工作流不记账的原行为）
   if (billUsage && finalTokens > 0) addUsage(username, finalTokens);
 
-  // 5. op_logs 审计（明细文案可为函数，以最终 tokens 为参）
-  const detailText = typeof opDetail === 'function' ? String(opDetail(finalTokens)) : String(opDetail);
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(username, opAction, detailText, ip, now());
+  // 5. op_logs 审计（明细文案可为函数，以最终 tokens 为参）；审计/trace 写入失败不阻断 done 事件（P5.33 审查修复 F10：保证前端不悬挂）
+  try {
+    const detailText = typeof opDetail === 'function' ? String(opDetail(finalTokens)) : String(opDetail);
+    db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
+      .run(username, opAction, detailText, ip, now());
+  } catch (e) { console.error('[chat-sink] op_logs 写入失败：', e.message); }
 
   // 6. chat_traces 全链路追踪（外部/技能链路无知识库命中与工具调用，固定 '[]'）
-  db.prepare('INSERT INTO chat_traces (session_id,message_id,agent_id,model,mode,latency_ms,tokens,prompt_chars,kb_hits,tool_calls,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
-    .run(sessionId, msgInfo.lastInsertRowid, agent ? agent.id : null, modelLabel, modeLabel, Date.now() - tStart, finalTokens, String(input || '').length, '[]', '[]', now());
+  try {
+    db.prepare('INSERT INTO chat_traces (session_id,message_id,agent_id,model,mode,latency_ms,tokens,prompt_chars,kb_hits,tool_calls,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
+      .run(sessionId, msgInfo.lastInsertRowid, agent ? agent.id : null, modelLabel, modeLabel, Date.now() - tStart, finalTokens, String(input || '').length, '[]', '[]', now());
+  } catch (e) { console.error('[chat-sink] chat_traces 写入失败：', e.message); }
 
   // 7. SSE done
   send('done', { content, tokens: finalTokens });

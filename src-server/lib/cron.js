@@ -78,16 +78,20 @@ function nextFire(expr, fromTs = Date.now(), horizonDays = 370) {
 }
 
 /** cron 中文语义化描述（与前台任务页 cronDesc 同源逻辑；P5.31 服务端复用）
- *  覆盖常见形态：每 N 分钟 / 每天 hh:mm / 每周X hh:mm / 每月 D 号 hh:mm / 每年；其余原样返回 */
+ *  覆盖常见形态：每分钟 / 每 N 分钟 / 每天 hh:mm / 每周X hh:mm / 每月 D 号 hh:mm / 每年；其余原样返回。
+ *  P5.33 审查修复（Y6）：分钟/小时字段为 * 时不再误报「每天 00:00」（实际频率最多差 1440 倍） */
 const WEEK_CN = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
 function describeCron(expr) {
   if (!expr) return '';
   const parts = String(expr).trim().split(/\s+/);
   if (parts.length !== 5) return String(expr);
   const [m, h, d, mon, w] = parts;
-  const hm = `${String(h === '*' ? 0 : h).padStart(2, '0')}:${String(m === '*' ? 0 : m).padStart(2, '0')}`;
+  if (m === '*' && h === '*') return '每分钟执行一次';
   if (m.startsWith('*/')) return `每 ${m.slice(2)} 分钟执行一次`;
+  if (m === '*' && h !== '*') return `每小时 ${h} 时段内每分钟执行（时域 ${h}）`;
+  if (h === '*' && m !== '*') return `每小时第 ${String(m).padStart(2, '0')} 分执行`;
   if (h.startsWith('*/')) return `每 ${h.slice(2)} 小时的 ${String(m).padStart(2, '0')} 分执行`;
+  const hm = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
   if (d === '*' && mon === '*' && w === '*') return `每天 ${hm} 执行`;
   if (d === '*' && mon !== '*' && w === '*') return `每年 ${mon} 月每天 ${hm} 执行`;
   if (d === '*' && mon === '*' && w !== '*') {

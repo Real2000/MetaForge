@@ -2,10 +2,10 @@
 import { api } from '../api.js';
 import { esc, toast, modal, confirmBox } from '../ui.js';
 
-  export async function render(el) {
-    let tasks = [];
-    let agents = [];
-    let me = null;
+export async function render(el) {
+  let tasks = [];
+  let agents = [];
+  let me = null;
 
     el.innerHTML = `
     <div class="page-head">

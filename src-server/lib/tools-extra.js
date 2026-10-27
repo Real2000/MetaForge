@@ -14,6 +14,7 @@ const fs = require('fs');
 const path = require('path');
 const { db, now } = require('../db');
 const { chatOnce } = require('./llm');
+const { check } = require('./security'); // P5.33：create_task 任务指令敏感词校验
 
 /* ---------------- 公共工具函数 ---------------- */
 const UPLOADS = path.join(__dirname, '..', '..', 'public', 'uploads');
@@ -32,11 +33,68 @@ function stripTags(s) {
 }
 const FETCH_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 
+/* ---------------- P5.33 审查修复（F2）：SSRF 防护 ----------------
+ * web_fetch 此前仅校验 http(s) 前缀——私网/环回/链路本地/云元数据地址全部可达，且被 P5.31 引入
+ * 无人值守执行链（系统任务智能体默认工具）放大。三层防护：
+ *  ① 字面量 IP / DNS 解析后 IP 黑名单（私网、环回、链路本地 169.254、保留段、IPv6 本地）
+ *  ② 重定向手动逐跳校验（防 302 跳入内网，上限 3 跳）
+ *  ③ jina reader 前置校验（防内网目标地址外泄给第三方代理）
+ * 内网知识源场景由管理员设 AGENT_FETCH_ALLOW_PRIVATE=1 显式放行 */
+const dns = require('dns');
+const FETCH_ALLOW_PRIVATE = process.env.AGENT_FETCH_ALLOW_PRIVATE === '1';
+function ipIsPrivate(ip) {
+  if (!ip) return true;
+  if (ip.includes(':')) {
+    const v6 = ip.toLowerCase();
+    return v6 === '::1' || v6 === '::' || v6.startsWith('fc') || v6.startsWith('fd') || v6.startsWith('fe80');
+  }
+  const parts = String(ip).split('.').map(Number);
+  if (parts.length !== 4 || parts.some(p => Number.isNaN(p))) return true;
+  const [a, b] = parts;
+  return a === 127 || a === 0 || a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168)
+    || (a === 169 && b === 254) || a >= 224; // 224+ 组播/保留段
+}
+async function assertPublicHttpUrl(rawUrl) {
+  if (!/^https?:\/\//i.test(rawUrl)) throw new Error('仅支持 http(s) 完整链接');
+  if (FETCH_ALLOW_PRIVATE) return; // 管理员显式放行（内网知识源场景）
+  let u;
+  try { u = new URL(rawUrl); } catch { throw new Error('链接格式非法'); }
+  const host = u.hostname.replace(/^\[|\]$/g, '');
+  const ips = /^\d+\.\d+\.\d+\.\d+$/.test(host)
+    ? [host]
+    : (await dns.promises.lookup(host, { all: true }).catch(() => [])).map(r => r.address);
+  if (!ips.length) throw new Error(`域名解析失败：${host}`);
+  for (const ip of ips) {
+    if (ipIsPrivate(ip)) throw new Error(`安全策略拒绝访问内网/本机地址（${host} → ${ip}）。如需抓取内网知识源，请管理员设置环境变量 AGENT_FETCH_ALLOW_PRIVATE=1 后重启服务`);
+  }
+}
+/** 手动逐跳重定向（每跳重新过私网校验；上限 3 跳） */
+async function fetchWithRedirectGuard(url, opts = {}, maxHops = 3) {
+  let cur = url;
+  for (let i = 0; i <= maxHops; i++) {
+    await assertPublicHttpUrl(cur);
+    const res = await fetch(cur, { ...opts, redirect: 'manual', signal: opts.signal || AbortSignal.timeout(15000) });
+    if ([301, 302, 303, 307, 308].includes(res.status)) {
+      const loc = res.headers.get('location');
+      if (!loc) return res;
+      cur = new URL(loc, cur).toString();
+      continue;
+    }
+    return res;
+  }
+  throw new Error('重定向次数过多（>3）');
+}
+
 /* =============== ① db_query：Text2SQL =============== */
 /** 敏感表黑名单：含凭据/密钥/鉴权信息的表不允许 LLM 生成 SQL 访问 */
 const DB_DENY_TABLES = new Set([
   'users', 'providers', 'user_providers', 'agent_api_keys', 'share_sessions',
   'secrets', 'sqlite_sequence', 'sqlite_stat1', 'sqlite_schema',
+  // P5.33 审查修复（F7）：消息/会话/审计类表拒绝 LLM 生成 SQL 横读（对话内容/任务产出/操作日志含
+  // 全体用户数据；api 层已修 IDOR，SQL 层不可再开面）
+  'messages', 'sessions', 'task_runs', 'chat_traces', 'op_logs', 'err_logs', 'agent_memories',
+  'notifications', 'feedback', 'enterprise_leads', 'localbridge_devices', 'localbridge_tasks',
+  'mcp_tokens', 'wf_files', 'words', 'word_categories',
 ]);
 
 /** SELECT 语句安全校验：单条、只读、无危险关键词、表黑名单、强制 LIMIT */
@@ -371,6 +429,12 @@ const web_fetch = {
   run: async (args) => {
     const url = String(args.url || '').trim();
     if (!/^https?:\/\//i.test(url)) return '仅支持 http(s) 完整链接';
+    // P5.33 审查修复（F2）：SSRF 前置防护——私网/环回/云元数据地址直接拒绝（含 jina 路径，防内网目标外泄）
+    try {
+      await assertPublicHttpUrl(url);
+    } catch (e) {
+      return `⛔ ${e.message}`;
+    }
     // 1) jina reader（正文抽取质量最好）
     try {
       const res = await fetch('https://r.jina.ai/' + url, {
@@ -384,11 +448,11 @@ const web_fetch = {
         }
       }
     } catch { /* 降级直抓 */ }
-    // 2) 直接抓取并抽正文
+    // 2) 直接抓取并抽正文（重定向逐跳校验，防 302 跳入内网）
     try {
-      const res = await fetch(url, {
+      const res = await fetchWithRedirectGuard(url, {
         headers: { 'User-Agent': FETCH_UA, 'Accept-Language': 'zh-CN,zh;q=0.9' },
-        redirect: 'follow', signal: AbortSignal.timeout(15000),
+        signal: AbortSignal.timeout(15000),
       });
       const ct = res.headers.get('content-type') || '';
       if (!/text\/|html|xml|json|markdown/i.test(ct)) return `该链接是二进制资源（${ct.split(';')[0]}），无法转为文本阅读。`;
@@ -1146,7 +1210,7 @@ const create_task = {
   run: async (args, ctx = {}) => {
     const username = ctx.username;
     if (!username) return '⛔ 缺少用户上下文，无法创建任务';
-    const name = String(args.name || '').trim().slice(0, 40);
+    const name = String(args.name || '').trim().slice(0, 30); // 与 schema 描述对齐（≤30 字）
     const schedule = String(args.schedule || '').trim();
     const prompt = String(args.prompt || '').trim();
     const scheduleDesc = String(args.schedule_desc || '').trim().slice(0, 60);
@@ -1163,6 +1227,12 @@ const create_task = {
     // 用户行（角色判断 + 权限校验用）
     const me = db.prepare('SELECT id, username, nickname, role, dept FROM users WHERE username=? AND status=1').get(username);
     if (!me) return '⛔ 当前账号不可用，无法创建任务';
+    // P5.33 审查修复（Y7）：任务指令过输入敏感词检测——模型转写的 prompt 是间接内容，
+    // 注入可借它把违规指令固化成 7×24 自动执行；blocked 时拒绝创建
+    const promptCheck = check(prompt, 'input');
+    if (promptCheck.blocked) {
+      return `⛔ 任务执行指令包含违规词汇（${promptCheck.words.map(w => w.word).join('、')}），已按安全策略拒绝创建。`;
+    }
     // 数量配额（管理员不受限）
     if (me.role !== 'admin') {
       const cnt = db.prepare('SELECT COUNT(*) c FROM tasks WHERE username=? AND enabled=1').get(username).c;
@@ -1178,8 +1248,10 @@ const create_task = {
       const { canView } = require('./agent-access');
       if (!canView(agent, me)) return `⛔ 无权绑定智能体「${agent.name}」（未对你开放）`;
     } else {
-      agent = db.prepare('SELECT * FROM agents WHERE name=? AND status=?').get(SYS_TASK_AGENT_NAME, 'published');
-      if (!agent) return '⛔ 系统执行智能体未初始化，请联系管理员重启服务后重试';
+      // P5.33 审查修复（Y4）：限定系统内置来源查找——agents.name 无唯一约束，
+      // 否则用户自建同名「定时任务执行助手」可劫持默认绑定（prompt/工具集完全由其控制）
+      agent = db.prepare("SELECT * FROM agents WHERE name=? AND status='published' AND source_name='系统内置'").get(SYS_TASK_AGENT_NAME);
+      if (!agent) return '⛔ 系统执行智能体未初始化，请联系管理员检查服务启动日志后重试';
     }
     const info = db.prepare(`INSERT INTO tasks (name,target_type,target_id,exec_type,cron,params,enabled,username,created_at)
       VALUES (?,?,?,?,?,?,1,?,datetime('now','localtime'))`)

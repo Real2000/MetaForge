@@ -2111,3 +2111,39 @@ agent-platform/
 - 死代码清理：chat.js 内 `isChatModel` 已无调用方（P5.33 勘察发现，留待下轮顺手清）
 
 > AI生成
+
+## P5.33b 双专家审查修复包（代码审查员 + 安全工程师并行审查，2026-10-27）
+
+> 流程：P5.31~P5.33 三特性完成后，按 dev-team 工作流派代码审查员与安全工程师并行审查 `f578fa2..HEAD` 全部 diff（+755/-108，15 文件）。两份报告交叉确认 13 项需修复问题（3🔴 + 10🟡），本包一次性收口。冒烟 166/166（含 11 个新回归用例）。
+
+### 🔴 高风险修复（3 项，均有实锤复现）
+
+1. **MCP 写类正则对 snake_case 全部失效**（R1/F6，安全工程师 `node -e` 实测复现）：原 `\b` 词边界把 `_` 视为词字符——`create_user`/`send_message`/`DeleteAll`/`fetch_and_send` 全部绕过写类检测，谎报 `readOnlyHint:true` 的写工具可在 trusted 后免确认执行。**重写为分词整词匹配**（驼峰拆分 + 非字母数字切词 + 写类词表含 wipe/erase/purge/destroy 等同义词），readOnlyHint 仅在首词为读动词且无写类词时才采信；11 个纯英文伪装向量回归用例锁定（`fetch_and_send`/`get_flag_then_delete`/`DeleteAll`/`xdelete` 等全 high）
+2. **web_fetch 零 SSRF 防护**（F2）：私网/环回/云元数据（169.254.169.254）地址全部可达，且被 P5.31 引入无人值守执行链放大。**三层防护**：字面量 IP/DNS 解析后 IP 黑名单 + 重定向手动逐跳校验（上限 3 跳）+ jina 路径前置校验；内网知识源场景设 `AGENT_FETCH_ALLOW_PRIVATE=1` 显式放行
+3. **PUT /api/tasks/:id 可改绑任意智能体**（R3/F5）：canView 防线只在 POST 闭合。PUT 改绑时补 `published + canView` 双校验（与 POST 共用公共函数）
+
+### 🟡 中风险修复（10 项）
+
+4. **runAgent 工具闸门**（F1）：定时/Webhook/手动执行/MCP Server 触发的工具循环无确认卡——`create_task`（任务造任务的自我复制持久化链）与 `local_exec`（无人值守桌面操作）在此上下文**一律拒绝**；对话链路不受影响（有 P5.25 确认卡）
+5. **runTask 前置配额闸门**（F3）：配额耗尽只拦对话不拦任务（denial-of-wallet）——执行前 checkQuota，超限**自动停用任务 + 站内信告知归属者** + task_runs 记录停用原因
+6. **toggle 启用配额复核**（F4）：堵「建满 20→全停用→再建 20→逐个启用」的无限绕过；配额检查抽 `denyIfOverTaskQuota` 公共函数
+7. **trusted 静默清零**（R2/F9）：PUT /api/mcp/:id 未传 trusted 时一律写 0——停用/启用按钮（只传 status）会顺手清零信任并写失真审计。改为「未传保留原值」（与 api_key/status 同语义）
+8. **db_query 拒绝表扩展**（F7）：messages/sessions/task_runs/chat_traces/op_logs/agent_memories/notifications 等消息审计类表禁止 LLM 生成 SQL 横读（API 层修了 IDOR，SQL 层不可再开面）；**webhook 免鉴权端点套 IP 限流**（30 次/分）
+9. **sink tokens 契约**（Y2）：`>= 0` 改 `> 0`——0/null 均回落估算，与注释及调用方 `|| undefined` 预处理对齐
+10. **describeCron 频率失真**（Y6）：`* * * * *`（每分钟）原显示「每天 00:00 执行」——确认卡误导用户批准高频任务（实际差 1440 倍）。补分钟/小时 `*` 分支（「每分钟执行一次」等）
+11. **create_task 任务指令敏感词校验**（Y7）：模型转写的 prompt 是间接内容，注入可借它把违规指令固化成 7×24 自动执行——blocked 时拒绝创建
+12. **系统智能体查找收紧**（Y4 短期方案）：按 name + `source_name='系统内置'` 双条件（agents.name 无唯一约束，用户自建同名可劫持默认绑定）；完整方案（标识列）留中期
+13. **sink 审计写入容错**（F10）：op_logs/chat_traces 写入失败不再阻断 done 事件（前端不悬挂）；另修前端文案引号/缩进污染（G7）与 create_task 名称长度对齐（G5）
+
+### 有意保留（审查裁决记录）
+
+- **Dify/Coze 对话链路新增配额记账**（Y1）：审查员确认基线漏账与 `quota.js` 注释口径（「对话（本地/Dify/Coze）按 messages.tokens」）相悖——判定为 sink 顺带修复历史欠账，保留并在此声明（限额用户的 Dify/Coze 对话现会推进 quota_used 并触发预警）
+- **workflow.js 延迟 require**（Y3）：审查员证实无循环依赖，三个包装函数属冗余间接层——功能正确，清理留待下轮顺手做（避免本轮叠加无关重构）
+
+### 遗留（下轮 backlog）
+
+- agents.js 保存时 tools 白名单校验（当前 create_task 靠 runAgent 闸门兜底）；任务执行期复查 agent 状态/可见性（F8）
+- llm.js 多轮工具循环 usage 只记末轮（Y5，既有缺陷，scheduler 记账偏少）；系统智能体标识列（Y4 完整方案）
+- MCP 分级「管理员逐工具人工标注优先，启发式仅作默认建议」（安全工程师长期建议）
+
+> AI生成

@@ -766,7 +766,9 @@ db.exec(`CREATE TABLE IF NOT EXISTS mcp_tokens (
 // create_task 未指定 agent_id 时绑定它；带联网检索/计算/Word 导出工具，定时任务具备真实执行能力） ----------------
 {
   const SYS_TASK_AGENT = '定时任务执行助手';
-  const exists = db.prepare('SELECT id FROM agents WHERE name=?').get(SYS_TASK_AGENT);
+  // P5.33 审查修复（Y4）：按 name + source_name 双条件判断——agents.name 无唯一约束，
+  // 仅按 name 判断时用户自建同名智能体会让种子跳过（劫持 create_task 默认绑定）
+  const exists = db.prepare('SELECT id FROM agents WHERE name=? AND source_name=?').get(SYS_TASK_AGENT, '系统内置');
   if (!exists) {
     db.prepare(`INSERT INTO agents
       (name,description,type,space_id,category,prompt,model,temperature,context_rounds,max_reply,opening,opening_questions,kb_id,tools,status,source,source_name,created_at,updated_at)

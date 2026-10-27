@@ -6,12 +6,28 @@ const { db, now } = require('../db');
 const { runAgent } = require('./workflow');
 const { lastFire } = require('./cron');
 const ops = require('./ops');
-const { addUsage } = require('./quota'); // P5.31：定时任务 token 记归属者配额
+const { addUsage, checkQuota } = require('./quota'); // P5.31 记归属者配额；P5.33 审查修复（F3）执行前配额闸门
 
 const fireMarks = new Map(); // task_id -> last fired ts
 
 async function runTask(task) {
   const started = now();
+  // P5.33 审查修复（F3）：执行前配额闸门——此前配额耗尽只拦对话，任务照常每 cron 周期烧 token（denial-of-wallet）。
+  // 超限自动停用任务并发站内信告知归属者（username='' 的历史管理员任务不限额不检查）
+  if (task.username) {
+    const quotaMsg = checkQuota(task.username);
+    if (quotaMsg) {
+      db.prepare('UPDATE tasks SET enabled=0, last_run_at=?, last_result=? WHERE id=?').run(started, 'fail', task.id);
+      db.prepare('INSERT INTO task_runs (task_id,status,started_at,finished_at,output) VALUES (?,?,?,?,?)')
+        .run(task.id, 'fail', started, now(), '任务已自动停用：' + quotaMsg);
+      try {
+        db.prepare('INSERT INTO notifications (username,title,content,type,link,is_read,created_at) VALUES (?,?,?,?,?,0,?)')
+          .run(task.username, '⏸️ 定时任务已自动停用', `任务「${task.name}」因 ${quotaMsg.replace(/\n[\s\S]*$/, '')} 已自动停用，可在「任务管理」页查看。`, 'task', '#/tasks', now());
+      } catch { /* 通知失败不影响停用 */ }
+      console.log(`[scheduler] 任务「${task.name}」归属者配额已耗尽，自动停用`);
+      return { status: 'fail', output: '任务已自动停用：' + quotaMsg };
+    }
+  }
   const agent = db.prepare('SELECT * FROM agents WHERE id=?').get(task.target_id);
   let output = '';
   let status = 'success';

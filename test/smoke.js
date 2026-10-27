@@ -2151,6 +2151,33 @@ function t(name, fn) {
           assert.strictEqual(denied.status, 403, '非管理员切换信任应 403（adminOnly）');
           // 恢复 trusted=1（后续单测组依赖该状态）
           await jfetch(`/api/mcp/${srvId}`, { method: 'PUT', body: JSON.stringify({ trusted: 1 }) }, tokA3);
+          // P5.33 审查修复（R2/F9）：无关字段更新（如 status 切换）不得静默重置 trusted
+          await jfetch(`/api/mcp/${srvId}`, { method: 'PUT', body: JSON.stringify({ status: 1 }) }, tokA3);
+          const kept = await jfetch('/api/mcp', {}, tok1);
+          assert.ok((kept.j.data || []).find(x => x.id === srvId).trusted === 1, '未传 trusted 的 PUT 应保留原信任状态');
+        });
+        await t('HTTP：任务改绑受限智能体被拒 + 启用配额复核（P5.33 审查修复）', async () => {
+          const aid2 = db.prepare(`SELECT id FROM users WHERE username='httpadmin'`).get().id;
+          const tokA4 = sign({ uid: aid2, exp: Date.now() + 3600000 });
+          db.prepare(`INSERT INTO agents (name,description,type,category,prompt,status,source,created_at,updated_at) VALUES ('受限草稿智能体','测试','enterprise','测试','p','draft','self',datetime('now','localtime'),datetime('now','localtime'))`).run();
+          const draftId = db.prepare("SELECT id FROM agents WHERE name='受限草稿智能体'").get().id;
+          const sysAgent2 = db.prepare(`SELECT id FROM agents WHERE name='定时任务执行助手' AND source_name='系统内置'`).get();
+          const c = await jfetch('/api/tasks', { method: 'POST', body: JSON.stringify({ name: '改绑测试', target_id: sysAgent2.id, exec_type: 'cron', cron: '0 9 * * *', params: '{}' }) }, tok1);
+          const tid = c.j.data.id;
+          // R3/F5：PUT 改绑草稿智能体应被拒（400 未发布；改绑受限已发布智能体为 403）
+          const put = await jfetch(`/api/tasks/${tid}`, { method: 'PUT', body: JSON.stringify({ target_id: draftId }) }, tok1);
+          assert.strictEqual(put.j && put.j.code, 400, 'PUT 改绑草稿智能体应被拒（未发布）：' + JSON.stringify(put.j));
+          assert.ok(String(put.j.msg).includes('未发布'), '拒绝理由应指向未发布状态');
+          // F4：造满 20 个启用任务后，停用再启用应被配额拦截（防「建满→停→再建→启用」绕过）
+          const ins = db.prepare(`INSERT INTO tasks (name,target_type,target_id,exec_type,cron,params,enabled,username,created_at) VALUES (?,?,?, 'cron','0 9 * * *','{}',1,?,datetime('now','localtime'))`);
+          for (let i = 0; i < 20; i++) ins.run('配额验证' + i, 'agent', sysAgent2.id, 'httpu1');
+          const stop = await jfetch(`/api/tasks/${tid}`, { method: 'PUT', body: JSON.stringify({ name: '改绑测试（停用中）' }) }, tok1);
+          await jfetch(`/api/tasks/${tid}/toggle`, { method: 'POST' }, tok1); // 停用
+          const reenable = await jfetch(`/api/tasks/${tid}/toggle`, { method: 'POST' }, tok1); // 启用 → 配额拦截
+          assert.strictEqual(reenable.j && reenable.j.code, 400, '达上限后重新启用应被拒：' + JSON.stringify(reenable.j));
+          // 清理
+          db.prepare("DELETE FROM tasks WHERE username='httpu1' AND name LIKE '配额验证%' OR (username='httpu1' AND name LIKE '改绑测试%')").run();
+          db.prepare("DELETE FROM agents WHERE name='受限草稿智能体'").run();
         });
       } else {
         failed++; console.error('  ❌ HTTP 测试服务未就绪，本组用例跳过');
@@ -2181,6 +2208,10 @@ function t(name, fn) {
       assert.strictEqual(describeCron('*/5 * * * *'), '每 5 分钟执行一次');
       assert.strictEqual(describeCron('0 9 1 * *'), '每月 1 号 09:00 执行');
       assert.strictEqual(describeCron('0 9 * * 1-5'), '每周一、周二、周三、周四、周五 09:00 执行');
+      // P5.33 审查修复（Y6）：分钟/小时为 * 时不再误报「每天 00:00」（实际频率相差最多 1440 倍）
+      assert.strictEqual(describeCron('* * * * *'), '每分钟执行一次');
+      assert.strictEqual(describeCron('15 * * * *'), '每小时第 15 分执行');
+      assert.strictEqual(describeCron('* 9 * * *'), '每小时 9 时段内每分钟执行（时域 9）');
     });
     const { create_task } = require('../src-server/lib/tools-extra');
     await t('create_task：无归属拒绝 / 非法 cron 拒绝 / 合法创建落库带归属', async () => {
@@ -2230,6 +2261,21 @@ function t(name, fn) {
       assert.strictEqual(gradeMcpToolRisk('delete_file', '删除文件', { readOnlyHint: true }), 'high', '写类词优先于 readOnlyHint 注解（注解不可盲信）');
       assert.strictEqual(gradeMcpToolRisk('magic_op', '未知操作', {}), 'high', '未知命名应保守 high');
       assert.strictEqual(gradeMcpToolRisk('list_items', '列表', { destructiveHint: true }), 'high', 'destructiveHint 应 high');
+    });
+    await t('gradeMcpToolRisk：P5.33 审查修复——snake_case/驼峰/组合动词伪装全拦截（纯名称无中文兑底）', () => {
+      // R1/F6 实锤：原 \b 词边界对下划线命名全部失效，以下用例在修复前均判 low 或靠未知兑底
+      assert.strictEqual(gradeMcpToolRisk('create_user', '', {}), 'high', 'create_user 应 high（原正则不命中）');
+      assert.strictEqual(gradeMcpToolRisk('delete_file', '', { readOnlyHint: true }), 'high', 'delete_file+readOnlyHint 应 high');
+      assert.strictEqual(gradeMcpToolRisk('update_settings', '', { readOnlyHint: true }), 'high', 'update_settings+readOnlyHint 应 high');
+      assert.strictEqual(gradeMcpToolRisk('send_message', '', {}), 'high', 'send_message 应 high');
+      assert.strictEqual(gradeMcpToolRisk('fetch_and_send', '', { readOnlyHint: true }), 'high', '读前缀+写动词组合应 high');
+      assert.strictEqual(gradeMcpToolRisk('get_flag_then_delete', '', {}), 'high', 'get_..._delete 组合应 high');
+      assert.strictEqual(gradeMcpToolRisk('read_then_update', '', {}), 'high', 'read_..._update 组合应 high');
+      assert.strictEqual(gradeMcpToolRisk('DeleteAll', '', { readOnlyHint: true }), 'high', '驼峰 DeleteAll 应 high');
+      assert.strictEqual(gradeMcpToolRisk('get_then_wipe', '', {}), 'high', '同义词 wipe 应 high');
+      assert.strictEqual(gradeMcpToolRisk('xdelete', '', { readOnlyHint: true }), 'high', 'xdelete+readOnlyHint 伪装应 high（首词非读动词不采信注解）');
+      assert.strictEqual(gradeMcpToolRisk('get_user', '', {}), 'low', '正常读工具不误伤：get_user 应 low');
+      assert.strictEqual(gradeMcpToolRisk('query_order_status', '', {}), 'low', '正常读工具不误伤：query_order_status 应 low');
     });
     const { toolRiskOf, loadMcpTools } = require('../src-server/lib/tools');
     await t('toolRiskOf：MCP 细粒度——trusted+low 才降级，其余一律 high（向后兼容）', () => {
@@ -2307,6 +2353,52 @@ function t(name, fn) {
       // 上一用例已记一次；本次 billUsage=false → 不应再增长
       const msg1tokens = Math.ceil('回复中包含****的部分。'.length * 0.6);
       assert.strictEqual(quota2 - baseQuota, msg1tokens, 'billUsage=false 不应记账');
+    });
+  }
+
+  console.log('【N+4】P5.33 审查修复回归：SSRF / 任务敏感词 / 配额闸门 / sink 契约');
+  {
+    const { web_fetch } = require('../src-server/lib/tools-extra');
+    await t('web_fetch：SSRF 防护——私网/环回/云元数据地址一律拒绝（F2）', async () => {
+      const vectors = ['http://127.0.0.1:9999/x', 'http://localhost:8080/admin', 'http://192.168.1.1/router', 'http://10.0.0.5/', 'http://172.16.0.1/', 'http://169.254.169.254/latest/meta-data/', 'http://0.0.0.0/', 'http://[::1]:8080/'];
+      for (const url of vectors) {
+        const r = String(await web_fetch.run({ url }));
+        assert.ok(r.includes('安全策略拒绝') || r.includes('仅支持 http'), `内网地址 ${url} 应被拒绝：` + r.slice(0, 80));
+      }
+    });
+    const { create_task } = require('../src-server/lib/tools-extra');
+    await t('create_task：任务指令含输入敏感词拒绝创建（Y7）', async () => {
+      db.prepare('INSERT INTO words (category_id,word,input_block,output_block,hit_count,created_at) VALUES (NULL,?,1,0,0,?)').run('违禁任务词', new Date().toISOString().slice(0, 19));
+      const r = String(await create_task.run({ name: 'x', schedule: '0 9 * * *', prompt: '执行违禁任务词相关操作' }, { username: 'httpu1' }));
+      assert.ok(r.includes('违规词汇') && r.includes('拒绝创建'), '含敏感词的任务指令应拒绝：' + r.slice(0, 80));
+    });
+    const { runTask } = require('../src-server/lib/scheduler');
+    await t('runTask：配额耗尽自动停用任务 + 站内信告知（F3）', async () => {
+      db.prepare(`INSERT INTO users (username,password,nickname,role,status,must_change_pwd,quota_total,quota_used,created_at) VALUES ('taskq',?,'配额闸门测试','user',1,0,10,10,datetime('now','localtime'))`).run(hashPwd('taskq-pass-1'));
+      const sysAgent = db.prepare(`SELECT id FROM agents WHERE name='定时任务执行助手' AND source_name='系统内置'`).get();
+      const info = db.prepare(`INSERT INTO tasks (name,target_type,target_id,exec_type,cron,params,enabled,username,created_at) VALUES ('配额闸门任务','agent',?, 'cron','0 9 * * *',?,1,'taskq',datetime('now','localtime'))`).run(sysAgent.id, JSON.stringify({ input: '测试' }));
+      const r = await runTask(db.prepare('SELECT * FROM tasks WHERE id=?').get(info.lastInsertRowid));
+      assert.strictEqual(r.status, 'fail', '配额耗尽应返回 fail');
+      assert.ok(String(r.output).includes('自动停用'), '输出应说明已停用：' + r.output.slice(0, 60));
+      const t2 = db.prepare('SELECT * FROM tasks WHERE id=?').get(info.lastInsertRowid);
+      assert.strictEqual(t2.enabled, 0, '任务应已自动停用');
+      const note = db.prepare("SELECT * FROM notifications WHERE username='taskq' AND type='task' ORDER BY id DESC").get();
+      assert.ok(note && note.title.includes('停用'), '应发站内信告知归属者');
+    });
+    const { finishExternalTurn } = require('../src-server/lib/chat-sink');
+    await t('finishExternalTurn：tokens=0/null 视为缺省走估算（Y2 契约对齐）', () => {
+      const ev = [];
+      const r = finishExternalTurn({
+        send: (e, d) => ev.push({ e, d }), sessionId: null, username: 'httpu1', ip: '1.2.3.4',
+        input: 'x', full: '四十二个字符的回复内容四十二个字符的回复内容四十二个字符的',
+        modelLabel: 'm', modeLabel: 't', tStart: Date.now(), tokens: 0,
+      });
+      assert.strictEqual(r.tokens, Math.ceil('四十二个字符的回复内容四十二个字符的回复内容四十二个字符的'.length * 0.6), 'tokens=0 应回落估算而非记 0');
+      const r2 = finishExternalTurn({
+        send: () => { }, sessionId: null, username: 'httpu1', ip: '1.2.3.4',
+        input: 'x', full: '同样内容同样内容同样内容同样内容', modelLabel: 'm', modeLabel: 't', tStart: Date.now(), tokens: null,
+      });
+      assert.strictEqual(r2.tokens, Math.ceil('同样内容同样内容同样内容同样内容'.length * 0.6), 'tokens=null 应回落估算');
     });
   }
 

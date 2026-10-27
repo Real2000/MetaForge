@@ -36,12 +36,13 @@ router.post('/', adminOnly, (req, res) => {
 });
 
 // 编辑（admin）——P5.32：trusted 信任开关（显式标记后才允许该服务的只读工具降为 low 免确认）
+// P5.33 审查修复（R2/F9）：trusted 未传时保留原值——此前停用/启用按钮只传 status 会静默清零信任并写失真审计
 router.put('/:id', adminOnly, (req, res) => {
   const old = db.prepare('SELECT * FROM mcp_servers WHERE id=?').get(req.params.id);
   if (!old) return res.json({ code: 404, msg: 'MCP 服务不存在' });
   const { name, url, api_key, transport, status, trusted } = req.body || {};
-  const nextTrusted = trusted === 1 || trusted === true ? 1 : 0;
-  if ((nextTrusted !== (old.trusted ? 1 : 0))) {
+  const nextTrusted = trusted !== undefined ? (trusted === 1 || trusted === true ? 1 : 0) : (old.trusted ? 1 : 0);
+  if (nextTrusted !== (old.trusted ? 1 : 0)) {
     db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
       .run(req.user.username, nextTrusted ? '信任MCP服务' : '取消信任MCP服务', `${old.name}（${nextTrusted ? '只读工具免确认' : '全部工具恢复确认'}）`, req.ip, now());
   }
