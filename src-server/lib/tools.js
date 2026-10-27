@@ -114,8 +114,18 @@ const TOOL_RISK = {
   medium: ['image_gen', 'export_word', 'tts', 'run_code'],
   high: ['create_task'], // P5.31：定时任务 = 持久化自动执行实体，提示词注入最想拿到的能力，必弹确认卡
 };
-function toolRiskOf(name) {
-  if (name.startsWith('mcp_') || name.startsWith('agent_call_') || name.startsWith('local_')) return 'high';
+function toolRiskOf(name, ctx = {}) {
+  if (name.startsWith('agent_call_') || name.startsWith('local_')) return 'high';
+  // P5.32 MCP 细粒度分级（白名单式）：默认整类 high；仅当①执行上下文提供了智能体挂载的 MCP 清单
+  // ②对应 server 管理员显式 trusted=1 ③该工具分级结果为 low 时才降为 low——任一不满足保守按 high。
+  // 无 ctx（旧调用方/未知来源）与旧缓存（无 risk 字段）均安全回落 high，向后兼容。
+  if (name.startsWith('mcp_')) {
+    if (ctx.mcpServers) {
+      const t = loadMcpTools(ctx.mcpServers).find(x => x.name === name);
+      if (t && t.server && t.server.trusted && t.risk === 'low') return 'low';
+    }
+    return 'high';
+  }
   for (const [level, ids] of Object.entries(TOOL_RISK)) if (ids.includes(name)) return level;
   return 'medium'; // 未知工具保守按 medium（需确认而非放行）
 }

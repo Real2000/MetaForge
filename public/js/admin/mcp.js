@@ -30,6 +30,7 @@ export async function render(el) {
         <span id="mcpCount" style="color:var(--text-2)">已注册 ${servers.length} 个 MCP 服务（协议：JSON-RPC 2.0 over HTTP，兼容 SSE 响应）</span>
         <button class="btn primary" id="newSrv">＋ 注册 MCP 服务</button>
       </div>
+      <div style="font-size:12px;color:var(--text-3);margin-bottom:8px">🔒 风险分级（P5.32）：工具徽标「读」（绿）=只读，服务器被信任后对话中免确认；「写」（橙）=写类/未知，始终需确认。分级依据 MCP 注解（readOnlyHint/destructiveHint）+ 名称启发式，管理员可在编辑弹窗调整服务信任状态。</div>
       <div class="table-wrap"><table class="tbl">
         <thead><tr><th>名称</th><th>URL</th><th>状态</th><th>工具数</th><th>工具清单</th><th>最近检查</th><th>操作</th></tr></thead>
         <tbody id="tbody"></tbody>
@@ -49,12 +50,13 @@ export async function render(el) {
       <tr>
         <td><b>${esc(s.name)}</b></td>
         <td class="mono" style="max-width:260px;word-break:break-all;font-size:12px">${esc(s.url)}</td>
-        <td>${s.status ? '<span class="tag green">启用</span>' : '<span class="tag gray">停用</span>'}${s.last_error ? `<div style="font-size:11px;color:var(--danger);margin-top:2px">${esc(s.last_error.slice(0, 60))}</div>` : ''}</td>
+        <td>${s.status ? '<span class="tag green">启用</span>' : '<span class="tag gray">停用</span>'}${s.trusted ? ' <span class="tag purple" title="只读工具免确认执行">🤝 已信任</span>' : ''}${s.last_error ? `<div style="font-size:11px;color:var(--danger);margin-top:2px">${esc(s.last_error.slice(0, 60))}</div>` : ''}</td>
         <td><b>${s.toolNames?.length || 0}</b></td>
-        <td style="font-size:12px;color:var(--text-2)">${s.toolNames?.length ? s.toolNames.map(t => `<span class="tag blue" style="font-size:10px;margin:1px">${esc(t)}</span>`).join('') : '-'}</td>
+        <td style="font-size:12px;color:var(--text-2)">${s.toolList?.length ? s.toolList.map(t => `<span class="tag ${t.risk === 'low' ? 'green' : 'orange'}" style="font-size:10px;margin:1px" title="${t.risk === 'low' ? '只读（trusted 后免确认）' : '写类/未知（始终需确认）'}">${esc(t.name)}${t.risk === 'low' ? '·读' : '·写'}</span>`).join('') : '-'}</td>
         <td style="color:var(--text-3);font-size:12px">${esc(s.last_check_at || '-')}</td>
         <td>
           <button class="btn link" data-rf="${s.id}">刷新工具</button>
+          <button class="btn link" data-tr="${s.id}">${s.trusted ? '取消信任' : '信任'}</button>
           <button class="btn link" data-tg="${s.id}">${s.status ? '停用' : '启用'}</button>
           <button class="btn link" data-ed="${s.id}">编辑</button>
           <button class="btn link" style="color:var(--danger)" data-del="${s.id}">删除</button>
@@ -65,9 +67,17 @@ export async function render(el) {
       b.textContent = '刷新中…'; b.disabled = true;
       try {
         const j = await api(`/mcp/${b.dataset.rf}/refresh`, { method: 'POST' });
-        toast(`连接成功，发现 ${j.data.count} 个工具`, 'ok');
+        toast(`连接成功，发现 ${j.data.count} 个工具（低风险 ${j.data.tools.filter(t => t.risk === 'low').length} 个）`, 'ok');
         load();
       } catch (e) { toast(e.message, 'err'); b.textContent = '刷新工具'; b.disabled = false; }
+    });
+    // P5.32 信任开关：trusted=1 时该服务的只读（低风险）工具在对话中免确认执行
+    el.querySelectorAll('[data-tr]').forEach(b => b.onclick = async () => {
+      const s = servers.find(x => x.id === +b.dataset.tr);
+      const next = s.trusted ? 0 : 1;
+      if (next && !await confirmBox(`信任「${s.name}」？信任后其只读类工具（绿徽标）在对话「默认权限」下不再弹确认卡；写类工具（橙徽标）仍需确认。仅信任你了解且可控的服务。`)) return;
+      await api(`/mcp/${s.id}`, { method: 'PUT', body: { trusted: next } });
+      toast(next ? '已信任（只读工具免确认）' : '已取消信任（全部恢复确认）'); load();
     });
     el.querySelectorAll('[data-tg]').forEach(b => b.onclick = async () => {
       const s = servers.find(x => x.id === +b.dataset.tg);
@@ -83,7 +93,7 @@ export async function render(el) {
   }
 
   function openEdit(id) {
-    const s = id ? servers.find(x => x.id === id) : { name: '', url: '', api_key_set: 0 };
+    const s = id ? servers.find(x => x.id === id) : { name: '', url: '', api_key_set: 0, trusted: 0 };
     const body = `
       <div class="form-item"><label>服务名称<span class="req">*</span></label><input class="input" id="m_name" value="${esc(s.name)}" placeholder="如：企业工具中心"></div>
       <div class="form-item"><label>Streamable HTTP 端点<span class="req">*</span></label>
@@ -91,7 +101,11 @@ export async function render(el) {
         <div class="hint">MCP Server 的 HTTP 端点；本机部署可填 http://127.0.0.1:端口/mcp</div>
       </div>
       <div class="form-item"><label>Bearer Token${s.api_key_set ? '（已配置，留空不修改）' : ''}</label>
-        <input class="input mono" id="m_key" type="password" placeholder="服务端鉴权 Token（可选）"></div>`;
+        <input class="input mono" id="m_key" type="password" placeholder="服务端鉴权 Token（可选）"></div>
+      <div class="form-item" style="display:flex;align-items:center;gap:8px">
+        <input type="checkbox" id="m_trusted" ${s.trusted ? 'checked' : ''} style="width:auto">
+        <label for="m_trusted" style="margin:0">信任该服务（其只读类工具在对话「默认权限」下免确认执行；写类工具仍需确认）</label>
+      </div>`;
     modal({
       title: id ? '编辑 MCP 服务' : '注册 MCP 服务', body,
       foot: `<button class="btn" data-cancel>取消</button>${id ? '' : '<button class="btn" data-test>测试连接</button>'}<button class="btn primary" data-save>保存</button>`,
@@ -111,6 +125,7 @@ export async function render(el) {
             const payload = {
               name: mask.querySelector('#m_name').value.trim(),
               url: mask.querySelector('#m_url').value.trim(),
+              trusted: mask.querySelector('#m_trusted').checked ? 1 : 0,
             };
             const key = mask.querySelector('#m_key').value;
             if (key !== '') payload.api_key = key;

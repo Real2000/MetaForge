@@ -906,7 +906,8 @@ router.post('/stream', async (req, res) => {
       send('tool_confirm', { key: toolKey, name, args: argsJson });
     });
     const executeTool = async (name, argsJson) => {
-      const risk = toolRiskOf(name);
+      // P5.32：MCP 工具传入挂载上下文做细粒度分级（trusted 服务器的只读工具降为 low 免确认疲劳；其余仍 high）
+      const risk = toolRiskOf(name, { mcpServers: agent?.mcp_servers || '[]' });
       if (chatPerm === 'default' && risk !== 'low') {
         const toolKey = `${session_id}:${Date.now()}:${name}`;
         send('tool', { name, status: 'awaiting' });

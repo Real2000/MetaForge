@@ -2057,3 +2057,31 @@ agent-platform/
 - 修改任务/删除任务暂不做工具（防注入改掉用户既有任务）；管理走任务页
 
 > AI生成
+
+## P5.32 MCP 工具细粒度风险分级（2026-10-27）
+
+> 动因：本 README 遗留 backlog 第四项——`toolRiskOf` 把整类 `mcp_*` 工具一律归 high，「默认权限」下每次调用都弹确认卡，纯只读工具（查询/检索类）造成确认疲劳。
+
+### 实现内容（白名单式，安全优先）
+
+- **工具级分级**（`lib/mcp.js` 新增 `gradeMcpToolRisk`，`listTools` 时计算并随 `tools_cache` 持久化）：
+  - **写类启发式永远 high**：名称词边界匹配 create/write/update/delete/send/exec/set… 或描述含写入/修改/删除/发送——即使 server 自报 `readOnlyHint: true` 也按 high（注解由 server 自报，不可盲信）
+  - MCP 规范注解：`destructiveHint: true` → high；`readOnlyHint: true` → low
+  - 读类前缀（get/read/search/find/query/list/fetch…）→ low；其余未知 → high（保守）
+- **服务级信任开关**（`mcp_servers.trusted` 迁移，默认 0）：**降级三条件缺一不可**——①执行上下文提供智能体挂载清单 ②server 管理员显式 trusted=1 ③工具分级为 low。任一不满足保守 high；无 ctx 的旧调用方与无 risk 字段的旧缓存均安全回落 high（向后兼容）
+- **对话链路接入**（chat.js `executeTool`）：`toolRiskOf(name, { mcpServers })` 按挂载上下文细查；trusted 服务的只读工具在「默认权限」下免确认，「全自动执行」不受影响
+- **管理端**（admin/mcp.js）：工具清单带风险徽标（绿·读 / 橙·写）；「信任」快捷开关 + 编辑弹窗复选框（含二次确认提示语义）；信任变更落 op_logs 审计
+
+### 验证（冒烟 158/158）
+
+- `gradeMcpToolRisk` 单测：写类/中文写描述/readOnlyHint 被写类词覆盖/destructiveHint/读前缀/未知保守
+- `toolRiskOf` 单测：trusted+low 降级 / 未 trusted high / 无 ctx high / 未挂载 high / 旧缓存无 risk 字段 high / loadMcpTools 透传
+- HTTP：GET 透传 trusted 与 toolList 风险清单 / 管理员切换信任 / 非 admin 切换 403
+
+### 设计取舍（记录备查）
+
+- **不按 server 粒度整体降级**：只对「分级为 low 的单个工具」免确认，写类/未知工具即使 trusted 也逐一确认——一次误信任不放大到全服务
+- **信任语义显式化**：trusted 不是「安全」标记，而是「接受该服务只读工具的免确认便利」——UI 确认弹窗明示语义与边界
+- 存量服务器需点一次「刷新工具」才会带 risk 字段；此前全部按 high，行为不变（零回归风险上线）
+
+> AI生成

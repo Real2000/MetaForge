@@ -2026,6 +2026,12 @@ function t(name, fn) {
     const tok1 = sign({ uid: uid1, exp: Date.now() + 3600000 });
     const tok2 = sign({ uid: uid2, exp: Date.now() + 3600000 });
 
+    // P5.32：MCP 风险分级测试数据（HTTP 组与后续单测组共用）：A 已信任带 low 工具 / B 未信任 / C 旧缓存无 risk 字段
+    const mkMcpTools = (name, risk) => JSON.stringify([{ name: `mcp_${name}`, originalName: name, description: '', schema: { type: 'function', function: { name: `mcp_${name}`, description: '', parameters: { type: 'object', properties: {} } } }, ...(risk ? { risk } : {}) }]);
+    db.prepare(`INSERT INTO mcp_servers (name,url,api_key,transport,status,tools_cache,trusted,created_at) VALUES ('信任服务A','http://a.test','','http',1,?,1,datetime('now','localtime'))`).run(mkMcpTools('get_x', 'low'));
+    db.prepare(`INSERT INTO mcp_servers (name,url,api_key,transport,status,tools_cache,trusted,created_at) VALUES ('未信任服务B','http://b.test','','http',1,?,0,datetime('now','localtime'))`).run(mkMcpTools('search_y', 'low'));
+    db.prepare(`INSERT INTO mcp_servers (name,url,api_key,transport,status,tools_cache,trusted,created_at) VALUES ('旧缓存服务C','http://c.test','','http',1,?,1,datetime('now','localtime'))`).run(mkMcpTools('get_z'));
+
     const port = 33000 + Math.floor(Math.random() * 2000);
     const base = `http://127.0.0.1:${port}`;
     const child = spawn(process.execPath, ['server.js'], {
@@ -2126,6 +2132,23 @@ function t(name, fn) {
           const adminList = await jfetch('/api/tasks', {}, tokA2);
           assert.ok((adminList.j.data || []).some(x => x.id === tid), '管理员应能看到全部任务');
         });
+        await t('HTTP：MCP 信任开关与风险清单透传（P5.32）', async () => {
+          const aid = db.prepare(`SELECT id FROM users WHERE username='httpadmin'`).get().id;
+          const tokA3 = sign({ uid: aid, exp: Date.now() + 3600000 });
+          const srvId = db.prepare("SELECT id FROM mcp_servers WHERE name='信任服务A'").get().id;
+          const before = await jfetch('/api/mcp', {}, tok1);
+          const row = (before.j.data || []).find(x => x.id === srvId);
+          assert.ok(row && row.trusted === 1, 'GET 应透传 trusted 状态');
+          assert.ok(Array.isArray(row.toolList) && row.toolList.some(t => t.name === 'get_x' && t.risk === 'low'), 'GET 应返回工具风险清单');
+          const off = await jfetch(`/api/mcp/${srvId}`, { method: 'PUT', body: JSON.stringify({ trusted: 0 }) }, tokA3);
+          assert.ok(off.j && off.j.code === 0, '管理员切换信任应成功：' + JSON.stringify(off.j));
+          const after = await jfetch('/api/mcp', {}, tok1);
+          assert.ok((after.j.data || []).find(x => x.id === srvId).trusted === 0, '切换后 GET 应反映 trusted=0');
+          const denied = await jfetch(`/api/mcp/${srvId}`, { method: 'PUT', body: JSON.stringify({ trusted: 1 }) }, tok1);
+          assert.strictEqual(denied.status, 403, '非管理员切换信任应 403（adminOnly）');
+          // 恢复 trusted=1（后续单测组依赖该状态）
+          await jfetch(`/api/mcp/${srvId}`, { method: 'PUT', body: JSON.stringify({ trusted: 1 }) }, tokA3);
+        });
       } else {
         failed++; console.error('  ❌ HTTP 测试服务未就绪，本组用例跳过');
       }
@@ -2189,6 +2212,36 @@ function t(name, fn) {
       // 清理：删掉配额填充与草稿 agent，避免影响后续用例
       db.prepare("DELETE FROM tasks WHERE username='httpu2' AND name LIKE '配额填充%'").run();
       db.prepare("DELETE FROM agents WHERE name='草稿智能体'").run();
+    });
+  }
+
+  console.log('【N+2】P5.32 MCP 细粒度风险分级');
+  {
+    const { gradeMcpToolRisk } = require('../src-server/lib/mcp');
+    await t('gradeMcpToolRisk：写类启发式/注解/读前缀/未知保守', () => {
+      assert.strictEqual(gradeMcpToolRisk('create_user', '创建用户', {}), 'high', 'create 前缀应 high');
+      assert.strictEqual(gradeMcpToolRisk('get_settings', '读取配置', {}), 'low', 'get 前缀应 low（settings 不含独立写词）');
+      assert.strictEqual(gradeMcpToolRisk('get_settings', '写入配置', {}), 'high', '中文描述含写入应 high（优先于读前缀）');
+      assert.strictEqual(gradeMcpToolRisk('search_docs', '检索文档', {}), 'low', 'search 前缀应 low');
+      assert.strictEqual(gradeMcpToolRisk('read_file', '读文件', { readOnlyHint: true }), 'low', 'readOnlyHint 应 low');
+      assert.strictEqual(gradeMcpToolRisk('delete_file', '删除文件', { readOnlyHint: true }), 'high', '写类词优先于 readOnlyHint 注解（注解不可盲信）');
+      assert.strictEqual(gradeMcpToolRisk('magic_op', '未知操作', {}), 'high', '未知命名应保守 high');
+      assert.strictEqual(gradeMcpToolRisk('list_items', '列表', { destructiveHint: true }), 'high', 'destructiveHint 应 high');
+    });
+    const { toolRiskOf, loadMcpTools } = require('../src-server/lib/tools');
+    await t('toolRiskOf：MCP 细粒度——trusted+low 才降级，其余一律 high（向后兼容）', () => {
+      // 数据已在 HTTP 组 setup 创建：A 已信任带 low 工具 / B 未信任 / C 旧缓存无 risk 字段
+      const aId = db.prepare("SELECT id FROM mcp_servers WHERE name='信任服务A'").get().id;
+      const bId = db.prepare("SELECT id FROM mcp_servers WHERE name='未信任服务B'").get().id;
+      const cId = db.prepare("SELECT id FROM mcp_servers WHERE name='旧缓存服务C'").get().id;
+      assert.strictEqual(toolRiskOf('mcp_get_x', { mcpServers: JSON.stringify([aId]) }), 'low', 'trusted+low 应降为 low（免确认疲劳）');
+      assert.strictEqual(toolRiskOf('mcp_search_y', { mcpServers: JSON.stringify([bId]) }), 'high', '未 trusted 一律 high（白名单式）');
+      assert.strictEqual(toolRiskOf('mcp_get_x'), 'high', '无 ctx（旧调用方）应 high（向后兼容）');
+      assert.strictEqual(toolRiskOf('mcp_get_x', { mcpServers: '[]' }), 'high', '未挂载该服务的上下文应 high');
+      assert.strictEqual(toolRiskOf('mcp_get_z', { mcpServers: JSON.stringify([cId]) }), 'high', '旧缓存无 risk 字段应 high（需刷新工具清单）');
+      // 分级字段随 tools_cache 透传（loadMcpTools）
+      const loaded = loadMcpTools(JSON.stringify([aId]));
+      assert.ok(loaded[0].risk === 'low' && loaded[0].server.trusted === 1, 'loadMcpTools 应透传 risk 与 server.trusted');
     });
   }
 

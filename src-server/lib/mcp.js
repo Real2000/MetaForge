@@ -67,7 +67,25 @@ async function connect(server, timeoutMs = 15000) {
   return { serverInfo: result?.serverInfo || {}, sessionId };
 }
 
-/** 拉取工具清单（OpenAI tools 兼容格式 + MCP 原始信息） */
+/** P5.32 MCP 工具风险分级（白名单式，安全优先）：
+ *  - 写类启发式（名称词边界匹配 create/write/update/delete/send/… 或中文描述含写入/修改/删除/发送）→ 永远 high，
+ *    即使 server 声明 readOnlyHint 也按 high（防御：注解由 server 自报，不可盲信）
+ *  - destructiveHint=true → high；readOnlyHint=true 且非写类 → low；读类前缀（get/search/list/…）→ low；其余未知 → high（保守）
+ *  - 分级结果仅在 server.trusted=1（管理员显式信任）时生效——默认 0 时整类 high（tools.js toolRiskOf 查询时判定）
+ *  返回值随 listTools 落入 tools_cache 持久化，向后兼容：无 risk 字段的旧缓存一律按 high */
+const MCP_WRITE_RE = /\b(create|write|update|delete|remove|drop|insert|post|put|patch|send|submit|exec|execute|run|move|rename|copy|upload|set|add|edit|modify|clear|reset|close|cancel|confirm|approve|pay|transfer|publish|deploy|install|kill|stop|start|reboot|restart)\b/i;
+const MCP_WRITE_CN_RE = /(写入|修改|删除|发送|创建|执行|上传|发布|停用|启用|变更|提交|支付|转移)/;
+const MCP_READ_PREFIX_RE = /^(get|read|search|find|query|list|fetch|view|show|describe|lookup|select|check|count|analyze|summar|scan|browse)/i;
+function gradeMcpToolRisk(originalName, description, annotations = {}) {
+  const name = String(originalName || '');
+  if (MCP_WRITE_RE.test(name) || MCP_WRITE_CN_RE.test(String(description || ''))) return 'high';
+  if (annotations && annotations.destructiveHint === true) return 'high';
+  if (annotations && annotations.readOnlyHint === true) return 'low';
+  if (MCP_READ_PREFIX_RE.test(name)) return 'low';
+  return 'high'; // 未知命名/无注解 → 保守按 high
+}
+
+/** 拉取工具清单（OpenAI tools 兼容格式 + MCP 原始信息 + P5.32 风险分级） */
 async function listTools(server) {
   const { sessionId } = await connect(server);
   const { result } = await rpc(server.url, server.api_key, 'tools/list', {}, { id: sessionId });
@@ -76,6 +94,8 @@ async function listTools(server) {
     name: `mcp_${t.name}`,
     originalName: t.name,
     description: t.description || '',
+    annotations: t.annotations || {}, // MCP 规范注解（readOnlyHint/destructiveHint 等，分级依据）
+    risk: gradeMcpToolRisk(t.name, t.description, t.annotations), // P5.32 分级结果随 tools_cache 持久化
     schema: {
       type: 'function',
       function: {
@@ -111,4 +131,4 @@ async function callTool(server, toolName, argsJson, timeoutMs = 30000) {
   return parts.join('\n') || '(空结果)';
 }
 
-module.exports = { connect, listTools, callTool };
+module.exports = { connect, listTools, callTool, gradeMcpToolRisk };
