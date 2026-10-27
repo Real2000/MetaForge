@@ -2179,6 +2179,52 @@ function t(name, fn) {
           db.prepare("DELETE FROM tasks WHERE username='httpu1' AND name LIKE '配额验证%' OR (username='httpu1' AND name LIKE '改绑测试%')").run();
           db.prepare("DELETE FROM agents WHERE name='受限草稿智能体'").run();
         });
+        await t('HTTP：智能体保存工具白名单——create_task/local_exec 拒绝（P5.34）', async () => {
+          const bad1 = await jfetch('/api/agents', { method: 'POST', body: JSON.stringify({ name: '注入测试A', tools: ['create_task'] }) }, tok1);
+          assert.strictEqual(bad1.j && bad1.j.code, 400, 'POST 配置 create_task 应 400：' + JSON.stringify(bad1.j));
+          assert.ok(String(bad1.j.msg).includes('create_task'), '错误信息应指名违禁工具');
+          const bad2 = await jfetch('/api/agents', { method: 'POST', body: JSON.stringify({ name: '注入测试B', tools: ['web_search', 'local_exec'] }) }, tok1);
+          assert.strictEqual(bad2.j && bad2.j.code, 400, 'POST 配置 local_exec 应 400');
+          // 合法创建 → PUT 注入同样拒绝
+          const ok = await jfetch('/api/agents', { method: 'POST', body: JSON.stringify({ name: '白名单正常智能体', tools: ['web_search'] }) }, tok1);
+          assert.ok(ok.j && ok.j.code === 0, '常规工具应可正常创建');
+          const aid3 = ok.j.data.id;
+          const bad3 = await jfetch(`/api/agents/${aid3}`, { method: 'PUT', body: JSON.stringify({ name: '白名单正常智能体', tools: ['run_code', 'create_task'], force: 1 }) }, tok1);
+          assert.strictEqual(bad3.j && bad3.j.code, 400, 'PUT 注入 create_task 应 400');
+          const bad4 = await jfetch('/api/agents/import', { method: 'POST', body: JSON.stringify({ config: { agent: { name: '导入注入', tools: ['create_task'] } } }) }, tok1);
+          assert.strictEqual(bad4.j && bad4.j.code, 400, 'import 注入 create_task 应 400');
+          // run_code（沙箱已加固+medium 确认卡）应放行
+          const okRun = await jfetch(`/api/agents/${aid3}`, { method: 'PUT', body: JSON.stringify({ name: '白名单正常智能体', tools: ['run_code'], force: 1 }) }, tok1);
+          assert.ok(okRun.j && okRun.j.code === 0, 'run_code 应放行：' + JSON.stringify(okRun.j).slice(0, 100));
+          db.prepare("DELETE FROM agents WHERE name IN ('白名单正常智能体','注入测试A','注入测试B','导入注入')").run();
+        });
+        await t('HTTP：MCP 工具人工定级 API——标注/透传/auto 回落 + 非 admin 403（P5.34）', async () => {
+          const aid4 = db.prepare(`SELECT id FROM users WHERE username='httpadmin'`).get().id;
+          const tokA5 = sign({ uid: aid4, exp: Date.now() + 3600000 });
+          const srvId = db.prepare("SELECT id FROM mcp_servers WHERE name='信任服务A'").get().id;
+          // 人工把 get_x 定为 high（覆盖启发式 low）
+          const set = await jfetch(`/api/mcp/${srvId}/tool-risk`, { method: 'PUT', body: JSON.stringify({ tool: 'get_x', level: 'high' }) }, tokA5);
+          assert.ok(set.j && set.j.code === 0, '管理员定级应成功：' + JSON.stringify(set.j));
+          const after = await jfetch('/api/mcp', {}, tok1);
+          const row = (after.j.data || []).find(x => x.id === srvId);
+          const tl = row.toolList.find(t => t.name === 'get_x');
+          assert.strictEqual(tl.risk, 'high', 'GET 应返回生效值 high');
+          assert.strictEqual(tl.override, 'high', 'GET 应透传 override 标记');
+          // auto 回落启发式
+          const auto = await jfetch(`/api/mcp/${srvId}/tool-risk`, { method: 'PUT', body: JSON.stringify({ tool: 'get_x', level: 'auto' }) }, tokA5);
+          assert.ok(auto.j && auto.j.code === 0, 'auto 清除标注应成功');
+          const after2 = await jfetch('/api/mcp', {}, tok1);
+          const tl2 = (after2.j.data || []).find(x => x.id === srvId).toolList.find(t => t.name === 'get_x');
+          assert.strictEqual(tl2.risk, 'low', 'auto 后应回落启发式 low');
+          assert.strictEqual(tl2.override, null, 'auto 后 override 应为空');
+          // 越权与非法参数
+          const denied = await jfetch(`/api/mcp/${srvId}/tool-risk`, { method: 'PUT', body: JSON.stringify({ tool: 'get_x', level: 'low' }) }, tok1);
+          assert.strictEqual(denied.status, 403, '非管理员定级应 403');
+          const badLevel = await jfetch(`/api/mcp/${srvId}/tool-risk`, { method: 'PUT', body: JSON.stringify({ tool: 'get_x', level: 'middle' }) }, tokA5);
+          assert.strictEqual(badLevel.j && badLevel.j.code, 400, '非法 level 应 400');
+          const badTool = await jfetch(`/api/mcp/${srvId}/tool-risk`, { method: 'PUT', body: JSON.stringify({ tool: 'not_in_list', level: 'low' }) }, tokA5);
+          assert.strictEqual(badTool.j && badTool.j.code, 400, '清单外工具应 400');
+        });
       } else {
         failed++; console.error('  ❌ HTTP 测试服务未就绪，本组用例跳过');
       }
@@ -2399,6 +2445,74 @@ function t(name, fn) {
         input: 'x', full: '同样内容同样内容同样内容同样内容', modelLabel: 'm', modeLabel: 't', tStart: Date.now(), tokens: null,
       });
       assert.strictEqual(r2.tokens, Math.ceil('同样内容同样内容同样内容同样内容'.length * 0.6), 'tokens=null 应回落估算');
+    });
+  }
+
+  console.log('【N+5】P5.34 审查遗留收口：usage 累计 / 工具白名单 / MCP 人工定级 / 执行期复查');
+  {
+    const { toolRiskOf, loadMcpTools: loadMcpToolsForTest } = require('../src-server/lib/tools');
+    const { accumulateUsage } = require('../src-server/lib/llm');
+    await t('accumulateUsage：null 容错 / 多轮求和 / 非数值字段容错（Y5）', () => {
+      assert.strictEqual(accumulateUsage(null, null), null, '双方 null 应返回 null');
+      assert.deepStrictEqual(accumulateUsage(null, { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 }),
+        { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 }, '首轮应初始化');
+      const acc = accumulateUsage({ prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 }, { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 });
+      assert.deepStrictEqual(acc, { prompt_tokens: 110, completion_tokens: 55, total_tokens: 165 }, '多轮应求和（计费口径）');
+      const bad = accumulateUsage(acc, { prompt_tokens: 'x', completion_tokens: undefined, total_tokens: -5 });
+      assert.deepStrictEqual(bad, acc, '非数值/负值字段应按 0 容错（结果不变）');
+    });
+    const { validateAgentTools } = require('../src-server/lib/tools');
+    await t('validateAgentTools：create_task/local_exec 拒绝，run_code 与常规工具放行（F1②）', () => {
+      assert.strictEqual(validateAgentTools(['web_search', 'run_code', 'calculator']), null, '常规工具+run_code 应放行');
+      assert.ok(String(validateAgentTools(['create_task'])).includes('create_task') && String(validateAgentTools(['create_task'])).includes('不允许'), 'create_task 应拒绝');
+      assert.ok(String(validateAgentTools(['web_search', 'local_exec'])).includes('local_exec'), 'local_exec 应拒绝');
+      assert.ok(String(validateAgentTools(['not_a_tool'])).includes('未知工具'), '未知工具应拒绝');
+      assert.strictEqual(validateAgentTools([]), null, '空清单应放行');
+    });
+    await t('loadMcpTools：人工标注优先于启发式，auto 回落（P5.34）', () => {
+      // 服务 A（trusted=1，get_x 启发式 low）手工把 get_x 改 high；服务 B（未信任）手工把 search_y 保持 low
+      const aId = db.prepare("SELECT id FROM mcp_servers WHERE name='信任服务A'").get().id;
+      db.prepare("UPDATE mcp_servers SET risk_overrides=? WHERE id=?").run(JSON.stringify({ get_x: 'high' }), aId);
+      const loaded = loadMcpToolsForTest(JSON.stringify([aId]));
+      const gx = loaded.find(t => t.name === 'mcp_get_x');
+      assert.strictEqual(gx.risk, 'high', '人工 high 应覆盖启发式 low');
+      assert.strictEqual(gx.risk_override, 'high', '应透传 override 标记');
+      assert.strictEqual(toolRiskOf('mcp_get_x', { mcpServers: JSON.stringify([aId]) }), 'high', 'toolRiskOf 应按人工 high 判 high（即使 trusted）');
+      // auto：删除 key 回落启发式 low
+      db.prepare("UPDATE mcp_servers SET risk_overrides=? WHERE id=?").run('{}', aId);
+      const loaded2 = loadMcpToolsForTest(JSON.stringify([aId]));
+      assert.strictEqual(loaded2.find(t => t.name === 'mcp_get_x').risk, 'low', 'auto（无 key）应回落启发式 low');
+      assert.strictEqual(toolRiskOf('mcp_get_x', { mcpServers: JSON.stringify([aId]) }), 'low', '回落后 trusted+low 应恢复免确认');
+    });
+    const { runTask } = require('../src-server/lib/scheduler');
+    await t('runTask：执行期复查——主体下架自动停用 + 通知（F8）', async () => {
+      db.prepare(`INSERT INTO users (username,password,nickname,role,status,must_change_pwd,created_at) VALUES ('f8u',?,'F8测试','user',1,0,datetime('now','localtime'))`).run(hashPwd('f8-pass-123'));
+      const sysAgent = db.prepare("SELECT id FROM agents WHERE system_key='system_task_runner'").get();
+      const info = db.prepare(`INSERT INTO tasks (name,target_type,target_id,exec_type,cron,params,enabled,username,created_at) VALUES ('F8下架任务','agent',?, 'cron','0 9 * * *',?,1,'f8u',datetime('now','localtime'))`).run(sysAgent.id, JSON.stringify({ input: 'x' }));
+      const tid = info.lastInsertRowid;
+      // 下架主体
+      db.prepare("UPDATE agents SET status='draft' WHERE id=?").run(sysAgent.id);
+      const r = await runTask(db.prepare('SELECT * FROM tasks WHERE id=?').get(tid));
+      assert.strictEqual(r.status, 'fail', '主体下架应 fail');
+      assert.ok(String(r.output).includes('下架'), '输出应说明下架停用：' + r.output.slice(0, 60));
+      assert.strictEqual(db.prepare('SELECT enabled FROM tasks WHERE id=?').get(tid).enabled, 0, '任务应已自动停用');
+      assert.ok(db.prepare("SELECT id FROM notifications WHERE username='f8u' AND type='task' ORDER BY id DESC").get(), '应发站内信');
+      // 恢复主体发布状态 + 删除测试任务（不影响后续用例）
+      db.prepare("UPDATE agents SET status='published' WHERE id=?").run(sysAgent.id);
+      db.prepare('DELETE FROM tasks WHERE id=?').run(tid);
+      db.prepare("DELETE FROM notifications WHERE username='f8u'").run();
+    });
+    await t('create_task：system_key 稳定绑定——用户自建同名智能体不劫持（Y4 完整方案）', async () => {
+      const { create_task } = require('../src-server/lib/tools-extra');
+      // 用户自建同名「定时任务执行助手」（published、带危险工具集）——不应影响默认绑定
+      db.prepare(`INSERT INTO agents (name,description,type,category,prompt,status,source,source_name,tools,owner,created_at,updated_at) VALUES ('定时任务执行助手','劫持测试','digital','测试','p','published','self','用户自建',?, 'httpu2',datetime('now','localtime'),datetime('now','localtime'))`).run(JSON.stringify(['run_code']));
+      const r = String(await create_task.run({ name: 'Y4验证', schedule: '0 9 * * *', prompt: 'p' }, { username: 'httpu1' }));
+      assert.ok(r.includes('✅'), '创建应成功');
+      const row = db.prepare("SELECT * FROM tasks WHERE name='Y4验证'").get();
+      const agent = db.prepare('SELECT * FROM agents WHERE id=?').get(row.target_id);
+      assert.strictEqual(agent.system_key, 'system_task_runner', '应绑定 system_key 智能体而非自建同名');
+      db.prepare("DELETE FROM tasks WHERE name='Y4验证'").run();
+      db.prepare("DELETE FROM agents WHERE source_name='用户自建' AND name='定时任务执行助手'").run();
     });
   }
 

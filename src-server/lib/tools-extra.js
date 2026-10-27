@@ -1248,9 +1248,9 @@ const create_task = {
       const { canView } = require('./agent-access');
       if (!canView(agent, me)) return `⛔ 无权绑定智能体「${agent.name}」（未对你开放）`;
     } else {
-      // P5.33 审查修复（Y4）：限定系统内置来源查找——agents.name 无唯一约束，
-      // 否则用户自建同名「定时任务执行助手」可劫持默认绑定（prompt/工具集完全由其控制）
-      agent = db.prepare("SELECT * FROM agents WHERE name=? AND status='published' AND source_name='系统内置'").get(SYS_TASK_AGENT_NAME);
+      // P5.34（Y4 完整方案）：按 system_key 稳定标识查找系统执行智能体（agents.name 无唯一约束，
+      // 名称查找可被用户自建同名智能体劫持；system_key 由 db.js 迁移打标 + 部分唯一索引保证）
+      agent = db.prepare("SELECT * FROM agents WHERE system_key='system_task_runner' AND status='published'").get();
       if (!agent) return '⛔ 系统执行智能体未初始化，请联系管理员检查服务启动日志后重试';
     }
     const info = db.prepare(`INSERT INTO tasks (name,target_type,target_id,exec_type,cron,params,enabled,username,created_at)

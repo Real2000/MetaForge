@@ -268,23 +268,9 @@ router.patch('/sessions/:id', (req, res) => {
   res.json({ code: 0 });
 });
 
-// 可用模型列表（前台首页下拉）。仅返回对话模型：
-// ① 命中已知 TTS/图片/视频/向量模型黑名单的排除（注意：VL 多模态对话模型放行——Qwen-VL 系列纯文本对话完全可用，
-//    2026-10-14 修正误杀：紫光云旗舰 Qwen3-VL 曾被 vl 黑名单隐藏导致下拉选不到）；
-// ② 未知名称经 KNOWN_TEXT 白名单校验（如 bge-m3 嵌入模型被排除）
-const NON_TEXT_RE = /tts|asr|speech|whisper|embedding|rerank|image|video|audio|voice|ocr|t2v|a2v|realtime|sensevoice|minimax[\s-]?h\d|ref2va/i;
-const KNOWN_TEXT = /^(dsv4|glm|qwen(\b|[-_0-9])|deepseek|doubao|minimax[\s-]text|moonshot|kimi|ernie|baichuan|yi-|gpt|claude|gemini)/i;
-
+// 可用模型列表（前台首页下拉）。
 // P4（2026-10-22）：模型类型分类（chat/image/video/tts/embedding），前台四模式模型隔离按 type 过滤
 const { classifyModel } = require('../lib/model-types');
-
-function isChatModel(name) {
-  const n = String(name || '');
-  if (NON_TEXT_RE.test(n)) return false;
-  // 名称里带 "text"/"chat"/"completions" 的一律放行（如 minimax-text、xxx-chat）
-  if (/text|chat|completions|instruct/i.test(n)) return true;
-  return KNOWN_TEXT.test(n);
-}
 
 router.get('/models', (req, res) => {
   const ps = db.prepare('SELECT name, models, configured, api_key, is_default FROM providers WHERE configured=1').all();
@@ -889,7 +875,10 @@ router.post('/stream', async (req, res) => {
     const executeTool = async (name, argsJson) => {
       // P5.32：MCP 工具传入挂载上下文做细粒度分级（trusted 服务器的只读工具降为 low 免确认疲劳；其余仍 high）
       const risk = toolRiskOf(name, { mcpServers: agent?.mcp_servers || '[]' });
-      if (chatPerm === 'default' && risk !== 'low') {
+      // P5.34（审查建议③）：create_task 即使「全自动执行」也强制确认——持久化自动执行实体不应被
+      // 一次性授权（auto）静默创建；防提示词注入借 auto 权限批量造任务烧 token
+      const needConfirm = risk !== 'low' && (chatPerm === 'default' || name === 'create_task');
+      if (needConfirm) {
         const toolKey = `${session_id}:${Date.now()}:${name}`;
         send('tool', { name, status: 'awaiting' });
         const verdict = await waitUserConfirm(toolKey, name, argsJson);

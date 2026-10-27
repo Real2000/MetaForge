@@ -87,6 +87,20 @@ async function postModel(url, headers, body, { tries = 3, signal } = {}) {
   throw new Error(`${lastErr?.message || '网关持续返回 5xx'}（已自动重试 ${tries - 1} 次仍失败，模型服务暂不可用）`);
 }
 
+/** P5.34（审查 Y5）：多轮工具循环的 usage 累计——此前每轮覆盖只保留末轮，前几轮 prompt/completion
+ *  token 被丢弃（scheduler 记账与 calcCost 偏少）。口径：求和 = 用户实际计费口径（每轮全价，
+ *  后续轮的 prompt 含累积上下文也照计）。null/缺字段安全处理，单轮调用行为不变 */
+function accumulateUsage(acc, u) {
+  if (!u || typeof u !== 'object') return acc;
+  const num = (v) => (Number.isFinite(+v) && +v > 0 ? +v : 0);
+  if (!acc) return { prompt_tokens: num(u.prompt_tokens), completion_tokens: num(u.completion_tokens), total_tokens: num(u.total_tokens) };
+  return {
+    prompt_tokens: (acc.prompt_tokens || 0) + num(u.prompt_tokens),
+    completion_tokens: (acc.completion_tokens || 0) + num(u.completion_tokens),
+    total_tokens: (acc.total_tokens || 0) + num(u.total_tokens),
+  };
+}
+
 /** 真实调用：OpenAI 兼容 SSE。yield {delta} 或 {toolCall}；返回 usage
  *  支持 function calling 循环：opts.tools（OpenAI 格式）+ opts.executeTool(name, argsJson) → string
  *  P1：partial 标记 —— 错误发生时是否已对外输出过内容（决定上层能否换模型重试，避免重复输出）
@@ -183,7 +197,7 @@ async function* callReal(provider, messages, opts = {}) {
                 if (tc.function?.arguments) acc.args += tc.function.arguments;
               }
             }
-            if (j.usage) usage = j.usage;
+            if (j.usage) usage = accumulateUsage(usage, j.usage); // P5.34：多轮累计（原覆盖只留末轮）
           } catch { /* 忽略不完整片段 */ }
         }
       }
@@ -380,4 +394,4 @@ async function chatOnce(messages, opts = {}) {
   return out; // { usage, full, mode }
 }
 
-module.exports = { chat, chatOnce, getDefaultProvider, getConfiguredProviders, buildCandidates, postModel, friendlyNetError, isFailoverWorthy };
+module.exports = { chat, chatOnce, getDefaultProvider, getConfiguredProviders, buildCandidates, postModel, friendlyNetError, isFailoverWorthy, accumulateUsage };

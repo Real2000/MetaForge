@@ -18,7 +18,7 @@
 const vm = require('node:vm');
 const { db } = require('../db');
 const { chat, chatOnce } = require('./llm');
-const { runTool } = require('./tools');
+const { runTool, buildTools, loadMcpTools } = require('./tools'); // P5.34（Y3）：顶层解构——依赖图无环（tools 不回指 workflow），原延迟 require 包装属冗余间接层
 const { renderEnv, maskSecrets } = require('./secrets');
 const { calcCost } = require('./cost');
 const { fileToRich, fileToText } = require('./fileparse'); // P5.14 文件一等变量
@@ -869,15 +869,14 @@ async function runAgent(agent, input, ctx = {}) {
   // 定时/Webhook/API 触发属可信执行路径，无对话确认卡（P5.25 权限闸门仅对话链路）。
   let agentToolIds = [];
   try { agentToolIds = JSON.parse((agent && agent.tools) || '[]'); } catch { agentToolIds = []; }
-  const agentMcpTools = agent ? loadMcpToolsForRun(agent.mcp_servers || '[]') : [];
-  const toolSchemas = buildToolsForRun(agentToolIds, agentMcpTools, []);
+  const agentMcpTools = agent ? loadMcpTools(agent.mcp_servers || '[]') : [];
+  const toolSchemas = buildTools(agentToolIds, agentMcpTools, []);
   const baseOpts = {
     model: agent && agent.model, temperature: (agent && agent.temperature) ?? 0.5, top_p: agent && agent.top_p,
     max_reply: Math.min((agent && agent.max_reply) || 1024, 2048), agentName: agent && agent.name,
     username: ctx.username, // P5.31：任务归属者（用户自有模型优先路由；无值走平台默认）
   };
   if (toolSchemas.length) {
-    const { chat } = require('./llm');
     // P5.33 审查修复（F1）：runAgent 执行源（定时/Webhook/手动执行/MCP Server/子智能体）均无确认卡交互——
     // create_task（任务造任务的自我复制持久化链）与 local_exec（无人值守桌面操作）在此上下文一律拒绝，
     // 无论智能体如何配置。对话链路不受影响（chat.js 有 P5.25 确认卡 + high 风险闸门）。
@@ -892,7 +891,7 @@ async function runAgent(agent, input, ctx = {}) {
         if (UNATTENDED_DENY.has(name)) {
           return `⛔ 工具 ${name} 不允许在任务执行（定时/Webhook/子智能体）上下文中调用——请直接完成当前任务，不要尝试创建新任务或操作本地设备。`;
         }
-        return runToolForRun(name, argsJson, { kbId: (agent && agent.kb_id) || null, mcpServers: (agent && agent.mcp_servers) || '[]', username: ctx.username });
+        return runTool(name, argsJson, { kbId: (agent && agent.kb_id) || null, mcpServers: (agent && agent.mcp_servers) || '[]', username: ctx.username });
       },
     });
     let full = '';
@@ -914,17 +913,6 @@ async function runAgent(agent, input, ctx = {}) {
   const c = calcCost(agent && agent.model, u.prompt_tokens, u.completion_tokens);
   return { text: (r.full || '').trim(), mode: 'form',
     usage: { totalTokens: u.total_tokens ?? 0, tokensIn: u.prompt_tokens ?? 0, tokensOut: u.completion_tokens ?? 0, costCny: +c.total.toFixed(6), priced: c.priced, nodes: [{ title: '单次调用', type: 'llm', tokens: u.total_tokens ?? 0, costCny: +c.total.toFixed(6), model: (agent && agent.model) || '' }] } };
-}
-
-// P5.31 工具循环依赖（延迟 require，避免 tools.js ↔ workflow.js 循环依赖在模块加载期爆栈）
-function loadMcpToolsForRun(mcpServersJson) {
-  try { return require('./tools').loadMcpTools(mcpServersJson); } catch { return []; }
-}
-function buildToolsForRun(toolIds, mcpTools, childTools) {
-  try { return require('./tools').buildTools(toolIds, mcpTools, childTools); } catch { return []; }
-}
-async function runToolForRun(name, argsJson, ctx) {
-  try { return await require('./tools').runTool(name, argsJson, ctx); } catch (e) { return `工具执行失败：${e.message}`; }
 }
 
 module.exports = { runWorkflow, runAgent, runGraph, render, topologicalSort, evaluateConditions, evalCondition, computeActive, resolveInputs, resolveRefRaw, NODE_EXECUTORS, buildClassifyPrompt, parseClassifyReply, flattenToolResult, buildLlmMessages };

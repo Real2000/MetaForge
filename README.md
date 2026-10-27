@@ -2147,3 +2147,32 @@ agent-platform/
 - MCP 分级「管理员逐工具人工标注优先，启发式仅作默认建议」（安全工程师长期建议）
 
 > AI生成
+
+## P5.34 审查遗留收口包（2026-10-27）
+
+> 动因：上轮双专家审查（P5.33b）确认的高优先级遗留 + 审查建议③，按路线图继续收口。冒烟 166→173。
+
+### 实现内容
+
+1. **智能体工具白名单**（审查 F1②，`lib/tools.js` `validateAgentTools` + `routes/agents.js`）：POST / PUT / import 三个入口统一校验——`create_task`（持久化自动执行实体）与 `local_exec`（外设操作）不允许配置进智能体（前端 studio 工具清单本就不含，此为 **API 直调注入兜底**）；未知工具拒收（import 场景未知工具静默剔除+违禁拒收）。`run_code` 放行（沙箱已加固 + medium 确认卡）
+2. **create_task 在「全自动执行」下也强制确认**（审查建议③，`routes/chat.js` executeTool）：持久化自动执行实体不应被一次性授权静默创建——`needConfirm = risk !== 'low' && (chatPerm === 'default' || name === 'create_task')`，防注入借 auto 权限批量造任务烧 token
+3. **多轮工具循环 usage 累计**（审查 Y5，`lib/llm.js` `accumulateUsage`）：原 `usage = j.usage` 每轮覆盖只留末轮，前几轮 token 丢弃（scheduler 记账与 calcCost 偏少）。改为求和累计（口径=用户实际计费口径：后续轮的 prompt 含累积上下文照计）；null/非数值/负值字段容错，单轮调用行为不变。函数导出可单测
+4. **MCP 工具风险管理员人工定级**（安全工程师长期建议，`mcp_servers.risk_overrides` 列 + `PUT /api/mcp/:id/tool-risk`）：人工值优先于启发式；前端徽标三态点击循环 **自动→低→高→自动**（✎+虚线框=已手动定级）。语义不变：人工 low 仍需 server trusted=1 才免确认（白名单原则）；人工 high 恒 high（即使 trusted）；auto 清除标注回落启发式。工具需在已拉取清单内（防任意 key 注入）；定级落 op_logs 审计
+5. **任务执行期复查**（审查 F8，`lib/scheduler.js`）：主体被删除/下架（非 published）或不再对归属者可见（canView）→ 自动停用 + task_runs 记录 + 站内信（配额闸门同款 `disableTask` 助手复用）；归属者账号停用同样停用。权限不再只在创建时点校验
+6. **系统智能体稳定标识**（审查 Y4 完整方案）：`agents.system_key` 列 + 部分唯一索引（`WHERE system_key != ''`）+ 存量回填；种子与 create_task 默认绑定均按 `system_key='system_task_runner'` 查找——用户自建同名「定时任务执行助手」不再可能劫持（单测锁定）
+7. **代码清理**（Y3 + 死代码）：workflow.js 三个延迟 require 包装函数删除（依赖图无环已验证，模块加载测试通过）；chat.js 的 `isChatModel`/`NON_TEXT_RE`/`KNOWN_TEXT` 死代码删除（P4 起无调用方）
+
+### 验证（冒烟 173/173）
+
+- accumulateUsage 单测（null 容错/求和/非数值容错）；validateAgentTools 单测（create_task/local_exec/未知拒绝，run_code 放行）
+- loadMcpTools 人工标注单测（override high 覆盖启发式 low / auto 回落 / toolRiskOf 联动）
+- runTask 执行期复查单测（主体下架→自动停用+通知）；create_task system_key 绑定单测（自建同名不劫持）
+- HTTP：智能体保存白名单（POST/PUT/import 注入 400 + run_code 放行）；MCP 定级 API（标注/GET 透传/auto 回落/非 admin 403/非法 level/清单外工具 400）
+
+### 设计取舍（记录备查）
+
+- **管理员同样受限白名单**：create_task/local_exec 对所有角色不可配进智能体（一致性优先；首页助手的服务端默认集不受限且有确认卡）
+- **usage 求和而非只记末轮增量**：与计费口径一致（每轮全价）；如需「净新增 token」口径需供应商返回 cached_tokens 字段，暂不支持
+- 既有智能体的历史 tools 配置不追溯清洗（runAgent 闸门 + 对话确认卡双层兜底已覆盖存量风险）
+
+> AI生成

@@ -181,13 +181,29 @@ function safeCalc(expr) {
   }
 }
 
+// P5.34（审查 F1②）：智能体可配置工具白名单——create_task（持久化自动执行实体）与
+// local_exec（外设操作）不允许配进智能体（对话链路仅首页助手服务端默认集可用且有确认卡）；
+// 前端 studio 工具清单本就不含这两项，此处为 API 直调注入兑底。run_code 允许（沙箱已加固 + medium 确认卡）。
+const AGENT_TOOL_DENY = new Set(['create_task', 'local_exec']);
+/** 校验智能体工具清单。返回 null=合法；否则返回错误信息（含违禁工具名） */
+function validateAgentTools(toolIds) {
+  const bad = (toolIds || []).filter(t => AGENT_TOOL_DENY.has(t) || !TOOL_DEFS[t]);
+  if (bad.length) {
+    const denied = bad.filter(t => AGENT_TOOL_DENY.has(t));
+    if (denied.length) return `工具 ${denied.join('、')} 不允许配置到智能体（持久化任务/本机操作类仅首页助手可用）`;
+    return `未知工具：${bad.join('、')}`;
+  }
+  return null;
+}
+
 /** 组装 OpenAI tools 数组：内置工具 + MCP 工具（mcpTools: [{schema}]）+ 子智能体工具（childTools: [{schema}]，agent_call_ 前缀） */
 function buildTools(toolIds, mcpTools = [], childTools = []) {
   const builtin = (toolIds || []).filter(id => TOOL_DEFS[id]).map(id => TOOL_DEFS[id].schema);
   return [...builtin, ...mcpTools.map(t => t.schema), ...(childTools || []).map(t => t.schema)];
 }
 
-/** 加载智能体挂载的 MCP 服务工具清单（从缓存读，避免每次连接） */
+/** 加载智能体挂载的 MCP 服务工具清单（从缓存读，避免每次连接）
+ *  P5.34：应用管理员逐工具人工标注（mcp_servers.risk_overrides）——人工值优先于刷新时算好的启发式值 */
 function loadMcpTools(agentMcpIds) {
   let ids = [];
   try { ids = JSON.parse(agentMcpIds || '[]'); } catch { }
@@ -195,9 +211,14 @@ function loadMcpTools(agentMcpIds) {
   const servers = db.prepare(`SELECT * FROM mcp_servers WHERE status=1`).all().filter(s => ids.includes(s.id));
   const out = [];
   for (const s of servers) {
+    let overrides = {};
+    try { overrides = JSON.parse(s.risk_overrides || '{}') || {}; } catch { overrides = {}; }
     try {
       const tools = JSON.parse(s.tools_cache || '[]');
-      tools.forEach(t => out.push({ ...t, server: s }));
+      tools.forEach(t => {
+        const ov = overrides[t.originalName];
+        out.push({ ...t, server: s, risk: ov || t.risk, risk_override: ov || null });
+      });
     } catch { }
   }
   return out;
@@ -227,4 +248,4 @@ async function runTool(name, argsJson, ctx = {}) {
   }
 }
 
-module.exports = { TOOL_DEFS, buildTools, runTool, loadMcpTools, toolRiskOf };
+module.exports = { TOOL_DEFS, buildTools, runTool, loadMcpTools, toolRiskOf, validateAgentTools };

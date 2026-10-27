@@ -30,7 +30,7 @@ export async function render(el) {
         <span id="mcpCount" style="color:var(--text-2)">已注册 ${servers.length} 个 MCP 服务（协议：JSON-RPC 2.0 over HTTP，兼容 SSE 响应）</span>
         <button class="btn primary" id="newSrv">＋ 注册 MCP 服务</button>
       </div>
-      <div style="font-size:12px;color:var(--text-3);margin-bottom:8px">🔒 风险分级（P5.32）：工具徽标「读」（绿）=只读，服务器被信任后对话中免确认；「写」（橙）=写类/未知，始终需确认。分级依据 MCP 注解（readOnlyHint/destructiveHint）+ 名称启发式，管理员可在编辑弹窗调整服务信任状态。</div>
+      <div style="font-size:12px;color:var(--text-3);margin-bottom:8px">🔒 风险分级（P5.32/P5.34）：工具徽标「读」（绿）=只读，服务器被信任后对话中免确认；「写」（橙）=写类/未知，始终需确认。带 ✎ 虚线框=管理员手动定级（优先于启发式）；点击徽标可循环 自动→低→高→自动。</div>
       <div class="table-wrap"><table class="tbl">
         <thead><tr><th>名称</th><th>URL</th><th>状态</th><th>工具数</th><th>工具清单</th><th>最近检查</th><th>操作</th></tr></thead>
         <tbody id="tbody"></tbody>
@@ -52,7 +52,15 @@ export async function render(el) {
         <td class="mono" style="max-width:260px;word-break:break-all;font-size:12px">${esc(s.url)}</td>
         <td>${s.status ? '<span class="tag green">启用</span>' : '<span class="tag gray">停用</span>'}${s.trusted ? ' <span class="tag purple" title="只读工具免确认执行">🤝 已信任</span>' : ''}${s.last_error ? `<div style="font-size:11px;color:var(--danger);margin-top:2px">${esc(s.last_error.slice(0, 60))}</div>` : ''}</td>
         <td><b>${s.toolNames?.length || 0}</b></td>
-        <td style="font-size:12px;color:var(--text-2)">${s.toolList?.length ? s.toolList.map(t => `<span class="tag ${t.risk === 'low' ? 'green' : 'orange'}" style="font-size:10px;margin:1px" title="${t.risk === 'low' ? '只读（trusted 后免确认）' : '写类/未知（始终需确认）'}">${esc(t.name)}${t.risk === 'low' ? '·读' : '·写'}</span>`).join('') : '-'}</td>
+        <td style="font-size:12px;color:var(--text-2)">${s.toolList?.length ? s.toolList.map(t => {
+          const lv = t.override || 'auto';
+          const cls = t.risk === 'low' ? 'green' : 'orange';
+          const mark = t.override ? (t.risk === 'low' ? '·读✎' : '·写✎') : (t.risk === 'low' ? '·读' : '·写');
+          const tip = t.override
+            ? `管理员已定级：${t.risk === 'low' ? '低风险（trusted 后免确认）' : '高风险（始终需确认）'}；点击切回自动`
+            : `启发式判定：${t.risk === 'low' ? '只读（trusted 后免确认）' : '写类/未知（始终需确认）'}；点击手动定级`;
+          return `<span class="tag ${cls}" data-trk="${s.id}" data-tool="${esc(t.name)}" data-lv="${lv}" style="font-size:10px;margin:1px;cursor:pointer;${t.override ? 'outline:1px dashed currentColor;outline-offset:1px;' : ''}" title="${esc(tip)}">${esc(t.name)}${mark}</span>`;
+        }).join('') : '-'}</td>
         <td style="color:var(--text-3);font-size:12px">${esc(s.last_check_at || '-')}</td>
         <td>
           <button class="btn link" data-rf="${s.id}">刷新工具</button>

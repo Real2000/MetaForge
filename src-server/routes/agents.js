@@ -4,7 +4,7 @@ const { db, now } = require('../db');
 const { auth } = require('../lib/auth');
 const { chatOnce } = require('../lib/llm');
 const { canView, canEdit, isOwnerLevel, parseJsonArr } = require('../lib/agent-access');
-const { runTool } = require('../lib/tools');
+const { runTool, validateAgentTools, TOOL_DEFS } = require('../lib/tools');
 
 const router = express.Router();
 router.use(auth);
@@ -42,6 +42,10 @@ router.get('/members', (req, res) => {
 function parseBody(b) {
   let tools = [];
   try { tools = Array.isArray(b.tools) ? b.tools : JSON.parse(b.tools || '[]'); } catch { tools = []; }
+  // P5.34（审查 F1②）：工具白名单校验——create_task/local_exec 不可配进智能体（防 API 直调注入
+  // 持久化自动执行/外设操作类工具；对话链路中首页助手的服务端默认集不受此限）
+  const toolDeny = validateAgentTools(tools);
+  if (toolDeny) tools = []; // 校验失败时清空，由路由返回 400（parseBody 不持有 res）
   let mcpServers = [];
   try { mcpServers = Array.isArray(b.mcp_servers) ? b.mcp_servers : JSON.parse(b.mcp_servers || '[]'); } catch { mcpServers = []; }
   let variables = [];
@@ -76,6 +80,8 @@ function parseBody(b) {
     child_ids: JSON.stringify([...new Set(childIds)]),
     // ⑦ 路由模式（2026-10-22 P3）：function 主模型 function calling 编排（默认）/ classifier 分类器直达子智能体
     routing_mode: ['function', 'classifier', 'workflow'].includes(b.routing_mode) ? b.routing_mode : 'function',
+    // P5.34：工具白名单校验结果（null=通过；非 null 时路由返回 400）
+    tool_error: toolDeny,
     // P5.1 画布编排 V2：workflow JSON（{nodes:[{id:"node_N",type,position,data}],edges:[{id,source,target,sourceHandle}]}）；null/空串清除
     // edit_mode 独立字段：form 表单（默认）/ canvas 画布（不再依赖 routing_mode 推断）
     edit_mode: b.edit_mode === 'canvas' ? 'canvas' : 'form',
@@ -91,6 +97,7 @@ function parseBody(b) {
 router.post('/', (req, res) => {
   const a = parseBody(req.body || {});
   if (!a.name) return res.json({ code: 400, msg: '智能体名称不能为空' });
+  if (a.tool_error) return res.json({ code: 400, msg: a.tool_error }); // P5.34：工具白名单
   // 商业化软约束：免费版智能体数达上限不硬拦，返回升级提示（upgrade_hint 前端弹引导）
   const { planUsage } = require('../lib/plans');
   const pu = planUsage(req.user.username);
@@ -174,6 +181,7 @@ router.put('/:id', (req, res) => {
   }
   const a = parseBody(b);
   if (!a.name) return res.json({ code: 400, msg: '智能体名称不能为空' });
+  if (a.tool_error) return res.json({ code: 400, msg: a.tool_error }); // P5.34：工具白名单
   if (a.workflow && a.workflow.error) return res.json({ code: 400, msg: '画布工作流结构错误：' + a.workflow.error });
   // 有画布数据但无 start 节点 → 结构错误拒绝（前端画布模式应保证有 start）
   // 可见性与协作者名单：仅归属级（创建者/管理员）可改；协作者保存时保留原值（不能自我提权/改可见范围）
@@ -664,6 +672,11 @@ router.post('/import', (req, res) => {
   if (!cfg) return res.json({ code: 400, msg: '导入失败：不是有效的智能体配置文件（缺少 agent 字段）' });
   const a = cfg.agent;
   if (!a.name) return res.json({ code: 400, msg: '导入失败：配置缺少名称' });
+  // P5.34：导入配置同样过工具白名单（外部配置文件不可绕过；未知工具静默剔除，违禁工具拒收）
+  const importTools = Array.isArray(a.tools) ? a.tools : [];
+  const importDeny = validateAgentTools(importTools);
+  if (importDeny) return res.json({ code: 400, msg: '导入失败：' + importDeny });
+  const safeImportTools = importTools.filter(t => TOOL_DEFS[t]);
   // 知识库按名称匹配（跨环境 ID 不通用）
   let kbId = null;
   if (a.kb_name) {
@@ -680,7 +693,7 @@ router.post('/import', (req, res) => {
       a.icon || '', a.context_rounds ?? 10, a.max_reply ?? 1024,
       a.opening || '', JSON.stringify(Array.isArray(a.opening_questions) ? a.opening_questions : []),
       kbId, 'draft', 'self',
-      JSON.stringify(Array.isArray(a.tools) ? a.tools : []), JSON.stringify(Array.isArray(a.mcp_servers) ? a.mcp_servers : []),
+      JSON.stringify(safeImportTools), JSON.stringify(Array.isArray(a.mcp_servers) ? a.mcp_servers : []),
       a.long_memory ? 1 : 0, a.allow_user_model === false || a.allow_user_model === 0 ? 0 : 1,
       a.suggest_enabled === false || a.suggest_enabled === 0 ? 0 : 1,
       JSON.stringify(Array.isArray(a.variables) ? a.variables.filter(v => v && v.name) : []),

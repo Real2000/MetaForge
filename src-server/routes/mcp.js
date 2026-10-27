@@ -16,10 +16,16 @@ router.get('/', (req, res) => {
       const { api_key, ...rest } = s;
       rest.api_key_set = api_key ? 1 : 0;
       let tools = [];
+      let overrides = {};
       try { tools = JSON.parse(s.tools_cache || '[]'); } catch { }
+      try { overrides = JSON.parse(s.risk_overrides || '{}') || {}; } catch { overrides = {}; }
       rest.toolNames = tools.map(t => t.originalName || t.name);
       // P5.32：工具级风险分级清单（徽标展示；低风险仅在 trusted=1 时对话中免确认）
-      rest.toolList = tools.map(t => ({ name: t.originalName || t.name, risk: t.risk === 'low' ? 'low' : 'high' }));
+      // P5.34：人工标注优先——risk 为生效值（override ?? 启发式），override 非空表示管理员已手动定级
+      rest.toolList = tools.map(t => {
+        const ov = overrides[t.originalName] || null;
+        return { name: t.originalName || t.name, risk: ov || (t.risk === 'low' ? 'low' : 'high'), override: ov };
+      });
       return rest;
     }),
   });
@@ -49,6 +55,31 @@ router.put('/:id', adminOnly, (req, res) => {
   db.prepare('UPDATE mcp_servers SET name=?,url=?,api_key=?,transport=?,status=?,trusted=? WHERE id=?')
     .run(name || old.name, url || old.url, api_key !== undefined ? api_key : old.api_key, transport || old.transport, status ?? old.status, nextTrusted, old.id);
   res.json({ code: 0, msg: '已保存' });
+});
+
+// P5.34：管理员逐工具人工定级（人工值优先于启发式）——level: 'low'|'high' 显式定级，
+// 'auto' 清除标注回落启发式。人工 high 恒 high（即使 server trusted）；人工 low 仅在 trusted=1 时免确认
+router.put('/:id/tool-risk', adminOnly, (req, res) => {
+  const old = db.prepare('SELECT * FROM mcp_servers WHERE id=?').get(req.params.id);
+  if (!old) return res.json({ code: 404, msg: 'MCP 服务不存在' });
+  const { tool, level } = req.body || {};
+  const toolName = String(tool || '').trim();
+  if (!toolName) return res.json({ code: 400, msg: '缺少工具名（tool）' });
+  if (!['low', 'high', 'auto'].includes(level)) return res.json({ code: 400, msg: 'level 仅支持 low / high / auto（auto=清除标注回落启发式）' });
+  // 工具需在已拉取的清单内（防任意 key 注入）
+  let tools = [];
+  try { tools = JSON.parse(old.tools_cache || '[]'); } catch { }
+  if (!tools.some(t => (t.originalName || t.name) === toolName)) {
+    return res.json({ code: 400, msg: `工具「${toolName}」不在清单中，请先「刷新工具」` });
+  }
+  let overrides = {};
+  try { overrides = JSON.parse(old.risk_overrides || '{}') || {}; } catch { overrides = {}; }
+  if (level === 'auto') delete overrides[toolName];
+  else overrides[toolName] = level;
+  db.prepare('UPDATE mcp_servers SET risk_overrides=? WHERE id=?').run(JSON.stringify(overrides), old.id);
+  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
+    .run(req.user.username, 'MCP工具定级', `${old.name} / ${toolName} → ${level === 'auto' ? '自动（启发式）' : level}`, req.ip, now());
+  res.json({ code: 0, msg: level === 'auto' ? '已恢复启发式定级' : `已定级为 ${level === 'low' ? '低风险（只读）' : '高风险（写类）'}` });
 });
 
 // 删除（admin）

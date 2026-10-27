@@ -666,6 +666,23 @@ db.exec(`CREATE INDEX IF NOT EXISTS idx_wf_runs_agent ON workflow_runs(agent_id,
     db.exec('ALTER TABLE mcp_servers ADD COLUMN trusted INTEGER DEFAULT 0');
     console.log('[db] mcp_servers 表已迁移：新增 trusted 信任字段（工具风险分级白名单）');
   }
+  // P5.34：管理员逐工具人工标注（{工具原始名: 'low'|'high'}；人工值优先于启发式，auto=删除 key 回落启发式）
+  if (!mcpCols.includes('risk_overrides')) {
+    db.exec("ALTER TABLE mcp_servers ADD COLUMN risk_overrides TEXT DEFAULT '{}'");
+    console.log('[db] mcp_servers 表已迁移：新增 risk_overrides 字段（工具风险人工标注）');
+  }
+}
+// P5.34（审查 Y4 完整方案）：agents 稳定标识列——系统资源（内置智能体）与用户资产解耦，
+// 按 system_key 查找/种子不再受 agents.name 无唯一约束的影响（用户自建同名智能体无法劫持）
+{
+  const agentCols = db.prepare('PRAGMA table_info(agents)').all().map(c => c.name);
+  if (!agentCols.includes('system_key')) {
+    db.exec("ALTER TABLE agents ADD COLUMN system_key TEXT DEFAULT ''");
+    console.log('[db] agents 表已迁移：新增 system_key 系统标识字段');
+  }
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_system_key ON agents(system_key) WHERE system_key != ''`);
+  // 存量回填：P5.31 按名称+来源种子过的系统执行智能体打上稳定标识
+  db.exec("UPDATE agents SET system_key='system_task_runner' WHERE name='定时任务执行助手' AND source_name='系统内置' AND (system_key IS NULL OR system_key='')");
 }
 // P5.14 文件一等变量：工作流文件表（上传原文+解析文本；变量值传 fileId，运行时注入内容/下载链接）
 // content_b64 仅 ≤8MB 文件保留（供原文下载）；text_content 为解析全文（PDF/DOCX/TXT/MD）
@@ -763,24 +780,25 @@ db.exec(`CREATE TABLE IF NOT EXISTS mcp_tokens (
 }
 
 // ---------------- P5.31 系统智能体：定时任务执行助手（幂等自种——存量库迁移补齐 + 新库种子；对话内
-// create_task 未指定 agent_id 时绑定它；带联网检索/计算/Word 导出工具，定时任务具备真实执行能力） ----------------
+// create_task 未指定 agent_id 时绑定它；带联网检索/计算/Word 导出工具，定时任务具备真实执行能力）
+// P5.34：按 system_key 稳定标识种子/查找（Y4 完整方案——agents.name 无唯一约束，
+// 名称判断会被用户自建同名智能体劫持；system_key 带部分唯一索引） ----------------
 {
   const SYS_TASK_AGENT = '定时任务执行助手';
-  // P5.33 审查修复（Y4）：按 name + source_name 双条件判断——agents.name 无唯一约束，
-  // 仅按 name 判断时用户自建同名智能体会让种子跳过（劫持 create_task 默认绑定）
-  const exists = db.prepare('SELECT id FROM agents WHERE name=? AND source_name=?').get(SYS_TASK_AGENT, '系统内置');
+  const SYS_TASK_KEY = 'system_task_runner';
+  const exists = db.prepare('SELECT id FROM agents WHERE system_key=?').get(SYS_TASK_KEY);
   if (!exists) {
     db.prepare(`INSERT INTO agents
-      (name,description,type,space_id,category,prompt,model,temperature,context_rounds,max_reply,opening,opening_questions,kb_id,tools,status,source,source_name,created_at,updated_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      (name,description,type,space_id,category,prompt,model,temperature,context_rounds,max_reply,opening,opening_questions,kb_id,tools,status,source,source_name,system_key,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
       .run(
         SYS_TASK_AGENT, '系统内置执行引擎：对话中创建的定时任务默认由它执行（也可手动绑定）。按任务指令自主完成检索、计算与文档产出。',
         'digital', null, '系统',
         '你是定时任务执行助手，负责自主完成交给你的定时任务指令（如资讯监控、数据汇总、报告生成）。\n工作方式：\n1. 需要外部信息时必须调用 web_search / web_fetch 真实检索，禁止凭记忆编造；\n2. 涉及计算用 calculator 保证准确；\n3. 用户要报告/文档时用 export_word 生成可下载的 Word 交付；\n4. 输出结构化摘要（要点+来源），指明信息时效；\n5. 无法完成的步骤如实说明，不要虚构结果。',
         '', 0.3, 0, 2048, '', '[]', null,
         JSON.stringify(['web_search', 'web_fetch', 'get_datetime', 'calculator', 'export_word']),
-        'published', 'self', '系统内置', now(), now());
-    console.log('[db] 已种子系统智能体「' + SYS_TASK_AGENT + '」（create_task 默认执行主体）');
+        'published', 'self', '系统内置', SYS_TASK_KEY, now(), now());
+    console.log('[db] 已种子系统智能体「' + SYS_TASK_AGENT + '」（system_key=' + SYS_TASK_KEY + '）');
   }
 }
 
