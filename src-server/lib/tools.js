@@ -8,6 +8,7 @@ const { retrieve } = require('./retriever');
 const mcp = require('./mcp');
 const { db } = require('../db');
 const skills = require('./skills'); // 文生图委托给 skills.genImage（多供应商路由 + 重试容错，避免绑死默认供应商）
+const { AGENT_TOOL_DENY } = require('./tool-deny'); // P5.34b：抽零依赖模块（db.js 迁移也引用，避免循环依赖）
 
 const TOOL_DEFS = {
   kb_search: {
@@ -184,7 +185,7 @@ function safeCalc(expr) {
 // P5.34（审查 F1②）：智能体可配置工具白名单——create_task（持久化自动执行实体）与
 // local_exec（外设操作）不允许配进智能体（对话链路仅首页助手服务端默认集可用且有确认卡）；
 // 前端 studio 工具清单本就不含这两项，此处为 API 直调注入兑底。run_code 允许（沙箱已加固 + medium 确认卡）。
-const AGENT_TOOL_DENY = new Set(['create_task', 'local_exec']);
+// 违禁集定义在 lib/tool-deny.js（零依赖，db.js 存量清洗也引用）
 /** 校验智能体工具清单。返回 null=合法；否则返回错误信息（含违禁工具名） */
 function validateAgentTools(toolIds) {
   const bad = (toolIds || []).filter(t => AGENT_TOOL_DENY.has(t) || !TOOL_DEFS[t]);
@@ -248,4 +249,4 @@ async function runTool(name, argsJson, ctx = {}) {
   }
 }
 
-module.exports = { TOOL_DEFS, buildTools, runTool, loadMcpTools, toolRiskOf, validateAgentTools };
+module.exports = { TOOL_DEFS, buildTools, runTool, loadMcpTools, toolRiskOf, validateAgentTools, AGENT_TOOL_DENY };

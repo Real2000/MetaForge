@@ -87,6 +87,19 @@ export async function render(el) {
       await api(`/mcp/${s.id}`, { method: 'PUT', body: { trusted: next } });
       toast(next ? '已信任（只读工具免确认）' : '已取消信任（全部恢复确认）'); load();
     });
+    // P5.34 工具风险人工定级：点击徽标三态循环 自动→低→高→自动（✎+虚线框=已手动定级；人工值优先于启发式）
+    el.querySelectorAll('[data-trk]').forEach(b => b.onclick = async () => {
+      const cur = b.dataset.lv; // auto | low | high
+      const next = cur === 'auto' ? 'low' : (cur === 'low' ? 'high' : 'auto');
+      const tool = b.dataset.tool;
+      const srv = servers.find(x => x.id === +b.dataset.trk);
+      if (next === 'low' && srv && !srv.trusted && !await confirmBox(`将「${tool}」定为低风险？注意：当前服务未信任（trusted=0），低风险定级需服务受信任后才会在对话中免确认。`)) return;
+      if (next === 'high' && !await confirmBox(`将「${tool}」定为高风险？该工具此后在对话中始终需要确认（即使服务已信任）。`)) return;
+      try {
+        const j = await api(`/mcp/${b.dataset.trk}/tool-risk`, { method: 'PUT', body: { tool, level: next } });
+        toast(j.msg || '已定级'); load();
+      } catch (e) { toast(e.message, 'err'); }
+    });
     el.querySelectorAll('[data-tg]').forEach(b => b.onclick = async () => {
       const s = servers.find(x => x.id === +b.dataset.tg);
       await api(`/mcp/${s.id}`, { method: 'PUT', body: { status: s.status ? 0 : 1 } });

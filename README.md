@@ -2176,3 +2176,44 @@ agent-platform/
 - 既有智能体的历史 tools 配置不追溯清洗（runAgent 闸门 + 对话确认卡双层兜底已覆盖存量风险）
 
 > AI生成
+
+## P5.34b 双专家审查修复包（2026-10-27）
+
+> 流程：P5.34 完成后派代码审查员 + 安全工程师并行审查 `8145fda..HEAD`。两份报告交叉确认 1🔴 + 7🟡 + 多项提示，本包收口。冒烟 173→176。
+
+### 🔴 高风险修复
+
+1. **前端 MCP 徽标点击交互缺失**（代码审查员 R1，实锤）：徽标模板渲染了 `data-trk` 属性与「点击可循环」文案，但事件绑定从未写入（批量编辑部分未生效未被察觉）——「人工定级」对管理员实际不可用。补绑定：三态循环 自动→低→高→自动，high 档强制二次确认（放宽风险等级是安全敏感操作）
+2. **子智能体链路绕过 create_task 恒确认**（安全工程师 F1，实锤）：`runChildAgent` 的 executeTool 是 runTool 直调——无确认卡也无 UNATTENDED_DENY，存量含 create_task 的子智能体在 perm=auto 下可静默造任务（「双层兜底」论断对该链路不成立）。补同款拒绝闸门
+
+### 🟡 中风险修复
+
+3. **copy 路径无白名单**（F2/Y1）：源智能体 tools 原样复制——存量违禁配置的传播放大器。复制时过滤（剔除违禁+未知，复制语义保留）
+4. **技能资产可配违禁工具**（F3）：skillassets 的 filter 只查 TOOL_DEFS——API 直调可创建带 create_task/local_exec 的技能，@技能并入后 local_exec 在 auto 下静默执行。两处 filter 补排除 deny
+5. **@技能/@专家并入不过滤**（F4）：chat.js 并入点补 `safeToolId` 过滤（组装点收敛——存量配置的违禁工具不再进 function calling）
+6. **db.js 存量回填无容错**（F7/Y2）：多行同名同源时部分唯一索引 UNIQUE 冲突会让服务启动崩溃。改逐行 UPDATE + try/catch 跳过冲突行
+7. **通知文案重复**（Y3）：「任务已自动停用：任务已自动停用：…」——disableTask 改为只传原因短语统一拼装
+8. **无人值守 MCP 工具一致性**（F6）：runAgent 的闸门扩展——MCP 外部工具在无人值守上下文仅放行「低风险」（trusted + 启发式/人工判 low），与对话链路 low 免确认语义对齐；写类/未知 MCP 工具无法弹确认卡一律拒绝（从严）
+
+### 存量清洗 + 基建
+
+- **存量清洗迁移**（安全工程师建议）：agents/skill_assets 的 tools 中被注入的 create_task/local_exec 启动时一次性剔除（幂等，无违禁项零操作）——配合各入口白名单与并入点过滤，存量+增量全收敛
+- **lib/tool-deny.js（新）**：违禁集抽零依赖小模块（db.js 迁移与 tools.js 共同引用，避免 db ↔ tools 循环依赖）
+- import 注释对齐实际行为（未知工具同样拒收）；chat.js perm 注释补 create_task 例外
+
+### 🔴 踩坑实录（重要教训）
+
+- **python 文本操作差点毁掉 7 张表**：用 python 脚本移动 db.js 代码块时，`index()` 定位跨度过大导致 wf_files/secrets/security_events/user_providers/skill_assets/feedbacks/mcp_tokens 七张表的建表语句在工作区被误删（git 提交历史完好，属未提交工作区损坏）。发现路径：新加的存量清洗块查 skill_assets 报「no such table」→ 对比基线建表数 40 vs 33 → git diff 定位 → 从提交历史提取恢复。**教训：核心 schema 文件的代码移动用 Edit 工具精确锚点操作，python 全文 index/replace 慎用；每轮改完 db.js 立即验证新库建表数**（现已把「40 张表」验证纳入流程）
+
+### 验证（冒烟 176/176）
+
+- F8 三闸门全覆盖（主体下架 / 归属者账号停用 / canView 不可见）
+- copy/技能过滤单测（违禁+未知剔除）；runChildAgent 与 @并入 tripwire（源码级）
+- 新库建表数 40 验证 + 模块加载无环
+
+### 遗留（下轮 backlog）
+
+- 手动执行 400 提示附带最近停用原因（Y4 体验优化）；llm.js 不可达 return 清理
+- child_ids 可见性校验（F5，影响存量编排需评估）；工具进入 function calling 的「唯一闸口」架构（安全工程师长期建议）
+
+> AI生成

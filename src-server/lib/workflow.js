@@ -18,7 +18,7 @@
 const vm = require('node:vm');
 const { db } = require('../db');
 const { chat, chatOnce } = require('./llm');
-const { runTool, buildTools, loadMcpTools } = require('./tools'); // P5.34（Y3）：顶层解构——依赖图无环（tools 不回指 workflow），原延迟 require 包装属冗余间接层
+const { runTool, buildTools, loadMcpTools, toolRiskOf } = require('./tools'); // P5.34（Y3）：顶层解构——依赖图无环（tools 不回指 workflow），原延迟 require 包装属冗余间接层
 const { renderEnv, maskSecrets } = require('./secrets');
 const { calcCost } = require('./cost');
 const { fileToRich, fileToText } = require('./fileparse'); // P5.14 文件一等变量
@@ -880,6 +880,8 @@ async function runAgent(agent, input, ctx = {}) {
     // P5.33 审查修复（F1）：runAgent 执行源（定时/Webhook/手动执行/MCP Server/子智能体）均无确认卡交互——
     // create_task（任务造任务的自我复制持久化链）与 local_exec（无人值守桌面操作）在此上下文一律拒绝，
     // 无论智能体如何配置。对话链路不受影响（chat.js 有 P5.25 确认卡 + high 风险闸门）。
+    // P5.34b（审查 F6）：MCP 外部工具在无人值守上下文仅放行「低风险」（trusted 服务 + 启发式/人工判 low）——
+    // 与对话链路「low 免确认」语义对齐；写类/未知 MCP 工具无人值守时无法弹确认卡，一律拒绝（从严）。
     const UNATTENDED_DENY = new Set(['create_task', 'local_exec']);
     const gen = chat([
       { role: 'system', content: system },
@@ -890,6 +892,9 @@ async function runAgent(agent, input, ctx = {}) {
       executeTool: (name, argsJson) => {
         if (UNATTENDED_DENY.has(name)) {
           return `⛔ 工具 ${name} 不允许在任务执行（定时/Webhook/子智能体）上下文中调用——请直接完成当前任务，不要尝试创建新任务或操作本地设备。`;
+        }
+        if (String(name).startsWith('mcp_') && toolRiskOf(name, { mcpServers: (agent && agent.mcp_servers) || '[]' }) !== 'low') {
+          return `⛔ MCP 工具 ${name} 在无人值守执行中属于写类/未知风险（需用户确认才能执行），已拒绝。请基于已有信息完成任务；只读类 MCP 工具（低风险）可正常使用。`;
         }
         return runTool(name, argsJson, { kbId: (agent && agent.kb_id) || null, mcpServers: (agent && agent.mcp_servers) || '[]', username: ctx.username });
       },

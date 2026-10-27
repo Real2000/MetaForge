@@ -9,7 +9,7 @@ const { retrieve } = require('../lib/retriever');
 const { check, countHits, mask, detectPII, maskPII, detectInjection, logSecurityEvent } = require('../lib/security');
 const dify = require('../lib/dify');
 const coze = require('../lib/coze');
-const { buildTools, runTool, loadMcpTools, toolRiskOf } = require('../lib/tools');
+const { buildTools, runTool, loadMcpTools, toolRiskOf, AGENT_TOOL_DENY } = require('../lib/tools');
 const skills = require('../lib/skills');
 const { checkQuota, addUsage } = require('../lib/quota');
 const { parseSkillMentions, parseAgentMentions } = require('../lib/skill-mention');
@@ -210,7 +210,14 @@ async function runChildAgent(child, task, maxReply) {
     ], {
       ...opts,
       tools: schemas,
-      executeTool: (name, argsJson) => runTool(name, argsJson, { kbId: child.kb_id || null, mcpServers: child.mcp_servers || '[]' }),
+      // P5.34b（审查 F1）：子智能体工具执行闸门——与 workflow.runAgent 的 UNATTENDED_DENY 同构。
+      // 此前为 runTool 直调（无确认卡也无 deny），存量含 create_task 的子智能体在 perm=auto 下可静默造任务
+      executeTool: (name, argsJson) => {
+        if (name === 'create_task' || name === 'local_exec') {
+          return `⛔ 工具 ${name} 不允许在子智能体执行上下文中调用——请直接完成当前任务，不要尝试创建新任务或操作本地设备。`;
+        }
+        return runTool(name, argsJson, { kbId: child.kb_id || null, mcpServers: child.mcp_servers || '[]' });
+      },
     });
     let full = '';
     while (true) {
@@ -742,15 +749,20 @@ router.post('/stream', async (req, res) => {
       agentTools = ['get_datetime', 'calculator', 'web_search', 'db_query', 'run_code', 'local_exec', 'create_task'];
     }
     // P3 @技能携带的工具并入（去重；技能工具经 buildTools 走同一 function calling 循环）
+    // P5.24 @专家携带的工具并入（去重；指定专家 = 完整能力：提示词 + 工具，与技能同链路）——
+    // 没有工具并入时专家会「声称查询」却无工具可用，模型只能编造数据（实测发现）
+    // P5.34b（审查 F4）：技能/专家并入统一过滤违禁工具（组装点收敛——存量配置的 create_task/
+    // local_exec 不再进入 function calling；新写入已被 agents 白名单拦截，此处兕存量）
+    const safeToolId = (tid) => typeof tid === 'string' && !AGENT_TOOL_DENY.has(tid);
     for (const s of usedSkills) {
       let st = []; try { st = JSON.parse(s.tools || '[]'); } catch { st = []; }
-      for (const tid of st) if (!agentTools.includes(tid)) agentTools.push(tid);
+      for (const tid of st) if (safeToolId(tid) && !agentTools.includes(tid)) agentTools.push(tid);
     }
     // P5.24 @专家携带的工具并入（去重；指定专家 = 完整能力：提示词 + 工具，与技能同链路）——
     // 没有工具并入时专家会「声称查询」却无工具可用，模型只能编造数据（实测发现）
     for (const a of usedExperts) {
       let et = []; try { et = JSON.parse(a.tools || '[]'); } catch { et = []; }
-      for (const tid of et) if (!agentTools.includes(tid)) agentTools.push(tid);
+      for (const tid of et) if (safeToolId(tid) && !agentTools.includes(tid)) agentTools.push(tid);
     }
     const mcpTools = loadMcpTools(agent?.mcp_servers || '[]');
     // 子智能体编排（SinguX 式）：子智能体注册为 function calling 工具，主模型自主路由
@@ -909,9 +921,9 @@ router.post('/stream', async (req, res) => {
       kbContext,
       agentName: agent?.name,
       tools: allTools,
-      // 工具执行回调：先推送「执行中」事件（借鉴 SinguX PROCESSING 事件），完成事件由 toolCall 结果推送
-      // P5.25 对话权限闸门：perm='default' 时 medium/high 风险工具执行前需用户确认（SSE 推 tool_confirm，
-      // 前端弹卡 → POST /api/chat/confirm 决议）；perm='auto' 全部放行（「全自动执行」语义）；low 永不拦截。
+    // 工具执行回调：先推送「执行中」事件（借鉴 SinguX PROCESSING 事件），完成事件由 toolCall 结果推送
+    // P5.25 对话权限闸门：perm='default' 时 medium/high 风险工具执行前需用户确认（SSE 推 tool_confirm，
+    // 前端弹卡 → POST /api/chat/confirm 决议）；perm='auto' 全部放行（P5.34 起唯一例外：create_task 恒确认）；low 永不拦截。
       executeTool,
       signal: ac.signal, // P5.29 停止生成：客户端断开时中止模型 fetch（workflow/classifier 链路无 fetch 级中止，靠循环内 clientClosed 兑底跳出）
     });

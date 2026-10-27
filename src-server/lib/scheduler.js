@@ -11,14 +11,15 @@ const { canView } = require('./agent-access'); // P5.34（审查 F8）：执行�
 
 const fireMarks = new Map(); // task_id -> last fired ts
 
-/** P5.34（审查 F8）：自动停用任务并通知归属者（配额耗尽/主体失效等场景共用） */
-function disableTask(task, outputMsg, title) {
+/** P5.34（审查 F8）：自动停用任务并通知归属者（配额耗尽/主体失效等场景共用）
+ *  P5.34b（Y3）：outputMsg 只传原因短语（不再自带「任务已自动停用：」前缀），通知模板统一拼装 */
+function disableTask(task, reason, title) {
   db.prepare('UPDATE tasks SET enabled=0, last_run_at=?, last_result=? WHERE id=?').run(now(), 'fail', task.id);
   db.prepare('INSERT INTO task_runs (task_id,status,started_at,finished_at,output) VALUES (?,?,?,?,?)')
-    .run(task.id, 'fail', now(), now(), outputMsg);
+    .run(task.id, 'fail', now(), now(), '任务已自动停用：' + reason);
   try {
     db.prepare('INSERT INTO notifications (username,title,content,type,link,is_read,created_at) VALUES (?,?,?,?,?,0,?)')
-      .run(task.username, title || '⏸️ 定时任务已自动停用', `${task.name ? `任务「${task.name}」` : '任务'}已自动停用：${outputMsg.replace(/\n[\s\S]*$/, '')}。可在「任务管理」页查看。`, 'task', '#/tasks', now());
+      .run(task.username, title || '⏸️ 定时任务已自动停用', `任务「${task.name || task.id}」因 ${String(reason).replace(/\n[\s\S]*$/, '')} 已自动停用，可在「任务管理」页查看。`, 'task', '#/tasks', now());
   } catch { /* 通知失败不影响停用 */ }
 }
 
@@ -29,31 +30,30 @@ async function runTask(task) {
   if (task.username) {
     const quotaMsg = checkQuota(task.username);
     if (quotaMsg) {
-      disableTask(task, '任务已自动停用：' + quotaMsg);
+      disableTask(task, String(quotaMsg).split('\n')[0]);
       console.log(`[scheduler] 任务「${task.name}」归属者配额已耗尽，自动停用`);
-      return { status: 'fail', output: '任务已自动停用：' + quotaMsg };
+      return { status: 'fail', output: '任务已自动停用：' + String(quotaMsg).split('\n')[0] };
     }
   }
   const agent = db.prepare('SELECT * FROM agents WHERE id=?').get(task.target_id);
   // P5.34（审查 F8）：执行期复查智能体状态与可见性——权限只在创建时点校验，事后下架/转受限的
   // 智能体不应继续在无人值守周期执行（历史任务 username='' 为管理员创建，仅查发布状态）
   if (!agent || agent.status !== 'published') {
-    const msg = !agent ? '执行主体（智能体）已被删除，任务自动停用' : '执行主体（智能体）已下架（非发布状态），任务自动停用';
-    disableTask(task, msg);
+    const reason = !agent ? '执行主体（智能体）已被删除' : '执行主体（智能体）已下架（非发布状态）';
+    disableTask(task, reason);
     console.log(`[scheduler] 任务「${task.name}」执行主体已失效，自动停用`);
-    return { status: 'fail', output: msg };
+    return { status: 'fail', output: '任务已自动停用：' + reason };
   }
   if (task.username) {
     const owner = db.prepare('SELECT id, username, nickname, role, dept FROM users WHERE username=? AND status=1').get(task.username);
     if (!owner) {
-      disableTask(task, '任务归属者账号已停用/删除，任务自动停用');
-      return { status: 'fail', output: '任务归属者账号已停用/删除，任务自动停用' };
+      disableTask(task, '任务归属者账号已停用/删除');
+      return { status: 'fail', output: '任务已自动停用：任务归属者账号已停用/删除' };
     }
     if (!canView(agent, owner)) {
-      const msg = '执行主体（智能体）已不对任务归属者开放，任务自动停用';
-      disableTask(task, msg);
+      disableTask(task, '执行主体（智能体）已不对任务归属者开放');
       console.log(`[scheduler] 任务「${task.name}」主体可见性变更，自动停用`);
-      return { status: 'fail', output: msg };
+      return { status: 'fail', output: '任务已自动停用：执行主体（智能体）已不对任务归属者开放' };
     }
   }
   let output = '';

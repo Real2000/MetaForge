@@ -499,10 +499,14 @@ router.post('/:id/copy', (req, res) => {
   if (!canView(a, req.user)) return res.json({ code: 403, msg: '无权访问该智能体' });
   if (!a.allow_copy) return res.json({ code: 403, msg: '该智能体未开放复制（模板）' });
   const name = ((req.body || {}).name || a.name + '（副本）').slice(0, 50);
+  // P5.34b（审查 F2/Y1）：复制时过滤违禁与未知工具——否则存量被注入的 create_task/local_exec
+  // 可借复制无限传播（复制语义保留：剔除而非拒收，与对话链路组装点过滤同口径）
+  let copyTools = [];
+  try { copyTools = JSON.parse(a.tools || '[]').filter(t => TOOL_DEFS[t] && !AGENT_TOOL_DENY.has(t)); } catch { copyTools = []; }
   const info = db.prepare(`INSERT INTO agents (name,description,type,space_id,category,prompt,user_prompt,model,temperature,top_p,diversity_mode,icon,context_rounds,max_reply,opening,opening_questions,kb_id,status,source,source_name,tools,mcp_servers,long_memory,allow_user_model,suggest_enabled,variables,child_ids,owner,created_at,updated_at)
     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))`)
     .run(name, a.description, a.type, a.space_id, a.category, a.prompt, a.user_prompt, a.model, a.temperature, a.top_p, a.diversity_mode, a.icon,
-      a.context_rounds, a.max_reply, a.opening, a.opening_questions, a.kb_id, 'draft', 'self', '', a.tools, a.mcp_servers,
+      a.context_rounds, a.max_reply, a.opening, a.opening_questions, a.kb_id, 'draft', 'self', '', JSON.stringify(copyTools), a.mcp_servers,
       a.long_memory, a.allow_user_model, a.suggest_enabled, a.variables, a.child_ids, req.user.username);
   db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
     .run(req.user.username, '复制智能体', `${a.name} → ${name}`, req.ip, now());
@@ -672,11 +676,12 @@ router.post('/import', (req, res) => {
   if (!cfg) return res.json({ code: 400, msg: '导入失败：不是有效的智能体配置文件（缺少 agent 字段）' });
   const a = cfg.agent;
   if (!a.name) return res.json({ code: 400, msg: '导入失败：配置缺少名称' });
-  // P5.34：导入配置同样过工具白名单（外部配置文件不可绕过；未知工具静默剔除，违禁工具拒收）
+  // P5.34：导入配置同样过工具白名单（外部配置文件不可绕过；未知工具与违禁工具一律拒收——
+  // 校验函数对两者均报错；拒收比剔除更安全，与 POST/PUT 行为一致）
   const importTools = Array.isArray(a.tools) ? a.tools : [];
   const importDeny = validateAgentTools(importTools);
   if (importDeny) return res.json({ code: 400, msg: '导入失败：' + importDeny });
-  const safeImportTools = importTools.filter(t => TOOL_DEFS[t]);
+  const safeImportTools = importTools.filter(t => TOOL_DEFS[t]); // 防御性二次过滤（当前不可达，保留兑底）
   // 知识库按名称匹配（跨环境 ID 不通用）
   let kbId = null;
   if (a.kb_name) {

@@ -6,7 +6,7 @@
 const express = require('express');
 const { db, now } = require('../db');
 const { auth } = require('../lib/auth');
-const { TOOL_DEFS } = require('../lib/tools');
+const { TOOL_DEFS, AGENT_TOOL_DENY } = require('../lib/tools');
 
 const router = express.Router();
 router.use(auth);
@@ -35,7 +35,9 @@ router.post('/', (req, res) => {
   if (db.prepare('SELECT id FROM skill_assets WHERE owner=? AND name=?').get(req.user.username, n)) {
     return res.json({ code: 400, msg: '你已有同名技能' });
   }
-  const toolIds = (Array.isArray(tools) ? tools : []).filter(t => TOOL_DEFS[t]); // 只接受内置工具白名单
+  // P5.34b（审查 F3）：技能工具白名单——排除违禁（create_task/local_exec，防 API 直调注入后借 @技能
+  // 在 auto 权限下静默外设操作/造任务）与未知工具（保留剔除语义，同 agents import 口径）
+  const toolIds = (Array.isArray(tools) ? tools : []).filter(t => TOOL_DEFS[t] && !AGENT_TOOL_DENY.has(t));
   const info = db.prepare('INSERT INTO skill_assets (owner,name,description,icon,prompt,tools,status,created_at) VALUES (?,?,?,?,?,?,?,?)')
     .run(req.user.username, n, String(description || '').slice(0, 200), String(icon || '✨').slice(0, 4),
       String(prompt).slice(0, 4000), JSON.stringify(toolIds), status ? 1 : 0, now());
@@ -53,7 +55,7 @@ router.put('/:id', (req, res) => {
   if (!String(prompt ?? (old.prompt || '')).trim()) return res.json({ code: 400, msg: '提示词不能为空' });
   const dup = db.prepare('SELECT id FROM skill_assets WHERE owner=? AND name=? AND id != ?').get(req.user.username, n, old.id);
   if (dup) return res.json({ code: 400, msg: '你已有同名技能' });
-  const toolIds = (Array.isArray(tools) ? tools : JSON.parse(old.tools || '[]')).filter(t => TOOL_DEFS[t]);
+  const toolIds = (Array.isArray(tools) ? tools : JSON.parse(old.tools || '[]')).filter(t => TOOL_DEFS[t] && !AGENT_TOOL_DENY.has(t)); // P5.34b：同 POST 口径排除违禁
   db.prepare('UPDATE skill_assets SET name=?,description=?,icon=?,prompt=?,tools=?,status=? WHERE id=?')
     .run(n, String(description ?? old.description).slice(0, 200), String(icon ?? old.icon).slice(0, 4),
       String(prompt ?? old.prompt).slice(0, 4000), JSON.stringify(toolIds),

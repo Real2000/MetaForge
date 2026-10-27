@@ -682,8 +682,20 @@ db.exec(`CREATE INDEX IF NOT EXISTS idx_wf_runs_agent ON workflow_runs(agent_id,
   }
   db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_system_key ON agents(system_key) WHERE system_key != ''`);
   // 存量回填：P5.31 按名称+来源种子过的系统执行智能体打上稳定标识
-  db.exec("UPDATE agents SET system_key='system_task_runner' WHERE name='定时任务执行助手' AND source_name='系统内置' AND (system_key IS NULL OR system_key='')");
+  // P5.34b（审查 F7/Y2）：逐行回填 + try/catch——多行同名同源时部分唯一索引会抛 UNIQUE 冲突，
+  // 整块 UPDATE 无容错会让服务启动崩溃；逐行跳过冲突行并告警（首行生效即达到目的）
+  {
+    const rows = db.prepare("SELECT id FROM agents WHERE name='定时任务执行助手' AND source_name='系统内置' AND (system_key IS NULL OR system_key='') ORDER BY id").all();
+    for (const r of rows) {
+      try {
+        db.prepare("UPDATE agents SET system_key='system_task_runner' WHERE id=?").run(r.id);
+      } catch (e) {
+        console.warn(`[db] system_key 回填跳过 #${r.id}（唯一冲突，已有同值行）：${e.message}`);
+      }
+    }
+  }
 }
+
 // P5.14 文件一等变量：工作流文件表（上传原文+解析文本；变量值传 fileId，运行时注入内容/下载链接）
 // content_b64 仅 ≤8MB 文件保留（供原文下载）；text_content 为解析全文（PDF/DOCX/TXT/MD）
 db.exec(`CREATE TABLE IF NOT EXISTS wf_files (
@@ -990,6 +1002,34 @@ db.exec(`CREATE TABLE IF NOT EXISTS workflow_templates (
     VALUES (?,?,?,?,?,?,?,?,0,'platform',datetime('now','localtime'))`);
   for (const s of require('./lib/wf-template-seed').SEEDS) {
     ins.run(s.slug, s.name, s.icon, s.category, s.description, s.scene, JSON.stringify(s.workflow), 1);
+  }
+}
+
+// P5.34b（审查建议）：存量清洗——agents/skill_assets 的 tools 中被注入的违禁工具（create_task/
+// local_exec）一次性剔除（幂等：每次启动执行，无违禁项则无操作；新写入已被各入口白名单拦截，
+// 此处清存量，防 @技能/@专家/copy 等旁路继续生效）。位置在全部建表之后（skill_assets 在前文创建）
+{
+  const { AGENT_TOOL_DENY } = require('./lib/tool-deny'); // 零依赖模块，避免 db ↔ tools 循环依赖
+  const denyArr = [...AGENT_TOOL_DENY];
+  if (denyArr.length) {
+    let cleaned = 0;
+    const rows = db.prepare(`SELECT id, tools FROM agents WHERE ${denyArr.map(() => "tools LIKE ?").join(' OR ')}`).all(...denyArr.map(w => `%"${w}"%`));
+    for (const r of rows) {
+      try {
+        const ts = JSON.parse(r.tools || '[]').filter(t => !AGENT_TOOL_DENY.has(t));
+        db.prepare('UPDATE agents SET tools=? WHERE id=?').run(JSON.stringify(ts), r.id);
+        cleaned++;
+      } catch { /* 脏数据跳过 */ }
+    }
+    const srows = db.prepare(`SELECT id, tools FROM skill_assets WHERE ${denyArr.map(() => "tools LIKE ?").join(' OR ')}`).all(...denyArr.map(w => `%"${w}"%`));
+    for (const r of srows) {
+      try {
+        const ts = JSON.parse(r.tools || '[]').filter(t => !AGENT_TOOL_DENY.has(t));
+        db.prepare('UPDATE skill_assets SET tools=? WHERE id=?').run(JSON.stringify(ts), r.id);
+        cleaned++;
+      } catch { /* 脏数据跳过 */ }
+    }
+    if (cleaned) console.log(`[db] 存量清洗：已从 ${cleaned} 条 agents/skill_assets 记录中剔除违禁工具（${denyArr.join('/')}）`);
   }
 }
 

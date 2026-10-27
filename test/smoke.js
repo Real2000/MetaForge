@@ -2502,6 +2502,53 @@ function t(name, fn) {
       db.prepare('DELETE FROM tasks WHERE id=?').run(tid);
       db.prepare("DELETE FROM notifications WHERE username='f8u'").run();
     });
+    await t('runTask：执行期复查——归属者账号停用 / 主体不可见两闸门（F8 补齐）', async () => {
+      const sysAgent = db.prepare("SELECT id FROM agents WHERE system_key='system_task_runner'").get();
+      // 闸门 1：归属者账号停用
+      db.prepare(`INSERT INTO users (username,password,nickname,role,status,must_change_pwd,created_at) VALUES ('f8u2',?,'F8测试二','user',1,0,datetime('now','localtime'))`).run(hashPwd('f8-pass-123'));
+      let info = db.prepare(`INSERT INTO tasks (name,target_type,target_id,exec_type,cron,params,enabled,username,created_at) VALUES ('F8账号任务','agent',?, 'cron','0 9 * * *',?,1,'f8u2',datetime('now','localtime'))`).run(sysAgent.id, JSON.stringify({ input: 'x' }));
+      db.prepare("UPDATE users SET status=0 WHERE username='f8u2'").run(); // 停用归属者账号
+      let r = await runTask(db.prepare('SELECT * FROM tasks WHERE id=?').get(info.lastInsertRowid));
+      assert.ok(String(r.output).includes('账号已停用'), '归属者停用应停用任务：' + r.output.slice(0, 60));
+      assert.strictEqual(db.prepare('SELECT enabled FROM tasks WHERE id=?').get(info.lastInsertRowid).enabled, 0, '任务应已停用');
+      // 闸门 2：主体对归属者不可见（把系统智能体转 restricted 且不在名单）
+      db.prepare(`INSERT INTO users (username,password,nickname,role,status,must_change_pwd,created_at) VALUES ('f8u3',?,'F8测试三','user',1,0,datetime('now','localtime'))`).run(hashPwd('f8-pass-123'));
+      db.prepare("UPDATE agents SET visibility='restricted', visible_members='[\"other-user\"]' WHERE id=?").run(sysAgent.id);
+      info = db.prepare(`INSERT INTO tasks (name,target_type,target_id,exec_type,cron,params,enabled,username,created_at) VALUES ('F8可见性任务','agent',?, 'cron','0 9 * * *',?,1,'f8u3',datetime('now','localtime'))`).run(sysAgent.id, JSON.stringify({ input: 'x' }));
+      r = await runTask(db.prepare('SELECT * FROM tasks WHERE id=?').get(info.lastInsertRowid));
+      assert.ok(String(r.output).includes('不对任务归属者开放'), '主体不可见应停用任务：' + r.output.slice(0, 60));
+      // 清理：恢复智能体公开 + 删测试数据
+      db.prepare("UPDATE agents SET visibility='public', visible_members='[]' WHERE id=?").run(sysAgent.id);
+      db.prepare("DELETE FROM tasks WHERE name IN ('F8账号任务','F8可见性任务')").run();
+      db.prepare("DELETE FROM users WHERE username IN ('f8u2','f8u3')").run();
+      db.prepare("DELETE FROM notifications WHERE username IN ('f8u2','f8u3')").run();
+    });
+    await t('copy/技能资产白名单：违禁工具被剔除（P5.34b 审查 F2/F3）', () => {
+      // copy：源智能体含违禁工具（模拟历史注入）→ 副本剔除
+      const sysAgent = db.prepare("SELECT id FROM agents WHERE system_key='system_task_runner'").get();
+      db.prepare(`INSERT INTO agents (name,description,type,category,prompt,status,source,tools,allow_copy,owner,created_at,updated_at) VALUES ('违禁源智能体','x','digital','测试','p','published','self',?,1,'httpadmin',datetime('now','localtime'),datetime('now','localtime'))`).run(JSON.stringify(['web_search', 'create_task', 'local_exec', 'not_a_tool']));
+      const srcId = db.prepare("SELECT id FROM agents WHERE name='违禁源智能体'").get().id;
+      // 直接调用 copy 的核心过滤逻辑（路由层 HTTP 测不了 canView/admin 上下文，此处验证数据面）：
+      // 复制 SQL 用 filter(t => TOOL_DEFS[t] && !AGENT_TOOL_DENY.has(t))
+      const { TOOL_DEFS, AGENT_TOOL_DENY } = require('../src-server/lib/tools');
+      const copyTools = JSON.parse(db.prepare('SELECT tools FROM agents WHERE id=?').get(srcId).tools).filter(t => TOOL_DEFS[t] && !AGENT_TOOL_DENY.has(t));
+      assert.deepStrictEqual(copyTools, ['web_search'], 'copy 过滤应只剩合法工具：' + JSON.stringify(copyTools));
+      // 技能资产：API 直调注入 create_task → filter 剔除（skillassets.js 同口径）
+      const skillTools = ['create_task', 'web_search', 'local_exec'].filter(t => TOOL_DEFS[t] && !AGENT_TOOL_DENY.has(t));
+      assert.deepStrictEqual(skillTools, ['web_search'], '技能工具过滤应剔除违禁');
+      db.prepare("DELETE FROM agents WHERE name='违禁源智能体'").run();
+    });
+    await t('P5.34b tripwire：runChildAgent 与 @技能/@专家并入均带违禁拒绝（F1/F4）', () => {
+      const src = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'routes', 'chat.js'), 'utf8');
+      // F1：runChildAgent 的 executeTool 拒绝 create_task/local_exec
+      const rcStart = src.indexOf('async function runChildAgent');
+      const rcEnd = src.indexOf('/** ⑦ 分类器路由');
+      assert.ok(rcStart > 0 && rcEnd > rcStart, 'runChildAgent 定位成功');
+      const rcBlock = src.slice(rcStart, rcEnd);
+      assert.ok(rcBlock.includes("name === 'create_task' || name === 'local_exec'"), '子智能体执行应拒绝 create_task/local_exec');
+      // F4：技能/专家并入处有 safeToolId 过滤
+      assert.ok(src.includes('safeToolId(tid)'), '@技能/@专家并入应经 safeToolId 过滤');
+    });
     await t('create_task：system_key 稳定绑定——用户自建同名智能体不劫持（Y4 完整方案）', async () => {
       const { create_task } = require('../src-server/lib/tools-extra');
       // 用户自建同名「定时任务执行助手」（published、带危险工具集）——不应影响默认绑定
