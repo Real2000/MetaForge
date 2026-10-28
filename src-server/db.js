@@ -1134,6 +1134,14 @@ CREATE INDEX IF NOT EXISTS idx_agents_status_pub ON agents(status) WHERE status=
 CREATE INDEX IF NOT EXISTS idx_agents_owner ON agents(owner);
 CREATE INDEX IF NOT EXISTS idx_agents_share_token ON agents(share_token) WHERE share_token != '';
 CREATE INDEX IF NOT EXISTS idx_agents_source_ext ON agents(source, external_app_id);
+-- P0-4 2026-10-28 token 吊销表（登出/改密时插入，auth 中间件校验拦截）
+CREATE TABLE IF NOT EXISTS token_blacklist (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  jti TEXT NOT NULL,
+  username TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_token_blacklist_jti ON token_blacklist(jti);
 `);
 
 module.exports = { db, hashPwd, hashPwdAsync, verifyPwd, now, daysAgo };

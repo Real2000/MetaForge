@@ -1074,7 +1074,8 @@ const run_code = {
     const uploadsDir = path.join(__dirname, '..', '..', 'public', 'uploads', 'sandbox');
     fs.mkdirSync(workDir, { recursive: true });
     fs.mkdirSync(uploadsDir, { recursive: true });
-    // ③ 受限 fs 代理：写/删仅限 workDir；读额外放行白名单前缀
+    // ③ 受限 fs 代理：写/删仅限 workDir；读额外放行白名单前缀；禁止生成 HTML 文件
+    const SANDBOX_ALLOWED_EXT = ['.json', '.csv', '.tsv', '.txt', '.md', '.xml', '.yaml', '.yml', '.log', '.sql', '.py', '.js', '.ts', '.c', '.cpp', '.h', '.java', '.rb', '.sh', '.bat', '.ps1', ''];
     const inWorkDir = p => { try { const r = path.resolve(workDir, p); return r === workDir || r.startsWith(workDir + path.sep); } catch { return false; } };
     const canRead = p => {
       if (inWorkDir(p)) return true;
@@ -1084,7 +1085,12 @@ const run_code = {
       } catch { return false; }
     };
     const fsShim = {
-      writeFileSync: (p, ...rest) => { if (!inWorkDir(p)) throw new Error(`沙箱拒绝写入沙箱外路径：${p}`); return fs.writeFileSync(path.resolve(workDir, p), ...rest); },
+      writeFileSync: (p, ...rest) => {
+        if (!inWorkDir(p)) throw new Error(`沙箱拒绝写入沙箱外路径：${p}`);
+        const ext = path.extname(p).toLowerCase();
+        if (!SANDBOX_ALLOWED_EXT.includes(ext)) throw new Error(`沙箱禁止生成 ${ext} 文件（仅允许：${SANDBOX_ALLOWED_EXT.join(', ')})`);
+        return fs.writeFileSync(path.resolve(workDir, p), ...rest);
+      },
       readFileSync: (p, ...rest) => { if (!canRead(p)) throw new Error(`沙箱拒绝读取受限路径：${p}`); return fs.readFileSync(path.resolve(workDir, p), ...rest); },
       existsSync: p => inWorkDir(p) ? fs.existsSync(path.resolve(workDir, p)) : (canRead(p) && fs.existsSync(path.resolve(workDir, p))),
       mkdirSync: (p, ...rest) => { if (!inWorkDir(p)) throw new Error(`沙箱拒绝在沙箱外建目录：${p}`); return fs.mkdirSync(path.resolve(workDir, p), ...rest); },

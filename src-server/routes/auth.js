@@ -1,7 +1,7 @@
 /** 认证路由：登录 / 当前用户 / 修改密码 */
 const express = require('express');
 const { db, hashPwd, verifyPwd, hashPwdAsync, now } = require('../db');
-const { sign, auth, TOKEN_TTL_MS } = require('../lib/auth');
+const { sign, auth, revokeToken, TOKEN_TTL_MS } = require('../lib/auth');
 const { createLimiter, clientIp } = require('../lib/rate-limit');
 
 const router = express.Router();
@@ -30,6 +30,12 @@ router.post('/login', loginLimiter, async (req, res) => {
 
 router.get('/me', auth, (req, res) => res.json({ code: 0, data: req.user }));
 
+// P0-4 登出：吊销当前 token（仅做令牌废弃，不改状态）
+router.post('/logout', auth, (req, res) => {
+  revokeToken(req);
+  res.json({ code: 0, msg: '已退出登录' });
+});
+
 // 新手引导完成标记（完成或跳过均标记，仅弹一次）
 router.post('/onboarding', auth, (req, res) => {
   db.prepare('UPDATE users SET onboarded=1 WHERE id=?').run(req.user.id);
@@ -46,6 +52,8 @@ router.post('/login/change-password', auth, async (req, res) => {
   const WEAK = ['123456', 'admin123', 'demo123', 'password', '111111', '000000', 'abc123'];
   if (WEAK.includes(newPwd)) return res.json({ code: 400, msg: '新密码过于简单（常见默认口令），请换一个' });
   db.prepare('UPDATE users SET password=?, must_change_pwd=0 WHERE id=?').run(await hashPwdAsync(newPwd), user.id);
+  // 改密后吊销当前 token（旧 token 立即失效）
+  revokeToken(req);
   db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
     .run(user.username, '修改密码', '密码已更新' + (user.must_change_pwd ? '（弱口令强制改密完成）' : ''), req.ip, now());
   res.json({ code: 0, msg: '密码修改成功' });

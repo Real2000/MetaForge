@@ -6,12 +6,24 @@
 const express = require('express');
 const path = require('path');
 const { startScheduler } = require('./src-server/lib/scheduler');
+const fs = require('fs');
 
 const app = express();
 const PORT = process.env.PORT || 3210;
 
 app.use(express.json({ limit: '20mb' })); // 知识库支持 PDF/DOCX base64 上传
-app.use(express.static(path.join(__dirname, 'public')));
+
+// P0-3 2026-10-28 安全加固：sandbox 产物强制下载（防 .html 文件同源执行窃取 localStorage token）
+app.use('/uploads/sandbox', (req, res, next) => {
+  const filePath = path.join(__dirname, 'public', 'uploads', 'sandbox', req.path);
+  if (!fs.existsSync(filePath)) return res.status(404).end();
+  const ext = path.extname(filePath).toLowerCase();
+  if (ext === '.html' || ext === '.htm') {
+    res.set('Content-Type', 'application/octet-stream');
+    res.set('Content-Disposition', 'attachment; filename="sandbox-output.txt"');
+  }
+  next();
+}, express.static(path.join(__dirname, 'public')));
 
 // API 路由
 app.use('/api/auth', require('./src-server/routes/auth'));

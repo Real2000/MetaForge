@@ -46,7 +46,7 @@ if (SECRET === LEGACY_SECRET && !process.env.AGENT_JWT_SECRET) {
 const TOKEN_TTL_MS = (+(process.env.AGENT_TOKEN_TTL_HOURS || 0) > 0 ? +process.env.AGENT_TOKEN_TTL_HOURS : 168) * 3600000;
 
 function sign(payload) {
-  const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const body = Buffer.from(JSON.stringify({ ...payload, jti: crypto.randomBytes(16).toString('hex') })).toString('base64url');
   const sig = crypto.createHmac('sha256', SECRET).update(body).digest('base64url');
   return body + '.' + sig;
 }
@@ -58,6 +58,11 @@ function verify(token) {
   try {
     const payload = JSON.parse(Buffer.from(body, 'base64url').toString());
     if (payload.exp && Date.now() > payload.exp) return null;
+    // P0-4 token 吊销检查：查询 blacklist 表，命中则视为无效
+    if (payload.jti) {
+      const blacklisted = db.prepare('SELECT 1 FROM token_blacklist WHERE jti=?').get(payload.jti);
+      if (blacklisted) return null;
+    }
     return payload;
   } catch { return null; }
 }
@@ -75,5 +80,18 @@ function adminOnly(req, res, next) {
   if (req.user.role !== 'admin') return res.status(403).json({ code: 403, msg: '需要管理员权限' });
   next();
 }
+/** P0-4 token 吊销：将当前请求携带的 token 加入黑名单 */
+function revokeToken(req) {
+  const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+  if (!token) return;
+  try {
+    const [body] = token.split('.');
+    const payload = JSON.parse(Buffer.from(body, 'base64url').toString());
+    if (payload.jti && payload.uid) {
+      db.prepare('INSERT OR IGNORE INTO token_blacklist (jti, username, created_at) VALUES (?,?,?)')
+        .run(payload.jti, req.user?.username || String(payload.uid), new Date().toISOString());
+    }
+  } catch { }
+}
 
-module.exports = { sign, verify, auth, adminOnly, TOKEN_TTL_MS };
+module.exports = { sign, verify, auth, adminOnly, revokeToken, TOKEN_TTL_MS };
