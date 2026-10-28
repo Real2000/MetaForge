@@ -22,8 +22,10 @@ node server.js     # 或 npm start
 
 | 账号 | 密码 | 角色 |
 |---|---|---|
-| admin | admin123 | 管理员（可进管理后台） |
-| demo | demo123 | 普通用户（仅前台） |
+| admin | admin123（首次登录强制改密） | 管理员（可进管理后台） |
+| demo | demo123（首次登录强制改密） | 普通用户（仅前台） |
+
+> ⚠️ 安全提醒：P0 安全加固后所有弱口令账号首次登录必须修改密码。admin 密码已强制更新为 `StrongAdmin#2026`，demo 已强制更新为 `DemoSafe#2026`。测试账号 tadmin/tuser1/tuser2 密码不变。
 
 ### 重置数据
 ```bash

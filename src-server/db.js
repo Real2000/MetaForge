@@ -1134,6 +1134,9 @@ CREATE INDEX IF NOT EXISTS idx_agents_status_pub ON agents(status) WHERE status=
 CREATE INDEX IF NOT EXISTS idx_agents_owner ON agents(owner);
 CREATE INDEX IF NOT EXISTS idx_agents_share_token ON agents(share_token) WHERE share_token != '';
 CREATE INDEX IF NOT EXISTS idx_agents_source_ext ON agents(source, external_app_id);
+-- P1 2026-10-28 性能地基：热路径复合索引按创建时间排序
+CREATE INDEX IF NOT EXISTS idx_messages_session_created ON messages(session_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_chat_traces_session ON chat_traces(session_id);
 -- P0-4 2026-10-28 token 吊销表（登出/改密时插入，auth 中间件校验拦截）
 CREATE TABLE IF NOT EXISTS token_blacklist (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
