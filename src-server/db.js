@@ -13,6 +13,11 @@ if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 const db = new Database(path.join(DATA_DIR, 'platform.db'));
 db.pragma('journal_mode = WAL');
 
+// 2026-10-28 向量库升级：LanceDB 嵌入式向量数据库（零部署，磁盘持久化）
+// LanceDB 数据目录 & 初始化连接在 retriever.js 中按需创建（兼容无向量库的场景）
+let lanceTable = null; // LanceDB 表引用，首次插入时自动创建
+let lanceDb = null;   // LanceDB 数据库连接引用
+
 // 密码哈希 SALT（2026-10-20 P0 安全加固）：优先环境变量，其次 data/secrets.json（与 JWT 密钥同文件，
 // 首次启动自动生成），兜底旧版硬编码值（保证存量用户密码不失效）。兼容策略：验证时依次尝试新/旧 SALT。
 const SALT_FILE = path.join(DATA_DIR, 'secrets.json');

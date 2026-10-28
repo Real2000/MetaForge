@@ -224,6 +224,34 @@ async function retrieve(query, kbId = null, topN = 5, threshold = 0.01) {
   const upd = db.prepare('UPDATE kb_chunks SET embedding=? WHERE id=?');
   const parsed = rows.map(r => parseVec(r.embedding));
 
+  // 优先 LanceDB ANN 搜索（2026-10-28 P3 向量库升级）
+  let annResult = null;
+  try {
+    const { annSearch, initDB } = require('./vector-store');
+    if (await initDB()) {
+      annResult = await annSearch(embed(query), RERANK_CANDIDATES);
+    }
+  } catch { /* ANN 不可用 → 回退全表扫描 */ }
+
+  if (annResult && annResult.length) {
+    const annRows = [];
+    const idxMap = new Map(annResult.map(r => [r.id, r]));
+    for (let i = 0; i < rows.length; i++) {
+      if (idxMap.has(rows[i].id)) annRows.push({ ...rows[i], score: idxMap.get(rows[i].id).score });
+    }
+    if (annRows.length) {
+      const annBm25 = bm25Scores(annRows, qTerms);
+      const annParsed = annRows.map(r => parseVec(r.embedding));
+      if (annParsed.some(p => p.engine === 'B3')) {
+        const q = await bgeEmbed([query]);
+        if (q) return rerankAndSlice(query, finish(annRows, annBm25, annParsed.map(p => p.v), new Float32Array(q[0]), 'B3', RERANK_CANDIDATES, threshold), topN);
+      }
+      return rerankAndSlice(query, finish(annRows, annBm25, annParsed.map(p => p.v), embed(query), 'H', RERANK_CANDIDATES, threshold), topN);
+    }
+  }
+
+  // 回退：全表扫描（LanceDB 不可用或无命中时）
+
   // 优先 bge-m3：任一分块缺 B3 缓存 → 批量补齐（查询向量同引擎）
   let engine = 'B3';
   if (parsed.every(p => p.engine === 'B3')) {
