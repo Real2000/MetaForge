@@ -1970,7 +1970,7 @@ export function createCanvas(root, opts = {}) {
             <button class="btn" id="cvFileUp-${esc(v.name)}">📎 ${t('选择文件')}</button>
             <span class="hint" id="cvFileLab-${esc(v.name)}" style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${t('未选择（PDF/DOCX/TXT/MD ≤8MB）')}</span>
           </div>
-          <input type="file" id="cvFileInp-${esc(v.name)}" accept=".pdf,.docx,.xlsx,.xls,.csv,.txt,.md" ${v.type === 'array[file]' ? 'multiple' : ''} style="display:none">
+          <input type="file" id="cvFileInp-${esc(v.name)}" accept=".pdf,.docx,.pptx,.xlsx,.xls,.csv,.txt,.md" ${v.type === 'array[file]' ? 'multiple' : ''} style="display:none">
         </div>`;
       }
       return `<div class="fd" style="margin:0;margin-top:10px"><label>${esc(v.name)}（{{#start.${esc(v.name)}#}}）</label>

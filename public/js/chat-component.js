@@ -56,7 +56,7 @@ export function mountChat(el, opts) {
     if (!btn) return;
     const inp = document.createElement('input');
     inp.type = 'file';
-    inp.accept = '.pdf,.docx,.xlsx,.xls,.csv,.txt,.md';
+    inp.accept = '.pdf,.docx,.pptx,.xlsx,.xls,.csv,.txt,.md';
     inp.multiple = true;
     inp.style.display = 'none';
     el.appendChild(inp);

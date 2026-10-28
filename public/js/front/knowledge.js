@@ -146,8 +146,8 @@ export async function render(el) {
       </div>
       <div id="u_file_pane">
         <div class="form-item"><label>选择文件<span class="req">*</span></label>
-          <input class="input" type="file" id="f_picker" accept=".txt,.md,.markdown,.pdf,.docx">
-          <div class="hint">支持 txt / md / pdf / docx，自动提取文本并智能切片（段落优先，超长段落按句边界 ~500 字切分）；扫描版 PDF 需先 OCR</div>
+          <input class="input" type="file" id="f_picker" accept=".txt,.md,.markdown,.pdf,.docx,.pptx,.xlsx,.xls,.csv">
+          <div class="hint">支持 txt / md / pdf / docx / pptx / xlsx / xls / csv，自动提取文本并智能切片（段落优先，超长段落按句边界 ~500 字切分）；扫描版 PDF 需先 OCR</div>
           <div id="f_pick_info" style="margin-top:6px;font-size:12px;color:var(--brand)"></div>
         </div>
       </div>
