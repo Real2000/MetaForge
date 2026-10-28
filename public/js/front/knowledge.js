@@ -76,6 +76,7 @@ export async function render(el) {
               <td style="color:var(--text-3)">${esc(f.created_at)}</td>
               <td>
                 <button class="btn link" data-re="${f.id}">重新解析</button>
+                <button class="btn link" data-chunks="${f.id}">查看分块</button>
                 <button class="btn link" style="color:var(--danger)" data-df="${f.id}">删除</button>
               </td>
             </tr>`).join('') || '<tr><td colspan="6" class="empty">暂无文件，点击「上传文件」导入（支持粘贴文本内容）</td></tr>'}
@@ -94,6 +95,65 @@ export async function render(el) {
       if (!await confirmBox('删除该文件及其全部片段？')) return;
       await api(`/knowledge/files/${b.dataset.df}`, { method: 'DELETE' });
       toast('已删除'); loadFiles().then(renderKbList);
+    });
+    paneKb.querySelectorAll('[data-chunks]').forEach(b => b.onclick = async () => {
+      const j = await api(`/knowledge/files/${b.dataset.chunks}/chunks`);
+      const { file, chunks } = j.data;
+      const body = `
+        <div style="font-size:13px;color:var(--text-3);margin-bottom:8px">文件：${esc(file.name)}（共 ${chunks.length} 个片段）</div>
+        <div style="max-height:500px;overflow-y:auto">${chunks.map((c, i) => `
+          <div class="card" style="box-shadow:none;border:1px solid var(--border);margin-bottom:8px" data-chunk-id="${c.id}">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+              <b style="color:var(--brand);font-size:12px">#${i + 1}</b>
+              <div>
+                <button class="btn link sm" data-edit-chunk="${c.id}">编辑</button>
+                <button class="btn link sm" data-del-chunk="${c.id}" style="color:var(--danger)">删除</button>
+                ${i > 0 ? `<button class="btn link sm" data-merge-up="${c.id}" title="合并到上一块">↑ 合并</button>` : ''}
+              </div>
+            </div>
+            <div style="font-size:12px;color:var(--text-2);line-height:1.7;white-space:pre-wrap;word-break:break-word">${esc(c.content)}</div>
+          </div>`).join('')}
+        </div>`;
+      modal({
+        title: '查看分块', body, wide: true,
+        foot: '<button class="btn" data-close>关闭</button>',
+        onMount(mask, close) {
+          mask.querySelector('[data-close]').onclick = close;
+          mask.querySelectorAll('[data-edit-chunk]').forEach(btn => btn.onclick = async () => {
+            const cid = btn.dataset.editChunk;
+            const card = mask.querySelector(`[data-chunk-id="${cid}"]`);
+            const contentDiv = card?.querySelector('div:last-child');
+            if (!contentDiv) return;
+            const cur = contentDiv.textContent;
+            const newContent = prompt('编辑分块内容：', cur);
+            if (newContent == null || newContent === cur) return;
+            await api(`/knowledge/chunks/${cid}`, { method: 'PUT', body: { content: newContent } });
+            toast('已更新');
+            contentDiv.textContent = newContent;
+          });
+          mask.querySelectorAll('[data-del-chunk]').forEach(btn => btn.onclick = async () => {
+            if (!await confirmBox('确定删除该分块？')) return;
+            const cid = btn.dataset.delChunk;
+            await api(`/knowledge/chunks/${cid}`, { method: 'DELETE' });
+            toast('已删除');
+            const card = mask.querySelector(`[data-chunk-id="${cid}"]`);
+            if (card) card.remove();
+          });
+          mask.querySelectorAll('[data-merge-up]').forEach(btn => btn.onclick = async () => {
+            const sourceId = btn.dataset.mergeUp;
+            const card = mask.querySelector(`[data-chunk-id="${sourceId}"]`);
+            const prevCard = card?.previousElementSibling;
+            const prevId = prevCard?.dataset.chunkId;
+            if (!prevId) return toast('无法找到上一块', 'err');
+            if (!await confirmBox('确定将当前分块合并到上一块？')) return;
+            await api('/knowledge/chunks/merge', { method: 'POST', body: { sourceId: +sourceId, targetId: +prevId } });
+            toast('已合并');
+            if (card) card.remove();
+            const prevContent = prevCard?.querySelector('div:last-child');
+            if (prevContent) prevContent.textContent += '\n' + (mask.querySelector(`[data-chunk-id="${sourceId}"]`)?.querySelector('div:last-child')?.textContent || '');
+          });
+        },
+      });
     });
   }
 

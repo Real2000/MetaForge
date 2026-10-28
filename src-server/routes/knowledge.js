@@ -152,6 +152,58 @@ router.post('/files/:fileId/reparse', (req, res) => {
   res.json({ code: 0, msg: '重新解析完成' });
 });
 
+// 分块管理（P1 2026-10-28：列出/编辑/合并/删除单个 chunk）
+router.get('/files/:fileId/chunks', (req, res) => {
+  const f = db.prepare('SELECT * FROM kb_files WHERE id=?').get(req.params.fileId);
+  if (!f) return res.json({ code: 404, msg: '文件不存在' });
+  const kb = db.prepare('SELECT * FROM kbs WHERE id=?').get(f.kb_id);
+  const deny = denyIfNotAllowed(kb, req.user);
+  if (deny) return res.json(deny);
+  const rows = db.prepare('SELECT c.id, c.content, c.file_id, c.kb_id FROM kb_chunks c WHERE c.file_id=? ORDER BY c.id').all(req.params.fileId);
+  res.json({ code: 0, data: { file: { id: f.id, name: f.name, kb_id: f.kb_id }, chunks: rows } });
+});
+
+// 更新单个 chunk 内容
+router.put('/chunks/:chunkId', (req, res) => {
+  const c = db.prepare('SELECT * FROM kb_chunks WHERE id=?').get(req.params.chunkId);
+  if (!c) return res.json({ code: 404, msg: '分块不存在' });
+  const kb = db.prepare('SELECT * FROM kbs WHERE id=?').get(c.kb_id);
+  const deny = denyIfNotAllowed(kb, req.user);
+  if (deny) return res.json(deny);
+  const { content } = req.body || {};
+  if (content == null) return res.json({ code: 400, msg: '请提供内容' });
+  db.prepare('UPDATE kb_chunks SET content=? WHERE id=?').run(String(content || ''), c.id);
+  // 更新文件 chunk_count（不做严格同步，简单 +1 即可）
+  res.json({ code: 0, msg: '分块已更新' });
+});
+
+// 删除单个 chunk
+router.delete('/chunks/:chunkId', (req, res) => {
+  const c = db.prepare('SELECT * FROM kb_chunks WHERE id=?').get(req.params.chunkId);
+  if (!c) return res.json({ code: 404, msg: '分块不存在' });
+  const kb = db.prepare('SELECT * FROM kbs WHERE id=?').get(c.kb_id);
+  const deny = denyIfNotAllowed(kb, req.user);
+  if (deny) return res.json(deny);
+  db.prepare('DELETE FROM kb_chunks WHERE id=?').run(c.id);
+  res.json({ code: 0, msg: '已删除' });
+});
+
+// 合并相邻两个 chunk（sourceId 的内容合并到 targetId，然后删除 sourceId）
+router.post('/chunks/merge', (req, res) => {
+  const { sourceId, targetId } = req.body || {};
+  if (!sourceId || !targetId) return res.json({ code: 400, msg: '请指定要合并的两个分块 ID' });
+  const source = db.prepare('SELECT * FROM kb_chunks WHERE id=?').get(sourceId);
+  const target = db.prepare('SELECT * FROM kb_chunks WHERE id=?').get(targetId);
+  if (!source || !target) return res.json({ code: 404, msg: '分块不存在' });
+  if (source.kb_id !== target.kb_id) return res.json({ code: 400, msg: '不能合并不同知识库的分块' });
+  const kb = db.prepare('SELECT * FROM kbs WHERE id=?').get(source.kb_id);
+  const deny = denyIfNotAllowed(kb, req.user);
+  if (deny) return res.json(deny);
+  db.prepare('UPDATE kb_chunks SET content=? WHERE id=?').run((source.content + '\n' + target.content).trim(), target.id);
+  db.prepare('DELETE FROM kb_chunks WHERE id=?').run(source.id);
+  res.json({ code: 0, msg: '已合并' });
+});
+
 // 召回测试（混合检索：BM25 + 向量 RRF 融合；P2 升级 async 双引擎）
 router.post('/recall-test', async (req, res) => {
   const { kb_id, file_id, query, top_n, threshold } = req.body || {};
