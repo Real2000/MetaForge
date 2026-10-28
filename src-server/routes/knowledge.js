@@ -133,7 +133,7 @@ router.post('/files/:fileId/reparse', (req, res) => {
   const kb = db.prepare('SELECT * FROM kbs WHERE id=?').get(f.kb_id);
   const deny = denyIfNotAllowed(kb, req.user); // P5.30：同上
   if (deny) return res.json(deny);
-  db.prepare('UPDATE kb_files SET status="success" WHERE id=?').run(f.id);
+  db.prepare("UPDATE kb_files SET status='success' WHERE id=?").run(f.id);
   res.json({ code: 0, msg: '重新解析完成' });
 });
 

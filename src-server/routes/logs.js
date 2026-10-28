@@ -26,7 +26,7 @@ router.get('/err-logs', (req, res) => {
 });
 
 router.delete('/err-logs', (req, res) => {
-  db.prepare('DELETE FROM err_logs');
+  db.prepare('DELETE FROM err_logs').run();
   db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)').run(req.user.username, '清空异常日志', '手动清理', req.ip, now());
   res.json({ code: 0, msg: '已清空' });
 });

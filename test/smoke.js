@@ -2561,6 +2561,36 @@ function t(name, fn) {
       db.prepare("DELETE FROM tasks WHERE name='Y4验证'").run();
       db.prepare("DELETE FROM agents WHERE source_name='用户自建' AND name='定时任务执行助手'").run();
     });
+    await t('测试轮修复回归：copy 路由 INSERT 列数与占位符配比（防占位符丢失回归）', () => {
+      const src = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'routes', 'agents.js'), 'utf8');
+      const re = /INSERT INTO agents \(([^)]*)\)\s*VALUES\s*\(([\s\S]*?)\)\s*\.run\(/g;
+      let found = null, m;
+      while ((m = re.exec(src))) { if (m[1].includes('long_memory') && m[1].includes('child_ids')) { found = m; break; } }
+      assert.ok(found, 'copy 的 INSERT 语句存在');
+      const cols = found[1].split(',').map(s => s.trim()).filter(Boolean);
+      // VALUES 段整段统计（datetime('now','localtime') 内含逗号，不能按逗号 split）
+      const q = (found[2].match(/\?/g) || []).length;
+      const dt = (found[2].match(/datetime\(/g) || []).length;
+      assert.strictEqual(cols.length, q + dt, `列数 ${cols.length} 应等于 ?数 ${q} + datetime数 ${dt}（测试轮实锤：曾丢 1 个 ? 致复制必 500）`);
+    });
+    await t('测试轮修复回归：SQL 字符串字面量不得用双引号（categories/kb_files 修复）', () => {
+      for (const f of ['agents.js', 'knowledge.js']) {
+        const src = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'routes', f), 'utf8');
+        const bad = src.split('\n').filter(l => !l.trim().startsWith('//') && !l.trim().startsWith('*') && /status="[a-z_]+"/.test(l));
+        assert.deepStrictEqual(bad, [], `${f} 代码行不得再用双引号字面量（SQLite 视为标识符；残留：${JSON.stringify(bad)}）`);
+      }
+      const rows = db.prepare("SELECT category, COUNT(*) c FROM agents WHERE status='published' GROUP BY category ORDER BY c DESC").all();
+      assert.ok(Array.isArray(rows), 'categories SQL 应可执行');
+    });
+    await t('测试轮修复回归：agents.js 导入 AGENT_TOOL_DENY（S1 副本工具恒空修复）', () => {
+      const src = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'routes', 'agents.js'), 'utf8');
+      const imp = src.match(/const \{[^}]*\} = require\('\.\.\/lib\/tools'\)/);
+      assert.ok(imp && imp[0].includes('AGENT_TOOL_DENY'), 'tools 导入必须包含 AGENT_TOOL_DENY（漏导入被 catch 吞错 → 副本工具恒空）');
+    });
+    await t('测试轮修复回归：err-logs 清空带 .run()（S2 假成功修复）', () => {
+      const src = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'routes', 'logs.js'), 'utf8');
+      assert.ok(/DELETE FROM err_logs'\)\.run\(\)/.test(src), 'DELETE FROM err_logs 必须带 .run()（prepare 只编译不执行，曾 77→77 假成功）');
+    });
   }
 
   // 收尾：关闭库并清理临时目录

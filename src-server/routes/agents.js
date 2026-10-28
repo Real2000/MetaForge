@@ -4,7 +4,7 @@ const { db, now } = require('../db');
 const { auth } = require('../lib/auth');
 const { chatOnce } = require('../lib/llm');
 const { canView, canEdit, isOwnerLevel, parseJsonArr } = require('../lib/agent-access');
-const { runTool, validateAgentTools, TOOL_DEFS } = require('../lib/tools');
+const { runTool, validateAgentTools, TOOL_DEFS, AGENT_TOOL_DENY } = require('../lib/tools'); // P5.34b copy 过滤依赖 AGENT_TOOL_DENY（此前漏导入被 catch 吞错致副本工具恒空——测试轮实锤修复）
 
 const router = express.Router();
 router.use(auth);
@@ -28,7 +28,8 @@ router.get('/', (req, res) => {
 });
 
 router.get('/categories', (req, res) => {
-  const rows = db.prepare('SELECT category, COUNT(*) c FROM agents WHERE status="published" GROUP BY category ORDER BY c DESC').all();
+  // 测试轮修复：原 status="published" 双引号在 SQLite 是标识符引用 → no such column 500（接口从未可用过）
+  const rows = db.prepare("SELECT category, COUNT(*) c FROM agents WHERE status='published' GROUP BY category ORDER BY c DESC").all();
   res.json({ code: 0, data: rows });
 });
 
@@ -504,7 +505,7 @@ router.post('/:id/copy', (req, res) => {
   let copyTools = [];
   try { copyTools = JSON.parse(a.tools || '[]').filter(t => TOOL_DEFS[t] && !AGENT_TOOL_DENY.has(t)); } catch { copyTools = []; }
   const info = db.prepare(`INSERT INTO agents (name,description,type,space_id,category,prompt,user_prompt,model,temperature,top_p,diversity_mode,icon,context_rounds,max_reply,opening,opening_questions,kb_id,status,source,source_name,tools,mcp_servers,long_memory,allow_user_model,suggest_enabled,variables,child_ids,owner,created_at,updated_at)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))`)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))`)
     .run(name, a.description, a.type, a.space_id, a.category, a.prompt, a.user_prompt, a.model, a.temperature, a.top_p, a.diversity_mode, a.icon,
       a.context_rounds, a.max_reply, a.opening, a.opening_questions, a.kb_id, 'draft', 'self', '', JSON.stringify(copyTools), a.mcp_servers,
       a.long_memory, a.allow_user_model, a.suggest_enabled, a.variables, a.child_ids, req.user.username);
