@@ -355,15 +355,148 @@ export function mountChat(el, opts) {
     try { return JSON.parse(localStorage.getItem('ap_user')).nickname || t('我'); } catch { return t('我'); }
   }
 
+  /**
+   * 纯正则 markdown → HTML 渲染器（零依赖）
+   * 处理：标题、分割线、引用、加粗、斜体、行内代码、代码块、链接、无序列表、有序列表
+   * 内置 HTML 转义，输出安全 HTML。
+   */
+  function renderMarkdown(text) {
+    const s = String(text ?? '');
+
+    // 1. 保护代码块 ```...```（先于一切处理，防止内部被转义或 markdown 解析破坏）
+    const codeBlocks = [];
+    let tmp = s.replace(/(?:^|\n)```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
+      const idx = codeBlocks.length;
+      codeBlocks.push({ lang, code });
+      return `\n\x00CODEBLOCK${idx}\x00\n`; // 换行包裹确保列表分割正确
+    });
+
+    // 2. 保护行内代码 `...`（同样防止转义）
+    const inlineCodes = [];
+    tmp = tmp.replace(/`([^`]+)`/g, (_, code) => {
+      const idx = inlineCodes.length;
+      inlineCodes.push(code);
+      return `\x00INLINECODE${idx}\x00`;
+    });
+
+    // 3. 保护引用 > 行（提取为一整段，转义后再释放为 HTML 标签，防止 <blockquote> 被转义破坏）
+    const blockquotes = [];
+    tmp = tmp.replace(/^ {0,3}>[ \t]?(.*)$/gm, (_, content) => {
+      const idx = blockquotes.length;
+      blockquotes.push(content);
+      return `\x00BQ${idx}\x00`;
+    });
+
+    // 4. HTML 转义剩余文本（此时所有特殊结构均已被占位符保护，不会破坏引号/尖括号/& 等）
+    tmp = tmp.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+    // 5. 恢复引用（内容已在保护阶段原样保留，这里输出转义后的 HTML）
+    tmp = tmp.replace(/\x00BQ(\d+)\x00/g, (_, n) => {
+      const content = blockquotes[+n] || '';
+      const escaped = content.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+      return `<blockquote>${escaped}</blockquote>`;
+    });
+
+    // 合并连续的 <blockquote> 为一块
+    tmp = tmp.replace(/(<blockquote>.*?(?:\n<blockquote>.*?)*)/g, match => {
+      return match.replace(/\n<blockquote>/g, '\n') + '</blockquote>';
+    });
+    // 去除每个 blockquote 多余的闭合标签（除了最后一个）
+    // 上面 replace 的 regex 略激进，改用更精确的逐行合并：
+    // 先去掉每个 blockquote 的内部闭合标签（../g 匹配时已包含），改用行解析
+    // 更稳健：用 wrapList 风格合并连续 blockquote
+    tmp = (function mergeBlockquotes(t) {
+      const lines = t.split('\n');
+      const out = [];
+      let inBq = false;
+      for (let i = 0; i < lines.length; i++) {
+        if (/^<blockquote>/.test(lines[i])) {
+          if (!inBq) { out.push('<blockquote>'); inBq = true; }
+          out.push(lines[i].replace(/^<blockquote>(.*)<\/blockquote>$/, '$1'));
+        } else {
+          if (inBq) { out[out.length - 1] += '</blockquote>'; inBq = false; }
+          out.push(lines[i]);
+        }
+      }
+      if (inBq) out[out.length - 1] += '</blockquote>';
+      return out.join('\n');
+    })(tmp);
+
+    // 6. 分割线（必须优先于 * 加粗/斜体规则）
+    tmp = tmp.replace(/^ {0,3}([-*_]){3,}\s*$/gm, '<hr>');
+
+    // 7. 标题（先处理多级标题避免 H3 覆盖 H1；内容已在第 4 步转义）
+    tmp = tmp.replace(/^ {0,3}######\s+(.*)$/gm, '<h6>$1</h6>');
+    tmp = tmp.replace(/^ {0,3}#####\s+(.*)$/gm, '<h5>$1</h5>');
+    tmp = tmp.replace(/^ {0,3}####\s+(.*)$/gm, '<h4>$1</h4>');
+    tmp = tmp.replace(/^ {0,3}###\s+(.*)$/gm, '<h3>$1</h3>');
+    tmp = tmp.replace(/^ {0,3}##\s+(.*)$/gm, '<h2>$1</h2>');
+    tmp = tmp.replace(/^ {0,3}#\s+(.*)$/gm, '<h1>$1</h1>');
+
+    // 8. 图片 ![alt](url) — 在转义后、链接前处理
+    tmp = tmp.replace(/!\[([^\]]*)\]\(((?:https?:\/\/|data:image\/|\/)[^\s)]+)\)/g, '<img src="$2" alt="$1" loading="lazy">');
+
+    // 9. 加粗 **text** 和 __text__
+    tmp = tmp.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+    tmp = tmp.replace(/__(.+?)__/g, '<strong>$1</strong>');
+
+    // 10. 斜体 *text* 和 _text_（注意不要匹配加粗中的 __）
+    tmp = tmp.replace(/\*(.+?)\*/g, '<em>$1</em>');
+    tmp = tmp.replace(/(?<!_)_{1}(?!_)(.+?)(?<!_)_{1}(?!_)/g, '<em>$1</em>');
+
+    // 11. 链接 [text](url)
+    tmp = tmp.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+|\/[^\s)]+)\)/g, '<a href="$2" rel="noopener">$1</a>');
+
+    // 12. 行内代码恢复
+    tmp = tmp.replace(/\x00INLINECODE(\d+)\x00/g, (_, n) => {
+      const code = inlineCodes[+n] || '';
+      return '<code>' + code.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])) + '</code>';
+    });
+
+    // 13. 代码块恢复
+    tmp = tmp.replace(/\x00CODEBLOCK(\d+)\x00/g, (_, n) => {
+      const b = codeBlocks[+n];
+      if (!b) return '';
+      const lang = b.lang ? `<span class="code-lang">${b.lang}</span>` : '';
+      const escaped = b.code.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+      return `<pre><code>${lang}${escaped}</code></pre>`;
+    });
+
+    // 14. 列表
+    tmp = wrapList(tmp, /^ {0,3}[-*]\s+(.+)$/gm, '<ul>', '<li>', '</li>', '</ul>');
+    tmp = wrapList(tmp, /^ {0,3}\d+\.\s+(.+)$/gm, '<ol>', '<li>', '</li>', '</ol>');
+
+    return tmp;
+  }
+
+  /** 辅助：将连续匹配的行包裹为列表 */
+  function wrapList(text, lineRe, openTag, itemOpen, itemClose, closeTag) {
+    const lines = text.split('\n');
+    const result = [];
+    let inList = false;
+    // 移除 lineRe 的 g flag（逐行匹配不用 g），否则 .match() 返回完整匹配而非捕获组
+    const re = new RegExp(lineRe.source, lineRe.flags.replace('g', ''));
+    for (let i = 0; i < lines.length; i++) {
+      const m = lines[i].match(re);
+      if (m) {
+        if (!inList) { result.push(openTag); inList = true; }
+        result.push(itemOpen + m[1] + itemClose);
+      } else {
+        if (inList) { result[result.length - 1] += closeTag; inList = false; }
+        result.push(lines[i]);
+      }
+    }
+    if (inList) result[result.length - 1] += closeTag;
+    return result.join('\n');
+  }
+
   function renderBubble(m) {
     // P5.14 附件行：用户消息携带附件时在正文前展示（可下载原文）
     const attachRow = (m.attachments && m.attachments.length)
       ? `<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px">${m.attachments.map(a => `<a href="/api/files/${a.id}/download" class="btn sm" style="text-decoration:none" title="${t('下载原文')}">📄 ${esc(a.name)}</a>`).join('')}</div>`
       : '';
-    // 引用角标 [n] / markdown 图片 / [VIDEO:taskId] 视频卡片 / [PPT:url|名|页数] 下载卡片
-    let html = attachRow + esc(m.content)
-      .replace(/!\[([^\]]*)\]\(((?:https?:\/\/|data:image\/|\/)[^\s)]+)\)/g, (all, alt, url) =>
-        `<img class="gen-img" src="${url}" alt="${alt}" loading="lazy">`)
+    // 引用角标 [n] / 平台专有卡片语法（先 markdown 转换，再叠加平台卡片替换）
+    let html = attachRow + renderMarkdown(m.content)
       .replace(/\[(\d{1,2})\]/g, (all, n) =>
         `<sup class="cite-mark" data-cite="${n}">[${n}]</sup>`);
     html = html.replace(/\[VIDEO:([A-Za-z0-9_-]+)\]/g, (all, taskId) =>
