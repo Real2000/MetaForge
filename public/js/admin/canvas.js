@@ -613,8 +613,11 @@ export function createCanvas(root, opts = {}) {
       showNoteMenu((wf.notes || []).find(x => x.id === noteEl.dataset.id), e.clientX, e.clientY);
     }
   });
-  window.addEventListener('mousedown', e => { if (!e.target.closest('.cv-menu')) closeCvMenu(); }, true);
-  window.addEventListener('keydown', e => { if (e.key === 'Escape') closeCvMenu(); });
+  // 具名引用以便 destroy 统一移除（防编排页进出泄漏 window 监听器）
+  const onCvMenuClose = e => { if (!e.target.closest('.cv-menu')) closeCvMenu(); };
+  const onCvEsc = e => { if (e.key === 'Escape') closeCvMenu(); };
+  window.addEventListener('mousedown', onCvMenuClose, true);
+  window.addEventListener('keydown', onCvEsc);
 
   // ---------- P5.15 双击画布空白 → 创建便签（立即进入编辑态） ----------
   stage.addEventListener('dblclick', e => {
@@ -1583,12 +1586,13 @@ export function createCanvas(root, opts = {}) {
     moveGhost(e);
   });
   function moveGhost(e) { if (dragGhost) { dragGhost.style.left = (e.clientX + 12) + 'px'; dragGhost.style.top = (e.clientY - 14) + 'px'; } }
-  window.addEventListener('mousemove', e => {
+  // 具名引用以便 destroy 统一移除（防编排页进出泄漏拖拽监听器）
+  const onCvDragMove = e => {
     if (!dropInfo) return;
     moveGhost(e);
     stage.classList.toggle('drag-over', e.target.closest('.cv-stage') != null);
-  });
-  window.addEventListener('mouseup', e => {
+  };
+  const onCvDragUp = e => {
     if (!dropInfo) return;
     const inStage = e.target.closest && (e.target.closest('.cv-stage') || e.target.closest('.cv-world') || e.target.closest('.cv-node') || e.target.closest('.cv-svg'));
     if (inStage) {
@@ -1597,7 +1601,9 @@ export function createCanvas(root, opts = {}) {
     }
     dragGhost?.remove(); dragGhost = null; dropInfo = null;
     stage.classList.remove('drag-over');
-  });
+  };
+  window.addEventListener('mousemove', onCvDragMove);
+  window.addEventListener('mouseup', onCvDragUp);
 
   // ---------- 交互：节点拖动 / 选中 / 删除 ----------
   world.addEventListener('mousedown', e => {
@@ -2585,7 +2591,16 @@ export function createCanvas(root, opts = {}) {
     else { history = []; histIdx = -1; pushHistory(); }
     renderNodes(); renderProp(); applyViewport(); renderMinimap();
   }
-  function destroy() { window.removeEventListener('keydown', keyHandler); closeVarPop(); root.innerHTML = ''; }
+  function destroy() {
+    window.removeEventListener('keydown', keyHandler);
+    window.removeEventListener('keydown', onCvEsc);
+    window.removeEventListener('mousedown', onCvMenuClose, true);
+    window.removeEventListener('mousemove', onCvDragMove);
+    window.removeEventListener('mouseup', onCvDragUp);
+    if (window.__cvViewportShiftCleanup) window.__cvViewportShiftCleanup(); // 清 resize + devicePosture
+    closeVarPop(); closeCvMenu();
+    root.innerHTML = '';
+  }
   // P5.12 对外：保存前校验（返回问题清单）+ 校验结果注入（渲染红点角标）
   function runValidation() {
     const r = validateWorkflow();

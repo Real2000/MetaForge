@@ -4,6 +4,7 @@ const { db, now } = require('../db');
 const { auth, adminOnly } = require('../lib/auth');
 const circuit = require('../lib/circuit');
 const { classifyModel } = require('../lib/model-types');
+const { encrypt, decrypt } = require('../lib/crypto-util');
 
 const router = express.Router();
 router.use(auth, adminOnly);
@@ -28,7 +29,10 @@ function maskKey(key) {
 }
 
 router.get('/', (req, res) => {
-  const rows = db.prepare('SELECT * FROM providers ORDER BY id').all().map(p => ({ ...p, api_key: maskKey(p.api_key), model_types: parseTypes(p.model_types) }));
+  const rows = db.prepare('SELECT * FROM providers ORDER BY id').all().map(p => {
+    const plain = decrypt(p.api_key);
+    return { ...p, api_key: maskKey(plain), model_types: parseTypes(p.model_types) };
+  });
   res.json({ code: 0, data: rows });
 });
 
@@ -42,8 +46,9 @@ router.post('/', (req, res) => {
   if (!name?.trim()) return res.json({ code: 400, msg: '供应商名称不能为空' });
   const ms = typeof models === 'string' ? models.split(/[,，\s]+/).filter(Boolean) : (models || []);
   const configured = 1;
+  const encryptedKey = api_key ? encrypt(api_key) : '';
   const info = db.prepare(`INSERT INTO providers (name,base_url,api_key,models,configured,is_default,remark,created_at) VALUES (?,?,?,?,?,0,?,datetime('now','localtime'))`)
-    .run(name.trim(), base_url || '', api_key || '', JSON.stringify(ms), configured, remark || '');
+    .run(name.trim(), base_url || '', encryptedKey, JSON.stringify(ms), configured, remark || '');
   db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)').run(req.user.username, '新增模型供应商', name.trim(), req.ip, now());
   res.json({ code: 0, data: { id: info.lastInsertRowid } });
 });
@@ -58,7 +63,7 @@ router.put('/:id', (req, res) => {
   else ms = JSON.parse(old.models || '[]');
   // P5.30 安全止血：api_key 为空或含掩码（旧前端缓存的脱敏回显值）一律视为「不修改」，防掩码串覆盖真 Key
   const keyIn = typeof api_key === 'string' ? api_key.trim() : '';
-  const nextKey = keyIn && !keyIn.includes('****') ? keyIn : old.api_key;
+  const nextKey = keyIn && !keyIn.includes('****') ? encrypt(keyIn) : old.api_key;
   const configured = base_url && nextKey ? 1 : old.configured;
   db.prepare('UPDATE providers SET name=?,base_url=?,api_key=?,models=?,configured=?,remark=? WHERE id=?')
     .run(name || old.name, base_url ?? old.base_url, nextKey, JSON.stringify(ms), configured, remark ?? old.remark, old.id);

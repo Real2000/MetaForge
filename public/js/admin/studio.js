@@ -1007,4 +1007,6 @@ export async function render(el, params) {
   renderLeft();
   renderEdit();
   $('#stSaved').textContent = t('就绪');
+  // 返回 destroy：路由切换时清理画布 window 监听器（防编排页进出泄漏）
+  return { destroy() { if (cvAPI && typeof cvAPI.destroy === 'function') cvAPI.destroy(); } };
 }

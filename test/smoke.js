@@ -21,18 +21,28 @@ function t(name, fn) {
 (async () => {
   console.log('【1】密码哈希与认证');
   const { db, hashPwd, verifyPwd } = require('../src-server/db');
-  await t('hashPwd 稳定且区分大小写', () => {
-    assert.strictEqual(hashPwd('abc123'), hashPwd('abc123'));
-    assert.notStrictEqual(hashPwd('abc123'), hashPwd('ABC123'));
+  await t('hashPwd 稳定且区分大小写', async () => {
+    const pwd = 'abc123';
+    const h1 = await hashPwd(pwd);
+    const h2 = await hashPwd(pwd);
+    const h3 = await hashPwd('ABC123');
+    // 同样的密码每次生成不同盐值，因此哈希不同（由 salt 保证）
+    assert.notStrictEqual(h1, h2);
+    // 密码区分大小写：不同大小写一定不同
+    assert.notStrictEqual(h1, h3);
+    // 但都能被 verifyPwd 正确验证
+    assert.deepStrictEqual(await verifyPwd(pwd, h1), { ok: true, legacy: false });
+    assert.deepStrictEqual(await verifyPwd(pwd, h2), { ok: true, legacy: false });
+    assert.strictEqual((await verifyPwd('ABC123', h1)).ok, false);
   });
-  await t('verifyPwd 新 SALT 命中 / 错误密码拒绝', () => {
-    const stored = hashPwd('right-pass');
-    assert.deepStrictEqual(verifyPwd('right-pass', stored), { ok: true, legacy: false });
-    assert.strictEqual(verifyPwd('wrong-pass', stored).ok, false);
+  await t('verifyPwd 新 SALT 命中 / 错误密码拒绝', async () => {
+    const stored = await hashPwd('right-pass');
+    assert.deepStrictEqual(await verifyPwd('right-pass', stored), { ok: true, legacy: false });
+    assert.strictEqual((await verifyPwd('wrong-pass', stored)).ok, false);
   });
-  await t('verifyPwd 旧 SALT（升级前存量密码）兼容命中且标记 legacy', () => {
+  await t('verifyPwd 旧 SALT（升级前存量密码）兼容命中且标记 legacy', async () => {
     const legacyHash = require('crypto').createHash('sha256').update('agent-platform-salt-v1' + 'old-user-pwd').digest('hex');
-    const v = verifyPwd('old-user-pwd', legacyHash);
+    const v = await verifyPwd('old-user-pwd', legacyHash);
     assert.strictEqual(v.ok, true);
     assert.strictEqual(v.legacy, true);
   });

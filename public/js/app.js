@@ -6,6 +6,9 @@ import { t, getLang, setLang } from './i18n.js';
 // <html lang> 跟随界面语言（P3 多语言）
 document.documentElement.lang = getLang() === 'en' ? 'en' : 'zh-CN';
 
+// 路由层 destroy 生命周期：页面模块 render() 可返回 { destroy }，切页时统一清理（防 monitor 轮询/canvas 监听器泄漏）
+let currentDestroy = null;
+
 const routes = {
   '/login': { page: () => import('./login.js'), layout: 'none' },
   '/home': { page: () => import('./front/home.js'), layout: 'front', title: '前台首页' },
@@ -206,6 +209,9 @@ async function route() {  const hash = location.hash || '#/home';
   const base = '/' + segs.slice(0, segs[0] === 'admin' ? 2 : 1).join('/');
   const conf = routes[base] || routes['/home'];
 
+  // 切页前清理上一页 destroy（防轮询/监听器泄漏）
+  if (currentDestroy) { try { currentDestroy(); } catch (e) { console.warn('destroy err', e); } currentDestroy = null; }
+
   if (!getToken() && !conf.public && base !== '/login') { location.hash = '#/login'; return; }
   if (base === '/login' && getToken()) { location.hash = '#/home'; return; }
   if (conf.admin && getUser()?.role !== 'admin') { toast(t('需要管理员权限'), 'err'); location.hash = '#/home'; return; }
@@ -216,7 +222,8 @@ async function route() {  const hash = location.hash || '#/home';
   if (conf.layout === 'none') {
     app.innerHTML = '';
     const mod = await conf.page();
-    mod.render(app, params);
+    const ret = await mod.render(app, params);
+    if (typeof ret?.destroy === 'function') currentDestroy = ret.destroy;
   } else {
     app.innerHTML = layoutShell(conf.layout, path, conf.title, skeletonHTML(conf.layout));
     // P5.23 嵌入模式：隐藏 chrome 后还需把高度报给宿主（iframe 自适应高度场景）
@@ -238,7 +245,8 @@ async function route() {  const hash = location.hash || '#/home';
     const box = document.getElementById('pageContent') || app.querySelector('.main');
     const mod = await conf.page();
     try {
-      mod.render(box, params);
+      const ret = await mod.render(box, params);
+      if (typeof ret?.destroy === 'function') currentDestroy = ret.destroy;
     } catch (e) {
       console.error(e);
       box.innerHTML = `<div class="empty-box"><div class="big">⚠️</div>页面加载失败：${esc(e.message)}</div>`;

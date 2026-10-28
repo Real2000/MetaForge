@@ -1,11 +1,17 @@
 /* P5.23 Service Worker：离线缓存静态资源
  * 策略：
  *   - HTML 入口：network-first（保证发版即时生效），失败回缓存（离线可开壳）
- *   - /css /js /icons 静态资源：stale-while-revalidate（秒开 + 后台更新）
+ *   - /css /js /icons /vendor 静态资源：stale-while-revalidate（秒开 + 后台更新）
  *   - /api /** 与 SSE/流式：永不缓存（NEVER_CACHE），直连网络
  *   - 版本号 bump 触发旧缓存清理；仅在同源且非导出/下载请求时缓存
+ *
+ * 版本号规范：p<里程碑>-v<里程碑内递增序号>
+ *   例：p5.34-v1 → p5.34-v2（同一里程碑内多次发版）；p5.34-v1 → p5.35-v1（进入新里程碑）
+ * 何时必须 bump：凡改动 public/js、public/css、public/vendor、public/sw.js、public/index.html 任一文件
+ *   （即任何会被 STATIC_CACHE 缓存的资源变更），发版前必须 bump SW_VERSION，否则用户端拿旧缓存。
+ * 提交前自检：git diff --name-only HEAD~1 | grep -E '^public/(js|css|vendor|sw\.js|index\.html)' 命中则必须改本常量。
  */
-const SW_VERSION = 'p5.23-v1';
+const SW_VERSION = 'p5.35-v1';
 const STATIC_CACHE = `ap-static-${SW_VERSION}`;
 const NEVER_CACHE = [/^\/api\//, /\/sse/, /\/stream/, /\/files\/download/, /\?[^\s]*download/];
 
@@ -22,7 +28,7 @@ self.addEventListener('activate', e => {
   );
 });
 
-const isStatic = url => /^\/(css|js|icons|manifest\.json)/.test(url.pathname) || url.pathname === '/' || url.pathname.endsWith('.html');
+const isStatic = url => /^\/(css|js|icons|vendor|manifest\.json)/.test(url.pathname) || url.pathname === '/' || url.pathname.endsWith('.html');
 
 self.addEventListener('fetch', e => {
   const req = e.request;

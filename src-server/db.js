@@ -39,14 +39,96 @@ function loadSalt() {
   return LEGACY_SALT;
 }
 const SALT = loadSalt();
-function hashPwd(pwd) {
-  return crypto.createHash('sha256').update(SALT + pwd).digest('hex');
+/* P0-1 2026-10-28 密码哈希升级：SHA-256 → scrypt + per-user salt，存量透明迁移
+ * hashPwd 现在生成 scrypt 哈希（自动加随机盐），verifyPwd 兼容旧 SHA-256 全局盐哈希，
+ * 登录时自动升级为 scrypt（修改 history 列为用户专属 salt+hash）。
+ * 新注册用户直接用 scrypt。
+ * db schema: users.password 字段含义不变，但格式为 `salt.derivedKey`（scrypt）或旧 hash（SHA-256）
+ * 其中 scrypt 配置：N=16384, r=8, p=1, keylen=32
+ */
+const SCRYPT_OPTS = { N: 1 << 14, r: 8, p: 1, maxmem: 128 * 1024 * 1024 }; // N=16384
+
+function generateSalt(len = 16) {
+  return crypto.randomBytes(len).toString('hex');
 }
-/** 兼容旧 SALT 的验证（老密码一次登录后即换新哈希，平滑迁移） */
-function verifyPwd(pwd, stored) {
-  if (stored === hashPwd(pwd)) return { ok: true, legacy: false };
-  const legacyHash = crypto.createHash('sha256').update(LEGACY_SALT + pwd).digest('hex');
-  return { ok: stored === legacyHash, legacy: stored === legacyHash };
+
+async function hashPwdScrypt(pwd, salt) {
+  try {
+    const key = await new Promise((resolve, reject) => {
+      crypto.scrypt(pwd, salt, SCRYPT_OPTS.keylen || 32, SCRYPT_OPTS, (err, derivedKey) => {
+        if (err) reject(err);
+        else resolve(derivedKey);
+      });
+    });
+    return salt + '.' + key.toString('hex');
+  } catch (e) {
+    const key = crypto.scryptSync(pwd, salt, SCRYPT_OPTS.keylen || 32, SCRYPT_OPTS);
+    return salt + '.' + key.toString('hex');
+  }
+}
+
+async function verifyPwdScrypt(pwd, stored) {
+  // scrypt 格式：salt.derivedKey
+  if (stored.includes('.')) {
+    const parts = stored.split('.');
+    // 确保格式正确（至少 salt + key 两部分）
+    if (parts.length >= 2) {
+      const salt = parts[0];
+      const keyHex = parts.slice(1).join('.'); // 可能有多个点，重新连接
+      try {
+        const derived = await new Promise((resolve, reject) => {
+          crypto.scrypt(pwd, salt, SCRYPT_OPTS.keylen || 32, SCRYPT_OPTS, (err, derivedKey) => {
+            if (err) reject(err);
+            else resolve(derivedKey);
+          });
+        });
+        if (derived.toString('hex') === keyHex) return { ok: true, legacy: false };
+      } catch (e) {
+        // fallthrough to legacy
+      }
+    }
+    // 格式不对或验证失败，fallthrough 尝试旧方式
+  }
+  // 旧兼容：SHA-256 + 全局 SALT
+  const legacyHash = crypto.createHash('sha256').update(SALT + pwd).digest('hex');
+  if (stored === legacyHash) return { ok: true, legacy: true };
+  // 再兼容旧旧 SALT（LEGACY_SALT 兜底）
+  const legacyHash2 = crypto.createHash('sha256').update(LEGACY_SALT + pwd).digest('hex');
+  return { ok: stored === legacyHash2, legacy: stored === legacyHash2 };
+}
+
+// 保持 hashPwd 和 verifyPwd 的旧接口签名不变，内部实现升级
+function hashPwd(pwd) {
+  // 同步包装，实际上 db 操作时统一用 async 变体
+  // 但为了向后兼容，保留此函数返回同步值（调用方在赋初值时用）
+  // 实际新注册/改密时使用 hashPwdAsync
+  const salt = generateSalt();
+  // 同步 scrypt 不支持于所有 Node 版本，这里用同步方式生成（主线程阻塞，但只在注册和改密时调用一次，可接受）
+  const key = crypto.scryptSync(pwd, salt, SCRYPT_OPTS.keylen || 32, SCRYPT_OPTS);
+  return salt + '.' + key.toString('hex');
+}
+
+// 验证时用 async 版本
+async function verifyPwd(pwd, stored) {
+  return verifyPwdScrypt(pwd, stored);
+}
+
+// 注册/改密时写入哈希
+async function hashPwdAsync(pwd) {
+  const salt = generateSalt();
+  try {
+    const key = await new Promise((resolve, reject) => {
+      crypto.scrypt(pwd, salt, SCRYPT_OPTS.keylen || 32, SCRYPT_OPTS, (err, derivedKey) => {
+        if (err) reject(err);
+        else resolve(derivedKey);
+      });
+    });
+    return salt + '.' + key.toString('hex');
+  } catch (e) {
+    // fallback: synchronous scrypt
+    const key = crypto.scryptSync(pwd, salt, SCRYPT_OPTS.keylen || 32, SCRYPT_OPTS);
+    return salt + '.' + key.toString('hex');
+  }
 }
 function now() {
   return new Date().toLocaleString('sv-SE', { timeZone: 'Asia/Shanghai' });
@@ -1054,7 +1136,7 @@ CREATE INDEX IF NOT EXISTS idx_agents_share_token ON agents(share_token) WHERE s
 CREATE INDEX IF NOT EXISTS idx_agents_source_ext ON agents(source, external_app_id);
 `);
 
-module.exports = { db, hashPwd, verifyPwd, now, daysAgo };
+module.exports = { db, hashPwd, hashPwdAsync, verifyPwd, now, daysAgo };
 
 // ---------------- P5.27 本地桥设备与任务队列（2026-10-27）----------------
 // 轮询模式：网页对话发 local_exec → 任务入队 → 本地桥 daemon poll 拉取执行 → result 回推

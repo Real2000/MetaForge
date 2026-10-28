@@ -133,4 +133,6 @@ export async function render(el) {
   }
 
   await loadServer();
+  // 返回 destroy：路由切换时清理 3s 轮询 interval，防 N 次进出 N 个 interval 叠加泄漏
+  return { destroy() { clearInterval(timer); timer = null; } };
 }
