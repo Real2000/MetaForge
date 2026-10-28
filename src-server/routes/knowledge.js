@@ -34,12 +34,13 @@ router.post('/', (req, res) => {
 });
 
 router.put('/:id', (req, res) => {
-  const { name, description, enabled } = req.body || {};
+  const { name, description, enabled, chunk_size, chunk_overlap, chunk_separator } = req.body || {};
   const old = db.prepare('SELECT * FROM kbs WHERE id=?').get(req.params.id);
   const deny = denyIfNotAllowed(old, req.user);
   if (deny) return res.json(deny);
-  db.prepare('UPDATE kbs SET name=?,description=?,enabled=? WHERE id=?')
-    .run(name || old.name, description ?? old.description, enabled ?? old.enabled, old.id);
+  db.prepare('UPDATE kbs SET name=?,description=?,enabled=?,chunk_size=?,chunk_overlap=?,chunk_separator=? WHERE id=?')
+    .run(name || old.name, description ?? old.description, enabled ?? old.enabled,
+      chunk_size ?? old.chunk_size, chunk_overlap ?? old.chunk_overlap, chunk_separator ?? old.chunk_separator, old.id);
   res.json({ code: 0, msg: '已保存' });
 });
 
@@ -91,19 +92,33 @@ router.post('/:id/files', async (req, res) => {
   text = (text || '').replace(/\r\n/g, '\n').replace(/\u0000/g, '').trim();
   if (text.length < 8) return res.json({ code: 400, msg: '解析后无有效文本内容（扫描版 PDF 需先 OCR）' });
 
-  // 智能切片
+  // 智能切片（使用知识库配置参数）
+  const chunkSize = kb.chunk_size || 500;
+  const chunkOverlap = kb.chunk_overlap || 0;
+  const sep = kb.chunk_separator || '\n\s*\n';
+  const sepRe = new RegExp(sep);
   const chunks = [];
-  for (const para of text.split(/\n\s*\n/)) {
+  for (const para of text.split(sepRe)) {
     const p = para.trim();
     if (p.length < 8) continue;
-    if (p.length <= 500) { chunks.push(p); continue; }
-    // 超长段落：按句边界切 ~500 字
+    if (p.length <= chunkSize) { chunks.push(p); continue; }
+    // 超长段落：按句边界切 ~chunkSize 字
     let cur = '';
     for (const sent of p.split(/(?<=[。！？；.!?;])/)) {
-      if ((cur + sent).length > 500 && cur) { chunks.push(cur.trim()); cur = sent; }
+      if ((cur + sent).length > chunkSize && cur) { chunks.push(cur.trim()); cur = sent; }
       else cur += sent;
     }
     if (cur.trim().length >= 8) chunks.push(cur.trim());
+  }
+  // 重叠切片：对相邻两块各取末尾 overlap 字符追加到前一块
+  if (chunkOverlap > 0 && chunks.length > 1) {
+    for (let i = chunks.length - 1; i > 0; i--) {
+      const prev = chunks[i - 1];
+      const next = chunks[i];
+      if (prev.length > chunkOverlap) {
+        chunks[i - 1] = prev + '\n' + next.slice(0, chunkOverlap);
+      }
+    }
   }
   if (!chunks.length) return res.json({ code: 400, msg: '切片后无有效片段' });
 

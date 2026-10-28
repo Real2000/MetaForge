@@ -122,14 +122,28 @@ export async function render(el) {
       <div class="form-item"><label>描述</label><textarea class="input" id="kb_desc">${esc(kb.description || '')}</textarea></div>
       <div class="form-item"><label>状态</label>
         <select class="input" id="kb_enabled"><option value="1" ${kb.enabled ? 'selected' : ''}>启用</option><option value="0" ${!kb.enabled ? 'selected' : ''}>停用</option></select>
-      </div>`;
+      </div>
+      <hr>
+      <div style="font-size:13px;font-weight:600;color:var(--text);margin:10px 0 6px">切片配置</div>
+      <div class="form-item"><label>切片大小（字符数）</label><input class="input" id="kb_chunk_size" type="number" min="100" max="2000" value="${kb.chunk_size || 500}"></div>
+      <div class="form-item"><label>重叠字符数</label><input class="input" id="kb_chunk_overlap" type="number" min="0" max="${(kb.chunk_size || 500) - 1}" value="${kb.chunk_overlap || 0}"></div>
+      <div class="form-item"><label>分隔符（正则）</label><input class="input" id="kb_chunk_sep" value="${esc(kb.chunk_separator || '\\n\\s*\\n')}" placeholder="默认：\\n\\s*\\n"><div style="font-size:11px;color:var(--text-3)">用于按段落切分，正则表达式格式，默认按空行分段。</div></div>`;
     modal({
       title: '编辑知识库', body,
       foot: '<button class="btn" data-cancel>取消</button><button class="btn primary" data-save>保存</button>',
       onMount(mask, close) {
         mask.querySelector('[data-cancel]').onclick = close;
         mask.querySelector('[data-save]').onclick = async () => {
-          await api('/knowledge/' + kb.id, { method: 'PUT', body: { name: mask.querySelector('#kb_name').value, description: mask.querySelector('#kb_desc').value, enabled: +mask.querySelector('#kb_enabled').value } });
+          const chunkSize = Math.min(2000, Math.max(100, +mask.querySelector('#kb_chunk_size').value)) || 500;
+          const chunkOverlap = Math.min(chunkSize - 1, Math.max(0, +mask.querySelector('#kb_chunk_overlap').value)) || 0;
+          await api('/knowledge/' + kb.id, { method: 'PUT', body: {
+            name: mask.querySelector('#kb_name').value,
+            description: mask.querySelector('#kb_desc').value,
+            enabled: +mask.querySelector('#kb_enabled').value,
+            chunk_size: chunkSize,
+            chunk_overlap: chunkOverlap,
+            chunk_separator: mask.querySelector('#kb_chunk_sep').value || '\\n\\s*\\n',
+          } });
           toast('已保存'); close(); loadKbs().then(() => { current = kbs.find(x => x.id === kb.id); renderKbList(); });
         };
       },

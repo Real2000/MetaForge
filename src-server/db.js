@@ -662,6 +662,19 @@ if (!chunkCols.includes('embedding')) {
   db.exec(`ALTER TABLE kb_chunks ADD COLUMN embedding TEXT DEFAULT ''`);
   console.log('[db] kb_chunks 表已迁移：新增 embedding 字段');
 }
+const kbCols = db.prepare('PRAGMA table_info(kbs)').all().map(c => c.name);
+if (!kbCols.includes('chunk_size')) {
+  db.exec(`ALTER TABLE kbs ADD COLUMN chunk_size INTEGER DEFAULT 500`);
+  console.log('[db] kbs 表已迁移：新增 chunk_size 字段');
+}
+if (!kbCols.includes('chunk_overlap')) {
+  db.exec(`ALTER TABLE kbs ADD COLUMN chunk_overlap INTEGER DEFAULT 0`);
+  console.log('[db] kbs 表已迁移：新增 chunk_overlap 字段');
+}
+if (!kbCols.includes('chunk_separator')) {
+  db.exec(`ALTER TABLE kbs ADD COLUMN chunk_separator TEXT DEFAULT '\\n\\s*\\n'`);
+  console.log('[db] kbs 表已迁移：新增 chunk_separator 字段');
+}
 // 全链路追踪表
 db.exec(`CREATE TABLE IF NOT EXISTS chat_traces (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
