@@ -1,6 +1,6 @@
 /** 后台-系统监控：服务监控（真实指标）+ 操作日志 + 异常日志 */
 import { api } from '../api.js';
-import { esc, toast, lineChart, fmtBytes, fmtNum, fmtUptime, pager } from '../ui.js';
+import { esc, toast, lineChart, fmtBytes, fmtNum, fmtUptime, pager, confirmBox } from '../ui.js';
 
 export async function render(el) {
   let tab = 'server';
@@ -125,7 +125,7 @@ export async function render(el) {
         <div class="pager" id="errPager"></div>
       </div>`;
     pane.querySelector('#clearErr').onclick = async () => {
-      if (!confirm('清空全部异常日志？')) return;
+      if (!await confirmBox('清空全部异常日志？')) return;
       await api('/monitor/err-logs', { method: 'DELETE' });
       toast('已清空'); loadErr(1);
     };

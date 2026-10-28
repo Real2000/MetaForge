@@ -399,7 +399,7 @@ export async function render(el) {
           toast(j.msg); close(); openApiKeys(id);
         });
         mask.querySelectorAll('[data-dk]').forEach(b => b.onclick = async () => {
-          if (!confirm('删除该密钥？使用中的调用将立即失效。')) return;
+          if (!(await confirmBox('删除该密钥？使用中的调用将立即失效。'))) return;
           await api(`/agents/${id}/api-keys/${b.dataset.dk}`, { method: 'DELETE' });
           toast('已删除'); close(); openApiKeys(id);
         });

@@ -1,6 +1,6 @@
 /** Hash 路由 + 双布局（前台/后台）+ 主题/语言切换（P3） */
 import { api, getToken, getUser, logout } from './api.js';
-import { esc, toast, modal, getTheme, getThemePref, setTheme } from './ui.js';
+import { esc, toast, modal, confirmBox, getTheme, getThemePref, setTheme } from './ui.js';
 import { t, getLang, setLang } from './i18n.js';
 
 // <html lang> 跟随界面语言（P3 多语言）
@@ -230,7 +230,7 @@ async function route() {  const hash = location.hash || '#/home';
     if (isEmbedMode()) postEmbedHeight();
     const lb = document.getElementById('logoutBtn');
     if (lb) lb.onclick = async () => {
-      if (confirm('确定退出登录？')) { logout(); location.hash = '#/login'; }
+      if (await confirmBox('确定退出登录？')) { logout(); location.hash = '#/login'; }
     };
     const uc = document.getElementById('userChip');
     if (uc) uc.onclick = () => location.hash = '#/home';

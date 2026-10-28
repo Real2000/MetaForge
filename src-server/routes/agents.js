@@ -158,6 +158,9 @@ router.get('/:id/detail', (req, res) => {
 
 // 智能体长期记忆列表 / 清空（编排页记忆区块管理）
 router.get('/:id/memories', (req, res) => {
+  const agent = db.prepare('SELECT * FROM agents WHERE id=?').get(req.params.id);
+  if (!agent) return res.json({ code: 404, msg: '智能体不存在' });
+  if (!canView(agent, req.user)) return res.json({ code: 403, msg: '无权查看该智能体的记忆' });
   const rows = db.prepare('SELECT id, fact, created_at, username FROM agent_memories WHERE agent_id=? ORDER BY id DESC LIMIT 200').all(req.params.id);
   res.json({ code: 0, data: rows });
 });
@@ -726,19 +729,35 @@ router.put('/spaces/:id', (req, res) => {
   const { name, type, owner, members } = req.body || {};
   const old = db.prepare('SELECT * FROM spaces WHERE id=?').get(req.params.id);
   if (!old) return res.json({ code: 404, msg: '空间不存在' });
+  // 权限校验：仅管理员或空间创建者（owner 字段对于新空间存的是 nickname/username）可修改
+  if (req.user.role !== 'admin' && (!old.owner || old.owner !== (req.user.nickname || req.user.username))) {
+    return res.json({ code: 403, msg: '仅管理员或空间创建者可修改' });
+  }
   db.prepare('UPDATE spaces SET name=?,type=?,owner=?,members=? WHERE id=?').run(name || old.name, type || old.type, owner ?? old.owner, members ?? old.members, old.id);
   res.json({ code: 0, msg: '已保存' });
 });
 router.delete('/spaces/:id', (req, res) => {
+  const old = db.prepare('SELECT * FROM spaces WHERE id=?').get(req.params.id);
+  if (!old) return res.json({ code: 404, msg: '空间不存在' });
+  // 权限校验：仅管理员或空间创建者可删除（owner 字段对于新空间存的是 nickname/username）
+  if (req.user.role !== 'admin' && old.owner !== (req.user.nickname || req.user.username)) {
+    return res.json({ code: 403, msg: '仅管理员或空间创建者可删除' });
+  }
   db.prepare('DELETE FROM spaces WHERE id=?').run(req.params.id);
   db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)').run(req.user.username, '删除空间', '#' + req.params.id, req.ip, now());
   res.json({ code: 0, msg: '已删除' });
 });
 
-// ---------- 智能体测评（P3：发起测评需对该智能体有编辑权） ----------
+// ---------- 智能体测评（P3：发起测评需对该智能体有编辑权；查看/删除需有归属权限） ----------
 router.get('/evaluations', (req, res) => {
   const rows = db.prepare(`SELECT e.*, a.name AS agent_name FROM evaluations e LEFT JOIN agents a ON a.id=e.agent_id ORDER BY e.id DESC`).all();
-  res.json({ code: 0, data: rows });
+  // 非管理员只返回有权查看的智能体的测评（canView 过滤）
+  const filtered = req.user.role === 'admin' ? rows : rows.filter(r => {
+    const agent = db.prepare('SELECT owner,collaborators FROM agents WHERE id=?').get(r.agent_id);
+    if (!agent) return false;
+    return canView(agent, req.user);
+  });
+  res.json({ code: 0, data: filtered });
 });
 router.post('/evaluations', async (req, res) => {
   const { name, agent_id, rule_prompt, dataset } = req.body || {};
@@ -771,6 +790,11 @@ router.post('/evaluations', async (req, res) => {
   res.json({ code: 0, data: { id: info.lastInsertRowid, score } });
 });
 router.delete('/evaluations/:id', (req, res) => {
+  const evalRow = db.prepare('SELECT * FROM evaluations WHERE id=?').get(req.params.id);
+  if (!evalRow) return res.json({ code: 404, msg: '测评记录不存在' });
+  const agent = db.prepare('SELECT owner,collaborators FROM agents WHERE id=?').get(evalRow.agent_id);
+  if (!agent) return res.json({ code: 404, msg: '关联智能体不存在' });
+  if (!isOwnerLevel(agent, req.user)) return res.json({ code: 403, msg: '仅管理员或智能体创建者可删除测评' });
   db.prepare('DELETE FROM evaluations WHERE id=?').run(req.params.id);
   res.json({ code: 0, msg: '已删除' });
 });
