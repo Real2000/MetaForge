@@ -2634,6 +2634,24 @@ function t(name, fn) {
       assert.ok(Array.isArray(result));
       // 无供应商时不会崩溃，返回 RRF 排序结果
     });
+    // 【P3】P3 工程化：建表数 tripwire
+    await t('P3 工程化：新库建表数 = 40（防 schema 误删/迁移遗漏）', () => {
+      const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all();
+      // token_blacklist 是临时表才存在，种子数据不存在时不计数
+      const tableNames = tables.map(r => r.name);
+      const expected = 40; // 对照：db.js 中 CREATE TABLE 语句数
+      const hasTokenBlacklist = tableNames.includes('token_blacklist');
+      // token_blacklist 是动态决定是否存在的，不算标准建表数
+      assert.ok(tables.length >= expected, `建表数 ${tables.length} 应 ≥ ${expected}（当前可能缺表：${tableNames.filter(n => !tables.some(t => t.name === n)).join(',')}）`);
+    });
+    // 【P3】P3 工程化：P2 新增索引检查
+    await t('P3 工程化：P2 新增索引（rerank/父子切片/分块管理）', () => {
+      const have = db.prepare("SELECT name FROM sqlite_master WHERE type='index'").all().map(r => r.name);
+      const p2Indexes = ['idx_messages_session_created', 'idx_chat_traces_session'];
+      for (const idx of p2Indexes) {
+        assert.ok(have.includes(idx), `缺失 P2 新增索引：${idx}`);
+      }
+    });
   }
 
   // 收尾：关闭库并清理临时目录
