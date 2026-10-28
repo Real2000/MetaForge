@@ -9,7 +9,9 @@ const router = express.Router();
 router.use(auth, adminOnly);
 
 router.get('/op-logs', (req, res) => {
-  const { keyword, page = 1, size = 20 } = req.query;
+  const { keyword } = req.query;
+  let page = Math.max(1, +req.query.page) || 1;
+  let size = Math.min(100, Math.max(1, +req.query.size)) || 20;
   let sql = 'SELECT * FROM op_logs WHERE 1=1', args = [];
   if (keyword) { sql += ' AND (username LIKE ? OR action LIKE ? OR detail LIKE ?)'; args.push(`%${keyword}%`, `%${keyword}%`, `%${keyword}%`); }
   const total = db.prepare(sql.replace('SELECT *', 'SELECT COUNT(*) c')).get(...args).c;
@@ -19,7 +21,8 @@ router.get('/op-logs', (req, res) => {
 });
 
 router.get('/err-logs', (req, res) => {
-  const { page = 1, size = 20 } = req.query;
+  let page = Math.max(1, +req.query.page) || 1;
+  let size = Math.min(100, Math.max(1, +req.query.size)) || 20;
   const total = db.prepare('SELECT COUNT(*) c FROM err_logs').get().c;
   const list = db.prepare('SELECT * FROM err_logs ORDER BY id DESC LIMIT ? OFFSET ?').all(+size, (+page - 1) * +size);
   res.json({ code: 0, data: { list, total } });
