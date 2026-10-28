@@ -71,8 +71,58 @@ async function parseFileBuffer(name, buf) {
   } else { // txt / md / markdown
     text = buf.toString('utf-8');
   }
+  // PDF 纯文本表格增强：识别由空格/制表符对齐的表格结构并转为 Markdown 表格
+  if (ext === 'pdf') text = enhanceTableText(text);
   text = (text || '').replace(/\r\n/g, '\n').replace(/\u0000/g, '').trim();
   return { ext, text };
+}
+
+/**
+ * 从纯文本中识别由空格/制表符对齐的表格并转为 Markdown 表格格式。
+ * 检测逻辑：
+ *   1. 连续 3 行以上、每行由 3+ 列组成（按 2+ 空格/制表符分隔）
+ *   2. 首行推测为表头
+ *   3. 列数量一致时转为 | 表格语法
+ * 零新依赖、轻量启发式。典型覆盖：程序输出/类 CSV 文本/对齐报表。
+ * 对于复杂表格（跨行/合并单元格）能力有限，建议专门解析器如 camelot。
+ */
+function enhanceTableText(str) {
+  const lines = (str || '').split('\n');
+  if (lines.length < 3) return str;
+  const cellRe = /\S+(?:\s{2,}|\t)\S+/; // 至少两列，列间 2+ 空格或 tab
+  let inBlock = false;
+  const blocks = []; // [{start, end, cols}]
+  let start = -1, header = -1, lastColCount = 0;
+  for (let i = 0; i <= lines.length; i++) {
+    const line = i < lines.length ? lines[i] : null;
+    const cols = line && cellRe.test(line) ? line.split(/\s{2,}|\t+/).filter(Boolean).length : 0;
+    if (cols > 1) {
+      if (!inBlock) { start = i; header = i; inBlock = true; lastColCount = cols; }
+    } else {
+      if (inBlock && i - start >= 3 && lastColCount > 1) {
+        blocks.push({ start, end: i, cols: lastColCount });
+      }
+      inBlock = false; start = -1; lastColCount = 0;
+    }
+  }
+  if (blocks.length === 0) return str;
+  // 从后往前替换，保持行号不变
+  let result = lines.slice();
+  for (let b = blocks.length - 1; b >= 0; b--) {
+    const { start: s, end: e } = blocks[b];
+    const rows = lines.slice(s, e).map(l => l.split(/\s{2,}|\t+/).filter(Boolean));
+    // 取列数众数作为标准列数
+    const colCounts = rows.map(r => r.length);
+    const mode = colCounts.sort((a, z) => colCounts.filter(c => c === a).length - colCounts.filter(c => c === z).length).pop();
+    const validRows = rows.filter(r => r.length === mode);
+    if (validRows.length < 3) continue;
+    const headerLine = '| ' + validRows[0].map(c => c.trim()).join(' | ') + ' |';
+    const sepLine = '| ' + validRows[0].map(() => '---').join(' | ') + ' |';
+    const dataLines = validRows.slice(1).map(r => '| ' + r.map(c => c.trim()).join(' | ') + ' |');
+    const replacement = [headerLine, sepLine, ...dataLines].join('\n');
+    result.splice(s, e - s, replacement);
+  }
+  return result.join('\n');
 }
 
 /** 富文件对象（Runner 运行态）：results 里 start.file 变量的值形态 */
@@ -94,4 +144,4 @@ function fileToText(f) {
   return `[📄 文件 #${f.id}：${f.name}（${kb}，解析 ${f.text.length} 字）]\n${f.text}`;
 }
 
-module.exports = { FILE_EXTS, parseFileBuffer, fileToRich, fileToText };
+module.exports = { FILE_EXTS, parseFileBuffer, fileToRich, fileToText, enhanceTableText };
