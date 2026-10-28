@@ -140,7 +140,7 @@ export async function render(el) {
     const body = `
       <div class="form-item"><label>上传方式</label>
         <div style="display:flex;gap:8px">
-          <button class="btn primary" id="u_tab_file" style="flex:1">📎 选择文件（PDF/DOCX/TXT/MD）</button>
+          <button class="btn primary" id="u_tab_file" style="flex:1">📎 选择文件（PDF/DOCX/PPTX/TXT/MD）</button>
           <button class="btn" id="u_tab_text" style="flex:1">📝 粘贴文本</button>
         </div>
       </div>

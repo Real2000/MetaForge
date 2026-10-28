@@ -41,9 +41,17 @@ async function parseFileBuffer(name, buf) {
     text = parts.join('\n\n') || '（空表格）';
   } else if (ext === 'pptx') {
     // P2 2026-10-28：PPTX 解析——用 jszip 解压后提取各 slide XML 的纯文本，按幻灯片分页切片
-    const JSZip = require('jszip');
-    const zip = await JSZip.loadAsync(buf);
+    let zip;
+    try {
+      const JSZip = require('jszip');
+      zip = await JSZip.loadAsync(buf);
+    } catch (e) {
+      throw new Error(`PPT 文件解析失败（可能是文件损坏）：${e.message}`);
+    }
     const slideFiles = Object.keys(zip.files).filter(k => /^ppt\/slides\/slide\d+\.xml$/.test(k)).sort();
+    if (!slideFiles.length) {
+      throw new Error('PPT 文件中未找到任何幻灯片内容（可能不是有效的 PPTX 文件或文件已损坏）');
+    }
     const slideTexts = [];
     for (const sf of slideFiles) {
       const xmlData = await zip.files[sf].async('text');
