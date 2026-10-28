@@ -1033,6 +1033,27 @@ db.exec(`CREATE TABLE IF NOT EXISTS workflow_templates (
   }
 }
 
+// ---------------- 热表索引（2026-10-28 DB 优化：补齐 6 张高频表二级索引 + agents 高频查询）----------------
+// 幂等：IF NOT EXISTS 已存在则跳过；首次对存量数据建索引可能耗时数秒（WAL 下读不阻塞，但 better-sqlite3 同步会短暂冻结事件循环）
+// 索引与 stats.js 聚合下推必须同批上线（WHERE created_at>=? 依赖 idx_messages_created 才能走范围扫，否则仍全表扫）
+db.exec(`
+CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
+CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
+CREATE INDEX IF NOT EXISTS idx_chat_traces_msg ON chat_traces(message_id);
+CREATE INDEX IF NOT EXISTS idx_chat_traces_agent ON chat_traces(agent_id);
+CREATE INDEX IF NOT EXISTS idx_kb_chunks_kb ON kb_chunks(kb_id);
+CREATE INDEX IF NOT EXISTS idx_kb_chunks_file ON kb_chunks(file_id);
+CREATE INDEX IF NOT EXISTS idx_op_logs_created ON op_logs(created_at);
+CREATE INDEX IF NOT EXISTS idx_err_logs_created ON err_logs(created_at);
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(username, updated_at);
+CREATE INDEX IF NOT EXISTS idx_sessions_agent ON sessions(agent_id);
+CREATE INDEX IF NOT EXISTS idx_task_runs_started ON task_runs(started_at);
+CREATE INDEX IF NOT EXISTS idx_agents_status_pub ON agents(status) WHERE status='published';
+CREATE INDEX IF NOT EXISTS idx_agents_owner ON agents(owner);
+CREATE INDEX IF NOT EXISTS idx_agents_share_token ON agents(share_token) WHERE share_token != '';
+CREATE INDEX IF NOT EXISTS idx_agents_source_ext ON agents(source, external_app_id);
+`);
+
 module.exports = { db, hashPwd, verifyPwd, now, daysAgo };
 
 // ---------------- P5.27 本地桥设备与任务队列（2026-10-27）----------------

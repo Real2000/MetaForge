@@ -102,8 +102,11 @@ router.post('/invoices', auth, (req, res) => {
   if (!/^\d{4}-\d{2}$/.test(m) || +m.slice(5, 7) < 1 || +m.slice(5, 7) > 12) return res.json({ code: 400, msg: '请选择有效的开票月份（格式 YYYY-MM）' });
   if (m > new Date().toISOString().slice(0, 7)) return res.json({ code: 400, msg: '开票月份不能晚于当前月' });
   // 该月实际用量带入（金额口径：专业版按月费 199；免费版 0 元通常无需开票，允许提交备注说明）
-  const usage = db.prepare(`SELECT COALESCE(SUM(m.tokens),0) c FROM messages m JOIN sessions s ON s.id=m.session_id WHERE s.username=? AND substr(m.created_at,1,7)=?`)
-    .get(req.user.username, m).c;
+  // 范围查询替代 substr(created_at,1,7)=?（函数包裹列会阻断 idx_messages_created 索引）
+  const monthStart = m + '-01 00:00:00';
+  const nextMonth = m.slice(0, 5) + String(+m.slice(5, 7) + 1).padStart(2, '0') + '-01 00:00:00';
+  const usage = db.prepare(`SELECT COALESCE(SUM(m.tokens),0) c FROM messages m JOIN sessions s ON s.id=m.session_id WHERE s.username=? AND m.created_at >= ? AND m.created_at < ?`)
+    .get(req.user.username, monthStart, nextMonth).c;
   const plan = planOf(db.prepare('SELECT plan FROM users WHERE username=?').get(req.user.username)?.plan);
   const pending = db.prepare("SELECT COUNT(*) c FROM invoices WHERE username=? AND month=? AND status='pending'").get(req.user.username, m).c;
   if (pending) return res.json({ code: 400, msg: `「${m}」已有一笔待处理的发票申请` });

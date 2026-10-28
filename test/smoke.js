@@ -2591,6 +2591,26 @@ function t(name, fn) {
       const src = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'routes', 'logs.js'), 'utf8');
       assert.ok(/DELETE FROM err_logs'\)\.run\(\)/.test(src), 'DELETE FROM err_logs 必须带 .run()（prepare 只编译不执行，曾 77→77 假成功）');
     });
+    await t('DB优化：热表索引齐备（6 热表 11 索引 + agents 4 索引 = 15 条新索引，防误删）', () => {
+      const must = ['idx_messages_session','idx_messages_created','idx_chat_traces_msg','idx_chat_traces_agent',
+        'idx_kb_chunks_kb','idx_kb_chunks_file','idx_op_logs_created','idx_err_logs_created',
+        'idx_sessions_user','idx_sessions_agent','idx_task_runs_started',
+        'idx_agents_status_pub','idx_agents_owner','idx_agents_share_token','idx_agents_source_ext'];
+      const have = db.prepare("SELECT name FROM sqlite_master WHERE type='index'").all().map(r => r.name);
+      const miss = must.filter(n => !have.includes(n));
+      assert.deepStrictEqual(miss, [], `缺失索引：${JSON.stringify(miss)}（热表无索引会全表扫冻结 SSE）`);
+    });
+    await t('DB优化：stats.js 聚合下推（无全表扫 messages 进内存）', () => {
+      const src = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'routes', 'stats.js'), 'utf8');
+      assert.ok(!/SELECT created_at, tokens FROM messages'\)\.all\(\)/.test(src), '不得再全表读 messages 进内存按天求和（应下推 SUM+GROUP BY）');
+      assert.ok(!/SELECT m\.created_at, s\.username FROM messages m JOIN sessions s.*'\)\.all\(\)/.test(src), '不得再全表读 messages+sessions 进内存按天去重（应下推 COUNT(DISTINCT)+GROUP BY）');
+      assert.ok(src.includes('activeUserSeries') && src.includes('tokenSeries') && src.includes('agentGrowthSeries'), '应抽取公共聚合函数');
+    });
+    await t('DB优化：biz.js 发票用量查询不得用 substr 函数包裹列（阻断索引）', () => {
+      const src = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'routes', 'biz.js'), 'utf8');
+      assert.ok(!/substr\(m\.created_at,1,7\)=\?/.test(src), '不得用 substr(created_at,1,7)=?（函数包裹列阻断 idx_messages_created），应改 created_at >= ? AND created_at < ? 范围查询');
+      assert.ok(/m\.created_at >= \? AND m\.created_at < \?/.test(src), '应改范围查询走索引');
+    });
   }
 
   // 收尾：关闭库并清理临时目录

@@ -17,6 +17,32 @@ function lastNDays(n) {
   return out;
 }
 
+// 活跃用户按天去重（聚合下推 SQL，依赖 idx_messages_created；原实现全表读 messages 进内存 JS 去重会冻结 SSE）
+function activeUserSeries(days) {
+  const since = days[0] + ' 00:00:00';
+  const rows = db.prepare(`SELECT substr(m.created_at,1,10) AS d, COUNT(DISTINCT s.username) AS c
+    FROM messages m JOIN sessions s ON s.id = m.session_id
+    WHERE m.created_at >= ? GROUP BY substr(m.created_at,1,10)`).all(since);
+  const map = new Map(rows.map(r => [r.d, r.c]));
+  return { series: days.map(d => map.get(d) || 0), users: new Set(rows.length ? db.prepare(`SELECT DISTINCT s.username FROM messages m JOIN sessions s ON s.id=m.session_id WHERE m.created_at >= ?`).all(since).map(r => r.username) : []) };
+}
+// token 按天求和（聚合下推，依赖 idx_messages_created）
+function tokenSeries(days) {
+  const since = days[0] + ' 00:00:00';
+  const rows = db.prepare(`SELECT substr(created_at,1,10) AS d, COALESCE(SUM(tokens),0) AS c
+    FROM messages WHERE created_at >= ? GROUP BY substr(created_at,1,10)`).all(since);
+  const map = new Map(rows.map(r => [r.d, r.c]));
+  return days.map(d => map.get(d) || 0);
+}
+// 智能体累计增长（GROUP BY 算每日新增，JS 做前缀和；只读 2 列不读全表）
+function agentGrowthSeries(days) {
+  const rows = db.prepare(`SELECT substr(created_at,1,10) AS d, COUNT(*) AS daily FROM agents GROUP BY substr(created_at,1,10)`).all()
+    .sort((a, b) => a.d < b.d ? -1 : 1);
+  const cum = {}; let acc = 0;
+  for (const r of rows) { acc += r.daily; cum[r.d] = acc; }
+  return days.map(d => cum[d] ?? (Object.entries(cum).filter(([k]) => k <= d).pop()?.[1] || 0));
+}
+
 /** 数据看板 */
 router.get('/dashboard', (req, res) => {
   const days = lastNDays(7);
@@ -28,22 +54,14 @@ router.get('/dashboard', (req, res) => {
   const tokenTotal = db.prepare('SELECT COALESCE(SUM(tokens),0) c FROM messages').get().c;
   const taskTotal = db.prepare('SELECT COUNT(*) c FROM tasks').get().c;
 
-  // 活跃用户（按天去重）
-  const activeRows = db.prepare('SELECT m.created_at, s.username FROM messages m JOIN sessions s ON s.id = m.session_id').all();
-  const activeMap = new Map(days.map(d => [d, new Set()]));
-  activeRows.forEach(r => { const k = dayKey(r.created_at); if (activeMap.has(k)) activeMap.get(k).add(r.username); });
-  const activeUsers = days.map(d => activeMap.get(d).size);
+  // 活跃用户（按天去重，聚合下推）
+  const activeUsers = activeUserSeries(days).series;
 
-  // token 消耗（按天）
-  const tokenMap = new Map(days.map(d => [d, 0]));
-  db.prepare('SELECT created_at, tokens FROM messages').all().forEach(r => {
-    const k = dayKey(r.created_at);
-    if (tokenMap.has(k)) tokenMap.set(k, tokenMap.get(k) + r.tokens);
-  });
+  // token 消耗（按天，聚合下推）
+  const tokensByDay = tokenSeries(days);
 
-  // 智能体增长（按创建日累计）
-  const agentRows = db.prepare('SELECT created_at FROM agents ORDER BY created_at').all();
-  const agentGrowth = days.map(d => agentRows.filter(r => dayKey(r.created_at) <= d).length);
+  // 智能体增长（按创建日累计，聚合下推）
+  const agentGrowth = agentGrowthSeries(days);
 
   // TOP10
   const topChat = db.prepare(`
@@ -64,7 +82,7 @@ router.get('/dashboard', (req, res) => {
       cards: { agentTotal, agentPublished, userTotal, kbTotal, kbFiles, tokenTotal, taskTotal },
       days,
       activeUsers,
-      tokensByDay: days.map(d => tokenMap.get(d)),
+      tokensByDay,
       agentGrowth,
       topChat, topUsers, topTokens,
     },
@@ -86,15 +104,13 @@ router.get('/operation', (req, res) => {
   const users = db.prepare('SELECT COUNT(*) c FROM users').get().c;
 
   // 活跃 & 留存（演示口径：活跃=当日有消息；留存=7 日内曾活跃用户在最近一日仍活跃的比例）
-  const activeRows = db.prepare('SELECT m.created_at, s.username FROM messages m JOIN sessions s ON s.id = m.session_id').all();
-  const activeMap = new Map(days.map(d => [d, new Set()]));
-  activeRows.forEach(r => { const k = dayKey(r.created_at); if (activeMap.has(k)) activeMap.get(k).add(r.username); });
-  const activeSeries = days.map(d => activeMap.get(d).size);
+  const activeData = activeUserSeries(days);
+  const activeSeries = activeData.series;
   const userSeries = days.map(() => users);
   const agentTotal = db.prepare('SELECT COUNT(*) c FROM agents').get().c;
   const agentSeries = days.map(() => agentTotal);
-  const ever = new Set(); activeRows.forEach(r => ever.add(r.username));
-  const latest = activeMap.get(days[days.length - 1]) || new Set();
+  const ever = activeData.users;
+  const latest = new Set(db.prepare(`SELECT DISTINCT s.username FROM messages m JOIN sessions s ON s.id=m.session_id WHERE m.created_at >= ?`).all(days[days.length - 1] + ' 00:00:00').map(r => r.username));
   const retention = ever.size ? Math.round([...ever].filter(u => latest.has(u)).length / ever.size * 100) : 0;
 
   // 会话记录（运营视角：全平台）
