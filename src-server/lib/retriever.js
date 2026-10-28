@@ -5,7 +5,8 @@
  *    a. bge-m3 真实语义嵌入（网关 OpenAI 兼容 /embeddings，1024 维）——语义检索，缓存于 kb_chunks.embedding 列（JSON 前缀 "B3:"）
  *    b. 本地 n-gram 哈希兜底（256 维）——网关不可用时自动降级，零外部依赖（缓存前缀 "H:"）
  * 3. 融合：RRF（Reciprocal Rank Fusion），score = Σ 1/(60+rank)
- * 返回 [{content, file, kb, kb_id, score(融合), bm25, vec, engine}]
+ * 4. Rerank（2026-10-28 P2 重排升级）：RRF 粗召回 Top 30 → cross-encoder 重排取 Top 5
+ * 返回 [{content, file, kb, kb_id, score(融合), bm25, vec, engine, rerank_score}]
  */
 const { db } = require('../db');
 
@@ -13,6 +14,10 @@ const DIM = 256;              // 本地哈希向量维度
 const BGE_DIM = 1024;         // bge-m3 向量维度
 const BGE_MODEL = 'bge-m3';
 const BGE_TIMEOUT = 12000;    // 嵌入调用超时（超时/失败自动降级本地引擎，不阻塞检索）
+const RERANK_MODEL = 'bge-reranker-v2-m3'; // 默认重排模型
+const RERANK_TIMEOUT = 10000; // 重排调用超时
+const RERANK_CANDIDATES = 30; // 粗召回送入 Rerank 的候选数
+const RERANK_TOP_N = 5;      // Rerank 后精排输出数
 
 /* ---------------- bge-m3 网关嵌入（多供应商尝试，失败自动降级本地） ---------------- */
 
@@ -47,6 +52,59 @@ async function bgeEmbed(texts) {
     } catch { /* 换下一个供应商 */ }
   }
   bgeDownUntil = Date.now() + 30000; // 全部失败：30 秒内直接走本地引擎，避免每次检索都等超时
+  return null;
+}
+
+/* ---------------- Rerank 重排（2026-10-28：cross-encoder 精排） ---------------- */
+
+/** 找到拥有 rerank 模型的已配置供应商（默认优先） */
+function rerankProviders() {
+  return db.prepare("SELECT * FROM providers WHERE configured=1 AND api_key != '' AND base_url != '' ORDER BY is_default DESC, id")
+    .all()
+    .filter(p => {
+      try { return JSON.parse(p.models || '[]').some(m => /rerank|bge-reranker|reranker/i.test(m)); }
+      catch { return false; }
+    });
+}
+
+/** 调网关 rerank 接口，返回按相关性降序排列的索引数组。失败返回 null（跳过重排，回落 RRF 结果） */
+let rerankDownUntil = 0;
+async function bgeRerank(query, candidates) {
+  if (Date.now() < rerankDownUntil) return null;
+  if (!candidates || !candidates.length) return null;
+  const ps = rerankProviders();
+  if (!ps.length) return null;
+  for (const p of ps) {
+    try {
+      const url = p.base_url.replace(/\/+$/, '') + '/rerank';
+      const r = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + p.api_key },
+        body: JSON.stringify({
+          model: RERANK_MODEL,
+          query,
+          documents: candidates.map(c => c.content),
+          top_n: Math.min(candidates.length, RERANK_TOP_N),
+        }),
+        signal: AbortSignal.timeout(RERANK_TIMEOUT),
+      });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const j = await r.json();
+      // 标准响应格式：{ results: [{ index, relevance_score, document: { text } }, ...] }
+      if (j.results && Array.isArray(j.results) && j.results.length) {
+        j.results.sort((a, b) => (b.relevance_score || 0) - (a.relevance_score || 0));
+        // 返回按索引排列的精排结果（保留原索引以便后续 merge）
+        return j.results.map(r => ({ index: r.index, score: r.relevance_score || 0 }));
+      }
+      // 非标准响应：尝试 data[]（类 OpenAI 格式）
+      if (j.data && Array.isArray(j.data) && j.data.length) {
+        j.data.sort((a, b) => (b.relevance_score || 0) - (a.relevance_score || 0));
+        return j.data.map(r => ({ index: r.index, score: r.relevance_score || 0 }));
+      }
+      throw new Error('返回结构异常');
+    } catch { /* 换下一个供应商 */ }
+  }
+  rerankDownUntil = Date.now() + 30000; // 全部失败：30 秒内跳过重排
   return null;
 }
 
@@ -171,7 +229,7 @@ async function retrieve(query, kbId = null, topN = 5, threshold = 0.01) {
   if (parsed.every(p => p.engine === 'B3')) {
     // 全部已有 bge 缓存，查询向量走网关（失败则整体降级本地重算）
     const q = await bgeEmbed([query]);
-    if (q) return finish(rows, bm25, parsed.map(p => p.v), new Float32Array(q[0]), engine, topN, threshold);
+    if (q) return rerankAndSlice(query, finish(rows, bm25, parsed.map(p => p.v), new Float32Array(q[0]), engine, RERANK_CANDIDATES, threshold), topN);
   }
   const missIdx = rows.map((_, i) => i).filter(i => parsed[i].engine !== 'B3');
   if (missIdx.length) {
@@ -182,7 +240,7 @@ async function retrieve(query, kbId = null, topN = 5, threshold = 0.01) {
         try { upd.run('B3:' + JSON.stringify(got[k + 1]), rows[idx].id); } catch { }
         parsed[idx] = { v: new Float32Array(got[k + 1]), engine: 'B3' };
       });
-      return finish(rows, bm25, parsed.map(p => p.v), new Float32Array(got[0]), engine, topN, threshold);
+      return rerankAndSlice(query, finish(rows, bm25, parsed.map(p => p.v), new Float32Array(got[0]), engine, RERANK_CANDIDATES, threshold), topN);
     }
   }
 
@@ -195,7 +253,25 @@ async function retrieve(query, kbId = null, topN = 5, threshold = 0.01) {
     try { upd.run('H:' + JSON.stringify([...v]), r.id); } catch { }
     return v;
   });
-  return finish(rows, bm25, vecs, qVec, engine, topN, threshold);
+  return rerankAndSlice(query, finish(rows, bm25, vecs, qVec, engine, RERANK_CANDIDATES, threshold), topN);
+}
+
+/** Rerank 重排（优先）→ 如果不可用或失败，退回 RRF 排名前 topN 条 */
+async function rerankAndSlice(query, rrfResults, topN) {
+  if (!rrfResults || !rrfResults.length) return [];
+  try {
+    const ranked = await bgeRerank(query, rrfResults);
+    if (ranked && ranked.length) {
+      // 按 rerank 索引重排
+      const resultMap = new Map();
+      rrfResults.forEach((r, i) => resultMap.set(i, r));
+      return ranked
+        .map(r => ({ ...resultMap.get(r.index), rerank_score: r.score }))
+        .filter(Boolean)
+        .slice(0, topN);
+    }
+  } catch { /* fallthrough: 退回 RRF 排序 */ }
+  return rrfResults.slice(0, topN);
 }
 
 /** RRF 融合 + 排序输出（两种引擎共用） */
@@ -220,4 +296,4 @@ function finish(rows, bm25, vecs, qVec, engine, topN, threshold) {
     .slice(0, topN);
 }
 
-module.exports = { retrieve, embed, bgeEmbed };
+module.exports = { retrieve, embed, bgeEmbed, bgeRerank, rerankProviders };

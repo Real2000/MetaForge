@@ -2621,6 +2621,19 @@ function t(name, fn) {
       assert.ok(!/substr\(m\.created_at,1,7\)=\?/.test(src), '不得用 substr(created_at,1,7)=?（函数包裹列阻断 idx_messages_created），应改 created_at >= ? AND created_at < ? 范围查询');
       assert.ok(/m\.created_at >= \? AND m\.created_at < \?/.test(src), '应改范围查询走索引');
     });
+    // 【N+6】Rerank 重排序（2026-10-28 P2 重排升级）
+    await t('rerankProviders 无供应商时返回空数组', () => {
+      const { rerankProviders } = require('../src-server/lib/retriever');
+      const r = rerankProviders();
+      assert.ok(Array.isArray(r));
+      assert.strictEqual(r.length, 0);
+    });
+    await t('rerankAndSlice 退化逻辑（无供应商时退回 RRF 结果）', async () => {
+      const { retrieve } = require('../src-server/lib/retriever');
+      const result = await retrieve('测试', 0, 5, 0.01);
+      assert.ok(Array.isArray(result));
+      // 无供应商时不会崩溃，返回 RRF 排序结果
+    });
   }
 
   // 收尾：关闭库并清理临时目录
