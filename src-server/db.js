@@ -675,6 +675,12 @@ if (!kbCols.includes('chunk_separator')) {
   db.exec(`ALTER TABLE kbs ADD COLUMN chunk_separator TEXT DEFAULT '\\n\\s*\\n'`);
   console.log('[db] kbs 表已迁移：新增 chunk_separator 字段');
 }
+// kb_chunks 表增加 parent_id（父子切片：父 = ~1000 字上下文，子 = ~200 字精准召回）
+const chunkCols2 = db.prepare('PRAGMA table_info(kb_chunks)').all().map(c => c.name);
+if (!chunkCols2.includes('parent_id')) {
+  db.exec(`ALTER TABLE kb_chunks ADD COLUMN parent_id INTEGER DEFAULT NULL`);
+  console.log('[db] kb_chunks 表已迁移：新增 parent_id 字段（父子切片）');
+}
 // 全链路追踪表
 db.exec(`CREATE TABLE IF NOT EXISTS chat_traces (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -207,7 +207,7 @@ function bm25Scores(rows, qTerms) {
  */
 async function retrieve(query, kbId = null, topN = 5, threshold = 0.01) {
   const rows = db.prepare(`
-    SELECT c.id, c.content, c.kb_id, c.file_id, c.embedding, f.name AS file, k.name AS kb
+    SELECT c.id, c.content, c.kb_id, c.file_id, c.parent_id, c.embedding, f.name AS file, k.name AS kb
     FROM kb_chunks c
     LEFT JOIN kb_files f ON f.id = c.file_id
     LEFT JOIN kbs k ON k.id = c.kb_id
@@ -265,13 +265,33 @@ async function rerankAndSlice(query, rrfResults, topN) {
       // 按 rerank 索引重排
       const resultMap = new Map();
       rrfResults.forEach((r, i) => resultMap.set(i, r));
-      return ranked
+      return attachParentContext(ranked
         .map(r => ({ ...resultMap.get(r.index), rerank_score: r.score }))
         .filter(Boolean)
-        .slice(0, topN);
+        .slice(0, topN));
     }
   } catch { /* fallthrough: 退回 RRF 排序 */ }
-  return rrfResults.slice(0, topN);
+  return attachParentContext(rrfResults.slice(0, topN));
+}
+
+/** 父分片上下文增强：对命中子分片的结果，查找其父分片（parent_id）并将其内容合并到 content 前 */
+function attachParentContext(results) {
+  if (!results || !results.length) return results;
+  // 收集所有需要查找的 parent_id
+  const parentIds = results.filter(r => r.parent_id != null).map(r => Number(r.parent_id));
+  if (!parentIds.length) return results;
+  // 批量查询父分片
+  const placeholders = parentIds.map(() => '?').join(',');
+  const parents = db.prepare(`SELECT id, content FROM kb_chunks WHERE id IN (${placeholders})`).all(...parentIds);
+  const parentMap = new Map(parents.map(p => [p.id, p.content]));
+  for (const r of results) {
+    if (r.parent_id != null && parentMap.has(r.parent_id)) {
+      r.parent_content = parentMap.get(r.parent_id);
+      // 把父分片内容放在子分片内容前面，用换行分隔
+      r.content = parentMap.get(r.parent_id) + '\n' + r.content;
+    }
+  }
+  return results;
 }
 
 /** RRF 融合 + 排序输出（两种引擎共用） */

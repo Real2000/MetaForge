@@ -122,10 +122,39 @@ router.post('/:id/files', async (req, res) => {
   }
   if (!chunks.length) return res.json({ code: 400, msg: '切片后无有效片段' });
 
+  // 父子切片（2026-10-28 P2 父子切片）：子分片 ~200 字精准召回，父分片 ~1000 字保持上下文完整
+  // 按顺序每 4-6 个字分片合并为一个父分片（尽可能接近 1000 字）
+  const hasParentSlice = chunkSize > 200; // 只有 chunkSize > 200 时才需要分割父子切片
+  let parentChunks = [];
+  let childToParent = []; // 每个子分片对应的父分片索引（-1 = 独立，不关联）
+  if (hasParentSlice && chunks.length >= 2) {
+    // 计算每个父分片应该包含的子分片数
+    const pSize = 1000; // 目标父分片大小
+    const childCount = Math.max(2, Math.round(pSize / chunkSize));
+    parentChunks = [];
+    childToParent = [];
+    for (let i = 0; i < chunks.length; i += childCount) {
+      const group = chunks.slice(i, i + childCount);
+      parentChunks.push(group.join('\n'));
+      for (let j = 0; j < group.length; j++) childToParent.push(parentChunks.length - 1);
+    }
+  } else {
+    childToParent = chunks.map(() => -1);
+  }
+
   const info = db.prepare(`INSERT INTO kb_files (kb_id,name,size,status,chunk_count,created_at) VALUES (?,?,?,?,?,datetime('now','localtime'))`)
     .run(kb.id, name, byteSize, 'success', chunks.length);
-  const ins = db.prepare('INSERT INTO kb_chunks (file_id,kb_id,content) VALUES (?,?,?)');
-  chunks.forEach(c => ins.run(info.lastInsertRowid, kb.id, c));
+  // 先插父分片，再插子分片
+  if (hasParentSlice && parentChunks.length) {
+    const insParent = db.prepare('INSERT INTO kb_chunks (file_id,kb_id,content,parent_id) VALUES (?,?,?,?)');
+    parentChunks.forEach(pc => insParent.run(info.lastInsertRowid, kb.id, pc, null));
+  }
+  const ins = db.prepare('INSERT INTO kb_chunks (file_id,kb_id,content,parent_id) VALUES (?,?,?,?)');
+  const parentStartIdx = hasParentSlice ? parentChunks.length : 0;
+  chunks.forEach((c, i) => {
+    const parentId = hasParentSlice && childToParent[i] >= 0 ? (parentStartIdx + childToParent[i] + 1) : null;
+    ins.run(info.lastInsertRowid, kb.id, c, parentId);
+  });
   db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
     .run(req.user.username, '上传知识库文件', `${kb.name} / ${name}（${chunks.length} 片段）`, req.ip, now());
   res.json({ code: 0, data: { id: info.lastInsertRowid, chunks: chunks.length } });
