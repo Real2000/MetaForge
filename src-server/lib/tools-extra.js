@@ -1142,9 +1142,16 @@ const run_code = {
         for (const f of fs.readdirSync(workDir)) {
           const st = fs.statSync(path.join(workDir, f));
           if (st.isFile() && st.size <= 20 * 1024 * 1024) {
-            const destName = `${sbId}-${f}`;
+            // P0-3 安全加固：HTML 产物重命名为 .html.txt 防 XSS（同域上传 /uploads 可用 HTML 窃取 token）
+            let destName;
+            if (/\.html?$/i.test(f)) {
+              destName = `${sbId}-${f.replace(/\.html?$/i, '')}.html.txt`;
+            } else {
+              destName = `${sbId}-${f}`;
+            }
             fs.copyFileSync(path.join(workDir, f), path.join(uploadsDir, destName));
-            artifacts.push({ name: f, size: st.size, url: `/uploads/sandbox/${destName}` });
+            const url = `/uploads/sandbox/${destName}`;
+            artifacts.push({ name: f, size: st.size, url });
           }
         }
       } catch { }
@@ -1157,9 +1164,9 @@ const run_code = {
       result += `\n\n--- stdout ---\n${outText || '（无输出）'}`;
       if (errText) result += `\n\n--- stderr ---\n${errText}`;
       if (artifacts.length) {
-        result += `\n\n--- 产物文件（可直接下载） ---\n${artifacts.map(a => `- ${a.name}（${(a.size / 1024).toFixed(1)} KB）：${a.url}${/\.html?$/i.test(a.name) ? '（HTML 可在浏览器直接打开预览）' : ''}`).join('\n')}`;
-        // P5.28 代码应用场景：HTML 产物给 markdown 直链（回复中可点击预览/下载）；其余文件给下载链接
-        result += `\n请在回答中用 markdown 链接展示以上产物（[文件名](url)）供用户使用；${artifacts.some(a => /\.html?$/i.test(a.name)) ? 'HTML 文件用 [预览：文件名](url) 形式让用户点击打开。' : ''}`;
+        result += `\n\n--- 产物文件（可直接下载） ---\n${artifacts.map(a => `- ${a.name}（${(a.size / 1024).toFixed(1)} KB）：${a.url}${/\.html?$/i.test(a.name) ? '（保存为 .html.txt，下载后改回 .html 即可预览）' : ''}`).join('\n')}`;
+        // P0-3 安全加固：HTML 产物已重命名为 .html.txt，不再提示浏览器预览，改为下载提示
+        result += `\n请在回答中用 markdown 链接展示以上产物（[文件名](url)）供用户使用；${artifacts.some(a => /\.html?$/i.test(a.name)) ? 'HTML 文件已重命名为 .html.txt 防止浏览器直接执行，下载后将后缀改回 .html 即可在本地预览。' : ''}`;
       }
       if (out.join('\n').length > SANDBOX_OUT_LIMIT) result += `\n\n（stdout 已截断至 8KB）`;
       return result;

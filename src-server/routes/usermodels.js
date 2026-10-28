@@ -6,6 +6,7 @@
 const express = require('express');
 const { db, now } = require('../db');
 const { auth } = require('../lib/auth');
+const { encrypt, decrypt } = require('../lib/crypto-util');
 
 const router = express.Router();
 router.use(auth);
@@ -25,7 +26,7 @@ router.get('/', (req, res) => {
   const rows = db.prepare('SELECT * FROM user_providers WHERE username=? ORDER BY id').all(req.user.username);
   res.json({
     code: 0,
-    data: rows.map(r => ({ ...r, api_key: maskKey(r.api_key), key_set: !!r.api_key })),
+    data: rows.map(r => ({ ...r, api_key: maskKey(decrypt(r.api_key)), key_set: !!r.api_key })),
   });
 });
 
@@ -38,7 +39,7 @@ router.post('/', (req, res) => {
   const ms = parseModels(models, '[]');
   if (!ms.length) return res.json({ code: 400, msg: '请至少填写一个模型标识（逗号或空格分隔）' });
   const info = db.prepare('INSERT INTO user_providers (username,name,base_url,api_key,models,status,created_at) VALUES (?,?,?,?,?,1,?)')
-    .run(req.user.username, name.trim(), base_url.trim(), api_key || '', JSON.stringify(ms), now());
+    .run(req.user.username, name.trim(), base_url.trim(), api_key ? encrypt(api_key) : '', JSON.stringify(ms), now());
   db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
     .run(req.user.username, '接入我的模型', `${name.trim()}（${ms.length} 个模型）`, req.ip, now());
   res.json({ code: 0, data: { id: info.lastInsertRowid } });
@@ -50,7 +51,7 @@ router.put('/:id', (req, res) => {
   const { name, base_url, api_key, models, status } = req.body || {};
   const ms = parseModels(models, old.models);
   // Key 编辑保护：未传/传空/传掩码（****）都保留旧值；只有传新明文才覆盖
-  const keepKey = (api_key == null || api_key === '' || String(api_key).includes('****')) ? old.api_key : api_key;
+  const keepKey = (api_key == null || api_key === '' || String(api_key).includes('****')) ? old.api_key : encrypt(api_key);
   db.prepare('UPDATE user_providers SET name=?,base_url=?,api_key=?,models=?,status=? WHERE id=?')
     .run(name?.trim() || old.name, base_url?.trim() || old.base_url, keepKey, JSON.stringify(ms),
       status == null ? old.status : (status ? 1 : 0), old.id);
@@ -69,7 +70,8 @@ router.post('/:id/test', async (req, res) => {
   if (!old.base_url) return res.json({ code: 0, data: { ok: false, msg: '❌ 未配置服务地址' } });
   try {
     const url = old.base_url.replace(/\/+$/, '') + '/models';
-    const r = await fetch(url, { headers: old.api_key ? { Authorization: 'Bearer ' + old.api_key } : {}, signal: AbortSignal.timeout(8000) });
+    const plainKey = decrypt(old.api_key);
+    const r = await fetch(url, { headers: plainKey ? { Authorization: 'Bearer ' + plainKey } : {}, signal: AbortSignal.timeout(8000) });
     if (!r.ok) return res.json({ code: 0, data: { ok: false, msg: `❌ 列表接口返回 ${r.status}（检查地址与 API Key）` } });
     const ms = JSON.parse(old.models || '[]');
     if (!ms.length) return res.json({ code: 0, data: { ok: true, msg: '✅ 网关连通（尚未配置模型，请补充模型清单）' } });
@@ -77,7 +79,7 @@ router.post('/:id/test', async (req, res) => {
     try {
       const cr = await fetch(old.base_url.replace(/\/+$/, '') + '/chat/completions', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + old.api_key },
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + decrypt(old.api_key) },
         body: JSON.stringify({ model: ms[0], messages: [{ role: 'user', content: 'ping' }], max_tokens: 4 }),
         signal: AbortSignal.timeout(20000),
       });

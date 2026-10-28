@@ -7,7 +7,7 @@ const { db } = require('../db');
 
 // 每次操作时重新读取，支持热更新
 function loadEncryptionKey() {
-  const row = db.prepare("SELECT value FROM secrets WHERE name='encryption_key'").pluck().get();
+  const row = db.prepare("SELECT value FROM secrets WHERE name='ENCRYPTION_KEY'").pluck().get();
   // 密钥要求 32 字节，hex 编码就是 64 字符
   if (row && row.length === 64) return Buffer.from(row, 'hex');
   // 如果没有配置加密密钥，返回 null，不执行加密（兜底明文存储）

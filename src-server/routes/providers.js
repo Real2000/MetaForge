@@ -130,7 +130,7 @@ router.post('/:id/models', async (req, res) => {
   const ms = JSON.parse(old.models || '[]');
   if (ms.includes(m)) return res.json({ code: 400, msg: '模型已存在' });
   // 按类型真实连通性校验（列表能通 ≠ 有调用权限，如 TG 网关「仅限自有算力模型」403）
-  const v = await verifyModelByType(old.base_url, old.api_key, m, type);
+  const v = await verifyModelByType(old.base_url, decrypt(old.api_key), m, type);
   if (!v.ok) {
     return res.json({ code: 400, msg: `校验未通过，未添加：${v.msg}。请确认模型标识正确且当前 API Key 有调用权限（网关类供应商通常仅开放自有算力模型）` });
   }
@@ -156,10 +156,11 @@ router.delete('/:id/models/:model', (req, res) => {
 router.post('/:id/sync', async (req, res) => {
   const old = db.prepare('SELECT * FROM providers WHERE id=?').get(req.params.id);
   if (!old) return res.json({ code: 404, msg: '供应商不存在' });
-  if (!old.base_url || !old.api_key) return res.json({ code: 400, msg: '请先填写服务地址与 API Key' });
+  const plainKey = decrypt(old.api_key);
+  if (!old.base_url || !plainKey) return res.json({ code: 400, msg: '请先填写服务地址与 API Key' });
   try {
     const url = old.base_url.replace(/\/+$/, '') + '/models';
-    const r = await fetch(url, { headers: { Authorization: 'Bearer ' + old.api_key }, signal: AbortSignal.timeout(10000) });
+    const r = await fetch(url, { headers: { Authorization: 'Bearer ' + plainKey }, signal: AbortSignal.timeout(10000) });
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const j = await r.json();
     const all = (j.data || []).map(x => x.id).filter(Boolean).slice(0, 60);
@@ -181,15 +182,16 @@ router.post('/:id/test', async (req, res) => {
   const old = db.prepare('SELECT * FROM providers WHERE id=?').get(req.params.id);
   if (!old) return res.json({ code: 404, msg: '供应商不存在' });
   if (!old.base_url) return res.json({ code: 400, msg: '未配置服务地址' });
+  const plainKey = decrypt(old.api_key);
   try {
     const url = old.base_url.replace(/\/+$/, '') + '/models';
-    const r = await fetch(url, { headers: old.api_key ? { Authorization: 'Bearer ' + old.api_key } : {}, signal: AbortSignal.timeout(8000) });
+    const r = await fetch(url, { headers: plainKey ? { Authorization: 'Bearer ' + plainKey } : {}, signal: AbortSignal.timeout(8000) });
     if (!r.ok) return res.json({ code: 0, data: { ok: false, status: r.status, msg: `❌ 列表接口返回 ${r.status}（检查地址与 API Key）` } });
     const ms = JSON.parse(old.models || '[]');
     if (!ms.length) return res.json({ code: 0, data: { ok: true, status: r.status, msg: '✅ 网关连通（尚未接入模型，请先添加或同步模型）' } });
     // 对清单第一个模型按类型做真实调用，验证调用权限
     const types = parseTypes(old.model_types);
-    const v = await verifyModelByType(old.base_url, old.api_key, ms[0], types[ms[0]] || classifyModel(ms[0]));
+    const v = await verifyModelByType(old.base_url, plainKey, ms[0], types[ms[0]] || classifyModel(ms[0]));
     res.json({
       code: 0,
       data: { ok: v.ok, status: r.status, msg: v.ok ? `✅ 网关连通，模型 ${ms[0]} 可正常调用` : `⚠️ 网关连通，但模型 ${ms[0]} 调用失败：${v.msg}（建议移除该模型或更换 Key）` },
