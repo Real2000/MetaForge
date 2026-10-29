@@ -185,16 +185,33 @@ export async function render(el) {
       </div>
       <hr>
       <div style="font-size:13px;font-weight:600;color:var(--text);margin:10px 0 6px">切片配置</div>
-      <div class="form-item"><label>切片大小（字符数）</label><input class="input" id="kb_chunk_size" type="number" min="100" max="2000" value="${kb.chunk_size || 500}"></div>
-      <div class="form-item"><label>重叠字符数</label><input class="input" id="kb_chunk_overlap" type="number" min="0" max="${(kb.chunk_size || 500) - 1}" value="${kb.chunk_overlap || 0}"></div>
+      <div class="form-item"><label>切片大小（字符数）</label>
+        <input class="input" id="kb_chunk_size" type="range" min="100" max="2000" value="${kb.chunk_size || 500}" style="vertical-align:middle">
+        <span class="tag gray" id="kb_chunk_size_val" style="font-size:13px;margin-left:8px">${kb.chunk_size || 500}</span>
+      </div>
+      <div class="form-item"><label>重叠字符数</label>
+        <input class="input" id="kb_chunk_overlap" type="range" min="0" max="${(kb.chunk_size || 500) - 1}" value="${kb.chunk_overlap || 0}" style="vertical-align:middle">
+        <span class="tag gray" id="kb_chunk_overlap_val" style="font-size:13px;margin-left:8px">${kb.chunk_overlap || 0}</span>
+      </div>
       <div class="form-item"><label>分隔符（正则）</label><input class="input" id="kb_chunk_sep" value="${esc(kb.chunk_separator || '\\n\\s*\\n')}" placeholder="默认：\\n\\s*\\n"><div style="font-size:11px;color:var(--text-3)">用于按段落切分，正则表达式格式，默认按空行分段。</div></div>`;
     modal({
       title: '编辑知识库', body,
       foot: '<button class="btn" data-cancel>取消</button><button class="btn primary" data-save>保存</button>',
       onMount(mask, close) {
         mask.querySelector('[data-cancel]').onclick = close;
+        // 切片大小滑块实时显示值
+        const sizeInput = mask.querySelector('#kb_chunk_size');
+        const sizeVal = mask.querySelector('#kb_chunk_size_val');
+        sizeInput.oninput = () => {
+          sizeVal.textContent = sizeInput.value;
+          // 同步更新重叠滑块最大值
+          overlapInput.max = Math.max(0, +sizeInput.value - 1);
+        };
+        const overlapInput = mask.querySelector('#kb_chunk_overlap');
+        const overlapVal = mask.querySelector('#kb_chunk_overlap_val');
+        overlapInput.oninput = () => { overlapVal.textContent = overlapInput.value; };
         mask.querySelector('[data-save]').onclick = async () => {
-          const chunkSize = Math.min(2000, Math.max(100, +mask.querySelector('#kb_chunk_size').value)) || 500;
+          const chunkSize = Math.min(2000, Math.max(100, +sizeInput.value)) || 500;
           const chunkOverlap = Math.min(chunkSize - 1, Math.max(0, +mask.querySelector('#kb_chunk_overlap').value)) || 0;
           await api('/knowledge/' + kb.id, { method: 'PUT', body: {
             name: mask.querySelector('#kb_name').value,
