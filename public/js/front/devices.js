@@ -4,7 +4,7 @@
  *  - 安装包下载（服务端 /api/localbridge/installer 提供的 zip）+ 安装引导
  */
 import { api } from '../api.js';
-import { esc, toast, modal } from '../ui.js';
+import { esc, toast, modal, confirmBox } from '../ui.js';
 import { t } from '../i18n.js';
 
 export async function render(box) {
@@ -105,7 +105,7 @@ export async function render(box) {
         try { await api(`/localbridge/devices/${b.dataset.def}/default`, { method: 'POST' }); toast('已设为默认设备', 'ok'); loadDevs(); } catch (e) { toast(e.message, 'err'); }
       });
       el.querySelectorAll('[data-unbind]').forEach(b => b.onclick = async () => {
-        if (!confirm('解绑后该设备将无法再被 AI 操作，确定？')) return;
+        if (!(await confirmBox('解绑后该设备将无法再被 AI 操作，确定？'))) return;
         try { await api(`/localbridge/devices/${b.dataset.unbind}`, { method: 'DELETE' }); toast('已解绑', 'ok'); loadDevs(); } catch (e) { toast(e.message, 'err'); }
       });
     } catch (e) {

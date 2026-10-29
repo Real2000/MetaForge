@@ -2,7 +2,7 @@
  *  分类筛选 / 官方筛选 / 我的收藏 / 搜索 / 卡片统计（用户·会话·收藏）/ 详情侧栏 / 开始使用 / 一键复制创建
  */
 import { api, getToken } from '../api.js';
-import { esc, toast, modal } from '../ui.js';
+import { esc, toast, modal, confirmBox } from '../ui.js';
 
 const AVA = [
   ['#2563eb', '#7c3aed'], ['#059669', '#0d9488'], ['#d97706', '#dc2626'], ['#db2777', '#7c3aed'],
@@ -146,7 +146,7 @@ export async function render(el) {
       try {
         const j = await api(`/agents/${id}/copy`, { method: 'POST' });
         toast(j.msg || '已复制为草稿');
-        if (confirm('已复制为你的草稿智能体，是否前往编排页继续完善？')) {
+        if (await confirmBox('已复制为你的草稿智能体，是否前往编排页继续完善？')) {
           location.hash = '#/admin/studio/' + j.data.id;
         }
       } catch (err) { toast(err.message, 'err'); }
@@ -200,7 +200,7 @@ export async function render(el) {
           try {
             const j = await api(`/agents/${a.id}/copy`, { method: 'POST' });
             close(); toast(j.msg || '已复制为草稿');
-            if (confirm('已复制为你的草稿，前往编排页完善？')) location.hash = '#/admin/studio/' + j.data.id;
+            if (await confirmBox('已复制为你的草稿，前往编排页完善？')) location.hash = '#/admin/studio/' + j.data.id;
           } catch (e) { toast(e.message, 'err'); }
         };
       },
@@ -252,7 +252,7 @@ export async function render(el) {
       try {
         const j = await api(`/wf-templates/${b.dataset.wfuse}/create`, { method: 'POST', body: {} });
         toast(j.msg || '已创建草稿');
-        if (confirm(`已从「${t.name}」创建草稿，前往编排页调整？\n\n使用提示：${t.scene || ''}`)) location.hash = '#/admin/studio/' + j.data.id;
+        if (await confirmBox(`已从「${t.name}」创建草稿，前往编排页调整？\n\n使用提示：${t.scene || ''}`)) location.hash = '#/admin/studio/' + j.data.id;
         renderWfTemplates();
       } catch (e) { toast(e.message, 'err'); b.disabled = false; }
     });
@@ -277,7 +277,7 @@ export async function render(el) {
             try {
               const j2 = await api(`/wf-templates/${t.id}/create`, { method: 'POST', body: {} });
               close(); toast(j2.msg || '已创建草稿');
-              if (confirm('已创建草稿，前往编排页调整？')) location.hash = '#/admin/studio/' + j2.data.id;
+              if (await confirmBox('已创建草稿，前往编排页调整？')) location.hash = '#/admin/studio/' + j2.data.id;
               renderWfTemplates();
             } catch (e) { toast(e.message, 'err'); }
           };

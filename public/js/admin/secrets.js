@@ -4,7 +4,7 @@
  * - 命名规范：大写字母开头的字母/数字/下划线
  */
 import { api, getUser } from '../api.js';
-import { esc, toast, modal } from '../ui.js';
+import { esc, toast, modal, confirmBox } from '../ui.js';
 import { t } from '../i18n.js';
 
 export async function render(el) {
@@ -53,7 +53,7 @@ export async function render(el) {
         </div>`).join('');
       host.querySelectorAll('[data-edit]').forEach(b => b.onclick = () => openForm(b.dataset.edit, b.dataset.remark));
       host.querySelectorAll('[data-del]').forEach(b => b.onclick = async () => {
-        if (!confirm(`确认删除 {{env.${b.dataset.del}}} ？引用它的画布运行时将保留占位符原样`)) return;
+        if (!(await confirmBox(`确认删除 {{env.${b.dataset.del}}} ？引用它的画布运行时将保留占位符原样`))) return;
         const j2 = await api('/secrets', { method: 'POST', body: { name: b.dataset.del, value: '' } });
         toast(j2.msg || '已删除');
         load();

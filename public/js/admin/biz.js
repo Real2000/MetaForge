@@ -3,7 +3,7 @@
  *  发票：待处理/已开出/未通过 处理（站内信闭环通知申请人）
  */
 import { api } from '../api.js';
-import { esc, toast, modal } from '../ui.js';
+import { esc, toast, modal, confirmBox } from '../ui.js';
 
 const LEAD_ST = { new: '🆕 新线索', contacted: '📞 已联系', won: '✅ 成交', lost: '❌ 流失' };
 const INV_ST = { pending: '⏳ 处理中', issued: '✅ 已开出', rejected: '❌ 未通过' };
@@ -129,7 +129,7 @@ export async function render(el) {
     </div>`;
     box.querySelectorAll('[data-inv]').forEach(b => b.onclick = async () => {
       const st = b.dataset.st;
-      if (st === 'issued' && !confirm('确认已开出该发票？将站内信通知申请人。')) return;
+      if (st === 'issued' && !(await confirmBox('确认已开出该发票？将站内信通知申请人。'))) return;
       try {
         const j = await api(`/biz/invoices/${b.dataset.inv}`, { method: 'PUT', body: { status: st } });
         toast(j.msg || '已处理'); loadInvoices();

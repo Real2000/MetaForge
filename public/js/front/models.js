@@ -4,7 +4,7 @@
  *  卡片式管理：新增 / 编辑 / 启停 / 删除 / 两级连通测试（列表 + 真实调用）。
  */
 import { api } from '../api.js';
-import { esc, toast, modal } from '../ui.js';
+import { esc, toast, modal, confirmBox } from '../ui.js';
 
 export async function render(el) {
   let list = [];
@@ -111,7 +111,7 @@ export async function render(el) {
       } catch (e) { toast(e.message, 'err'); }
     });
     grid.querySelectorAll('[data-del]').forEach(b => b.onclick = async () => {
-      if (!confirm('确定删除该模型源？删除后对话下拉将不再出现其模型。')) return;
+      if (!(await confirmBox('确定删除该模型源？删除后对话下拉将不再出现其模型。'))) return;
       try {
         await api(`/usermodels/${b.dataset.del}`, { method: 'DELETE' });
         toast('已删除'); reload();

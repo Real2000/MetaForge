@@ -3,7 +3,7 @@
  *  防锁死护栏与后端一致：不能停用/降级/删除自己；平台至少保留一名可用管理员。
  */
 import { api, getUser } from '../api.js';
-import { esc, toast, modal } from '../ui.js';
+import { esc, toast, modal, confirmBox } from '../ui.js';
 
 export async function render(el) {
   let list = [];
@@ -195,7 +195,7 @@ export async function render(el) {
     tbody.querySelectorAll('[data-toggle]').forEach(b => b.onclick = async () => {
       const u = shown.find(x => x.id === +b.dataset.toggle);
       const to = u.status ? 0 : 1;
-      if (to === 0 && !confirm(`确定停用「${u.nickname || u.username}」？停用后其立即无法登录（已有登录态同时失效）。`)) return;
+      if (to === 0 && !(await confirmBox(`确定停用「${u.nickname || u.username}」？停用后其立即无法登录（已有登录态同时失效）。`))) return;
       try {
         await api(`/users/${u.id}`, { method: 'PUT', body: { status: to } });
         toast(to ? '已启用' : '已停用');
@@ -204,7 +204,7 @@ export async function render(el) {
     });
     tbody.querySelectorAll('[data-del]').forEach(b => b.onclick = async () => {
       const u = shown.find(x => x.id === +b.dataset.del);
-      if (!confirm(`确定删除用户「${u.username}」？\n\n其会话、收藏、长期记忆、自有模型源、技能资产将被一并清理；名下智能体回收给 admin（平台资产保留）。`)) return;
+      if (!(await confirmBox(`确定删除用户「${u.username}」？\n\n其会话、收藏、长期记忆、自有模型源、技能资产将被一并清理；名下智能体回收给 admin（平台资产保留）。`))) return;
       try {
         const j = await api(`/users/${u.id}`, { method: 'DELETE' });
         toast(j.msg || '已删除');

@@ -3,7 +3,7 @@
  *  对话输入 @技能名 即调用（技能提示词注入 + 工具并入 function calling）。
  */
 import { api } from '../api.js';
-import { esc, toast, modal } from '../ui.js';
+import { esc, toast, modal, confirmBox } from '../ui.js';
 
 // 内置工具白名单（与 src-server/lib/tools.js TOOL_DEFS 对齐；技能挂载后对话中可被模型调用）
 const TOOL_META = {
@@ -181,7 +181,7 @@ export async function render(el) {
     grid.querySelectorAll('[data-edit]').forEach(b => b.onclick = e => { e.stopPropagation(); openForm(list.find(s => s.id === +b.dataset.edit)); });
     grid.querySelectorAll('[data-del]').forEach(b => b.onclick = async e => {
       e.stopPropagation();
-      if (!confirm('确定删除该技能？')) return;
+      if (!(await confirmBox('确定删除该技能？'))) return;
       try {
         await api(`/skillassets/${b.dataset.del}`, { method: 'DELETE' });
         toast('已删除'); reload();
