@@ -297,8 +297,37 @@ export async function render(el) {
   async function loadKbs() { const j = await api('/knowledge'); kbs = j.data; renderKbList(); }
   async function loadFiles() { const j = await api(`/knowledge/${current.id}/files`); files = j.data; }
 
-  // ---------- 召回测试 ----------
-  function renderRecall() {
+  // ---------- 召回测试（2026-10-29 可视化升级：向量权重滑块 + Rerank 模型下拉 + 阈值滑块 + 命中高亮 + 命中通道标识） ----------
+
+  /** 命中词高亮：先转义再替换（安全），长词优先避免碎片化 */
+  function highlightTerms(text, hitTerms) {
+    const safe = esc(text);
+    if (!hitTerms || !hitTerms.length) return safe;
+    const pattern = hitTerms
+      .map(t => String(t).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+      .filter(Boolean)
+      .sort((a, b) => b.length - a.length)
+      .join('|');
+    if (!pattern) return safe;
+    try { return safe.replace(new RegExp('(' + pattern + ')', 'gi'), '<mark class="hl">$1</mark>'); }
+    catch { return safe; }
+  }
+
+  /** 命中通道标签 */
+  function channelTag(ch) {
+    return {
+      both: '<span class="tag green" style="font-size:10px">双命中</span>',
+      bm25: '<span class="tag blue" style="font-size:10px">BM25 命中</span>',
+      vec: '<span class="tag purple" style="font-size:10px">向量命中</span>',
+      none: '<span class="tag gray" style="font-size:10px">低分通过</span>',
+    }[ch] || '<span class="tag gray" style="font-size:10px">低分通过</span>';
+  }
+
+  async function renderRecall() {
+    // 拉取可用 Rerank 模型列表（失败不阻塞，回退默认项）
+    let rmList = [];
+    try { const j = await api('/knowledge/rerank-models'); rmList = (j.data || []); } catch { }
+
     paneRecall.innerHTML = `
       <div class="grid-2" style="align-items:start">
         <div class="card">
@@ -309,9 +338,26 @@ export async function render(el) {
           </div>
           <div class="form-row">
             <div class="form-item"><label>Top N</label><input class="input" id="r_top" type="number" value="5" min="1" max="20"></div>
-            <div class="form-item"><label>混合得分阈值（RRF）</label><input class="input" id="r_th" type="number" value="0.01" step="0.005" min="0" max="0.1"></div>
+            <div class="form-item"><label>混合得分阈值（RRF）</label>
+              <div style="display:flex;align-items:center;gap:8px">
+                <input class="input" id="r_th" type="range" min="0" max="0.05" step="0.002" value="0.01" style="width:130px">
+                <span id="r_th_v" style="font-size:12px;color:var(--text-2);white-space:nowrap">0.010</span>
+              </div>
+            </div>
           </div>
-          <div class="hint">混合检索：BM25 关键词 + 本地向量（256 维字符 n-gram）双通道，RRF 融合排序；阈值为融合分下限，命中任一通道即可参与排序</div>
+          <div class="form-item"><label>向量权重（融合比例）</label>
+            <div style="display:flex;align-items:center;gap:8px">
+              <input class="input" id="r_vw" type="range" min="0" max="1" step="0.05" value="0.5" style="width:130px">
+              <span id="r_vw_v" style="font-size:12px;color:var(--text-2);white-space:nowrap">向量 50% · 关键词 50%</span>
+            </div>
+          </div>
+          <div class="form-item"><label>Rerank 重排（cross-encoder 精排）</label>
+            <div style="display:flex;align-items:center;gap:8px">
+              <input type="checkbox" id="r_rr" checked style="width:16px;height:16px;flex:none">
+              <select class="input" id="r_rm" style="flex:1">${rmList.length ? rmList.map(m => `<option value="${esc(m)}">${esc(m)}</option>`).join('') : '<option value="">默认（bge-reranker-v2-m3）</option>'}</select>
+            </div>
+          </div>
+          <div class="hint">混合检索：BM25 关键词 + 语义向量双通道加权 RRF 融合；滑块实时调整向量/关键词权重；开启 Rerank 后先粗召回 Top 30 再精排取 Top N，关闭可对比纯融合效果</div>
           <button class="btn primary" id="r_run" style="width:100%;justify-content:center">▶ 执行测试</button>
         </div>
         <div class="card">
@@ -319,6 +365,15 @@ export async function render(el) {
           <div id="r_hits"><div class="empty-box"><div class="big">🎯</div>执行测试后在此查看命中的知识片段</div></div>
         </div>
       </div>`;
+
+    // 滑块实时数值联动
+    const vwEl = paneRecall.querySelector('#r_vw');
+    vwEl.oninput = () => {
+      const v = +vwEl.value;
+      paneRecall.querySelector('#r_vw_v').textContent = `向量 ${Math.round(v * 100)}% · 关键词 ${Math.round((1 - v) * 100)}%`;
+    };
+    const thEl = paneRecall.querySelector('#r_th');
+    thEl.oninput = () => { paneRecall.querySelector('#r_th_v').textContent = (+thEl.value).toFixed(3); };
 
     paneRecall.querySelector('#r_run').onclick = async () => {
       const q = paneRecall.querySelector('#r_q').value.trim();
@@ -331,17 +386,24 @@ export async function render(el) {
             kb_id: +paneRecall.querySelector('#r_kb').value || null,
             top_n: +paneRecall.querySelector('#r_top').value,
             threshold: +paneRecall.querySelector('#r_th').value,
+            vector_weight: +vwEl.value,
+            rerank_model: paneRecall.querySelector('#r_rm').value || null,
+            rerank_enabled: paneRecall.querySelector('#r_rr').checked,
           },
         });
         paneRecall.querySelector('#r_stat').textContent = `命中 ${j.data.count} 条`;
-        paneRecall.querySelector('#r_hits').innerHTML = j.data.hits.map((h, i) => `
+        paneRecall.querySelector('#r_hits').innerHTML = j.data.hits.map((h, i) => {
+          const rrTag = h.rerank_score != null ? `<span class="tag orange" style="font-size:10px">Rerank ${Number(h.rerank_score).toFixed(3)}</span>` : '';
+          const engTag = h.engine === 'B3' ? '<span class="tag gray" style="font-size:10px">bge-m3</span>' : '<span class="tag gray" style="font-size:10px">本地哈希</span>';
+          return `
           <div class="card" style="box-shadow:none;border:1px solid var(--border);margin-bottom:10px">
-            <div style="display:flex;justify-content:space-between;margin-bottom:6px">
+            <div style="display:flex;justify-content:space-between;margin-bottom:6px;flex-wrap:wrap;gap:4px">
               <b style="color:var(--brand)">#${i + 1}　${esc(h.file || '-')}</b>
-              <span><span class="tag blue">融合 ${h.score}</span> <span class="tag gray" style="font-size:10px">BM25 ${h.bm25}</span> <span class="tag gray" style="font-size:10px">向量 ${h.vec}</span></span>
+              <span>${channelTag(h.channels)} <span class="tag blue">融合 ${h.score}</span> <span class="tag gray" style="font-size:10px">BM25 ${h.bm25}</span> <span class="tag gray" style="font-size:10px">向量 ${h.vec}</span> ${rrTag} ${engTag}</span>
             </div>
-            <div style="font-size:13px;color:var(--text-2);line-height:1.7">${esc(h.content)}</div>
-          </div>`).join('') || '<div class="empty-box"><div class="big">🈳</div>未命中任何片段，可调整阈值或补充知识库内容</div>';
+            <div style="font-size:13px;color:var(--text-2);line-height:1.7">${highlightTerms(h.content, h.hit_terms)}</div>
+          </div>`;
+        }).join('') || '<div class="empty-box"><div class="big">🈳</div>未命中任何片段，可调整阈值或补充知识库内容</div>';
       } catch (e) { toast(e.message, 'err'); }
     };
   }
@@ -354,5 +416,5 @@ export async function render(el) {
   });
 
   await loadKbs();
-  renderRecall();
+  await renderRecall();
 }

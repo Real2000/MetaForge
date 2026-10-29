@@ -4,9 +4,10 @@
  * 2. 向量通道（双引擎）：
  *    a. bge-m3 真实语义嵌入（网关 OpenAI 兼容 /embeddings，1024 维）——语义检索，缓存于 kb_chunks.embedding 列（JSON 前缀 "B3:"）
  *    b. 本地 n-gram 哈希兜底（256 维）——网关不可用时自动降级，零外部依赖（缓存前缀 "H:"）
- * 3. 融合：RRF（Reciprocal Rank Fusion），score = Σ 1/(60+rank)
- * 4. Rerank（2026-10-28 P2 重排升级）：RRF 粗召回 Top 30 → cross-encoder 重排取 Top 5
- * 返回 [{content, file, kb, kb_id, score(融合), bm25, vec, engine, rerank_score}]
+ * 3. 融合：加权 RRF（Reciprocal Rank Fusion），score = Σ w/(60+rank)；向量权重 vecWeight 可调（0=纯关键词，1=纯向量，默认 0.5）
+ * 4. Rerank（2026-10-28 P2 重排升级）：RRF 粗召回 Top 30 → cross-encoder 重排取 Top 5，模型可选、可关闭
+ * 5. 可视化（2026-10-29）：每条结果带 channels（bm25/vec/both 命中通道）与 hit_terms（命中查询词，前端高亮用）
+ * 返回 [{content, file, kb, kb_id, score(融合), bm25, vec, engine, channels, hit_terms, rerank_score}]
  */
 const { db } = require('../db');
 
@@ -67,9 +68,9 @@ function rerankProviders() {
     });
 }
 
-/** 调网关 rerank 接口，返回按相关性降序排列的索引数组。失败返回 null（跳过重排，回落 RRF 结果） */
+/** 调网关 rerank 接口，返回按相关性降序排列的索引数组。失败返回 null（跳过重排，回落 RRF 结果）。model 可指定重排模型（默认 bge-reranker-v2-m3） */
 let rerankDownUntil = 0;
-async function bgeRerank(query, candidates) {
+async function bgeRerank(query, candidates, model) {
   if (Date.now() < rerankDownUntil) return null;
   if (!candidates || !candidates.length) return null;
   const ps = rerankProviders();
@@ -81,7 +82,7 @@ async function bgeRerank(query, candidates) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + p.api_key },
         body: JSON.stringify({
-          model: RERANK_MODEL,
+          model: model || RERANK_MODEL,
           query,
           documents: candidates.map(c => c.content),
           top_n: Math.min(candidates.length, RERANK_TOP_N),
@@ -106,6 +107,20 @@ async function bgeRerank(query, candidates) {
   }
   rerankDownUntil = Date.now() + 30000; // 全部失败：30 秒内跳过重排
   return null;
+}
+
+/** 列出全部已配置供应商提供的 rerank 模型名（去重，召回测试下拉用） */
+function rerankModels() {
+  const out = [];
+  const rows = db.prepare("SELECT models FROM providers WHERE configured=1 AND api_key != '' AND base_url != ''").all();
+  for (const r of rows) {
+    try {
+      for (const m of JSON.parse(r.models || '[]')) {
+        if (/rerank|bge-reranker|reranker/i.test(m) && !out.includes(m)) out.push(String(m));
+      }
+    } catch { }
+  }
+  return out;
 }
 
 function tokenize(s) {
@@ -201,11 +216,16 @@ function bm25Scores(rows, qTerms) {
 }
 
 /**
- * 混合检索（async，P2 双引擎）。返回 [{content, file, kb, kb_id, score, bm25, vec, engine}]
+ * 混合检索（async，P2 双引擎）。返回 [{content, file, kb, kb_id, score, bm25, vec, engine, channels, hit_terms}]
  * 向量引擎：优先 bge-m3（缺缓存的分块批量取嵌入并落库），网关不可用自动降级本地哈希。
+ * opts（2026-10-29 可视化升级，均可选）：
+ *   - vecWeight：向量通道融合权重 0~1（0=纯 BM25，1=纯向量，默认 0.5 均衡，与旧行为一致）
+ *   - rerankModel：重排模型名（默认 bge-reranker-v2-m3）
+ *   - rerankEnabled：是否启用重排（默认 true；false 时直接返回 RRF 排名，便于对比效果）
  * 调用方全部 await retrieve(...)（原同步调用点已同步改造）。
  */
-async function retrieve(query, kbId = null, topN = 5, threshold = 0.01) {
+async function retrieve(query, kbId = null, topN = 5, threshold = 0.01, opts = {}) {
+  const vecWeight = Math.min(1, Math.max(0, Number(opts.vecWeight ?? 0.5)));
   const rows = db.prepare(`
     SELECT c.id, c.content, c.kb_id, c.file_id, c.parent_id, c.embedding, f.name AS file, k.name AS kb
     FROM kb_chunks c
@@ -244,9 +264,9 @@ async function retrieve(query, kbId = null, topN = 5, threshold = 0.01) {
       const annParsed = annRows.map(r => parseVec(r.embedding));
       if (annParsed.some(p => p.engine === 'B3')) {
         const q = await bgeEmbed([query]);
-        if (q) return rerankAndSlice(query, finish(annRows, annBm25, annParsed.map(p => p.v), new Float32Array(q[0]), 'B3', RERANK_CANDIDATES, threshold), topN);
+        if (q) return rerankAndSlice(query, finish(annRows, annBm25, annParsed.map(p => p.v), new Float32Array(q[0]), 'B3', RERANK_CANDIDATES, threshold, vecWeight, qTerms), topN, opts);
       }
-      return rerankAndSlice(query, finish(annRows, annBm25, annParsed.map(p => p.v), embed(query), 'H', RERANK_CANDIDATES, threshold), topN);
+      return rerankAndSlice(query, finish(annRows, annBm25, annParsed.map(p => p.v), embed(query), 'H', RERANK_CANDIDATES, threshold, vecWeight, qTerms), topN, opts);
     }
   }
 
@@ -257,7 +277,7 @@ async function retrieve(query, kbId = null, topN = 5, threshold = 0.01) {
   if (parsed.every(p => p.engine === 'B3')) {
     // 全部已有 bge 缓存，查询向量走网关（失败则整体降级本地重算）
     const q = await bgeEmbed([query]);
-    if (q) return rerankAndSlice(query, finish(rows, bm25, parsed.map(p => p.v), new Float32Array(q[0]), engine, RERANK_CANDIDATES, threshold), topN);
+    if (q) return rerankAndSlice(query, finish(rows, bm25, parsed.map(p => p.v), new Float32Array(q[0]), engine, RERANK_CANDIDATES, threshold, vecWeight, qTerms), topN, opts);
   }
   const missIdx = rows.map((_, i) => i).filter(i => parsed[i].engine !== 'B3');
   if (missIdx.length) {
@@ -268,7 +288,7 @@ async function retrieve(query, kbId = null, topN = 5, threshold = 0.01) {
         try { upd.run('B3:' + JSON.stringify(got[k + 1]), rows[idx].id); } catch { }
         parsed[idx] = { v: new Float32Array(got[k + 1]), engine: 'B3' };
       });
-      return rerankAndSlice(query, finish(rows, bm25, parsed.map(p => p.v), new Float32Array(got[0]), engine, RERANK_CANDIDATES, threshold), topN);
+      return rerankAndSlice(query, finish(rows, bm25, parsed.map(p => p.v), new Float32Array(got[0]), engine, RERANK_CANDIDATES, threshold, vecWeight, qTerms), topN, opts);
     }
   }
 
@@ -281,14 +301,15 @@ async function retrieve(query, kbId = null, topN = 5, threshold = 0.01) {
     try { upd.run('H:' + JSON.stringify([...v]), r.id); } catch { }
     return v;
   });
-  return rerankAndSlice(query, finish(rows, bm25, vecs, qVec, engine, RERANK_CANDIDATES, threshold), topN);
+  return rerankAndSlice(query, finish(rows, bm25, vecs, qVec, engine, RERANK_CANDIDATES, threshold, vecWeight, qTerms), topN, opts);
 }
 
-/** Rerank 重排（优先）→ 如果不可用或失败，退回 RRF 排名前 topN 条 */
-async function rerankAndSlice(query, rrfResults, topN) {
+/** Rerank 重排（优先）→ 如果不可用/被关闭/失败，退回 RRF 排名前 topN 条。opts.rerankEnabled=false 跳过重排，opts.rerankModel 指定模型 */
+async function rerankAndSlice(query, rrfResults, topN, opts = {}) {
   if (!rrfResults || !rrfResults.length) return [];
+  if (opts.rerankEnabled === false) return attachParentContext(rrfResults.slice(0, topN));
   try {
-    const ranked = await bgeRerank(query, rrfResults);
+    const ranked = await bgeRerank(query, rrfResults, opts.rerankModel);
     if (ranked && ranked.length) {
       // 按 rerank 索引重排
       const resultMap = new Map();
@@ -322,26 +343,41 @@ function attachParentContext(results) {
   return results;
 }
 
-/** RRF 融合 + 排序输出（两种引擎共用） */
-function finish(rows, bm25, vecs, qVec, engine, topN, threshold) {
+/** 加权 RRF 融合 + 排序输出（两种引擎共用）。vecWeight 为向量通道权重（0~1）；qTerms 用于计算每条结果的命中词 */
+function finish(rows, bm25, vecs, qVec, engine, topN, threshold, vecWeight = 0.5, qTerms = []) {
   const vec = vecs.map(v => cosine(qVec, v));
   const K = 60;
+  const wV = Math.min(1, Math.max(0, vecWeight)); // 向量通道权重（0=纯关键词，1=纯向量）
+  const wB = 1 - wV;
   const bm25Rank = [...rows.keys()].sort((a, b) => bm25[b] - bm25[a]);
   const vecRank = [...rows.keys()].sort((a, b) => vec[b] - vec[a]);
   const rrf = new Array(rows.length).fill(0);
-  bm25Rank.forEach((idx, rank) => { if (bm25[idx] > 0) rrf[idx] += 1 / (K + rank + 1); });
-  vecRank.forEach((idx, rank) => { if (vec[idx] > 0.05) rrf[idx] += 1 / (K + rank + 1); });
+  bm25Rank.forEach((idx, rank) => { if (bm25[idx] > 0) rrf[idx] += wB / (K + rank + 1); });
+  vecRank.forEach((idx, rank) => { if (vec[idx] > 0.05) rrf[idx] += wV / (K + rank + 1); });
 
-  return rows.map((r, i) => ({
+  const out = rows.map((r, i) => ({
     content: r.content, file: r.file, kb: r.kb, kb_id: r.kb_id,
     score: Math.round(rrf[i] * 10000) / 10000,
     bm25: Math.round(bm25[i] * 1000) / 1000,
     vec: Math.round(vec[i] * 1000) / 1000,
     engine, // B3=bge-m3 语义检索 / H=本地哈希兜底
+    _i: i,
   }))
     .filter(r => r.score >= threshold)
     .sort((a, b) => b.score - a.score)
     .slice(0, topN);
+
+  // 命中通道标识（bm25/vec/both）+ 命中查询词（前端高亮用）——仅对输出条目计算，开销可控
+  const qSet = new Set(qTerms);
+  for (const r of out) {
+    const bm25Hit = r.bm25 > 0, vecHit = r.vec > 0.05;
+    r.channels = bm25Hit && vecHit ? 'both' : bm25Hit ? 'bm25' : vecHit ? 'vec' : 'none';
+    if (qSet.size) {
+      try { r.hit_terms = [...new Set(terms(rows[r._i].content).filter(t => qSet.has(t)))].slice(0, 20); } catch { }
+    }
+    delete r._i;
+  }
+  return out;
 }
 
-module.exports = { retrieve, embed, bgeEmbed, bgeRerank, rerankProviders };
+module.exports = { retrieve, embed, bgeEmbed, bgeRerank, rerankProviders, rerankModels };

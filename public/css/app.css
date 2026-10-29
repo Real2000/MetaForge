@@ -266,6 +266,10 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
 /* ---------- P1：引用角标 / 来源列表 / 工具标记（2026-10-09） ---------- */
 .cite-mark { color: var(--brand); font-weight: 600; cursor: pointer; padding: 0 1px; }
 .cite-mark:hover { text-decoration: underline; }
+
+/* ---------- 召回测试可视化（2026-10-29：命中词高亮） ---------- */
+mark.hl { background: rgba(59, 130, 246, .18); color: inherit; border-radius: 3px; padding: 0 2px; font-weight: 600; }
+
 .m-bubble .kb-ref-title { display: flex; justify-content: space-between; align-items: center; }
 .kb-ref-toggle { color: var(--brand); cursor: pointer; user-select: none; }
 .kb-ref-list { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
@@ -404,6 +408,7 @@ html[data-theme="dark"] .tag.green { background: rgba(52,211,153,.14); color: #6
 html[data-theme="dark"] .tag.gray { background: rgba(148,163,184,.14); color: #aab6c8; }
 html[data-theme="dark"] .tag.red { background: rgba(248,113,113,.14); color: #fca5a5; }
 html[data-theme="dark"] .tag.orange { background: rgba(251,191,36,.14); color: #fcd34d; }
+html[data-theme="dark"] mark.hl { background: rgba(96, 165, 250, .30); }
 html[data-theme="dark"] .tag.purple { background: rgba(167,139,250,.16); color: #c4b5fd; }
 html[data-theme="dark"] .role-tag { background: rgba(96,165,250,.16); color: #93c5fd; }
 html[data-theme="dark"] .nav-item.active { box-shadow: 0 2px 8px rgba(59,130,246,.3); }

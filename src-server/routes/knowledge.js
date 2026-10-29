@@ -2,7 +2,7 @@
 const express = require('express');
 const { db, now } = require('../db');
 const { auth } = require('../lib/auth');
-const { retrieve } = require('../lib/retriever');
+const { retrieve, rerankModels } = require('../lib/retriever');
 
 const router = express.Router();
 router.use(auth);
@@ -233,16 +233,25 @@ router.post('/chunks/merge', (req, res) => {
   res.json({ code: 0, msg: '已合并' });
 });
 
-// 召回测试（混合检索：BM25 + 向量 RRF 融合；P2 升级 async 双引擎）
+// 可用 Rerank 模型列表（召回测试下拉用，2026-10-29 可视化升级）
+router.get('/rerank-models', (req, res) => {
+  res.json({ code: 0, data: rerankModels() });
+});
+
+// 召回测试（混合检索：BM25 + 向量加权 RRF 融合 + 可选 Rerank；P2 升级 async 双引擎，2026-10-29 支持权重/重排可视化参数）
 router.post('/recall-test', async (req, res) => {
-  const { kb_id, file_id, query, top_n, threshold } = req.body || {};
+  const { kb_id, file_id, query, top_n, threshold, vector_weight, rerank_model, rerank_enabled } = req.body || {};
   if (!query?.trim()) return res.json({ code: 400, msg: '请输入测试问题' });
   let kbId = kb_id || null;
   if (file_id) {
     const f = db.prepare('SELECT * FROM kb_files WHERE id=?').get(file_id);
     kbId = f ? f.kb_id : kbId;
   }
-  const hits = await retrieve(query, kbId, top_n || 5, threshold ?? 0.01);
+  const hits = await retrieve(query, kbId, top_n || 5, threshold ?? 0.01, {
+    vecWeight: vector_weight,               // 向量权重 0~1（默认 0.5，滑块实时调）
+    rerankModel: rerank_model || null,      // 重排模型（下拉选择）
+    rerankEnabled: rerank_enabled !== false, // 重排开关（对比效果用）
+  });
   res.json({ code: 0, data: { query, hits, count: hits.length, mode: 'hybrid' } });
 });
 

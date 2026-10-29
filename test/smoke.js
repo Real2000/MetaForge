@@ -2124,6 +2124,49 @@ function t(name, fn) {
           const del = await jfetch(`/api/knowledge/${kbid}`, { method: 'DELETE' }, tok2);
           assert.strictEqual(del.j && del.j.code, 403, '非创建者删除应 403：' + JSON.stringify(del.j));
         });
+        await t('HTTP：召回测试可视化——rerank-models 接口返回模型列表（2026-10-29）', async () => {
+          const r = await jfetch('/api/knowledge/rerank-models', {}, tok1);
+          assert.ok(r.j && r.j.code === 0, '接口应成功：' + JSON.stringify(r.j));
+          assert.ok(Array.isArray(r.j.data), 'data 应为数组：' + JSON.stringify(r.j.data));
+        });
+        await t('HTTP：召回测试可视化——关闭重排+权重滑块参数（channels/hit_terms 字段）', async () => {
+          // 造测试数据：库 + 文件 + 两个含命中词的分块
+          db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('召回可视化测试库','',1,'测试用户一',datetime('now','localtime'))`).run();
+          const kbid = db.prepare(`SELECT id FROM kbs WHERE name='召回可视化测试库'`).get().id;
+          db.prepare(`INSERT INTO kb_files (kb_id,name,size,status,chunk_count,created_at) VALUES (?,'考勤制度.docx',1024,'success',2,datetime('now','localtime'))`).run(kbid);
+          const fid = db.prepare(`SELECT id FROM kb_files WHERE kb_id=? ORDER BY id DESC`).get(kbid).id;
+          db.prepare(`INSERT INTO kb_chunks (file_id,kb_id,content) VALUES (?,?,?)`).run(fid, kbid, '迟到一次扣款五十元，月度迟到三次以上视为旷工处理');
+          db.prepare(`INSERT INTO kb_chunks (file_id,kb_id,content) VALUES (?,?,?)`).run(fid, kbid, '报销流程：提交发票后三个工作日内完成审核打款');
+          const r = await jfetch('/api/knowledge/recall-test', {
+            method: 'POST',
+            body: JSON.stringify({ query: '迟到会怎么处理', kb_id: kbid, top_n: 5, threshold: 0, vector_weight: 0.5, rerank_enabled: false }),
+          }, tok1);
+          assert.ok(r.j && r.j.code === 0, '召回测试应成功：' + JSON.stringify(r.j).slice(0, 160));
+          assert.ok(r.j.data.count >= 1, '应至少命中 1 条（BM25 通道必命中"迟到"）：' + JSON.stringify(r.j.data.count));
+          const hit = r.j.data.hits.find(h => (h.content || '').includes('迟到'));
+          assert.ok(hit, '应命中含"迟到"的分块');
+          assert.ok(['bm25', 'vec', 'both', 'none'].includes(hit.channels), '每条结果应带 channels 字段：' + JSON.stringify(hit.channels));
+          assert.ok(Array.isArray(hit.hit_terms) && hit.hit_terms.length >= 1 && hit.hit_terms.includes('迟到'), 'hit_terms 应含命中词"迟到"：' + JSON.stringify(hit.hit_terms));
+          assert.ok(hit.rerank_score == null, '关闭重排时不应有 rerank_score');
+        });
+        await t('HTTP：召回测试可视化——向量权重 0（纯关键词）与 1（纯向量）均可调（滑块两端）', async () => {
+          const kbid = db.prepare(`SELECT id FROM kbs WHERE name='召回可视化测试库'`).get().id;
+          for (const vw of [0, 1]) {
+            const r = await jfetch('/api/knowledge/recall-test', {
+              method: 'POST',
+              body: JSON.stringify({ query: '迟到会怎么处理', kb_id: kbid, top_n: 5, threshold: 0, vector_weight: vw, rerank_enabled: false }),
+            }, tok1);
+            assert.ok(r.j && r.j.code === 0, `vector_weight=${vw} 应成功：` + JSON.stringify(r.j).slice(0, 160));
+            assert.ok(r.j.data.count >= 1, `vector_weight=${vw} 应有命中`);
+          }
+          // 纯关键词权重下，命中"迟到"的分块 BM25 通道必命中（channels 至少为 bm25；本地哈希向量可能同时命中即为 both）
+          const r0 = await jfetch('/api/knowledge/recall-test', {
+            method: 'POST',
+            body: JSON.stringify({ query: '迟到会怎么处理', kb_id: kbid, top_n: 5, threshold: 0, vector_weight: 0, rerank_enabled: false }),
+          }, tok1);
+          const hit0 = r0.j.data.hits.find(h => (h.content || '').includes('迟到'));
+          assert.ok(hit0 && (hit0.channels === 'bm25' || hit0.channels === 'both'), '纯关键词权重下"迟到"分块 BM25 通道应命中：' + JSON.stringify(hit0 && hit0.channels));
+        });
         await t('HTTP：任务归属——创建者自有，他人不可见不可删（P5.31）', async () => {
           const aid = db.prepare(`SELECT id FROM users WHERE username='httpadmin'`).get().id;
           const tokA2 = sign({ uid: aid, exp: Date.now() + 3600000 });
