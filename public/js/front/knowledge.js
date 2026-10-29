@@ -96,11 +96,27 @@ export async function render(el) {
       await api(`/knowledge/files/${b.dataset.df}`, { method: 'DELETE' });
       toast('已删除'); loadFiles().then(renderKbList);
     });
-    paneKb.querySelectorAll('[data-chunks]').forEach(b => b.onclick = async () => {
-      const j = await api(`/knowledge/files/${b.dataset.chunks}/chunks`);
-      const { file, chunks } = j.data;
-      const body = `
-        <div style="font-size:13px;color:var(--text-3);margin-bottom:8px">文件：${esc(file.name)}（共 ${chunks.length} 个片段）</div>
+    paneKb.querySelectorAll('[data-chunks]').forEach(b => b.onclick = () => openChunks(+b.dataset.chunks));
+  }
+
+  // 查看分块弹窗（2026-10-29 增补：关键词/问法标签展示 + AI 生成关键词）
+  async function openChunks(fileId) {
+    const j = await api(`/knowledge/files/${fileId}/chunks`);
+    const { file, chunks } = j.data;
+    const metaTags = (kw) => {
+      if (!kw) return '';
+      try {
+        const m = JSON.parse(kw);
+        const kws = (m.keywords || []).map(k => `<span class="tag blue" style="font-size:10px">${esc(k)}</span>`).join(' ');
+        const qs = (m.questions || []).map(q => `<span class="tag orange" style="font-size:10px">❓${esc(q)}</span>`).join(' ');
+        return (kws || qs) ? `<div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:4px">${kws} ${qs}</div>` : '';
+      } catch { return ''; }
+    };
+    const body = `
+        <div style="font-size:13px;color:var(--text-3);margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
+          <span>文件：${esc(file.name)}（共 ${chunks.length} 个片段）</span>
+          <button class="btn sm" data-gen-kw="${file.id}" title="用已配置模型为每个分块生成检索关键词与问法">✨ AI 生成关键词</button>
+        </div>
         <div style="max-height:500px;overflow-y:auto">${chunks.map((c, i) => `
           <div class="card" style="box-shadow:none;border:1px solid var(--border);margin-bottom:8px" data-chunk-id="${c.id}">
             <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
@@ -112,13 +128,24 @@ export async function render(el) {
               </div>
             </div>
             <div style="font-size:12px;color:var(--text-2);line-height:1.7;white-space:pre-wrap;word-break:break-word">${esc(c.content)}</div>
+            ${metaTags(c.keywords)}
           </div>`).join('')}
         </div>`;
-      modal({
-        title: '查看分块', body, wide: true,
-        foot: '<button class="btn" data-close>关闭</button>',
-        onMount(mask, close) {
-          mask.querySelector('[data-close]').onclick = close;
+    modal({
+      title: '查看分块', body, wide: true,
+      foot: '<button class="btn" data-close>关闭</button>',
+      onMount(mask, close) {
+        mask.querySelector('[data-close]').onclick = close;
+        mask.querySelectorAll('[data-gen-kw]').forEach(btn => btn.onclick = async () => {
+          if (!await confirmBox('将为该文件全部分块调用模型生成关键词与问法（大文件可能耗时较久），继续？')) return;
+          btn.disabled = true; btn.textContent = '⏳ 生成中…';
+          try {
+            const r = await api(`/knowledge/files/${fileId}/generate-keywords`, { method: 'POST' });
+            if (r.data?.skipped === 'no_provider') toast('未配置可用模型供应商，已跳过', 'err');
+            else toast(`生成完成：成功 ${r.data?.generated ?? 0} / 共 ${r.data?.total ?? 0} 个分块`);
+            close(); openChunks(fileId); // 重新打开以刷新关键词标签
+          } catch (e) { toast(e.message, 'err'); btn.disabled = false; btn.textContent = '✨ AI 生成关键词'; }
+        });
           mask.querySelectorAll('[data-edit-chunk]').forEach(btn => btn.onclick = async () => {
             const cid = btn.dataset.editChunk;
             const card = mask.querySelector(`[data-chunk-id="${cid}"]`);
@@ -154,7 +181,6 @@ export async function render(el) {
           });
         },
       });
-    });
   }
 
   function openNewKb() {

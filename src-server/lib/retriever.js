@@ -192,12 +192,12 @@ function parseVec(s) {
   } catch { return { v: null, engine: null }; }
 }
 
-/** BM25 通道打分 */
+/** BM25 通道打分（r._idx 存在时用扩展索引文本 = 原文 + 关键词/问法，提升换说法召回） */
 function bm25Scores(rows, qTerms) {
   const N = rows.length;
   const df = new Map();
   const docTerms = rows.map(r => {
-    const t = new Set(terms(r.content));
+    const t = new Set(terms(r._idx || r.content));
     t.forEach(x => df.set(x, (df.get(x) || 0) + 1));
     return t;
   });
@@ -227,13 +227,23 @@ function bm25Scores(rows, qTerms) {
 async function retrieve(query, kbId = null, topN = 5, threshold = 0.01, opts = {}) {
   const vecWeight = Math.min(1, Math.max(0, Number(opts.vecWeight ?? 0.5)));
   const rows = db.prepare(`
-    SELECT c.id, c.content, c.kb_id, c.file_id, c.parent_id, c.embedding, f.name AS file, k.name AS kb
+    SELECT c.id, c.content, c.kb_id, c.file_id, c.parent_id, c.embedding, c.keywords, f.name AS file, k.name AS kb
     FROM kb_chunks c
     LEFT JOIN kb_files f ON f.id = c.file_id
     LEFT JOIN kbs k ON k.id = c.kb_id
     WHERE (? IS NULL OR c.kb_id = ?) AND (k.enabled IS NULL OR k.enabled = 1)
   `).all(kbId, kbId);
   if (!rows.length) return [];
+  // 自动关键词/问法扩展（2026-10-29）：BM25 索引文本 = 原文 + keywords/questions；输出仍用原文（finish 取 r.content）
+  for (const r of rows) {
+    if (r.keywords) {
+      try {
+        const meta = JSON.parse(r.keywords);
+        const extra = [...(meta.keywords || []), ...(meta.questions || [])].filter(Boolean).join('\n');
+        if (extra) r._idx = r.content + '\n' + extra;
+      } catch { /* keywords 损坏则忽略，仅用原文 */ }
+    }
+  }
   const qTerms = terms(query);
   if (!qTerms.length) return [];
 

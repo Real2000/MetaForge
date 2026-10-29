@@ -3,6 +3,7 @@ const express = require('express');
 const { db, now } = require('../db');
 const { auth } = require('../lib/auth');
 const { retrieve, rerankModels } = require('../lib/retriever');
+const { generateForFile } = require('../lib/keywordgen');
 
 const router = express.Router();
 router.use(auth);
@@ -157,6 +158,8 @@ router.post('/:id/files', async (req, res) => {
   });
   db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
     .run(req.user.username, '上传知识库文件', `${kb.name} / ${name}（${chunks.length} 片段）`, req.ip, now());
+  // 自动关键词/问法生成（2026-10-29）：上传响应后后台 best-effort 生成，不阻塞上传；无模型/失败静默跳过
+  generateForFile(info.lastInsertRowid).catch(() => { });
   res.json({ code: 0, data: { id: info.lastInsertRowid, chunks: chunks.length } });
 });
 
@@ -188,8 +191,23 @@ router.get('/files/:fileId/chunks', (req, res) => {
   const kb = db.prepare('SELECT * FROM kbs WHERE id=?').get(f.kb_id);
   const deny = denyIfNotAllowed(kb, req.user);
   if (deny) return res.json(deny);
-  const rows = db.prepare('SELECT c.id, c.content, c.file_id, c.kb_id FROM kb_chunks c WHERE c.file_id=? ORDER BY c.id').all(req.params.fileId);
+  const rows = db.prepare('SELECT c.id, c.content, c.file_id, c.kb_id, c.keywords FROM kb_chunks c WHERE c.file_id=? ORDER BY c.id').all(req.params.fileId);
   res.json({ code: 0, data: { file: { id: f.id, name: f.name, kb_id: f.kb_id }, chunks: rows } });
+});
+
+// 手动补生成/重新生成关键词+问法（对存量分块，或内容编辑后刷新；无模型时友好提示）
+router.post('/files/:fileId/generate-keywords', async (req, res) => {
+  const f = db.prepare('SELECT * FROM kb_files WHERE id=?').get(req.params.fileId);
+  if (!f) return res.json({ code: 404, msg: '文件不存在' });
+  const kb = db.prepare('SELECT * FROM kbs WHERE id=?').get(f.kb_id);
+  const deny = denyIfNotAllowed(kb, req.user);
+  if (deny) return res.json(deny);
+  const r = await generateForFile(f.id);
+  if (!r.ok) return res.json({ code: 400, msg: r.msg });
+  if (r.skipped === 'no_provider') return res.json({ code: 0, data: { ...r, msg: '未配置可用模型供应商，已跳过生成' } });
+  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
+    .run(req.user.username, '生成关键词', `${kb.name} / ${f.name}（成功 ${r.generated}/${r.total}）`, req.ip, now());
+  res.json({ code: 0, data: r });
 });
 
 // 更新单个 chunk 内容

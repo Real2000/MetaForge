@@ -686,6 +686,11 @@ if (!chunkCols2.includes('parent_id')) {
   db.exec(`ALTER TABLE kb_chunks ADD COLUMN parent_id INTEGER DEFAULT NULL`);
   console.log('[db] kb_chunks 表已迁移：新增 parent_id 字段（父子切片）');
 }
+// kb_chunks 表增加 keywords（自动关键词/问法：JSON {keywords:[],questions:[]}，BM25 同时索引以提升换说法召回）
+if (!chunkCols2.includes('keywords')) {
+  db.exec(`ALTER TABLE kb_chunks ADD COLUMN keywords TEXT DEFAULT NULL`);
+  console.log('[db] kb_chunks 表已迁移：新增 keywords 字段（自动关键词/问法）');
+}
 // 全链路追踪表
 db.exec(`CREATE TABLE IF NOT EXISTS chat_traces (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

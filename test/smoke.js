@@ -2113,6 +2113,8 @@ function t(name, fn) {
           assert.ok(p, '测试供应商应在列表中');
           assert.strictEqual(p.api_key, 'sk-****abcd', 'Key 应脱敏为前 3 后 4：' + p.api_key);
           assert.ok(!JSON.stringify(r.j).includes('sk-secret-1234567890abcd'), '响应中不应出现完整 Key');
+          // 测试自清理：configured=1 供应商残留会泄漏到后续块（如 keywordgen 的 no_provider 判断）
+          db.prepare(`DELETE FROM providers WHERE name='脱敏测试供应商'`).run();
         });
         await t('HTTP：知识库写权限——非创建者改删被拒（P5.30）', async () => {
           db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('归属测试库','',1,'测试用户一',datetime('now','localtime'))`).run();
@@ -2166,6 +2168,19 @@ function t(name, fn) {
           }, tok1);
           const hit0 = r0.j.data.hits.find(h => (h.content || '').includes('迟到'));
           assert.ok(hit0 && (hit0.channels === 'bm25' || hit0.channels === 'both'), '纯关键词权重下"迟到"分块 BM25 通道应命中：' + JSON.stringify(hit0 && hit0.channels));
+        });
+        await t('HTTP：召回测试可视化——generate-keywords 无供应商友好跳过（2026-10-29）', async () => {
+          db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('kwHTTP测试库','',1,'测试用户一',datetime('now','localtime'))`).run();
+          const kbid = db.prepare(`SELECT id FROM kbs WHERE name='kwHTTP测试库'`).get().id;
+          db.prepare(`INSERT INTO kb_files (kb_id,name,size,status,chunk_count,created_at) VALUES (?,'httpkw.md',100,'success',1,datetime('now','localtime'))`).run(kbid);
+          const fid = db.prepare(`SELECT id FROM kb_files WHERE kb_id=? ORDER BY id DESC`).get(kbid).id;
+          const r = await jfetch(`/api/knowledge/files/${fid}/generate-keywords`, { method: 'POST' }, tok1);
+          assert.ok(r.j && r.j.code === 0, '接口应成功（无供应商不报错）：' + JSON.stringify(r.j));
+          assert.strictEqual(r.j.data && r.j.data.skipped, 'no_provider', '无供应商应 skipped=no_provider：' + JSON.stringify(r.j.data));
+          const nf = await jfetch('/api/knowledge/files/999999/generate-keywords', { method: 'POST' }, tok1);
+          assert.strictEqual(nf.j && nf.j.code, 404, '文件不存在应 404');
+          db.prepare(`DELETE FROM kb_files WHERE id=?`).run(fid);
+          db.prepare(`DELETE FROM kbs WHERE id=?`).run(kbid);
         });
         await t('HTTP：任务归属——创建者自有，他人不可见不可删（P5.31）', async () => {
           const aid = db.prepare(`SELECT id FROM users WHERE username='httpadmin'`).get().id;
@@ -2676,6 +2691,51 @@ function t(name, fn) {
       const result = await retrieve('测试', 0, 5, 0.01);
       assert.ok(Array.isArray(result));
       // 无供应商时不会崩溃，返回 RRF 排序结果
+    });
+    // 【N+7】自动关键词/问法生成（2026-10-29）
+    await t('keywordgen：kb_chunks 表已迁移 keywords 字段', () => {
+      const cols = db.prepare('PRAGMA table_info(kb_chunks)').all().map(c => c.name);
+      assert.ok(cols.includes('keywords'), 'kb_chunks 应有 keywords 列');
+    });
+    await t('keywordgen：parseMeta 解析——裸 JSON / 代码块包裹 / 杂讯容错', () => {
+      const { parseMeta } = require('../src-server/lib/keywordgen');
+      const a = parseMeta('{"keywords":["迟到","考勤"],"questions":["迟到怎么处理？"]}');
+      assert.deepStrictEqual(a, { keywords: ['迟到', '考勤'], questions: ['迟到怎么处理？'] });
+      const b = parseMeta('好的，以下是结果：\n```json\n{"keywords":["报销"],"questions":[]}\n```');
+      assert.deepStrictEqual(b, { keywords: ['报销'], questions: [] });
+      assert.strictEqual(parseMeta('这不是 JSON 输出'), null);
+      assert.strictEqual(parseMeta('{"keywords":[],"questions":[]}'), null, '全空应视为无效');
+      assert.strictEqual(parseMeta(''), null);
+    });
+    await t('keywordgen：generateForFile 无供应商时静默跳过（不阻塞）', async () => {
+      db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('关键词测试库','',1,'测试用户一',datetime('now','localtime'))`).run();
+      const kbid = db.prepare(`SELECT id FROM kbs WHERE name='关键词测试库'`).get().id;
+      db.prepare(`INSERT INTO kb_files (kb_id,name,size,status,chunk_count,created_at) VALUES (?,'kw文件.md',100,'success',1,datetime('now','localtime'))`).run(kbid);
+      const fid = db.prepare(`SELECT id FROM kb_files WHERE kb_id=? ORDER BY id DESC`).get(kbid).id;
+      db.prepare(`INSERT INTO kb_chunks (file_id,kb_id,content) VALUES (?,?,?)`).run(fid, kbid, '测试关键词生成的分块内容，长度超过八个字');
+      const { generateForFile } = require('../src-server/lib/keywordgen');
+      const r = await generateForFile(fid);
+      assert.ok(r.ok === true && r.skipped === 'no_provider' && r.generated === 0, '无供应商应返回 skipped=no_provider：' + JSON.stringify(r));
+      const r2 = await generateForFile(999999);
+      assert.ok(r2.ok === false, '文件不存在应返回 ok=false');
+      globalThis.__kwTestKbId = kbid; globalThis.__kwTestFileId = fid;
+    });
+    await t('keywordgen：BM25 通道索引关键词+问法——换说法提问可命中（检索扩展）', async () => {
+      const kbid = globalThis.__kwTestKbId, fid = globalThis.__kwTestFileId;
+      // 分块原文不含查询词；关键词/问法含查询词（数据安全/保障），验证 _idx 扩展生效
+      db.prepare(`INSERT INTO kb_chunks (file_id,kb_id,content,keywords) VALUES (?,?,?,?)`).run(
+        fid, kbid,
+        '本项目基于联邦学习与差分隐私技术构建分析平台，支持多方数据协作建模',
+        JSON.stringify({ keywords: ['数据安全', '隐私保护', '等保合规'], questions: ['数据怎么保障安全？'] }));
+      const { retrieve } = require('../src-server/lib/retriever');
+      const hits = await retrieve('数据安全保障措施', kbid, 5, 0);
+      const hit = hits.find(h => (h.content || '').includes('联邦学习'));
+      assert.ok(hit, '关键词扩展后应命中该分块：' + JSON.stringify(hits.map(h => h.content?.slice(0, 20))));
+      assert.ok(hit.bm25 > 0, '命中应来自 BM25 通道（原文不含查询词，仅关键词含）：bm25=' + hit.bm25);
+      assert.ok(!hit.content.includes('keywords'), '输出 content 应保持原文，不混入关键词文本');
+      db.prepare(`DELETE FROM kb_chunks WHERE file_id=?`).run(fid);
+      db.prepare(`DELETE FROM kb_files WHERE id=?`).run(fid);
+      db.prepare(`DELETE FROM kbs WHERE id=?`).run(kbid);
     });
     // 【P3】P3 工程化：建表数 tripwire
     await t('P3 工程化：新库建表数 = 40（防 schema 误删/迁移遗漏）', () => {
