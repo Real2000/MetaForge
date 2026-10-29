@@ -691,6 +691,18 @@ if (!chunkCols2.includes('keywords')) {
   db.exec(`ALTER TABLE kb_chunks ADD COLUMN keywords TEXT DEFAULT NULL`);
   console.log('[db] kb_chunks 表已迁移：新增 keywords 字段（自动关键词/问法）');
 }
+// P0-1: kbs.owner 存量数据迁移 nickname→username（此前创建时写入 nickname||username，denyIfNotAllowed 需精确匹配 username）
+{
+  const allKb = db.prepare('SELECT id, owner FROM kbs').all();
+  const ownerFix = db.prepare('UPDATE kbs SET owner=? WHERE id=?');
+  let fixed = 0;
+  for (const r of allKb) {
+    if (!r.owner) { ownerFix.run('admin', r.id); fixed++; continue; }
+    const u = db.prepare('SELECT username FROM users WHERE nickname=?').get(r.owner);
+    if (u && u.username !== r.owner) { ownerFix.run(u.username, r.id); fixed++; }
+  }
+  if (fixed) console.log(`[db] kbs 表已迁移：${fixed} 条 owner 从 nickname 修正为 username`);
+}
 // 全链路追踪表
 db.exec(`CREATE TABLE IF NOT EXISTS chat_traces (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

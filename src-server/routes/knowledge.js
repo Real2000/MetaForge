@@ -9,12 +9,11 @@ const router = express.Router();
 router.use(auth);
 
 // P5.30 安全止血：写操作归属校验——此前 PUT/DELETE/上传对任何登录用户放行（可改删他人知识库、向他人知识库注入内容）。
-// kbs.owner 存的是创建者昵称或用户名（历史设计，创建时写入 nickname||username），两者任一命中 + 管理员放行。
-// 彻底方案（owner 列改存 username）为中期项，届时需迁移存量数据
+// P0-1: owner 规范化——存量已迁移（nickname→username），创建时写入 req.user.username，校验仅比较 username 与 admin
 function denyIfNotAllowed(kb, user) {
   if (!kb) return { code: 404, msg: '知识库不存在' };
   if (user.role === 'admin') return null;
-  if (kb.owner === user.username || (user.nickname && kb.owner === user.nickname)) return null;
+  if (kb.owner === user.username) return null;
   return { code: 403, msg: '无权管理该知识库（仅创建者或管理员）' };
 }
 
@@ -29,7 +28,7 @@ router.post('/', (req, res) => {
   const { name, description } = req.body || {};
   if (!name?.trim()) return res.json({ code: 400, msg: '知识库名称不能为空' });
   const info = db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES (?,?,1,?,datetime('now','localtime'))`)
-    .run(name.trim(), description || '', req.user.nickname || req.user.username);
+    .run(name.trim(), description || '', req.user.username);
   db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)').run(req.user.username, '创建知识库', name.trim(), req.ip, now());
   res.json({ code: 0, data: { id: info.lastInsertRowid } });
 });

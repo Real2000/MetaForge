@@ -2117,7 +2117,7 @@ function t(name, fn) {
           db.prepare(`DELETE FROM providers WHERE name='脱敏测试供应商'`).run();
         });
         await t('HTTP：知识库写权限——非创建者改删被拒（P5.30）', async () => {
-          db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('归属测试库','',1,'测试用户一',datetime('now','localtime'))`).run();
+          db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('归属测试库','',1,'httpu1',datetime('now','localtime'))`).run();
           const kbid = db.prepare(`SELECT id FROM kbs WHERE name='归属测试库'`).get().id;
           const put = await jfetch(`/api/knowledge/${kbid}`, { method: 'PUT', body: JSON.stringify({ name: '改名' }) }, tok2);
           assert.strictEqual(put.j && put.j.code, 403, '非创建者改名应 403：' + JSON.stringify(put.j));
@@ -2133,7 +2133,7 @@ function t(name, fn) {
         });
         await t('HTTP：召回测试可视化——关闭重排+权重滑块参数（channels/hit_terms 字段）', async () => {
           // 造测试数据：库 + 文件 + 两个含命中词的分块
-          db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('召回可视化测试库','',1,'测试用户一',datetime('now','localtime'))`).run();
+          db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('召回可视化测试库','',1,'httpu1',datetime('now','localtime'))`).run();
           const kbid = db.prepare(`SELECT id FROM kbs WHERE name='召回可视化测试库'`).get().id;
           db.prepare(`INSERT INTO kb_files (kb_id,name,size,status,chunk_count,created_at) VALUES (?,'考勤制度.docx',1024,'success',2,datetime('now','localtime'))`).run(kbid);
           const fid = db.prepare(`SELECT id FROM kb_files WHERE kb_id=? ORDER BY id DESC`).get(kbid).id;
@@ -2170,7 +2170,7 @@ function t(name, fn) {
           assert.ok(hit0 && (hit0.channels === 'bm25' || hit0.channels === 'both'), '纯关键词权重下"迟到"分块 BM25 通道应命中：' + JSON.stringify(hit0 && hit0.channels));
         });
         await t('HTTP：召回测试可视化——generate-keywords 无供应商友好跳过（2026-10-29）', async () => {
-          db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('kwHTTP测试库','',1,'测试用户一',datetime('now','localtime'))`).run();
+          db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('kwHTTP测试库','',1,'httpu1',datetime('now','localtime'))`).run();
           const kbid = db.prepare(`SELECT id FROM kbs WHERE name='kwHTTP测试库'`).get().id;
           db.prepare(`INSERT INTO kb_files (kb_id,name,size,status,chunk_count,created_at) VALUES (?,'httpkw.md',100,'success',1,datetime('now','localtime'))`).run(kbid);
           const fid = db.prepare(`SELECT id FROM kb_files WHERE kb_id=? ORDER BY id DESC`).get(kbid).id;
@@ -2708,7 +2708,7 @@ function t(name, fn) {
       assert.strictEqual(parseMeta(''), null);
     });
     await t('keywordgen：generateForFile 无供应商时静默跳过（不阻塞）', async () => {
-      db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('关键词测试库','',1,'测试用户一',datetime('now','localtime'))`).run();
+      db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('关键词测试库','',1,'httpu1',datetime('now','localtime'))`).run();
       const kbid = db.prepare(`SELECT id FROM kbs WHERE name='关键词测试库'`).get().id;
       db.prepare(`INSERT INTO kb_files (kb_id,name,size,status,chunk_count,created_at) VALUES (?,'kw文件.md',100,'success',1,datetime('now','localtime'))`).run(kbid);
       const fid = db.prepare(`SELECT id FROM kb_files WHERE kb_id=? ORDER BY id DESC`).get(kbid).id;
