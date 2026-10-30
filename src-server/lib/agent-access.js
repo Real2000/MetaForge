@@ -28,7 +28,19 @@ function canView(a, user) {
   const members = parseJsonArr(a.visible_members);
   if (members.includes(user.username)) return true;
   const depts = parseJsonArr(a.visible_depts);
-  if (user.dept && depts.includes(user.dept)) return true;
+  if (depts.length) {
+    // P0-3 (2026-10-29)：visible_depts 兼容新旧两种格式——
+    // - 旧格式：["部门名"]，用 user.dept 文本部门名匹配
+    // - 新格式：["1","2"]（departments 表 ID 字符串），用 user.dept_id 匹配
+    // 优先尝试 dept_id 匹配（精准），失败回落文本部门名
+    if (depts.every(v => /^\d+$/.test(v))) {
+      // 全部为纯数字 → 新格式 ID
+      if (user.dept_id != null && depts.includes(String(user.dept_id))) return true;
+    } else {
+      // 包含非数字 → 旧格式文本部门名
+      if (user.dept && depts.includes(user.dept)) return true;
+    }
+  }
   return false;
 }
 
