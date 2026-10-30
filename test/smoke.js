@@ -2143,6 +2143,16 @@ function t(name, fn) {
 
     const port = 33000 + Math.floor(Math.random() * 2000);
     const base = `http://127.0.0.1:${port}`;
+    // ===== V1.3 #4 钉钉集成测试前置（2026-10-30）=====
+    // ⚠️ 必须在 spawn 子进程【之前】写入 secrets：lib/secrets.js 的 loadSecrets 有 60s 内存缓存，
+    //    子进程起服务后父进程再写库，子进程首次读已可能命中空值缓存走「未配置」分支（集成实测踩过的坑）
+    const dingCrypto = require('../src-server/lib/dingtalk-crypto');
+    const DT_AES_KEY = require('crypto').randomBytes(32).toString('base64').replace(/=+$/, ''); // 43 位，钉钉控制台 AESKey 形态
+    const DT_TOKEN = 'smoke-dt-token';
+    require('../src-server/lib/secrets').upsert('DINGTALK_AES_KEY', DT_AES_KEY, 'smoke V1.3#4');
+    require('../src-server/lib/secrets').upsert('DINGTALK_TOKEN', DT_TOKEN, 'smoke V1.3#4');
+    require('../src-server/lib/secrets').upsert('DINGTALK_APP_KEY', 'smoke-dt-app-key', 'smoke V1.3#4');       // 扫码登录骨架前置（本组暂不直接用，为后续用例铺路）
+    require('../src-server/lib/secrets').upsert('DINGTALK_APP_SECRET', 'smoke-dt-app-secret', 'smoke V1.3#4'); // 同上
     const child = spawn(process.execPath, ['server.js'], {
       cwd: path.join(__dirname, '..'),
       env: { ...process.env, PORT: String(port), AGENT_DATA_DIR: process.env.AGENT_DATA_DIR },
@@ -2383,6 +2393,93 @@ function t(name, fn) {
           assert.ok(collabPut.j && collabPut.j.code === 0, '协作者保存应成功（内容字段可编辑）：' + JSON.stringify(collabPut.j));
           assert.strictEqual(db.prepare('SELECT kb_metadata_filter FROM agents WHERE id=?').get(agid).kb_metadata_filter, before, '协作者提交的 kb_metadata_filter 应被忽略（归属级保护，防内容级 ACL 降权）：' + before);
         });
+        // ===== V1.3 #6 知识库级召回评测集（2026-10-30）：保存/列表 → 重跑 diff → 变更自动回归 → 智能体侧隔离 → 归属校验 =====
+        await t('HTTP：评测集保存 + 列表（V1.3 #6：type=kb 落库、kb_id 正确、初始 score NULL）', async () => {
+          db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('评测集测试库','',1,'httpu1',datetime('now','localtime'))`).run();
+          const kbid = db.prepare(`SELECT id FROM kbs WHERE name='评测集测试库'`).get().id;
+          db.prepare(`INSERT INTO kb_files (kb_id,name,size,status,chunk_count,created_at) VALUES (?,'考勤制度.txt',1024,'success',2,datetime('now','localtime'))`).run(kbid);
+          const fid = db.prepare(`SELECT id FROM kb_files WHERE kb_id=? ORDER BY id DESC`).get(kbid).id;
+          db.prepare(`INSERT INTO kb_chunks (file_id,kb_id,content) VALUES (?,?,?)`).run(fid, kbid, '迟到一次扣款五十元，月度迟到三次以上视为旷工处理');
+          db.prepare(`INSERT INTO kb_chunks (file_id,kb_id,content) VALUES (?,?,?)`).run(fid, kbid, '报销流程：提交发票后三个工作日内完成审核打款');
+          const s = await jfetch(`/api/knowledge/${kbid}/evaluations`, { method: 'POST', body: JSON.stringify({
+            name: '考勤黄金问答集',
+            dataset: [
+              { query: '迟到会怎么处理', expect_terms: ['迟到', '旷工', '扣款'] },
+              { query: '报销的时效', expect_terms: ['报销', '工作日', '发票'] },
+            ],
+          }) }, tok1);
+          assert.ok(s.j && s.j.code === 0, '保存评测集应成功：' + JSON.stringify(s.j));
+          const row = db.prepare(`SELECT * FROM evaluations WHERE kb_id=? AND type='kb'`).get(kbid);
+          assert.strictEqual(row.type, 'kb', '落库 type 应为 kb：' + row.type);
+          assert.strictEqual(row.kb_id, kbid, 'kb_id 应正确');
+          assert.strictEqual(row.score, null, '初始 score 应为 NULL（未重跑）');
+          const l = await jfetch(`/api/knowledge/${kbid}/evaluations`, {}, tok1);
+          const item = (l.j.data || []).find(x => x.name === '考勤黄金问答集');
+          assert.ok(item, '列表应出现该评测集：' + JSON.stringify(l.j.data));
+          assert.strictEqual(item.score, null, '未重跑 score 应为 null（前端显 —）');
+          assert.strictEqual(item.dataset_count, 2, 'dataset_count 应为 2');
+        });
+        await t('HTTP：重跑得分 + diff（V1.3 #6：先满分 → 破坏内容再跑 → 分数下降，diff 负值）', async () => {
+          const kbid = db.prepare(`SELECT id FROM kbs WHERE name LIKE '评测集测试库%'`).get().id;
+          const eid = db.prepare(`SELECT id FROM evaluations WHERE kb_id=? AND type='kb'`).get(kbid).id;
+          const r1 = await jfetch(`/api/knowledge/${kbid}/evaluations/${eid}/rerun`, { method: 'POST' }, tok1);
+          assert.ok(r1.j && r1.j.code === 0, '重跑应成功：' + JSON.stringify(r1.j).slice(0, 160));
+          assert.strictEqual(r1.j.data.score, 1, '两条全命中应为 1：' + JSON.stringify(r1.j.data).slice(0, 160));
+          assert.strictEqual(r1.j.data.diff, '首次', '首次重跑 diff 应为 首次');
+          assert.ok(r1.j.data.detail.every(d => d.hit === true), '每条都应命中');
+          // 破坏「迟到」命中词（子/父分片一并替换，防父上下文带出旧词）
+          db.prepare(`UPDATE kb_chunks SET content='安全管理规定：办公区域禁止携带宠物入场。' WHERE kb_id=? AND content LIKE '%迟到%'`).run(kbid);
+          const r2 = await jfetch(`/api/knowledge/${kbid}/evaluations/${eid}/rerun`, { method: 'POST' }, tok1);
+          assert.strictEqual(r2.j.data.score, 0.5, '仅剩报销条命中应为 0.5：' + JSON.stringify(r2.j.data).slice(0, 200));
+          assert.strictEqual(r2.j.data.prev_score, 1, 'prev_score 应为 1');
+          assert.strictEqual(r2.j.data.diff, '-0.50', 'diff 应为 -0.50：' + r2.j.data.diff);
+          assert.ok(r2.j.data.detail.some(d => d.hit === false && d.query.includes('迟到')), '迟到条应未命中');
+        });
+        await t('HTTP：触发点通知（V1.3 #6：PUT chunk_size 变化 → notifications 回归通知；不变参数/仅改名不触发）', async () => {
+          const kbid = db.prepare(`SELECT id FROM kbs WHERE name LIKE '评测集测试库%'`).get().id;
+          const p = await jfetch(`/api/knowledge/${kbid}`, { method: 'PUT', body: JSON.stringify({ chunk_size: 300, chunk_overlap: 0, chunk_separator: '\\n\\s*\\n' }) }, tok1);
+          assert.ok(p.j && p.j.code === 0, 'PUT 应成功：' + JSON.stringify(p.j));
+          let row = null;
+          for (let i = 0; i < 25 && !row; i++) { // fire-and-forget 异步回归，轮询最多 5s
+            await new Promise(r => setTimeout(r, 200));
+            row = db.prepare(`SELECT * FROM notifications WHERE username='httpu1' AND title LIKE '知识库%召回评测回归' ORDER BY id DESC`).get();
+          }
+          assert.ok(row, '应出现 owner 的回归通知');
+          assert.ok(row.title.includes('评测集测试库'), '标题应含库名：' + row.title);
+          assert.ok(row.content.includes('考勤黄金问答集') && row.content.includes('→'), 'content 应含评测集名与新旧分：' + row.content);
+          // 反例：不变参数 + 仅改名 → 不触发
+          await new Promise(r => setTimeout(r, 800));
+          const cnt = db.prepare(`SELECT COUNT(*) c FROM notifications WHERE username='httpu1' AND title LIKE '知识库%召回评测回归'`).get().c;
+          await jfetch(`/api/knowledge/${kbid}`, { method: 'PUT', body: JSON.stringify({ name: '评测集测试库改名' }) }, tok1);
+          await jfetch(`/api/knowledge/${kbid}`, { method: 'PUT', body: JSON.stringify({ chunk_size: 300, chunk_overlap: 0, chunk_separator: '\\n\\s*\\n' }) }, tok1);
+          await new Promise(r => setTimeout(r, 1500));
+          const after = db.prepare(`SELECT COUNT(*) c FROM notifications WHERE username='httpu1' AND title LIKE '知识库%召回评测回归'`).get().c;
+          assert.strictEqual(after, cnt, '不变参数/仅改名不应新增回归通知：' + cnt + ' → ' + after);
+        });
+        await t('HTTP：智能体侧隔离（V1.3 #6：GET /api/agents/evaluations 不含 kb 型数据）', async () => {
+          const adminUid = db.prepare(`SELECT id FROM users WHERE username='httpadmin'`).get().id;
+          const tokA = sign({ uid: adminUid, exp: Date.now() + 3600000 });
+          const r = await jfetch('/api/agents/evaluations', {}, tokA); // 管理员全量视角（非 admin 会被 canView 过滤、空列表证明力不足）
+          assert.ok(r.j && r.j.code === 0, '管理员查询应成功：' + JSON.stringify(r.j).slice(0, 120));
+          const list = r.j.data || [];
+          assert.ok(list.length >= 1, '应至少返回种子智能体测评行（证明查询本身有数据）：' + list.length);
+          assert.ok(!list.some(x => x.type === 'kb'), '不应出现 kb 型评测集');
+          assert.ok(list.every(x => x.type === 'agent' || x.type == null), '所有行 type 应为 agent/NULL：' + JSON.stringify([...new Set(list.map(x => x.type))]));
+          assert.ok('type' in list[0] && 'kb_id' in list[0], '响应字段应带 type/kb_id');
+        });
+        await t('HTTP：评测集归属校验（V1.3 #6：非 owner 保存/列表/重跑/删除全 403，评测集不被删）', async () => {
+          const kbid = db.prepare(`SELECT id FROM kbs WHERE name LIKE '评测集测试库%'`).get().id;
+          const eid = db.prepare(`SELECT id FROM evaluations WHERE kb_id=? AND type='kb'`).get(kbid).id;
+          const s = await jfetch(`/api/knowledge/${kbid}/evaluations`, { method: 'POST', body: JSON.stringify({ name: '越权集', dataset: [{ query: 'q', expect_terms: ['a'] }] }) }, tok2);
+          assert.strictEqual(s.j && s.j.code, 403, '他人保存应 403：' + JSON.stringify(s.j));
+          const l = await jfetch(`/api/knowledge/${kbid}/evaluations`, {}, tok2);
+          assert.strictEqual(l.j && l.j.code, 403, '他人列表应 403：' + JSON.stringify(l.j));
+          const r = await jfetch(`/api/knowledge/${kbid}/evaluations/${eid}/rerun`, { method: 'POST' }, tok2);
+          assert.strictEqual(r.j && r.j.code, 403, '他人重跑应 403：' + JSON.stringify(r.j));
+          const d = await jfetch(`/api/knowledge/${kbid}/evaluations/${eid}`, { method: 'DELETE' }, tok2);
+          assert.strictEqual(d.j && d.j.code, 403, '他人删除应 403：' + JSON.stringify(d.j));
+          assert.ok(db.prepare('SELECT COUNT(*) c FROM evaluations WHERE id=?').get(eid).c === 1, '403 后评测集应仍存在');
+        });
         await t('HTTP：召回测试可视化——rerank-models 接口返回模型列表（2026-10-29）', async () => {
           const r = await jfetch('/api/knowledge/rerank-models', {}, tok1);
           assert.ok(r.j && r.j.code === 0, '接口应成功：' + JSON.stringify(r.j));
@@ -2542,6 +2639,65 @@ function t(name, fn) {
       const { retrieve } = require('../src-server/lib/retriever');
       const withEmpty = await retrieve('迟到早退怎么处理', kbid, 3, 0, { rerankEnabled: false, metadataFilter: {} });
       assert.ok(withEmpty.length >= 1 && (withEmpty[0].content || '').includes('旷工'), '带空 metadataFilter 的黄金问答 Top-1 应仍命中「旷工」（无过滤行为锁定，防召回隐性劣化）');
+    });
+    // ===== V1.3 #4 钉钉集成（2026-10-30）：验签/加解密/幂等（纯逻辑 + db 层；HTTP 用例在 P5.30 组） =====
+    await t('钉钉签名：固定四参字典序排序 SHA1 正确值 + 拼接顺序敏感（V1.3 #4）', () => {
+      const dingCryptoU = require('../src-server/lib/dingtalk-crypto');
+      // 期望值由 node:crypto 独立预计算：sha1('1719700000'+'abc123'+'nonce123'+'testtoken')（四参字典序排序后拼接）
+      assert.strictEqual(dingCryptoU.sha1Sign('testtoken', '1719700000', 'nonce123', 'abc123'),
+        'db72fea6dcb567bf055ac65351f694d86325b971', '固定四参签名应为已知 SHA1 值（四参字典序排序后拼接）');
+      // 拼接顺序敏感性：钉钉算法对「传参顺序」天然不敏感（内部 sort），敏感的是「拼接顺序」——
+      // 若实现漏掉 sort 按传入序直接拼接，必产出不同签名，此断言即拦截该缺陷
+      const unsorted = require('crypto').createHash('sha1').update('testtoken1719700000nonce123abc123').digest('hex');
+      assert.notStrictEqual(unsorted, 'db72fea6dcb567bf055ac65351f694d86325b971', '未排序直接拼接的 SHA1 必不等（漏 sort 缺陷在此暴露）');
+      // 协议性质正向断言：同一组四值任意传参顺序签名一致（钉钉验签双方独立计算仍可对上）
+      assert.strictEqual(dingCryptoU.sha1Sign('nonce123', '1719700000', 'testtoken', 'abc123'),
+        'db72fea6dcb567bf055ac65351f694d86325b971', '交换传参顺序签名应不变（内部字典序排序）');
+      assert.notStrictEqual(dingCryptoU.sha1Sign('testtoken', '1719700000', 'nonce123', 'abc124'),
+        'db72fea6dcb567bf055ac65351f694d86325b971', 'encrypt 单字符变更签名必变');
+    });
+    await t('钉钉加解密：roundtrip（中文消息体+corpid）+ 非法输入报错不静默（V1.3 #4）', () => {
+      const dingCryptoU = require('../src-server/lib/dingtalk-crypto');
+      const AES_KEY_U = require('crypto').randomBytes(32).toString('base64').replace(/=+$/, '');
+      const msg = { EventType: 'user_add_org', UserId: 'dt001', NickName: '张三丰', DeptIdList: [1, 5], Phone: '13800001234' };
+      const r = dingCryptoU.decryptMsg(AES_KEY_U, dingCryptoU.encryptMsg(AES_KEY_U, 'smoke-dt-corpid', msg));
+      assert.deepStrictEqual(r.message, msg, '中文消息体加密→解密应逐字段还原');
+      assert.strictEqual(r.corpid, 'smoke-dt-corpid', '尾部 corpid 应精确提取校验');
+      // 组装报文签名可独立验证（fixtures 生成器自洽性）
+      const packet = dingCryptoU.buildEncryptedCallback(AES_KEY_U, 'smoke-dt-token', 'smoke-dt-corpid', { a: 1 }, { timestamp: '1719700000', nonce: 'nonce123' });
+      assert.strictEqual(dingCryptoU.sha1Sign('smoke-dt-token', '1719700000', 'nonce123', packet.encrypt), packet.msg_signature, '组装报文签名应可独立验证');
+      // 非法输入三类全部报错（不静默——解密链路静默吞错可被伪造报文探测利用）
+      assert.throws(() => dingCryptoU.encryptMsg(require('crypto').randomBytes(16).toString('base64'), 'c', {}), /32 字节|长度非法/, 'aesKey 解码非 32 字节应报错');
+      assert.throws(() => dingCryptoU.decryptMsg('!!!非法base64!!!', 'xx'), /Base64/, '损坏 Base64 的 AESKey 应报错');
+      // 手工构造坏结构密文：16B 随机串 + 声明长度 0x7FFFFFFF（远超实际）+ 短消息体 + corpid，再 AES 加密
+      const key = Buffer.from(AES_KEY_U, 'base64');
+      const bad = Buffer.concat([require('crypto').randomBytes(16), Buffer.from([0x7f, 0xff, 0xff, 0xff]), Buffer.from('{}'), Buffer.from('smoke-dt-corpid')]);
+      const c = require('crypto').createCipheriv('aes-256-cbc', key, key.subarray(0, 16));
+      assert.throws(() => dingCryptoU.decryptMsg(AES_KEY_U, Buffer.concat([c.update(bad), c.final()]).toString('base64')), /越界|结构非法/, '解密后长度字段越界应报错');
+    });
+    await t('钉钉回调幂等：同 EventId 二次 INSERT 被 UNIQUE 拦截（db 层防重放地基，V1.3 #4）', async () => {
+      const ins = db.prepare(`INSERT INTO dingtalk_events (event_id,event_type,payload,created_at) VALUES (?,?,?,datetime('now','localtime'))`);
+      ins.run('smoke-dt-evt-001', 'user_add_org', '{}');
+      let caught = null;
+      try { ins.run('smoke-dt-evt-001', 'dept_create', '{}'); } catch (e) { caught = e; }
+      assert.ok(caught && /UNIQUE/i.test(String(caught.message || caught.code || '')), '重复 EventId 第二次 INSERT 必须抛 UNIQUE 约束错误：' + (caught && caught.message));
+      assert.strictEqual(db.prepare(`SELECT COUNT(*) c FROM dingtalk_events WHERE event_id='smoke-dt-evt-001'`).get().c, 1, '表内该 EventId 只应有 1 行（路由层 catch 到 UNIQUE 即直接 ACK 不重放）');
+      // 不同 EventId 正常追加（确认拦截是 event_id 维度，非表整体锁死）
+      ins.run('smoke-dt-evt-002', 'dept_create', '{}');
+      assert.strictEqual(db.prepare(`SELECT COUNT(*) c FROM dingtalk_events WHERE event_id LIKE 'smoke-dt-evt-%'`).get().c, 2, '不同 EventId 应正常追加为 2 行');
+    });
+    await t('钉钉用户同步：空部门映射不清空已有 dept_id（V1.3 审查加固——扫码登录恒传空列表的覆写回归）', () => {
+      const { upsertDingtalkUser } = require('../src-server/routes/dingtalk');
+      // 造一个已有部门归属的用户（username 形如 dingtalk_${userId}，模拟此前同步建过的钉钉用户）
+      db.prepare(`INSERT INTO users (username,password,nickname,role,dept,dept_id,status,must_change_pwd,created_at) VALUES ('dingtalk_smoke-dt-u1',?,'钉钉同步测试','user','产品部',1,1,0,datetime('now','localtime'))`).run(hashPwd('x-pass-not-used'));
+      const uid = db.prepare(`SELECT id FROM users WHERE username='dingtalk_smoke-dt-u1'`).get().id;
+      assert.strictEqual(db.prepare(`SELECT dept_id FROM users WHERE id=?`).get(uid).dept_id, 1, '前置：用户应有 dept_id=1');
+      // 空映射（deptIdList 为空/映射不到本地部门——扫码登录恒传 []）再同步：dept_id 必须保留（COALESCE）
+      const u = upsertDingtalkUser({ userId: 'smoke-dt-u1', nickname: '新昵称', deptIdList: [], phone: '' });
+      assert.strictEqual(u.created, false, '同 userId 应命中已有用户：' + JSON.stringify(u));
+      assert.strictEqual(db.prepare(`SELECT dept_id FROM users WHERE id=?`).get(uid).dept_id, 1, '空映射同步后 dept_id 应保留（原实现裸写 null 直接清空——visible_depts 权限判定依据静默丢失）');
+      assert.strictEqual(db.prepare(`SELECT nickname FROM users WHERE id=?`).get(uid).nickname, '新昵称', 'nickname 更新照常生效（COALESCE 只保护 dept_id，不影响其他字段）');
+      db.prepare(`DELETE FROM users WHERE username='dingtalk_smoke-dt-u1'`).run();
     });
     await t('resolveKbFilter：$user.dept 占位符替换 / 无 dept 与无用户链路 fail-closed / 无效 JSON 返回 null（V1.2 #2）', () => {
       const { resolveKbFilter, sanitizeMetadata, NO_DEPT_SENTINEL } = require('../src-server/lib/kb-metadata');
@@ -2703,6 +2859,45 @@ function t(name, fn) {
           assert.strictEqual(badLevel.j && badLevel.j.code, 400, '非法 level 应 400');
           const badTool = await jfetch(`/api/mcp/${srvId}/tool-risk`, { method: 'PUT', body: JSON.stringify({ tool: 'not_in_list', level: 'low' }) }, tokA5);
           assert.strictEqual(badTool.j && badTool.j.code, 400, '清单外工具应 400');
+        });
+        // ===== V1.3 #4 钉钉验签失败静默拒绝（2026-10-30，HTTP） =====
+        await t('HTTP：钉钉验签失败静默拒绝——篡改签名 POST → 200 空体 + 审计 + 零数据变更（V1.3 #4）', async () => {
+          // ⚠️ 依赖前置：DINGTALK_* secrets 已在本区块 spawn 之前由父进程写入共享库（见前置块注释——
+          //    loadSecrets 60s 缓存，子进程起后再写会命中空值缓存走「未配置」分支，本用例必挂）
+          // 父进程 db 句柄直查基线（WAL 多连接，子进程写入对父进程可见）
+          const uB = db.prepare('SELECT COUNT(*) c FROM users').get().c;
+          const dB = db.prepare('SELECT COUNT(*) c FROM departments').get().c;
+          const eB = db.prepare('SELECT COUNT(*) c FROM dingtalk_events').get().c;
+          const audB = db.prepare(`SELECT COUNT(*) c FROM op_logs WHERE action='钉钉回调验签失败'`).get().c;
+          const packet = dingCrypto.buildEncryptedCallback(DT_AES_KEY, DT_TOKEN, 'smoke-dt-corpid',
+            { EventType: 'dept_create', EventId: 'smoke-dt-evil-001', DeptId: 666, ParentId: 1, DeptName: '伪造部门' });
+          const r = await fetch(base + '/api/dingtalk/callback', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ...packet, msg_signature: packet.msg_signature.slice(0, -4) + 'beef' }), // 篡改签名尾部
+          });
+          const txt = await r.text();
+          assert.strictEqual(r.status, 200, '拒绝必须 200（防钉钉 24h 重试风暴），实际 ' + r.status);
+          assert.strictEqual(txt, '', '空体静默（不给探测方任何信息），实际 ' + JSON.stringify(txt));
+          assert.ok(db.prepare(`SELECT COUNT(*) c FROM op_logs WHERE action='钉钉回调验签失败'`).get().c > audB, 'op_logs 应新增「钉钉回调验签失败」审计');
+          assert.strictEqual(db.prepare('SELECT COUNT(*) c FROM users').get().c, uB, 'users 零变更');
+          assert.strictEqual(db.prepare('SELECT COUNT(*) c FROM departments').get().c, dB, 'departments 零变更');
+          assert.strictEqual(db.prepare('SELECT COUNT(*) c FROM dingtalk_events').get().c, eB, 'dingtalk_events 零新增（伪造事件不落库）');
+        });
+        // ===== V1.3 审查加固（2026-10-30）：钉钉登录发起源同源校验 =====
+        await t('HTTP：钉钉登录发起源校验——伪造跨站 Origin 签发被拒（V1.3 审查加固 H1）', async () => {
+          // Origin 与 Host 不同源（curl 可伪造）→ 403，不签发 state（防后续 302 把 token 投到第三方站点）
+          const r = await fetch(base + '/api/auth/dingtalk/url', {
+            headers: { Origin: 'https://evil-smoke.example.com' },
+          });
+          const j = await r.json().catch(() => null);
+          assert.ok(j && j.code === 403, '伪造跨站 Origin 应被拒（403）：' + JSON.stringify(j));
+          // 同源 Origin（与请求 Host 一致）正常签发
+          const r2 = await fetch(base + '/api/auth/dingtalk/url', {
+            headers: { Origin: base },
+          });
+          const j2 = await r2.json().catch(() => null);
+          assert.ok(j2 && j2.code === 0 && j2.data.url.includes('login.dingtalk.com'), '同源 Origin 应正常签发授权 URL：' + JSON.stringify(j2).slice(0, 120));
+          assert.ok(j2.data.url.includes(encodeURIComponent(base + '/api/auth/dingtalk/callback')), 'redirect_uri 应为同源地址');
         });
       } else {
         failed++; console.error('  ❌ HTTP 测试服务未就绪，本组用例跳过');

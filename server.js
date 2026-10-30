@@ -47,6 +47,8 @@ app.use('/api/stats', require('./src-server/routes/stats'));
 app.use('/openapi', require('./src-server/routes/openapi'));
 app.use('/api/share', require('./src-server/routes/share'));
 app.use('/api/departments', require('./src-server/routes/departments')); // P0 组织部门树
+// V1.3 #4 2026-10-30 钉钉集成回调（mock 阶段：验签/解密/幂等/组织同步；服务器对服务器推送无登录态，安全靠验签，路由内故意不挂 auth）
+app.use('/api/dingtalk', require('./src-server/routes/dingtalk'));
 // P5.14 文件一等变量：工作流文件上传/下载（画布 file 变量 + 聊天附件共用）
 app.use('/api/files', require('./src-server/routes/files'));
 // MCP 服务管理与行业模板库（P2）

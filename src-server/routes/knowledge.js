@@ -6,6 +6,7 @@ const { retrieve, rerankModels } = require('../lib/retriever');
 const { generateForFile } = require('../lib/keywordgen');
 const { extractMetadataForFile, sanitizeMetadata } = require('../lib/kb-metadata'); // V1.2 #2 2026-10-30：自动元数据抽取 + 入参清洗
 const { retrieveGraph } = require('../lib/graphrag');
+const { rerunEvalSet, runKbRegression } = require('../lib/kb-eval-regression'); // V1.3 #6 2026-10-30：知识库级召回评测集重跑核心 + 库变更自动回归
 
 const router = express.Router();
 router.use(auth);
@@ -59,9 +60,22 @@ router.put('/:id', (req, res) => {
   if (deny) return res.json(deny);
   // V1.2 #2 2026-10-30：auto_metadata 开关归一（0/1；未传保留原值）——开启后上传文件后台 LLM 自动抽取元数据
   const autoMeta = auto_metadata == null ? (old.auto_metadata ?? 0) : (auto_metadata ? 1 : 0);
+  // V1.3 #6 2026-10-30：切片参数最终取值（未传保留原值）
+  const nextSize = chunk_size ?? old.chunk_size;
+  const nextOverlap = chunk_overlap ?? old.chunk_overlap;
+  const nextSep = chunk_separator ?? old.chunk_separator;
   db.prepare('UPDATE kbs SET name=?,description=?,enabled=?,chunk_size=?,chunk_overlap=?,chunk_separator=?,auto_metadata=? WHERE id=?')
     .run(name || old.name, description ?? old.description, enabled ?? old.enabled,
-      chunk_size ?? old.chunk_size, chunk_overlap ?? old.chunk_overlap, chunk_separator ?? old.chunk_separator, autoMeta, old.id);
+      nextSize, nextOverlap, nextSep, autoMeta, old.id);
+  // V1.3 #6 2026-10-30：切片参数任一实际变化（与 old 逐项比对；数值归一比较防字符串/数字形态误判）
+  // → fire-and-forget 召回评测回归：重跑该库全部评测集 + 通知 owner，异步执行不阻塞保存响应
+  const chunkChanged = Number(nextSize) !== Number(old.chunk_size)
+    || Number(nextOverlap) !== Number(old.chunk_overlap)
+    || String(nextSep ?? '') !== String(old.chunk_separator ?? '');
+  // V1.3 审查加固：回归失败落 err_logs（原全静默——owner 永远不知道回归没跑成）
+  if (chunkChanged) runKbRegression(old.id, { username: req.user.username, ip: req.ip }).catch(e => {
+    try { db.prepare('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)').run('kb-regression', `库#${old.id} 变更触发回归失败：${e.message}`, now()); } catch { }
+  });
   res.json({ code: 0, msg: '已保存' });
 });
 
@@ -251,6 +265,11 @@ router.post('/:id/files', async (req, res) => {
   // V1.2 #2 2026-10-30：自动元数据抽取——库开启 auto_metadata 时上传后 fire-and-forget 后台抽取
   // （与 generateForFile 并列）；未开启/无供应商/失败均静默跳过，不阻塞上传
   if (kb.auto_metadata) extractMetadataForFile(info.lastInsertRowid).catch(() => { });
+  // V1.3 #6 2026-10-30：上传成功（新内容入库）→ fire-and-forget 召回评测回归——验证召回未劣化
+  // 并通知 owner；异步执行不阻塞上传响应，无评测集时静默跳过
+  runKbRegression(kb.id, { username: req.user.username, ip: req.ip }).catch(e => {
+    try { db.prepare('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)').run('kb-regression', `库#${kb.id} 上传后回归失败：${e.message}`, now()); } catch { }
+  });
   res.json({ code: 0, data: { id: info.lastInsertRowid, chunks: chunks.length } });
 });
 
@@ -397,6 +416,80 @@ router.post('/recall-test', async (req, res) => {
     ...(Object.keys(mFilter).length ? { metadataFilter: mFilter } : {}), // V1.2 #2：非空才下发（AND 语义，fail-closed）
   });
   res.json({ code: 0, data: { query, hits, count: hits.length, mode: 'hybrid' } });
+});
+
+// ---------- V1.3 #6 2026-10-30：知识库级召回评测集（保存/列表/重跑 diff/删除，全端点归属校验） ----------
+// 背景：库变更（重传/切片参数调整/嵌入切换）后无量化对比是交付信心硬伤；与智能体级评测
+// （agents.js，type='agent'）同表共存（evaluations.type='kb' + kb_id）。
+// dataset 契约：[{ query, expect_terms: [标记词] }]；重跑 Top-1 命中判定与 diff 计算见 lib/kb-eval-regression.js
+
+// 保存评测集（召回测试面板「保存为评测集」入口；dataset 校验：非空数组、每条 query 非空、
+// expect_terms 归一为字符串数组截 8 项；整集截 50 条防超长重跑阻塞——沿用 agents.js 测评 slice 截断先例）
+router.post('/:id/evaluations', (req, res) => {
+  const kb = db.prepare('SELECT * FROM kbs WHERE id=?').get(req.params.id);
+  const deny = denyIfNotAllowed(kb, req.user);
+  if (deny) return res.json(deny);
+  const { name, dataset } = req.body || {};
+  const safeName = String(name || '').trim().slice(0, 50); // 名称截 50 字符（防存储滥用）
+  if (!safeName) return res.json({ code: 400, msg: '评测集名称不能为空' });
+  if (!Array.isArray(dataset) || !dataset.length) return res.json({ code: 400, msg: '评测集 dataset 须为非空数组（[{query, expect_terms}]）' });
+  const items = [];
+  for (const it of dataset.slice(0, 50)) {
+    const query = String(it?.query ?? '').trim();
+    if (!query) return res.json({ code: 400, msg: '评测集每条数据须有非空 query' });
+    const terms = (Array.isArray(it?.expect_terms) ? it.expect_terms : [])
+      .map(t => String(t || '').trim()).filter(Boolean).slice(0, 8);
+    items.push({ query, expect_terms: terms });
+  }
+  // score=NULL（从未重跑，列表显 '—'）+ result='[]'；type='kb' + kb_id 与智能体侧隔离
+  const info = db.prepare(`INSERT INTO evaluations (name,kb_id,type,dataset,status,score,result,created_at)
+    VALUES (?,?,?,?,'done',NULL,'[]',datetime('now','localtime'))`)
+    .run(safeName, kb.id, 'kb', JSON.stringify(items));
+  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
+    .run(req.user.username, '保存知识库评测集', `${kb.name} / ${safeName}（${items.length} 条）`, req.ip, now());
+  res.json({ code: 0, data: { id: info.lastInsertRowid, count: items.length } });
+});
+
+// 评测集列表（该库全部，id DESC；score=NULL 表示从未重跑，前端显 '—'；附带 dataset 条数）
+router.get('/:id/evaluations', (req, res) => {
+  const kb = db.prepare('SELECT * FROM kbs WHERE id=?').get(req.params.id);
+  const deny = denyIfNotAllowed(kb, req.user);
+  if (deny) return res.json(deny);
+  const rows = db.prepare(`SELECT id,name,score,created_at,dataset FROM evaluations WHERE kb_id=? AND type='kb' ORDER BY id DESC`).all(kb.id);
+  const data = rows.map(r => {
+    let count = 0;
+    try { const arr = JSON.parse(r.dataset || '[]'); if (Array.isArray(arr)) count = arr.length; } catch { count = 0; }
+    return { id: r.id, name: r.name, score: r.score ?? null, created_at: r.created_at, dataset_count: count };
+  });
+  res.json({ code: 0, data });
+});
+
+// 重跑单个评测集并返回 diff（旧 score=null → diff='首次'；变化 ±0.02 内 → '持平'；否则 ±x.xx）
+router.post('/:id/evaluations/:eid/rerun', async (req, res) => {
+  const kb = db.prepare('SELECT * FROM kbs WHERE id=?').get(req.params.id);
+  const deny = denyIfNotAllowed(kb, req.user);
+  if (deny) return res.json(deny);
+  const ev = db.prepare('SELECT * FROM evaluations WHERE id=?').get(req.params.eid);
+  // 归属校验：评测集必须存在于该库（防跨库 eid 越权重跑他人评测集）
+  if (!ev || ev.type !== 'kb' || ev.kb_id !== kb.id) return res.json({ code: 404, msg: '评测集不存在或不属于该知识库' });
+  const r = await rerunEvalSet(ev);
+  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
+    .run(req.user.username, '知识库评测回归', `${kb.name} / ${ev.name}：${r.prev_score == null ? '首次' : r.prev_score} → ${r.score}（${r.diff}）`, req.ip, now());
+  res.json({ code: 0, data: r });
+});
+
+// 删除评测集（知识库侧独立端点——agents.js 的 DELETE /evaluations/:id 是智能体侧路由且按 agent_id
+// 归属校验，kb 型行无 agent_id 会被其 404 拦截，故此处按库归属校验后删，前端「评测集」页专用）
+router.delete('/:id/evaluations/:eid', (req, res) => {
+  const kb = db.prepare('SELECT * FROM kbs WHERE id=?').get(req.params.id);
+  const deny = denyIfNotAllowed(kb, req.user);
+  if (deny) return res.json(deny);
+  const ev = db.prepare('SELECT * FROM evaluations WHERE id=?').get(req.params.eid);
+  if (!ev || ev.type !== 'kb' || ev.kb_id !== kb.id) return res.json({ code: 404, msg: '评测集不存在或不属于该知识库' });
+  db.prepare('DELETE FROM evaluations WHERE id=?').run(ev.id);
+  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
+    .run(req.user.username, '删除知识库评测集', `${kb.name} / ${ev.name}`, req.ip, now());
+  res.json({ code: 0, msg: '已删除' });
 });
 
 // 知识图谱检索（GraphRAG）：给定查询文本，返回已知实体与关联关系上下文

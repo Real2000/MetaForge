@@ -16,15 +16,18 @@ export async function render(el) {
       <div class="tab active" data-t="kb">知识库列表</div>
       <div class="tab" data-t="recall">召回测试</div>
       <div class="tab" data-t="logs">解析日志</div>
+      <div class="tab" data-t="evals">评测集</div>
     </div>
     <div id="paneKb"></div>
     <div id="paneRecall" style="display:none"></div>
-    <div id="paneLogs" style="display:none"></div>`;
+    <div id="paneLogs" style="display:none"></div>
+    <div id="paneEvals" style="display:none"></div>`;
 
   let activeTab = 'kb'; // V1.1 #1 2026-10-30：当前主 tab（上传成功/失败后按所在 tab 决定刷新目标）
   const paneKb = el.querySelector('#paneKb');
   const paneRecall = el.querySelector('#paneRecall');
   const paneLogs = el.querySelector('#paneLogs');
+  const paneEvals = el.querySelector('#paneEvals'); // V1.3 #6 2026-10-30：第四个主 tab「评测集」
 
   // V1.1 #1 2026-10-30：文件状态四态徽章（success/failed/pending/processing）
   // pending/processing 为 #5 摄取管道异步化后的预留态，当前同步架构下不产生（非缺陷）；失败落库后文件列表会出现 failed 行
@@ -441,6 +444,7 @@ export async function render(el) {
             toast(`上传成功，解析为 ${j.data.chunks} 个片段`);
             close();
             if (activeTab === 'logs') renderLogs(1); // V1.1 #1：日志页上传后自动刷新（回第 1 页看最新记录）
+            if (activeTab === 'evals') renderEvals(); // V1.3 #6：评测集页上传后刷新（后端已触发自动回归，分数将变化）
             loadFiles().then(renderKbList);
           } catch (e) {
             toast(e.message, 'err');
@@ -556,6 +560,7 @@ export async function render(el) {
   // 失败/未选库（全部启用）时静默隐藏该区；查询把非空选择组装成 metadataFilter 传 recall-test
   let metaOpts = null;       // {dept:[],level:[]} | null（未加载或不可用）
   let metaOptsKbId = null;   // 已缓存的库 id（懒加载一次）
+  let lastRecall = null;     // V1.3 #6 2026-10-30：最近一次成功召回测试 {kbId, query, hitTerms}——「保存为评测集」数据源
 
   async function loadMetaOptions(kbId) {
     if (kbId === metaOptsKbId) return; // 已缓存
@@ -660,6 +665,7 @@ export async function render(el) {
         </div>
         <div class="card">
           <h3>召回结果 <span class="sub" id="r_stat"></span></h3>
+          <button class="btn" id="r_save_eval" style="display:none;margin-bottom:10px" title="把当前测试问题与期望命中词存为评测集，供重跑对比与库变更自动回归">💾 保存为评测集</button>
           <div id="r_hits"><div class="empty-box"><div class="big">🎯</div>执行测试后在此查看命中的知识片段</div></div>
         </div>
       </div>`;
@@ -706,6 +712,13 @@ export async function render(el) {
           },
         });
         paneRecall.querySelector('#r_stat').textContent = `命中 ${j.data.count} 条`;
+        // V1.3 #6：记录本次成功测试（保存评测集用）；测试过后显示「保存为评测集」按钮
+        lastRecall = {
+          kbId: +paneRecall.querySelector('#r_kb').value || null,
+          query: q,
+          hitTerms: (j.data.hits[0] && j.data.hits[0].hit_terms) || [], // Top-1 命中词（默认标记词候选）
+        };
+        paneRecall.querySelector('#r_save_eval').style.display = '';
         paneRecall.querySelector('#r_hits').innerHTML = j.data.hits.map((h, i) => {
           const rrTag = h.rerank_score != null ? `<span class="tag orange" style="font-size:10px">Rerank ${Number(h.rerank_score).toFixed(3)}</span>` : '';
           const engTag = h.engine === 'B3' ? '<span class="tag gray" style="font-size:10px">bge-m3</span>' : '<span class="tag gray" style="font-size:10px">本地哈希</span>';
@@ -732,20 +745,167 @@ export async function render(el) {
         toast(e.message, 'err');
       }
     };
+
+    // V1.3 #6 2026-10-30：保存为评测集入口（仅测试成功后可见，见 r_run 成功分支）
+    paneRecall.querySelector('#r_save_eval').onclick = () => openSaveEvalModal();
   }
 
-  // 主 tab 切换（V1.1 #1：新增第三个 tab「解析日志」；切到日志页时按需加载）
+  // ---------- V1.3 #6 2026-10-30：知识库级召回评测集（保存/重跑 diff/删除；自动回归见后端触发点） ----------
+
+  // 保存为评测集弹窗：当前 query + 期望命中标记词（默认取 Top-1 命中词前 3 个，可手改）→ dataset 单条入库
+  function openSaveEvalModal() {
+    if (!lastRecall) return toast('请先执行召回测试', 'err');
+    if (!lastRecall.kbId) return toast('请选择具体知识库后再保存（评测集归属单个知识库）', 'err');
+    const defTerms = (lastRecall.hitTerms || []).slice(0, 3).join('，');
+    const body = `
+      <div class="form-item"><label>评测集名称<span class="req">*</span></label><input class="input" id="se_name" maxlength="50" placeholder="如：黄金问答集"></div>
+      <div class="form-item"><label>测试问题<span class="req">*</span></label><input class="input" id="se_query" value="${esc(lastRecall.query)}"></div>
+      <div class="form-item"><label>期望命中标记词（逗号分隔）<span class="req">*</span></label>
+        <input class="input" id="se_terms" value="${esc(defTerms)}" placeholder="如：迟到，旷工，扣款——Top-1 结果包含任一词即该条命中">
+        <div class="hint">重跑时逐条检索该库，Top-1 命中片段包含任一标记词即得 1 分；默认取当前命中 Top-1 的命中词，可手工调整</div>
+      </div>`;
+    modal({
+      title: '💾 保存为评测集', body,
+      foot: '<button class="btn" data-cancel>取消</button><button class="btn primary" data-save>保存</button>',
+      onMount(mask, close) {
+        mask.querySelector('[data-cancel]').onclick = close;
+        mask.querySelector('[data-save]').onclick = async () => {
+          const name = mask.querySelector('#se_name').value.trim();
+          const query = mask.querySelector('#se_query').value.trim();
+          const terms = mask.querySelector('#se_terms').value.split(/[,，、\s]+/).map(s => s.trim()).filter(Boolean).slice(0, 8);
+          if (!name) return toast('请填写评测集名称', 'err');
+          if (!query) return toast('请填写测试问题', 'err');
+          if (!terms.length) return toast('请填写至少一个期望命中标记词', 'err');
+          try {
+            await api(`/knowledge/${lastRecall.kbId}/evaluations`, { method: 'POST', body: { name, dataset: [{ query, expect_terms: terms }] } });
+            toast('评测集已保存，可在「评测集」页重跑');
+            close();
+          } catch (e) { toast(e.message, 'err'); }
+        };
+      },
+    });
+  }
+
+  // diff 徽章：'首次'/'持平' 灰，+x.xx 绿↑，-x.xx 红↓
+  function diffBadge(diff) {
+    if (diff === '首次') return '<span class="tag gray">首次评测</span>';
+    if (diff === '持平') return '<span class="tag gray">持平</span>';
+    const up = String(diff).startsWith('+');
+    return `<span class="tag ${up ? 'green' : 'red'}">${up ? '↑' : '↓'}${esc(String(diff).replace(/^[+-]/, ''))}</span>`;
+  }
+
+  // 得分徽章：未重跑显 '—'；≥0.8 绿 / ≥0.5 橙 / 其余红
+  function scoreBadge(score) {
+    if (score == null) return '<span class="tag gray">—</span>';
+    const cls = score >= 0.8 ? 'green' : score >= 0.5 ? 'orange' : 'red';
+    return `<span class="tag ${cls}">${(+score).toFixed(2)}</span>`;
+  }
+
+  // 评测集列表（名称/得分/条数/创建时间/重跑/删除；403 与加载失败优雅提示）
+  async function renderEvals() {
+    if (!current) {
+      paneEvals.innerHTML = `<div class="card"><div class="hint" style="padding:28px 0;text-align:center;font-size:13px">请先在知识库列表选择知识库</div></div>`;
+      return;
+    }
+    let j;
+    try { j = await api(`/knowledge/${current.id}/evaluations`); }
+    catch (e) {
+      const m = e.code === 403 ? '无权查看该知识库的评测集（仅创建者或管理员）' : `评测集加载失败：${e.message}`;
+      paneEvals.innerHTML = `<div class="card"><div class="hint" style="color:var(--danger)">${esc(m)}</div></div>`;
+      return;
+    }
+    const list = j.data || [];
+    paneEvals.innerHTML = `
+      <div class="toolbar">
+        <div class="filters">
+          <button class="btn" id="evBack">← 返回</button>
+          <b style="font-size:15px">${esc(current.name)}</b>
+          <span class="tag blue">召回评测集</span>
+        </div>
+      </div>
+      <div class="card">
+        <div class="table-wrap"><table class="tbl">
+          <thead><tr><th>名称</th><th>得分</th><th>条数</th><th>创建时间</th><th>操作</th></tr></thead>
+          <tbody>${list.map(e => `
+            <tr data-eval-row="${e.id}">
+              <td><b>${esc(e.name)}</b></td>
+              <td class="ev-score">${scoreBadge(e.score)}</td>
+              <td>${e.dataset_count}</td>
+              <td style="color:var(--text-3)">${esc(e.created_at)}</td>
+              <td>
+                <button class="btn link" data-rerun="${e.id}" data-name="${esc(e.name)}">重跑</button>
+                <button class="btn link" style="color:var(--danger)" data-del-eval="${e.id}">删除</button>
+              </td>
+            </tr>`).join('') || '<tr><td colspan="5" class="empty">暂无评测集——在「召回测试」页执行测试后点「💾 保存为评测集」，或等库变更后自动回归</td></tr>'}
+          </tbody>
+        </table></div>
+        <div class="hint" style="margin-top:10px">💡 知识库变更（重传文件/调整切片参数）后将自动回归评测并通知创建者；得分 = Top-1 命中条数 / 总条数（重跑跳过 Rerank 保证稳定）</div>
+      </div>
+      <div id="ev_detail"></div>`;
+    paneEvals.querySelector('#evBack').onclick = () => { current = null; switchTab('kb'); renderKbList(); };
+    paneEvals.querySelectorAll('[data-rerun]').forEach(b => b.onclick = () => rerunEvalUi(+b.dataset.rerun, b.dataset.name));
+    paneEvals.querySelectorAll('[data-del-eval]').forEach(b => b.onclick = async () => {
+      if (!await confirmBox('删除该评测集？')) return;
+      try {
+        await api(`/knowledge/${current.id}/evaluations/${b.dataset.delEval}`, { method: 'DELETE' });
+        toast('已删除'); renderEvals();
+      } catch (e) { toast(e.message, 'err'); }
+    });
+  }
+
+  // 重跑单个评测集 → 展示新得分/旧得分/diff 徽章 + 逐条明细（query/是否命中/期望词），并原地刷新该行得分
+  async function rerunEvalUi(eid, evalName) {
+    const btn = paneEvals.querySelector(`[data-rerun="${eid}"]`);
+    if (btn) { btn.disabled = true; btn.textContent = '⏳ 重跑中…'; }
+    try {
+      const j = await api(`/knowledge/${current.id}/evaluations/${eid}/rerun`, { method: 'POST' });
+      const { score, prev_score, diff, detail } = j.data;
+      const hitCount = (detail || []).filter(d => d.hit).length;
+      const total = (detail || []).length;
+      // 原地刷新该行得分徽章（不整页重渲染，保留下方明细展示）
+      const scoreCell = paneEvals.querySelector(`[data-eval-row="${eid}"] .ev-score`);
+      if (scoreCell) scoreCell.innerHTML = scoreBadge(score);
+      paneEvals.querySelector('#ev_detail').innerHTML = `
+        <div class="card">
+          <h3>重跑结果：${esc(evalName || '')} ${diffBadge(diff)}</h3>
+          <div class="grid-3">
+            <div class="stat-card"><div class="label">新得分</div><div class="num">${(+score).toFixed(2)}</div><div class="sub">Top-1 命中 ${hitCount} / ${total} 条</div></div>
+            <div class="stat-card"><div class="label">旧得分</div><div class="num">${prev_score == null ? '—' : (+prev_score).toFixed(2)}</div><div class="sub">重跑前最近一次</div></div>
+            <div class="stat-card"><div class="label">变化</div><div class="num" style="color:${diff === '持平' || diff === '首次' ? 'var(--text-3)' : String(diff).startsWith('+') ? 'var(--brand)' : 'var(--danger)'}">${esc(diff === '首次' ? '首次' : diff === '持平' ? '持平' : String(diff).replace(/^[+-]/, ''))}</div><div class="sub">±0.02 内算持平</div></div>
+          </div>
+          <div style="margin-top:12px">${(detail || []).map(d => `
+            <div style="border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin-bottom:8px">
+              <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center">
+                <b style="font-size:13px">${d.hit ? '✅' : '❌'} ${esc(d.query)}</b>
+                <span>${d.hit ? '<span class="tag green">命中</span>' : '<span class="tag red">未命中</span>'}${d.top_file ? ` <span class="tag gray" style="font-size:10px">📄 ${esc(d.top_file)}</span>` : ''}</span>
+              </div>
+              <div style="margin-top:4px;font-size:12px;color:var(--text-3)">期望词：${(d.expected || []).map(t => `<span class="tag blue" style="font-size:10px">${esc(t)}</span>`).join(' ') || '—'}</div>
+            </div>`).join('') || '<div class="empty-box"><div class="big">🈳</div>无明细数据</div>'}
+          </div>
+        </div>`;
+      toast(`重跑完成：得分 ${(+score).toFixed(2)}${prev_score != null ? `（原 ${(+prev_score).toFixed(2)}，${diff}）` : '（首次）'}`);
+    } catch (e) {
+      // 403/加载失败优雅处理（沿用 catch e.code 模式）
+      toast(e.code === 403 ? '无权重跑该评测集（仅创建者或管理员）' : (e.message || '重跑失败'), 'err');
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = '重跑'; }
+    }
+  }
+
+  // 主 tab 切换（V1.1 #1：第三个 tab「解析日志」；V1.3 #6：第四个 tab「评测集」；切页时按需加载）
   function switchTab(t) {
     activeTab = t;
     el.querySelectorAll('#mainTabs .tab').forEach(x => x.classList.toggle('active', x.dataset.t === t));
     paneKb.style.display = t === 'kb' ? '' : 'none';
     paneRecall.style.display = t === 'recall' ? '' : 'none';
     paneLogs.style.display = t === 'logs' ? '' : 'none';
+    paneEvals.style.display = t === 'evals' ? '' : 'none'; // V1.3 #6：评测集页
   }
 
   el.querySelectorAll('#mainTabs .tab').forEach(t => t.onclick = () => {
     switchTab(t.dataset.t);
     if (t.dataset.t === 'logs') renderLogs(1); // V1.1 #1：切到日志页时刷新（回第 1 页看最新记录）
+    if (t.dataset.t === 'evals') renderEvals(); // V1.3 #6：切到评测集页时刷新（拿最新分数）
   });
 
   await loadKbs();

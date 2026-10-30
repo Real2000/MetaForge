@@ -778,7 +778,10 @@ router.delete('/spaces/:id', (req, res) => {
 
 // ---------- 智能体测评（P3：发起测评需对该智能体有编辑权；查看/删除需有归属权限） ----------
 router.get('/evaluations', (req, res) => {
-  const rows = db.prepare(`SELECT e.*, a.name AS agent_name FROM evaluations e LEFT JOIN agents a ON a.id=e.agent_id ORDER BY e.id DESC`).all();
+  // V1.3 #6 2026-10-30：type 过滤防污染——evaluations 表已双型共存（type='agent'|'kb'，kb 型带 kb_id），
+  // 智能体侧列表仅取 type='agent'（OR type IS NULL 为存量 NULL 双保险：db 迁移已归一，防直改库残留）；
+  // 响应 e.* 天然带 type/kb_id 字段（kb 型行恒不出现于此列表，双向隔离见 knowledge.js 评测集端点）
+  const rows = db.prepare(`SELECT e.*, a.name AS agent_name FROM evaluations e LEFT JOIN agents a ON a.id=e.agent_id WHERE (e.type='agent' OR e.type IS NULL) ORDER BY e.id DESC`).all();
   // 非管理员只返回有权查看的智能体的测评（canView 过滤）
   const filtered = req.user.role === 'admin' ? rows : rows.filter(r => {
     const agent = db.prepare('SELECT owner,collaborators FROM agents WHERE id=?').get(r.agent_id);
@@ -812,7 +815,8 @@ router.post('/evaluations', async (req, res) => {
     results.push({ q: it.q, expect: it.expect, got, score });
   }
   const score = Math.round((total / results.length) * 100);
-  const info = db.prepare(`INSERT INTO evaluations (name,agent_id,rule_prompt,dataset,status,score,result,created_at) VALUES (?,?,?,?,?,?,?,datetime('now','localtime'))`)
+  // V1.3 #6 2026-10-30：写入时显式 type='agent' / kb_id=NULL——防知识库侧评测集语义混入智能体测评
+  const info = db.prepare(`INSERT INTO evaluations (name,agent_id,rule_prompt,dataset,status,score,result,type,kb_id,created_at) VALUES (?,?,?,?,?,?,?,'agent',NULL,datetime('now','localtime'))`)
     .run(name, agent_id, rule_prompt || '', JSON.stringify(items), 'done', score, JSON.stringify(results));
   db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)').run(req.user.username, '新建测评', name + '（得分 ' + score + '）', req.ip, now());
   res.json({ code: 0, data: { id: info.lastInsertRowid, score } });
