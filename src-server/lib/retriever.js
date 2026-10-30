@@ -227,7 +227,7 @@ function bm25Scores(rows, qTerms) {
 async function retrieve(query, kbId = null, topN = 5, threshold = 0.01, opts = {}) {
   const vecWeight = Math.min(1, Math.max(0, Number(opts.vecWeight ?? 0.5)));
   const rows = db.prepare(`
-    SELECT c.id, c.content, c.kb_id, c.file_id, c.parent_id, c.embedding, c.keywords, f.name AS file, k.name AS kb
+    SELECT c.id, c.content, c.kb_id, c.file_id, c.parent_id, c.chapter_id, c.embedding, c.keywords, f.name AS file, k.name AS kb
     FROM kb_chunks c
     LEFT JOIN kb_files f ON f.id = c.file_id
     LEFT JOIN kbs k ON k.id = c.kb_id
@@ -317,20 +317,20 @@ async function retrieve(query, kbId = null, topN = 5, threshold = 0.01, opts = {
 /** Rerank 重排（优先）→ 如果不可用/被关闭/失败，退回 RRF 排名前 topN 条。opts.rerankEnabled=false 跳过重排，opts.rerankModel 指定模型 */
 async function rerankAndSlice(query, rrfResults, topN, opts = {}) {
   if (!rrfResults || !rrfResults.length) return [];
-  if (opts.rerankEnabled === false) return attachParentContext(rrfResults.slice(0, topN));
+  if (opts.rerankEnabled === false) return attachChapterContext(attachParentContext(rrfResults.slice(0, topN)));
   try {
     const ranked = await bgeRerank(query, rrfResults, opts.rerankModel);
     if (ranked && ranked.length) {
       // 按 rerank 索引重排
       const resultMap = new Map();
       rrfResults.forEach((r, i) => resultMap.set(i, r));
-      return attachParentContext(ranked
+      return attachChapterContext(attachParentContext(ranked
         .map(r => ({ ...resultMap.get(r.index), rerank_score: r.score }))
         .filter(Boolean)
-        .slice(0, topN));
+        .slice(0, topN)));
     }
   } catch { /* fallthrough: 退回 RRF 排序 */ }
-  return attachParentContext(rrfResults.slice(0, topN));
+  return attachChapterContext(attachParentContext(rrfResults.slice(0, topN)));
 }
 
 /** 父分片上下文增强：对命中子分片的结果，查找其父分片（parent_id）并将其内容合并到 content 前 */
@@ -353,6 +353,38 @@ function attachParentContext(results) {
   return results;
 }
 
+/** TOC 章节上下文增强（2026-10-30）：命中分块带上同章节相邻分块，避免断章取义。
+ *  已有父分片上下文的条目跳过（父子切片已提供 ~1000 字上下文，防内容重复膨胀）。
+ */
+function attachChapterContext(results) {
+  if (!results || !results.length) return results;
+  const need = results.filter(r => r.chapter_id != null && r.parent_id == null);
+  if (!need.length) return results;
+  const chIds = [...new Set(need.map(r => Number(r.chapter_id)))];
+  const ph = chIds.map(() => '?').join(',');
+  const rows = db.prepare(`SELECT id, chapter_id, content FROM kb_chunks WHERE chapter_id IN (${ph}) ORDER BY id`).all(...chIds);
+  const byCh = new Map();
+  for (const row of rows) {
+    if (!byCh.has(row.chapter_id)) byCh.set(row.chapter_id, []);
+    byCh.get(row.chapter_id).push(row);
+  }
+  for (const r of need) {
+    const items = byCh.get(Number(r.chapter_id));
+    if (!items || items.length <= 1) continue;
+    const idx = items.findIndex(it => it.id === r.id);
+    if (idx < 0) continue;
+    const parts = [];
+    if (idx > 0) parts.push(items[idx - 1].content);
+    parts.push(items[idx].content);
+    if (idx < items.length - 1) parts.push(items[idx + 1].content);
+    if (parts.length > 1) {
+      r.chapter_context = parts.filter((_, i2) => i2 !== idx).join('\n'); // 相邻上下文（不含自身）
+      r.content = parts.join('\n');
+    }
+  }
+  return results;
+}
+
 /** 加权 RRF 融合 + 排序输出（两种引擎共用）。vecWeight 为向量通道权重（0~1）；qTerms 用于计算每条结果的命中词 */
 function finish(rows, bm25, vecs, qVec, engine, topN, threshold, vecWeight = 0.5, qTerms = []) {
   const vec = vecs.map(v => cosine(qVec, v));
@@ -366,11 +398,12 @@ function finish(rows, bm25, vecs, qVec, engine, topN, threshold, vecWeight = 0.5
   vecRank.forEach((idx, rank) => { if (vec[idx] > 0.05) rrf[idx] += wV / (K + rank + 1); });
 
   const out = rows.map((r, i) => ({
+    id: r.id, parent_id: r.parent_id ?? null, chapter_id: r.chapter_id ?? null, // P1/P0-TOC 修复：携带分块ID与归属，供上下文挂载
     content: r.content, file: r.file, kb: r.kb, kb_id: r.kb_id,
     score: Math.round(rrf[i] * 10000) / 10000,
     bm25: Math.round(bm25[i] * 1000) / 1000,
     vec: Math.round(vec[i] * 1000) / 1000,
-    engine, // B3=bge-m3 语义检索 / H=本地哈希兜底
+    engine, // B3=bge-m3 语义检索 / H=本地哈希兑底
     _i: i,
   }))
     .filter(r => r.score >= threshold)

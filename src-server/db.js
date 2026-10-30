@@ -704,6 +704,17 @@ if (!chunkCols2.includes('keywords')) {
   db.exec(`ALTER TABLE kb_chunks ADD COLUMN keywords TEXT DEFAULT NULL`);
   console.log('[db] kb_chunks 表已迁移：新增 keywords 字段（自动关键词/问法）');
 }
+// kbs 表增加 toc（TOC 目录结构：JSON [{title, level, startChunkId, chapterId}...]），切片后按章节标记分块归属
+const kbCols4 = db.prepare('PRAGMA table_info(kbs)').all().map(c => c.name);
+if (!kbCols4.includes('toc')) {
+  db.exec(`ALTER TABLE kbs ADD COLUMN toc TEXT DEFAULT '[]'`);
+  console.log('[db] kbs 表已迁移：新增 toc 字段（TOC 目录结构）');
+}
+// kb_chunks 表增加 chapter_id（该分块所属章节的索引，同章节分块检索时自动带上上下文）
+if (!chunkCols2.includes('chapter_id')) {
+  db.exec(`ALTER TABLE kb_chunks ADD COLUMN chapter_id INTEGER DEFAULT NULL`);
+  console.log('[db] kb_chunks 表已迁移：新增 chapter_id 字段（章节归属）');
+}
 // kb_files 表增加解析日志相关字段（2026-10-29：解析日志与状态可视化）
 const fileCols = db.prepare('PRAGMA table_info(kb_files)').all().map(c => c.name);
 if (!fileCols.includes('source')) {

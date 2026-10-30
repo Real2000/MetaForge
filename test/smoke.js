@@ -2182,6 +2182,37 @@ function t(name, fn) {
           db.prepare(`DELETE FROM kb_files WHERE id=?`).run(fid);
           db.prepare(`DELETE FROM kbs WHERE id=?`).run(kbid);
         });
+        await t('HTTP：graph-search 接口——实体/关系/上下文返回且服务不崩（P0-5 修复回归）', async () => {
+          // 造数据：库 + 文件 + 分块 + 实体 + 三元组（graph-search 曾因 terms 未定义导致服务崩溃）
+          db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('图谱HTTP测试库','',1,'httpu1',datetime('now','localtime'))`).run();
+          const kbid = db.prepare(`SELECT id FROM kbs WHERE name='图谱HTTP测试库'`).get().id;
+          db.prepare(`INSERT INTO kb_files (kb_id,name,size,status,chunk_count,created_at) VALUES (?,'http-graph.md',100,'success',1,datetime('now','localtime'))`).run(kbid);
+          const fid = db.prepare(`SELECT id FROM kb_files WHERE kb_id=? ORDER BY id DESC`).get(kbid).id;
+          db.prepare(`INSERT INTO kb_chunks (file_id,kb_id,content) VALUES (?,?,?)`).run(fid, kbid, '张三在产品部负责智能体平台研发工作');
+          const cid = db.prepare(`SELECT id FROM kb_chunks WHERE file_id=?`).get(fid).id;
+          const { persistEntities, persistTriples } = require('../src-server/lib/graphrag');
+          persistEntities([{ name: '张三', type: '人物' }, { name: '产品部', type: '组织' }]);
+          persistTriples([{ subject: '张三', predicate: '属于', object: '产品部' }], cid);
+          const r = await jfetch(`/api/knowledge/${kbid}/graph-search`, {
+            method: 'POST',
+            body: JSON.stringify({ query: '张三在哪个部门', top_k: 3 }),
+          }, tok1);
+          assert.ok(r.j && r.j.code === 0, 'graph-search 应成功且服务不崩：' + JSON.stringify(r.j).slice(0, 160));
+          assert.ok((r.j.data.entities || []).some(e => e.name === '张三'), '应命中实体张三：' + JSON.stringify(r.j.data.entities));
+          assert.ok((r.j.data.relations || []).some(x => x.relation === '属于'), '应带回关系：' + JSON.stringify(r.j.data.relations));
+          assert.ok((r.j.data.context || []).some(c => String(c).includes('产品部')), '应带回支撑分块：' + JSON.stringify(r.j.data.context));
+          // 服务存活验证（核心回归点：此前该接口会让整个进程崩溃；429=登录限流也证明进程存活）
+          const alive = await jfetch('/api/auth/login', { method: 'POST', body: JSON.stringify({ username: 'httpu1', password: 'wrong-x' }) }, tok1);
+          assert.ok(alive.status === 401 || alive.status === 429 || (alive.j && alive.j.code === 401), 'graph-search 后服务应存活可响应：' + alive.status);
+          // 空 query 校验
+          const bad = await jfetch(`/api/knowledge/${kbid}/graph-search`, { method: 'POST', body: JSON.stringify({ query: '' }) }, tok1);
+          assert.strictEqual(bad.j && bad.j.code, 400, '空 query 应 400');
+          db.prepare(`DELETE FROM kb_chunks WHERE file_id=?`).run(fid);
+          db.prepare(`DELETE FROM kb_files WHERE id=?`).run(fid);
+          db.prepare(`DELETE FROM kbs WHERE id=?`).run(kbid);
+          db.prepare(`DELETE FROM entity_relations`).run();
+          db.prepare(`DELETE FROM entities`).run();
+        });
         await t('HTTP：任务归属——创建者自有，他人不可见不可删（P5.31）', async () => {
           const aid = db.prepare(`SELECT id FROM users WHERE username='httpadmin'`).get().id;
           const tokA2 = sign({ uid: aid, exp: Date.now() + 3600000 });
@@ -2733,6 +2764,89 @@ function t(name, fn) {
       assert.ok(hit, '关键词扩展后应命中该分块：' + JSON.stringify(hits.map(h => h.content?.slice(0, 20))));
       assert.ok(hit.bm25 > 0, '命中应来自 BM25 通道（原文不含查询词，仅关键词含）：bm25=' + hit.bm25);
       assert.ok(!hit.content.includes('keywords'), '输出 content 应保持原文，不混入关键词文本');
+      db.prepare(`DELETE FROM kb_chunks WHERE file_id=?`).run(fid);
+      db.prepare(`DELETE FROM kb_files WHERE id=?`).run(fid);
+      db.prepare(`DELETE FROM kbs WHERE id=?`).run(kbid);
+    });
+    // 【P0-5】GraphRAG 修复回归（2026-10-30：graphrag.js 曾被误删为仅剩分词函数，无测试发现——补防回归）
+    await t('graphrag：persistEntities 幂等写入 + retrieveGraph 实体命中', () => {
+      const { persistEntities, retrieveGraph } = require('../src-server/lib/graphrag');
+      const n1 = persistEntities([{ name: '奇墨科技', type: '组织', description: 'AI中台厂商' }, { name: '李小龙', type: '人物', description: '分享人' }]);
+      assert.ok(n1 >= 1, '首次写入应新增实体，实际 ' + n1);
+      const n2 = persistEntities([{ name: '奇墨科技', type: '组织', description: '重复项' }]);
+      assert.strictEqual(n2, 0, '同名同类型应幂等跳过');
+      const g = retrieveGraph('奇墨科技的产品怎么样', null, 5);
+      assert.ok(g.entities.some(e => e.name === '奇墨科技'), '查询含实体名应命中：' + JSON.stringify(g.entities));
+      assert.ok(Array.isArray(g.relations) && Array.isArray(g.context), 'relations/context 应为数组');
+      const empty = retrieveGraph('完全无关的查询词组', null, 5);
+      assert.ok(Array.isArray(empty.entities), '无命中也不应抛错');
+    });
+    await t('graphrag：persistTriples 写入 + retrieveGraph 关系/上下文带回', () => {
+      const { persistEntities, persistTriples, retrieveGraph } = require('../src-server/lib/graphrag');
+      // 准备实体 + 分块
+      persistEntities([{ name: '张三', type: '人物' }, { name: '产品部', type: '组织' }]);
+      db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('图谱测试库','',1,'httpu1',datetime('now','localtime'))`).run();
+      const kbid = db.prepare(`SELECT id FROM kbs WHERE name='图谱测试库'`).get().id;
+      db.prepare(`INSERT INTO kb_files (kb_id,name,size,status,chunk_count,created_at) VALUES (?,'graph.md',100,'success',1,datetime('now','localtime'))`).run(kbid);
+      const fid = db.prepare(`SELECT id FROM kb_files WHERE kb_id=? ORDER BY id DESC`).get(kbid).id;
+      db.prepare(`INSERT INTO kb_chunks (file_id,kb_id,content) VALUES (?,?,?)`).run(fid, kbid, '张三在产品部负责智能体平台研发工作');
+      const cid = db.prepare(`SELECT id FROM kb_chunks WHERE file_id=?`).get(fid).id;
+      const n = persistTriples([{ subject: '张三', predicate: '属于', object: '产品部' }], cid);
+      assert.ok(n >= 1, '三元组应写入，实际 ' + n);
+      const g = retrieveGraph('张三', null, 5);
+      assert.ok(g.relations.some(r => r.relation === '属于'), '应带回关系：' + JSON.stringify(g.relations));
+      assert.ok(g.context.some(c => c.includes('产品部')), '上下文应带回支撑分块：' + JSON.stringify(g.context));
+      db.prepare(`DELETE FROM kb_chunks WHERE file_id=?`).run(fid);
+      db.prepare(`DELETE FROM kb_files WHERE id=?`).run(fid);
+      db.prepare(`DELETE FROM kbs WHERE id=?`).run(kbid);
+      db.prepare(`DELETE FROM entity_relations`).run();
+      db.prepare(`DELETE FROM entities`).run();
+    });
+    await t('graphrag：extractEntitiesFromChunks/extractTriples 无供应商静默跳过', async () => {
+      const { extractEntitiesFromChunks, extractTriples } = require('../src-server/lib/graphrag');
+      assert.deepStrictEqual(await extractEntitiesFromChunks([{ content: '测试内容' }]), []);
+      assert.deepStrictEqual(await extractTriples('测试内容'), []);
+    });
+    // 【TOC】目录增强（2026-10-30）
+    await t('TOC：kbs.toc 与 kb_chunks.chapter_id 列已迁移', () => {
+      const kbCols = db.prepare('PRAGMA table_info(kbs)').all().map(c => c.name);
+      const chCols = db.prepare('PRAGMA table_info(kb_chunks)').all().map(c => c.name);
+      assert.ok(kbCols.includes('toc'), 'kbs 应有 toc 列');
+      assert.ok(chCols.includes('chapter_id'), 'kb_chunks 应有 chapter_id 列');
+    });
+    await t('TOC：assignChapterIds 按标题归属章节（对象分块，修复回归）', () => {
+      const { assignChapterIds } = require('../src-server/lib/tocService');
+      const toc = [
+        { title: '第一章 总则', level: 1, chapterId: 1 },
+        { title: '第二章 考勤管理', level: 1, chapterId: 2 },
+      ];
+      const chunks = [
+        { content: '第一章 总则\n本制度适用于全体员工。' },
+        { content: '迟到一次扣款五十元。' },
+        { content: '第二章 考勤管理\n考勤记录以打卡系统为准。' },
+        { content: '月度迟到三次以上视为旷工。' },
+      ];
+      assignChapterIds(chunks, toc);
+      assert.strictEqual(chunks[0].chapterId, 1, '首块应归属第1章');
+      assert.strictEqual(chunks[1].chapterId, 1, '未遇新标题应延续第1章');
+      assert.strictEqual(chunks[2].chapterId, 2, '遇第2章标题应切换');
+      assert.strictEqual(chunks[3].chapterId, 2, '应延续第2章');
+      assert.ok(chunks.every(c => typeof c.content === 'string'), 'content 应保持字符串');
+    });
+    await t('TOC：attachChapterContext 同章节相邻分块带出（retriever 集成）', async () => {
+      db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('TOC检索测试库','',1,'httpu1',datetime('now','localtime'))`).run();
+      const kbid = db.prepare(`SELECT id FROM kbs WHERE name='TOC检索测试库'`).get().id;
+      db.prepare(`INSERT INTO kb_files (kb_id,name,size,status,chunk_count,created_at) VALUES (?,'toc.md',100,'success',1,datetime('now','localtime'))`).run(kbid);
+      const fid = db.prepare(`SELECT id FROM kb_files WHERE kb_id=? ORDER BY id DESC`).get(kbid).id;
+      db.prepare(`INSERT INTO kb_chunks (file_id,kb_id,content,chapter_id,parent_id) VALUES (?,?,?,?,NULL)`).run(fid, kbid, '第一章 迟到处理规则：迟到一次扣款五十元。', 1);
+      db.prepare(`INSERT INTO kb_chunks (file_id,kb_id,content,chapter_id,parent_id) VALUES (?,?,?,?,NULL)`).run(fid, kbid, '月度迟到累计三次以上按旷工半日处理。', 1);
+      db.prepare(`INSERT INTO kb_chunks (file_id,kb_id,content,chapter_id,parent_id) VALUES (?,?,?,?,NULL)`).run(fid, kbid, '第二章 报销制度：提交发票后三个工作日内完成审核打款。', 2);
+      const { retrieve } = require('../src-server/lib/retriever');
+      const hits = await retrieve('迟到扣款规则', kbid, 5, 0, { rerankEnabled: false });
+      const hit = hits.find(h => (h.content || '').includes('扣款'));
+      assert.ok(hit, '应命中迟到规则分块');
+      assert.ok(hit.content.includes('旷工'), '同章节相邻分块应被带出（避免断章取义）：' + hit.content.slice(0, 80));
+      assert.ok(hit.chapter_context != null || hit.parent_content != null, '应携带上下文标记字段');
       db.prepare(`DELETE FROM kb_chunks WHERE file_id=?`).run(fid);
       db.prepare(`DELETE FROM kb_files WHERE id=?`).run(fid);
       db.prepare(`DELETE FROM kbs WHERE id=?`).run(kbid);

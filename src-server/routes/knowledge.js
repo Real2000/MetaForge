@@ -123,6 +123,30 @@ router.post('/:id/files', async (req, res) => {
   }
   if (!chunks.length) return res.json({ code: 400, msg: '切片后无有效片段' });
 
+  // TOC目录增强（2026-10-30）：用LLM提取目录结构，按章节标记分块（失败不阻塞上传）
+  // 注意：chunks 统一保持字符串数组，章节归属单独存 chapterIds —— 避免对象混入导致 join 产生 [object Object]
+  let toc = null;
+  let chapterIds = chunks.map(() => null);
+  try {
+    const { extractToc, assignChapterIds } = require('../lib/tocService');
+    toc = await extractToc(text, chunkSize);
+    if (toc && toc.length) {
+      const withChapters = chunks.map(c => ({ content: c }));
+      assignChapterIds(withChapters, toc);
+      chapterIds = withChapters.map(c => c.chapterId || null);
+      // TOC 每章节定位：首个包含该标题的分块索引；未命中继承上一章节位置
+      let lastIdx = 0;
+      for (const t of toc) {
+        let found = -1;
+        for (let i = 0; i < chunks.length; i++) {
+          if (chunks[i].includes(t.title)) { found = i; break; }
+        }
+        t.startChunkIdx = found >= 0 ? found : lastIdx;
+        lastIdx = t.startChunkIdx;
+      }
+    }
+  } catch { /* TOC提取失败不阻塞上传 */ }
+
   // 父子切片（2026-10-28 P2 父子切片）：子分片 ~200 字精准召回，父分片 ~1000 字保持上下文完整
   // 按顺序每 4-6 个字分片合并为一个父分片（尽可能接近 1000 字）
   const hasParentSlice = chunkSize > 200; // 只有 chunkSize > 200 时才需要分割父子切片
@@ -150,12 +174,16 @@ router.post('/:id/files', async (req, res) => {
     const insParent = db.prepare('INSERT INTO kb_chunks (file_id,kb_id,content,parent_id) VALUES (?,?,?,?)');
     parentChunks.forEach(pc => insParent.run(info.lastInsertRowid, kb.id, pc, null));
   }
-  const ins = db.prepare('INSERT INTO kb_chunks (file_id,kb_id,content,parent_id) VALUES (?,?,?,?)');
+  const ins = db.prepare('INSERT INTO kb_chunks (file_id,kb_id,content,parent_id,chapter_id) VALUES (?,?,?,?,?)');
   const parentStartIdx = hasParentSlice ? parentChunks.length : 0;
   chunks.forEach((c, i) => {
     const parentId = hasParentSlice && childToParent[i] >= 0 ? (parentStartIdx + childToParent[i] + 1) : null;
-    ins.run(info.lastInsertRowid, kb.id, c, parentId);
+    ins.run(info.lastInsertRowid, kb.id, c, parentId, chapterIds[i]); // chapter_id = TOC 章节归属
   });
+  // 如果有 TOC，回写入 kbs 表
+  if (toc && toc.length) {
+    db.prepare('UPDATE kbs SET toc=? WHERE id=?').run(JSON.stringify(toc), kb.id);
+  }
   db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
     .run(req.user.username, '上传知识库文件', `${kb.name} / ${name}（${chunks.length} 片段）`, req.ip, now());
   // 自动关键词/问法生成（2026-10-29）：上传响应后后台 best-effort 生成，不阻塞上传；无模型/失败静默跳过
