@@ -731,8 +731,38 @@ if (!fileCols.includes('parsed_at')) {
 }
 if (!fileCols.includes('updated_at')) {
   db.exec(`ALTER TABLE kb_files ADD COLUMN updated_at TEXT DEFAULT NULL`);
-  console.log('[db] kb_files 表已迁移：新增 updated_at 字段（更新时间）');
+  console.log('[db] kb_files 表已迁移：新增 updated_at 字段');
 }
+// ---------------- V1.2 #2 元数据管理与检索过滤（2026-10-30） ----------------
+// kb_chunks.metadata：分块级元数据（JSON 对象，约定键：dept 部门/level 密级[公开|内部|机密]/doc_type 文档类型）；
+// NULL/''/'{}' 视为无元数据——检索带过滤时被 fail-closed 过滤（防误授权），不带过滤时行为不变
+if (!chunkCols2.includes('metadata')) {
+  db.exec(`ALTER TABLE kb_chunks ADD COLUMN metadata TEXT DEFAULT NULL`);
+  console.log('[db] kb_chunks 表已迁移：新增 metadata 字段（元数据过滤）');
+}
+// kbs.auto_metadata：1=上传解析后 LLM 自动抽取元数据（lib/kb-metadata.js 后台 best-effort）
+if (!kbCols4.includes('auto_metadata')) {
+  db.exec(`ALTER TABLE kbs ADD COLUMN auto_metadata INTEGER DEFAULT 0`);
+  console.log('[db] kbs 表已迁移：新增 auto_metadata 字段（自动元数据开关）');
+}
+// agents.kb_metadata_filter：挂知识库时声明的检索过滤（JSON 对象，AND 语义；值支持 "$user.dept" 占位符，
+// chat 时解析为请求用户部门文本名；NULL=不过滤）。例：{"level":"公开","dept":"$user.dept"}
+const agentCols2 = db.prepare('PRAGMA table_info(agents)').all().map(c => c.name);
+if (!agentCols2.includes('kb_metadata_filter')) {
+  db.exec(`ALTER TABLE agents ADD COLUMN kb_metadata_filter TEXT DEFAULT NULL`);
+  console.log('[db] agents 表已迁移：新增 kb_metadata_filter 字段（知识库检索过滤声明）');
+}
+// users.dept_id 存量回填（V1.1 审查 F4 收尾 2026-10-30）：按 dept 文本名精确匹配部门，仅无歧义时回填。
+// 幂等（WHERE dept_id IS NULL 可重跑）；行级迁移三件套：try-catch + 幂等 + 迁移日志
+try {
+  const backfill = db.prepare(`
+    UPDATE users SET dept_id = (
+      SELECT d.id FROM departments d WHERE d.name = users.dept LIMIT 1
+    ) WHERE dept_id IS NULL AND IFNULL(dept, '') != ''
+      AND (SELECT COUNT(*) FROM departments d2 WHERE d2.name = users.dept) = 1`);
+  const info = backfill.run();
+  if (info.changes > 0) console.log(`[db] users 表已迁移：${info.changes} 条 dept_id 按部门名回填（同名部门歧义的跳过）`);
+} catch (e) { console.error('[db] users.dept_id 回填迁移失败（不阻塞启动）：', e.message); }
 // P0-1: kbs.owner 存量数据迁移 nickname→username（此前创建时写入 nickname||username，denyIfNotAllowed 需精确匹配 username）
 {
   const allKb = db.prepare('SELECT id, owner FROM kbs').all();

@@ -855,10 +855,17 @@ async function runAgent(agent, input, ctx = {}) {
   }
   // form 模式（含 canvas 判定失败回退）：chatOnce + 知识库检索（与 mcp-server runAgentAsTool 同构）
   const { retrieve } = require('./retriever'); // 延迟 require 避免与 retriever 互依
+  const { resolveKbFilter } = require('./kb-metadata'); // V1.2 审查加固 2026-10-30：工作流检索同样受元数据过滤约束
   let system = (agent && agent.prompt) || `你是「${(agent && agent.name) || '智能体'}」，请专业、准确地完成交给你的任务。`;
   if (agent && agent.kb_id) {
     try {
-      const hits = await retrieve(taskText, agent.kb_id, 4);
+      // V1.2 审查加固：chat 触发时 ctx.username 为最终用户——按其部门解析 $user.dept 占位符；
+      // 定时/Webhook 触发无用户 → 占位符置哨兵恒不命中（fail-closed），固定值键照常生效
+      let wfUser = null;
+      if (ctx && ctx.username) {
+        try { wfUser = db.prepare('SELECT dept FROM users WHERE username=?').get(ctx.username) || null; } catch { }
+      }
+      const hits = await retrieve(taskText, agent.kb_id, 4, 0.01, { metadataFilter: resolveKbFilter(agent, wfUser) || undefined });
       if (hits && hits.length) {
         system += `\n\n以下是知识库检索到的相关内容，请优先依据这些内容：\n${hits.map((h, i) => `[${i + 1}] ${h.content}`).join('\n')}`;
       }

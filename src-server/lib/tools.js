@@ -2,7 +2,8 @@
  * 工具系统（function calling）：
  * - 内置工具：kb_search / get_datetime / calculator / image_gen（QwenImage，多供应商路由）
  * - MCP 工具：智能体挂载的 MCP 服务工具（mcp_ 前缀路由到对应 server）
- * ctx: { kbId, mcpServers: [MCP server 记录], defaultImageModel? }
+ * ctx: { kbId, mcpServers: [MCP server 记录], defaultImageModel?, metadataFilter? }
+ * V1.2 审查加固 2026-10-30：metadataFilter 为智能体声明的知识库元数据过滤（chat 链路按请求用户解析后传入）
  */
 const { retrieve } = require('./retriever');
 const mcp = require('./mcp');
@@ -28,7 +29,9 @@ const TOOL_DEFS = {
     },
     run: async (args, ctx) => {
       if (!ctx.kbId) return '当前智能体未关联知识库，无法检索。';
-      const hits = await retrieve(args.query || '', ctx.kbId, 5, 0.01);
+      // V1.2 审查加固 2026-10-30：kb_search 同样受智能体元数据过滤约束——ctx.metadataFilter 由 chat 主链路/
+      // 子智能体链路传入（无值=不过滤，兼容编排页试运行等无最终用户语义的调用方）
+      const hits = await retrieve(args.query || '', ctx.kbId, 5, 0.01, { metadataFilter: ctx.metadataFilter || undefined });
       if (!hits.length) return '知识库中未检索到相关内容。';
       return hits.map((h, i) => `[${i + 1}]（来源：${h.file || h.kb}，得分${h.score}）${h.content}`).join('\n');
     },

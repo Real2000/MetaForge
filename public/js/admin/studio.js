@@ -65,6 +65,14 @@ export async function render(el, params) {
     diversity_mode: DIVERSITY[cfg.diversity_mode] ? cfg.diversity_mode : 'balanced',
     context_rounds: cfg.context_rounds ?? 10, max_reply: cfg.max_reply ?? 1024,
     kb_id: cfg.kb_id || null,
+    // V1.2 #2 2026-10-30：知识库检索过滤声明（元数据 AND 语义；值支持 "$user.dept" 占位符随对话用户部门动态过滤）
+    // 兼容后端两种带出形态：TEXT 列原样 JSON 字符串 / 已解析对象
+    kb_metadata_filter: (() => {
+      const raw = cfg.kb_metadata_filter;
+      if (!raw) return null;
+      if (typeof raw === 'object') return Array.isArray(raw) ? null : raw;
+      try { const v = JSON.parse(raw); return (v && typeof v === 'object' && !Array.isArray(v)) ? v : null; } catch { return null; }
+    })(),
     opening: cfg.opening || '',
     opening_questions: (() => { try { return JSON.parse(cfg.opening_questions || '[]'); } catch { return []; } })(),
     tools: (() => { try { return JSON.parse(cfg.tools || '[]'); } catch { return []; } })(),
@@ -230,7 +238,7 @@ export async function render(el, params) {
         { key: 'tools', icon: '🛠️', label: '插件与工具', sub: `${S.tools.length + S.mcp_servers.length} 个 · ${S.child_ids.length} 子智能体` },
       ] },
       { group: '知识', items: [
-        { key: 'kb', icon: '📚', label: '文本知识库', sub: S.kb_id ? (kbs.find(k => k.id === S.kb_id)?.name || '已关联') : '未关联' },
+        { key: 'kb', icon: '📚', label: '文本知识库', sub: S.kb_id ? ((kbs.find(k => k.id === S.kb_id)?.name || '已关联') + (S.kb_metadata_filter ? ' · 已设过滤' : '')) : '未关联' },
       ] },
       { group: '记忆', items: [
         { key: 'memory', icon: '🧠', label: '变量与长期记忆', sub: `${S.variables.length} 变量 · ${S.long_memory ? '记忆开' : '记忆关'}` },
@@ -352,7 +360,19 @@ export async function render(el, params) {
       });
     }
 
+    // V1.2 #2：检索过滤摘要（如「密级=公开 · 部门=跟随用户」；无 → 未配置）
+    function kbFilterSummary(f) {
+      if (!f || !Object.keys(f).length) return t('未配置（不过滤）');
+      return Object.entries(f).map(([k, v]) => {
+        if (k === 'dept' && v === '$user.dept') return `${t('部门')}=${t('跟随用户')}`;
+        if (k === 'level') return `${t('密级')}=${esc(String(v))}`;
+        if (k === 'dept') return `${t('部门')}=${esc(String(v))}`;
+        return `${esc(String(k))}=${esc(String(v))}`;
+      }).join(' · ');
+    }
+
     if (view === 'kb') {
+      const f = S.kb_metadata_filter || {};
       box.innerHTML = `
         <div class="st-field"><label>关联文本知识库（RAG 检索增强）</label>
           <select class="st-select" id="edKb">
@@ -360,8 +380,63 @@ export async function render(el, params) {
             ${kbs.map(k => `<option value="${k.id}" ${S.kb_id === k.id ? 'selected' : ''}>📚 ${esc(k.name)}（${k.doc_count || 0} 文档）</option>`).join('')}
           </select>
           <div class="hint">对话时自动检索关联知识库并注入上下文，回答带来源编号</div>
-        </div>`;
-      $('#edKb').onchange = e => { S.kb_id = e.target.value ? +e.target.value : null; scheduleSave(); renderLeft(); };
+        </div>
+        ${S.kb_id ? `
+        <div class="st-field"><label>🛡️ 知识库检索过滤（元数据）</label>
+          <div class="hint" style="margin-bottom:8px">配置后该智能体检索知识库时仅命中满足条件的分块；未配置元数据的分块将被过滤（fail-closed）。部门选“跟随用户部门”时按对话用户所属部门动态过滤</div>
+          <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:8px">
+            <div style="flex:1;min-width:180px"><label style="display:block;font-size:12px;font-weight:600;color:var(--text,#374151);margin-bottom:6px">密级（level）</label>
+              <select class="st-select" id="kbFLevel">
+                <option value="" ${!f.level ? 'selected' : ''}>${t('不过滤')}</option>
+                ${['公开', '内部', '机密'].map(l => `<option value="${l}" ${f.level === l ? 'selected' : ''}>${l}</option>`).join('')}
+              </select></div>
+            <div style="flex:1;min-width:180px"><label style="display:block;font-size:12px;font-weight:600;color:var(--text,#374151);margin-bottom:6px">部门（dept）</label>
+              <select class="st-select" id="kbFDept">
+                <option value="" ${!f.dept ? 'selected' : ''}>${t('不过滤')}</option>
+                <option value="$user.dept" ${f.dept === '$user.dept' ? 'selected' : ''}>${t('跟随用户部门')}（$user.dept）</option>
+              </select></div>
+          </div>
+          <details>
+            <summary style="font-size:12px;color:var(--text-2,#6b7280);cursor:pointer;user-select:none">⚙️ ${t('高级：直接编辑完整过滤对象（JSON）')}</summary>
+            <textarea class="st-ta" id="kbFJson" style="margin-top:8px;min-height:90px;font-family:monospace;font-size:12px" spellcheck="false">${esc(JSON.stringify(S.kb_metadata_filter || {}, null, 2))}</textarea>
+            <div class="hint">${t('完整过滤对象（各条件 AND 语义，值支持 "$user.dept" 占位符）；修改后以本 JSON 为准，留空 {} 等于不过滤')}</div>
+          </details>
+          <div id="kbFilterSum" style="margin-top:10px;padding:8px 12px;background:var(--surface-2,#f9fafb);border:1px dashed var(--border,#d1d5db);border-radius:8px;font-size:12px;color:var(--text-2,#6b7280)">⚡ ${t('当前生效')}：${kbFilterSummary(S.kb_metadata_filter)}</div>
+        </div>` : `
+        <div class="st-field"><div class="hint">📚 ${t('选择关联知识库后，可配置「检索过滤（元数据）」限定命中范围')}</div></div>`}`;
+      $('#edKb').onchange = e => { S.kb_id = e.target.value ? +e.target.value : null; scheduleSave(); renderLeft(); renderEdit(); };
+      // V1.2 #2：过滤收集——高级 JSON 改过则以解析结果为准（校验失败拦存并提示）；未改则两个下拉覆盖约定键、其余键保留
+      if (S.kb_id) {
+        const jsonTa = box.querySelector('#kbFJson');
+        let jsonDirty = false;
+        jsonTa.addEventListener('input', () => { jsonDirty = true; });
+        const collect = (silent) => {
+          let obj;
+          if (jsonDirty) {
+            try {
+              obj = JSON.parse(jsonTa.value);
+              if (!obj || typeof obj !== 'object' || Array.isArray(obj)) throw new Error(t('不是 JSON 对象'));
+            } catch (e) {
+              if (!silent) toast(`${t('过滤 JSON 格式错误')}：${e.message}`, 'err');
+              return false; // 解析失败：S 保持旧值，不写入也不自动保存坏数据
+            }
+          } else {
+            obj = { ...(S.kb_metadata_filter || {}) };
+            const lv = box.querySelector('#kbFLevel').value, dp = box.querySelector('#kbFDept').value;
+            if (lv) obj.level = lv; else delete obj.level;
+            if (dp) obj.dept = dp; else delete obj.dept;
+          }
+          S.kb_metadata_filter = (obj && Object.keys(obj).length) ? obj : null; // 空过滤 → null
+          const sum = box.querySelector('#kbFilterSum');
+          if (sum) sum.innerHTML = `⚡ ${t('当前生效')}：${kbFilterSummary(S.kb_metadata_filter)}`;
+          scheduleSave(); renderLeft();
+          jsonDirty = false; jsonTa.value = JSON.stringify(S.kb_metadata_filter || {}, null, 2); // 回写规范化后的 JSON，防双重冲突
+          return true;
+        };
+        box.querySelector('#kbFLevel').onchange = () => collect(true);
+        box.querySelector('#kbFDept').onchange = () => collect(true);
+        jsonTa.onblur = () => { if (jsonDirty) collect(false); };
+      }
     }
 
     if (view === 'memory') {
@@ -715,6 +790,8 @@ export async function render(el, params) {
       icon: S.icon, context_rounds: S.context_rounds, max_reply: S.max_reply,
       opening: S.opening, opening_questions: S.opening_questions.filter(Boolean),
       kb_id: S.kb_id, tools: S.tools, mcp_servers: S.mcp_servers,
+      // V1.2 #2：知识库检索过滤声明（空过滤提交 null；非 owner 协作者提交会被后端忽略）
+      kb_metadata_filter: (S.kb_metadata_filter && Object.keys(S.kb_metadata_filter).length) ? S.kb_metadata_filter : null,
       long_memory: S.long_memory, allow_user_model: S.allow_user_model, suggest_enabled: S.suggest_enabled,
       variables: S.variables.filter(v => v.name),
       child_ids: S.child_ids,

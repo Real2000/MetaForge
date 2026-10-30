@@ -401,13 +401,15 @@ function t(name, fn) {
     assert.strictEqual(canView(byId, { username: 'bob', role: 'user', dept_id: null, dept: '市场部' }), false,
       '安全关键：纯数字名单不回落文本部门名——dept_id=null 时即使 dept="市场部" 也不可见（防误授权）');
   });
-  await t('canView：visible_depts 混合格式走文本模式（6af7cb5 回归保护）', () => {
+  await t('canView：visible_depts 混合格式双模式命中（V1.2 #2 语义升级：ID/文本任一命中）', () => {
     const mixed = { owner: 'alice', status: 'published', visibility: 'restricted',
       collaborators: '[]', visible_members: '[]', visible_depts: JSON.stringify(['1', '市场部']) };
     assert.strictEqual(canView(mixed, { username: 'bob', role: 'user', dept: '市场部' }), true,
-      '混合格式（含非数字）→ 文本分支：dept 文本命中可见');
-    assert.strictEqual(canView(mixed, { username: 'bob', role: 'user', dept_id: 1, dept: '研发部' }), false,
-      '混合格式按文本判定：dept_id=1 不参与（dept="研发部" 未命中不可见，防 ID 绕过文本名单）');
+      '混合名单：dept 文本命中可见');
+    assert.strictEqual(canView(mixed, { username: 'bob', role: 'user', dept_id: 1, dept: '研发部' }), true,
+      '混合名单：dept_id=1 命中可见（V1.2 双模式 OR——旧语义不命中，只扩不缩服务迁移期）');
+    assert.strictEqual(canView(mixed, { username: 'eve', role: 'user', dept_id: 99, dept: '研发部' }), false,
+      '混合名单：ID 与文本皆未命中不可见（fail-closed）');
     const legacyName = { ...mixed, visible_depts: JSON.stringify(['市场部']) };
     assert.strictEqual(canView(legacyName, { username: 'bob', role: 'user', dept: '市场部', dept_id: 99 }), true,
       '旧格式纯文本名单与 dept_id 字段共存不受影响：dept 命中即可见');
@@ -476,11 +478,12 @@ function t(name, fn) {
     assert.strictEqual(canView(byText, { username: 'bob', role: 'user', dept: '市场部' }), true, '历史文本部门保存后仍按 user.dept 文本命中');
     assert.strictEqual(canView(byText, { username: 'bob', role: 'user', dept: '市场部', dept_id: 99 }), true, 'dept_id 数字字段共存不干扰文本匹配（老用户补 dept_id 后不受影响）');
     assert.strictEqual(canView(byText, { username: 'bob', role: 'user', dept: '研发部', dept_id: 1 }), false, '文本未命中且 ID 不参与（文本模式下不可见）');
-    // 混合存量（历史文本 + 新勾选 ID 并存）：按 agent-access 既有语义走文本分支，ID 成员暂不生效（前端 hint 引导清理迁移）
+    // 混合存量（历史文本 + 新勾选 ID 并存）：V1.2 双模式 OR——ID 或文本任一命中即可见（只扩不缩，服务迁移期）
     const mixed = JSON.stringify(['市场部', '2'].map(String).filter(Boolean));
     const byMixed = { ...byText, visible_depts: mixed };
     assert.strictEqual(canView(byMixed, { username: 'bob', role: 'user', dept: '市场部' }), true, '混合名单文本命中仍生效（保存链路不丢历史项）');
-    assert.strictEqual(canView(byMixed, { username: 'eve', role: 'user', dept_id: 2 }), false, '混合名单 ID 暂不生效（含非数字走文本模式，迁移完成后转纯 ID 才走 dept_id）');
+    assert.strictEqual(canView(byMixed, { username: 'eve', role: 'user', dept_id: 2 }), true, '混合名单 ID 命中也可见（V1.2 双模式 OR，旧语义不命中）');
+    assert.strictEqual(canView(byMixed, { username: 'eve', role: 'user', dept_id: 99, dept: '研发部' }), false, '混合名单两者皆未命中不可见（fail-closed）');
   });
 
   // ================ P3 扩展工具（2026-10-22）：Text2SQL / 图表 / Word / MCP Server / 分类器路由 ================
@@ -2276,6 +2279,110 @@ function t(name, fn) {
           const cyc = await jfetch(`/api/departments/${parent.j.data.id}`, { method: 'PUT', body: JSON.stringify({ name: '环测试父', parent_id: child.j.data.id }) }, tokAdmin);
           assert.ok(cyc.j && cyc.j.code === 400, '父部门挂到子部门下应被环校验拒绝（防 walk 栈溢出无法自愈）：' + JSON.stringify(cyc.j));
         });
+        // ===== V1.2 #2 元数据管理与检索过滤（2026-10-30，HTTP 3 条）=====
+        await t('HTTP：recall-test 归属校验 + metadataFilter 过滤生效（V1.2 #2：非 owner 403；AND 语义 fail-closed）', async () => {
+          db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('元数据HTTP测试库','',1,'httpu1',datetime('now','localtime'))`).run();
+          const kbid = db.prepare(`SELECT id FROM kbs WHERE name='元数据HTTP测试库'`).get().id;
+          db.prepare(`INSERT INTO kb_files (kb_id,name,size,status,chunk_count,created_at) VALUES (?,'meta-http.md',100,'success',3,datetime('now','localtime'))`).run(kbid);
+          const fid = db.prepare(`SELECT id FROM kb_files WHERE kb_id=? ORDER BY id DESC`).get(kbid).id;
+          const ins = db.prepare('INSERT INTO kb_chunks (file_id,kb_id,content,metadata) VALUES (?,?,?,?)');
+          ins.run(fid, kbid, '迟到管理戊标记词', JSON.stringify({ dept: '产品部', level: '公开' }));
+          ins.run(fid, kbid, '迟到管理己标记词', JSON.stringify({ dept: ['产品部', '研发部'], level: '内部' }));
+          ins.run(fid, kbid, '迟到管理庚标记词', null);
+          const other = await jfetch('/api/knowledge/recall-test', { method: 'POST', body: JSON.stringify({ query: '迟到管理', kb_id: kbid, top_n: 5, threshold: 0, rerank_enabled: false }) }, tok2);
+          assert.strictEqual(other.j && other.j.code, 403, '非创建者 recall-test 应 403（此前无归属校验，任意登录用户可检索他人库）：' + JSON.stringify(other.j));
+          const allNoKb = await jfetch('/api/knowledge/recall-test', { method: 'POST', body: JSON.stringify({ query: '迟到管理', top_n: 5 }) }, tok1);
+          assert.strictEqual(allNoKb.j && allNoKb.j.code, 403, '普通用户不指定库（全库检索）应 403（fail-closed 收口，防旁路）：' + JSON.stringify(allNoKb.j));
+          const hit = await jfetch('/api/knowledge/recall-test', { method: 'POST', body: JSON.stringify({ query: '迟到管理', kb_id: kbid, top_n: 5, threshold: 0, rerank_enabled: false, metadataFilter: { dept: '产品部' } }) }, tok1);
+          assert.ok(hit.j && hit.j.code === 0, 'owner 带 metadataFilter 应成功：' + JSON.stringify(hit.j).slice(0, 120));
+          assert.strictEqual(hit.j.data.count, 2, 'dept=产品部 应命中 scalar+数组两条（无元数据行被 fail-closed 滤除）：' + hit.j.data.count);
+          // V1.2 审查加固：finish() 输出补 metadata 字段——此前白名单丢失该列，前端召回徽章永不渲染且无报错
+          assert.ok(hit.j.data.hits.length >= 1 && hit.j.data.hits.every(h => 'metadata' in h), '召回结果每条应携带 metadata 字段（finish 白名单补齐）');
+          assert.ok(hit.j.data.hits.some(h => h.metadata && String(h.metadata).includes('产品部')), '命中条目的 metadata 应为原 JSON 字符串且含过滤值');
+          const miss = await jfetch('/api/knowledge/recall-test', { method: 'POST', body: JSON.stringify({ query: '迟到管理', kb_id: kbid, top_n: 5, threshold: 0, rerank_enabled: false, metadataFilter: { dept: '市场部' } }) }, tok1);
+          assert.strictEqual(miss.j.data.count, 0, 'dept=市场部 应 0 命中（fail-closed 不兜底放开）');
+          const all = await jfetch('/api/knowledge/recall-test', { method: 'POST', body: JSON.stringify({ query: '迟到管理', kb_id: kbid, top_n: 5, threshold: 0, rerank_enabled: false }) }, tok1);
+          assert.strictEqual(all.j.data.count, 3, '不带 filter 应全命中 3 条（行为与现状一致）');
+          const gs = await jfetch(`/api/knowledge/${kbid}/graph-search`, { method: 'POST', body: JSON.stringify({ query: '迟到管理' }) }, tok2);
+          assert.strictEqual(gs.j && gs.j.code, 403, '非创建者 graph-search 应 403（读侧收口补齐）：' + JSON.stringify(gs.j));
+        });
+        await t('HTTP：chunks 编辑 metadata 持久化 + meta-options distinct（V1.2 #2）', async () => {
+          const kbid = db.prepare(`SELECT id FROM kbs WHERE name='元数据HTTP测试库'`).get().id;
+          const fid = db.prepare(`SELECT id FROM kb_files WHERE kb_id=? ORDER BY id DESC`).get(kbid).id;
+          const cid = db.prepare(`SELECT id FROM kb_chunks WHERE file_id=? AND metadata IS NULL ORDER BY id`).get(fid).id;
+          const put = await jfetch(`/api/knowledge/chunks/${cid}`, { method: 'PUT', body: JSON.stringify({ content: '迟到管理庚标记词（已编辑）', metadata: { dept: '产品部', level: '机密' } }) }, tok1);
+          assert.ok(put.j && put.j.code === 0, 'PUT chunks 带 metadata 应成功：' + JSON.stringify(put.j));
+          assert.strictEqual(db.prepare('SELECT metadata FROM kb_chunks WHERE id=?').get(cid).metadata, '{"dept":"产品部","level":"机密"}', 'metadata 应清洗后持久化为 JSON');
+          await jfetch(`/api/knowledge/chunks/${cid}`, { method: 'PUT', body: JSON.stringify({ content: '迟到管理庚标记词（已编辑）', metadata: null }) }, tok1);
+          assert.strictEqual(db.prepare('SELECT metadata FROM kb_chunks WHERE id=?').get(cid).metadata, null, 'metadata=null 应存 NULL（清除）');
+          const list = await jfetch(`/api/knowledge/files/${fid}/chunks`, {}, tok1);
+          const c = (list.j.data.chunks || list.j.data).find ? ((list.j.data.chunks || list.j.data).find(x => x.id === cid)) : null;
+          assert.ok(c && 'metadata' in c, 'chunks GET 响应应带 metadata 列（编辑回显）');
+          const mo = await jfetch(`/api/knowledge/${kbid}/meta-options`, {}, tok1);
+          assert.ok(mo.j && mo.j.code === 0, 'GET meta-options owner 应成功：' + JSON.stringify(mo.j));
+          // V1.2 审查加固：{keys, options} 双结构（自定义键 "keys" 不再覆盖键列表字段）
+          assert.deepStrictEqual([...mo.j.data.keys].sort(), ['dept', 'level'], 'keys 应为出现过的全部键：' + JSON.stringify(mo.j.data.keys));
+          assert.ok(mo.j.data.options.dept.length === 2 && mo.j.data.options.dept.includes('产品部') && mo.j.data.options.dept.includes('研发部'), 'options.dept distinct 应摊平数组值去重：' + JSON.stringify(mo.j.data.options.dept));
+          assert.ok(mo.j.data.options.level.length === 2 && mo.j.data.options.level.includes('公开') && mo.j.data.options.level.includes('内部'), 'options.level distinct：' + JSON.stringify(mo.j.data.options.level));
+          const mo403 = await jfetch(`/api/knowledge/${kbid}/meta-options`, {}, tok2);
+          assert.strictEqual(mo403.j && mo403.j.code, 403, '非创建者 meta-options 应 403：' + JSON.stringify(mo403.j));
+        });
+        await t('HTTP：users PUT dept_id 绑定 + agents PUT kb_metadata_filter 归一落库（V1.2 #2）', async () => {
+          const adminUid = db.prepare(`SELECT id FROM users WHERE username='httpadmin'`).get().id;
+          const tokA = sign({ uid: adminUid, exp: Date.now() + 3600000 });
+          const dp = await jfetch('/api/departments', { method: 'POST', body: JSON.stringify({ name: '元数据测试部' }) }, tokA);
+          assert.ok(dp.j && dp.j.code === 0, '管理员建部门应成功：' + JSON.stringify(dp.j));
+          const dpId = dp.j.data.id;
+          const u1id = db.prepare(`SELECT id FROM users WHERE username='httpu1'`).get().id;
+          const up = await jfetch(`/api/users/${u1id}`, { method: 'PUT', body: JSON.stringify({ dept: '元数据测试部', dept_id: dpId }) }, tokA);
+          assert.ok(up.j && up.j.code === 0, 'PUT users 绑 dept_id 应成功：' + JSON.stringify(up.j));
+          assert.strictEqual(db.prepare('SELECT dept_id FROM users WHERE id=?').get(u1id).dept_id, dpId, 'dept_id 应绑定落库');
+          const bad = await jfetch(`/api/users/${u1id}`, { method: 'PUT', body: JSON.stringify({ dept: '元数据测试部', dept_id: 999999 }) }, tokA);
+          assert.ok(bad.j && bad.j.code === 0, '传不存在 dept_id 不应报错（归 NULL）');
+          assert.strictEqual(db.prepare('SELECT dept_id FROM users WHERE id=?').get(u1id).dept_id, null, '不存在的 dept_id 应落 NULL（防悬空引用）');
+          const c = await jfetch('/api/agents', { method: 'POST', body: JSON.stringify({ name: '元数据过滤智能体测试' }) }, tok1);
+          const agid = c.j.data.id;
+          const pa = await jfetch(`/api/agents/${agid}`, { method: 'PUT', body: JSON.stringify({ name: '元数据过滤智能体测试', kb_metadata_filter: { level: '公开', dept: '$user.dept' }, force: 1 }) }, tok1);
+          assert.ok(pa.j && pa.j.code === 0, 'PUT agents 带 kb_metadata_filter 应成功：' + JSON.stringify(pa.j));
+          assert.strictEqual(db.prepare('SELECT kb_metadata_filter FROM agents WHERE id=?').get(agid).kb_metadata_filter, '{"level":"公开","dept":"$user.dept"}', '对象入参应归一落库且 $user.dept 占位符保留');
+          const ps = await jfetch(`/api/agents/${agid}`, { method: 'PUT', body: JSON.stringify({ name: '元数据过滤智能体测试', kb_metadata_filter: '{"level":"内部"}', force: 1 }) }, tok1);
+          assert.ok(ps.j && ps.j.code === 0, 'JSON 字符串入参应成功');
+          assert.strictEqual(db.prepare('SELECT kb_metadata_filter FROM agents WHERE id=?').get(agid).kb_metadata_filter, '{"level":"内部"}', 'JSON 字符串入参应归一落库');
+          const pn = await jfetch(`/api/agents/${agid}`, { method: 'PUT', body: JSON.stringify({ name: '元数据过滤智能体测试', kb_metadata_filter: { level: 123 }, force: 1 }) }, tok1);
+          assert.ok(pn.j && pn.j.code === 0, '无效值入参应成功（清洗）');
+          assert.strictEqual(db.prepare('SELECT kb_metadata_filter FROM agents WHERE id=?').get(agid).kb_metadata_filter, null, '无效值（数字）清洗后应存 NULL');
+          const d = await jfetch(`/api/agents/${agid}/detail`, {}, tok1);
+          assert.ok(d.j && d.j.code === 0 && 'kb_metadata_filter' in d.j.data, 'GET detail 应带 kb_metadata_filter 字段');
+        });
+        // ===== V1.2 审查加固（2026-10-30）：库列表 owner 过滤 + 智能体挂库归属校验 + 协作者不可改过滤声明 =====
+        await t('HTTP：库列表 owner 过滤 + agents 挂库归属校验 + 协作者不可改 kb_metadata_filter（V1.2 审查加固）', async () => {
+          // 他人私有库（owner=httpu2）
+          db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('元数据归属隔离库2','',1,'httpu2',datetime('now','localtime'))`).run();
+          const kb2 = db.prepare(`SELECT id FROM kbs WHERE name='元数据归属隔离库2'`).get().id;
+          // ① 库列表 owner 过滤：httpu1 看不到 httpu2 的库；管理员可见全部
+          const list1 = await jfetch('/api/knowledge', {}, tok1);
+          assert.ok(list1.j && list1.j.code === 0, 'GET /api/knowledge 应成功');
+          assert.ok(!list1.j.data.some(k => k.id === kb2), '普通用户不应看到他人库（此前全平台库名/配置对全员暴露）：' + JSON.stringify(list1.j.data.map(k => k.name)));
+          assert.ok(list1.j.data.some(k => k.name === '元数据HTTP测试库'), '本人库应可见');
+          const adminUid2 = db.prepare(`SELECT id FROM users WHERE username='httpadmin'`).get().id;
+          const tokA2 = sign({ uid: adminUid2, exp: Date.now() + 3600000 });
+          const listA = await jfetch('/api/knowledge', {}, tokA2);
+          assert.ok(listA.j.data.some(k => k.id === kb2), '管理员应可见全部库');
+          // ② agents 挂库归属校验：POST 挂他人库被拒
+          const badPost = await jfetch('/api/agents', { method: 'POST', body: JSON.stringify({ name: '越权挂库智能体', kb_id: kb2 }) }, tok1);
+          assert.strictEqual(badPost.j && badPost.j.code, 403, 'POST 挂他人库应 403（内容级 ACL 的行级地基）：' + JSON.stringify(badPost.j));
+          // PUT 改绑他人库同样被拒（复用 case 7 创建的智能体）
+          const agid = db.prepare(`SELECT id FROM agents WHERE name='元数据过滤智能体测试'`).get().id;
+          const badPut = await jfetch(`/api/agents/${agid}`, { method: 'PUT', body: JSON.stringify({ name: '元数据过滤智能体测试', kb_id: kb2, force: 1 }) }, tok1);
+          assert.strictEqual(badPut.j && badPut.j.code, 403, 'PUT 改绑他人库应 403：' + JSON.stringify(badPut.j));
+          // ③ 协作者不可改 kb_metadata_filter：管理员把 httpu2 加为协作者 → httpu2 提交新 filter → 保留原值
+          const addCollab = await jfetch(`/api/agents/${agid}`, { method: 'PUT', body: JSON.stringify({ name: '元数据过滤智能体测试', collaborators: ['httpu2'], force: 1 }) }, tokA2);
+          assert.ok(addCollab.j && addCollab.j.code === 0, '管理员添加协作者应成功：' + JSON.stringify(addCollab.j));
+          const before = db.prepare('SELECT kb_metadata_filter FROM agents WHERE id=?').get(agid).kb_metadata_filter;
+          const collabPut = await jfetch(`/api/agents/${agid}`, { method: 'PUT', body: JSON.stringify({ name: '元数据过滤智能体测试', kb_metadata_filter: { level: '机密' }, force: 1 }) }, tok2);
+          assert.ok(collabPut.j && collabPut.j.code === 0, '协作者保存应成功（内容字段可编辑）：' + JSON.stringify(collabPut.j));
+          assert.strictEqual(db.prepare('SELECT kb_metadata_filter FROM agents WHERE id=?').get(agid).kb_metadata_filter, before, '协作者提交的 kb_metadata_filter 应被忽略（归属级保护，防内容级 ACL 降权）：' + before);
+        });
         await t('HTTP：召回测试可视化——rerank-models 接口返回模型列表（2026-10-29）', async () => {
           const r = await jfetch('/api/knowledge/rerank-models', {}, tok1);
           assert.ok(r.j && r.j.code === 0, '接口应成功：' + JSON.stringify(r.j));
@@ -2357,12 +2464,135 @@ function t(name, fn) {
           // 空 query 校验
           const bad = await jfetch(`/api/knowledge/${kbid}/graph-search`, { method: 'POST', body: JSON.stringify({ query: '' }) }, tok1);
           assert.strictEqual(bad.j && bad.j.code, 400, '空 query 应 400');
-          db.prepare(`DELETE FROM kb_chunks WHERE file_id=?`).run(fid);
-          db.prepare(`DELETE FROM kb_files WHERE id=?`).run(fid);
-          db.prepare(`DELETE FROM kbs WHERE id=?`).run(kbid);
-          db.prepare(`DELETE FROM entity_relations`).run();
-          db.prepare(`DELETE FROM entities`).run();
-        });
+      db.prepare(`DELETE FROM kb_chunks WHERE file_id=?`).run(fid);
+      db.prepare(`DELETE FROM kb_files WHERE id=?`).run(fid);
+      db.prepare(`DELETE FROM kbs WHERE id=?`).run(kbid);
+    });
+    // 【V1.2 前置】黄金召回基线（2026-10-30）：#2 元数据改造动 retriever.js 检索链路前固化行为基线——
+    // 6 条黄金问答 × Top-1 命中断言 + 复跑稳定性；后续任何检索改动（元数据过滤/管道化）跑此用例防召回隐性劣化
+    await t('黄金召回基线：6 条黄金问答 Top-1 全命中 + 复跑稳定（V1.2 #2 改造护栏）', async () => {
+      db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('黄金基线库','',1,'httpu1',datetime('now','localtime'))`).run();
+      const kbid = db.prepare(`SELECT id FROM kbs WHERE name='黄金基线库'`).get().id;
+      db.prepare(`INSERT INTO kb_files (kb_id,name,size,status,chunk_count,created_at) VALUES (?,'黄金基线手册.md',1024,'success',6,datetime('now','localtime'))`).run(kbid);
+      const fid = db.prepare(`SELECT id FROM kb_files WHERE kb_id=? ORDER BY id DESC`).get(kbid).id;
+      const ins = db.prepare(`INSERT INTO kb_chunks (file_id,kb_id,content) VALUES (?,?,?)`);
+      // 6 个主题互异的黄金分块（含唯一标记词，保证 BM25/本地向量双通道可区分）
+      [
+        '考勤管理制度：员工迟到早退按次扣款，月度累计三次以上按旷工处理，旷工将影响季度绩效评定',
+        '差旅报销管理办法：出差须提前申请，回程后十个工作日内提交发票，住宿与交通按职级标准限额报销',
+        '数据安全规范：涉及多方协作的分析平台采用联邦学习与差分隐私技术，原始数据不出域即可完成联合建模',
+        '新员工入职流程：报到当日办理工卡与邮箱，首周完成信息安全培训与岗位必修课程，试用期六个月',
+        '薪酬福利制度：年终奖按公司经营状况与个人绩效双系数核发，每年四月启动调薪评审机制',
+        '保密管理制度：涉密文档按密级分为公开、内部、机密三级管理，机密级文档严禁外发与截屏转发',
+      ].forEach(c => ins.run(fid, kbid, c));
+      const { retrieve } = require('../src-server/lib/retriever');
+      const golden = [
+        ['迟到早退怎么处理', '旷工'],
+        ['出差发票报销流程', '差旅'],
+        ['多方数据协作怎么保障安全', '差分隐私'],
+        ['新员工报到要办什么', '入职'],
+        ['年终奖什么时候发', '调薪'],
+        ['机密文档的管理要求', '密级'],
+      ];
+      for (const [q, marker] of golden) {
+        const hits = await retrieve(q, kbid, 3, 0, { rerankEnabled: false });
+        assert.ok(hits.length >= 1, `「${q}」应至少命中 1 条`);
+        assert.ok((hits[0].content || '').includes(marker), `「${q}」Top-1 应命中含「${marker}」的分块，实际：${hits[0].content?.slice(0, 25)}`);
+      }
+      // 复跑稳定性：同查询两次 Top-1 一致（防排序不稳定导致的召回抖动）
+      const r1 = await retrieve('机密文档的管理要求', kbid, 3, 0, { rerankEnabled: false });
+      const r2 = await retrieve('机密文档的管理要求', kbid, 3, 0, { rerankEnabled: false });
+      assert.strictEqual(r1[0].id, r2[0].id, '同查询复跑 Top-1 应稳定（排序确定性）');
+      assert.strictEqual(r1[0].score, r2[0].score, '同查询复跑得分应一致');
+      globalThis.__goldenKbId = kbid;
+    });
+    // ===== V1.2 #2 元数据管理与检索过滤（2026-10-30，单元 4 条）=====
+    await t('retriever：metadataFilter 过滤——命中/数组包含/fail-closed/空过滤/损坏 JSON 不炸（V1.2 #2）', async () => {
+      const { retrieve } = require('../src-server/lib/retriever');
+      db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('元数据过滤测试库','',1,'httpu1',datetime('now','localtime'))`).run();
+      const kbid = db.prepare(`SELECT id FROM kbs WHERE name='元数据过滤测试库'`).get().id;
+      db.prepare(`INSERT INTO kb_files (kb_id,name,size,status,chunk_count,created_at) VALUES (?,'meta.md',100,'success',4,datetime('now','localtime'))`).run(kbid);
+      const fid = db.prepare(`SELECT id FROM kb_files WHERE kb_id=? ORDER BY id DESC`).get(kbid).id;
+      const ins = db.prepare('INSERT INTO kb_chunks (file_id,kb_id,content,metadata) VALUES (?,?,?,?)');
+      ins.run(fid, kbid, '迟到管理甲元数据标记词alpha', JSON.stringify({ dept: '产品部', level: '公开' }));
+      ins.run(fid, kbid, '迟到管理乙元数据标记词beta', JSON.stringify({ dept: ['产品部', '研发部'], level: '内部' }));
+      ins.run(fid, kbid, '迟到管理丙元数据标记词gamma', null);
+      ins.run(fid, kbid, '迟到管理丁元数据标记词delta', '{broken json');
+      const Q = '迟到管理', OPT = { rerankEnabled: false };
+      const h1 = await retrieve(Q, kbid, 5, 0, { ...OPT, metadataFilter: { dept: '产品部' } });
+      assert.strictEqual(h1.length, 2, 'dept=产品部 应命中 scalar+数组两条（无元数据/损坏 JSON 被 fail-closed 滤除）：' + h1.map(h => h.content.slice(0, 4)).join(','));
+      const h2 = await retrieve(Q, kbid, 5, 0, { ...OPT, metadataFilter: { dept: '研发部' } });
+      assert.strictEqual(h2.length, 1, 'dept=研发部 应仅命中数组值那条：' + h2.map(h => h.content.slice(0, 4)));
+      const h3 = await retrieve(Q, kbid, 5, 0, { ...OPT, metadataFilter: { dept: '产品部', level: '内部' } });
+      assert.strictEqual(h3.length, 1, 'AND 语义应收窄到数组那条（level=内部）');
+      const h4 = await retrieve(Q, kbid, 5, 0, { ...OPT, metadataFilter: { dept: '市场部' } });
+      assert.strictEqual(h4.length, 0, '无匹配应 0 命中（fail-closed 不兜底放开）');
+      const h5 = await retrieve(Q, kbid, 5, 0, { ...OPT, metadataFilter: {} });
+      assert.strictEqual(h5.length, 4, '空过滤对象应全通过（行为与无过滤一致）：' + h5.length);
+      const h6 = await retrieve(Q, kbid, 5, 0, OPT);
+      assert.deepStrictEqual(h5.map(h => h.id).sort(), h6.map(h => h.id).sort(), '空过滤与无过滤结果集应完全一致（黄金基线护栏红线）');
+      assert.ok(h6.some(h => h.content.includes('丁')), '损坏 JSON 行无过滤时应正常参与检索（不抛错）');
+      db.prepare(`DELETE FROM kb_chunks WHERE file_id=?`).run(fid);
+      db.prepare(`DELETE FROM kb_files WHERE id=?`).run(fid);
+      db.prepare(`DELETE FROM kbs WHERE id=?`).run(kbid);
+    });
+    await t('黄金基线回归：空 metadataFilter 不改变召回行为（V1.2 #2 护栏红线）', async () => {
+      const kbid = globalThis.__goldenKbId;
+      assert.ok(kbid, '黄金基线库应已由前置用例设置 globalThis.__goldenKbId');
+      const { retrieve } = require('../src-server/lib/retriever');
+      const withEmpty = await retrieve('迟到早退怎么处理', kbid, 3, 0, { rerankEnabled: false, metadataFilter: {} });
+      assert.ok(withEmpty.length >= 1 && (withEmpty[0].content || '').includes('旷工'), '带空 metadataFilter 的黄金问答 Top-1 应仍命中「旷工」（无过滤行为锁定，防召回隐性劣化）');
+    });
+    await t('resolveKbFilter：$user.dept 占位符替换 / 无 dept 与无用户链路 fail-closed / 无效 JSON 返回 null（V1.2 #2）', () => {
+      const { resolveKbFilter, sanitizeMetadata, NO_DEPT_SENTINEL } = require('../src-server/lib/kb-metadata');
+      const f1 = resolveKbFilter({ kb_metadata_filter: JSON.stringify({ level: '公开', dept: '$user.dept' }) }, { dept: '产品部' });
+      assert.deepStrictEqual(f1, { level: '公开', dept: '产品部' }, '$user.dept 应替换为请求用户部门：' + JSON.stringify(f1));
+      const f2 = resolveKbFilter({ kb_metadata_filter: JSON.stringify({ dept: '$user.dept' }) }, {});
+      assert.strictEqual(f2.dept, NO_DEPT_SENTINEL, '用户无 dept 应置哨兵值（恒不命中，fail-closed）：' + JSON.stringify(f2));
+      // V1.2 审查加固：无用户链路（分享页/开放 API）——占位符置哨兵恒不命中，固定值键照常生效（防免登录访客全库旁路）
+      const f3 = resolveKbFilter({ kb_metadata_filter: JSON.stringify({ level: '公开', dept: '$user.dept' }) }, null);
+      assert.deepStrictEqual(f3, { level: '公开', dept: NO_DEPT_SENTINEL }, '无用户链路：占位符置哨兵（部门内容不对免登录访客开放），固定值键照常：' + JSON.stringify(f3));
+      assert.strictEqual(resolveKbFilter({ kb_metadata_filter: '{bad json' }, {}), null, '无效 JSON 应返回 null（不过滤）');
+      assert.strictEqual(resolveKbFilter({ kb_metadata_filter: null }, {}), null, '无声明应返回 null');
+      assert.strictEqual(resolveKbFilter({}, {}), null, '无 agent 应返回 null');
+      // V1.2 审查加固：sanitizeMetadata 剥控制字符 + 丢弃哨兵值——防「无部门用户精确命中被打了哨兵值的块」的穿透
+      const s1 = sanitizeMetadata({ dept: '\u0000__no_dept__', level: '内部\u0007' });
+      assert.strictEqual(s1.level, '内部', '控制字符应被剥离（NUL/BEL 等）：' + JSON.stringify(s1));
+      assert.ok(!('dept' in s1) || s1.dept !== NO_DEPT_SENTINEL, '全等哨兵值的条目应被丢弃（剥离后不可能等于哨兵，双保险）：' + JSON.stringify(s1));
+      const s2 = sanitizeMetadata({ 'bad\u0000key': '值' });
+      assert.ok(!('badkey' in s2) || Object.keys(s2).every(k => !/[\u0000-\u001f]/.test(k)), '键名中的控制字符应被剥离');
+    });
+    await t('canView：visible_depts 混合名单 ID/文本任一命中（V1.2 #2 双模式 OR，纯名单行为不变）', () => {
+      const { canView } = require('../src-server/lib/agent-access');
+      const mk = depts => ({ status: 'published', visibility: 'restricted', visible_depts: JSON.stringify(depts) });
+      const u = { role: 'user', username: 'x', dept: '市场部', dept_id: 2 };
+      assert.strictEqual(canView(mk(['市场部', '2']), u), true, '混合名单：dept 文本命中应可见');
+      assert.strictEqual(canView(mk(['市场部', '2']), { ...u, dept: '研发部', dept_id: 2 }), true, '混合名单：dept_id 命中应可见（旧语义不命中，只扩不缩）');
+      assert.strictEqual(canView(mk(['市场部', '2']), { ...u, dept: '研发部', dept_id: null }), false, '混合名单：两者皆无不命中');
+      assert.strictEqual(canView(mk(['1', '2']), { ...u, dept_id: 2 }), true, '纯数字名单：ID 命中（行为不变）');
+      assert.strictEqual(canView(mk(['1', '2']), { ...u, dept: '市场部', dept_id: null }), false, '纯数字名单：文本不命中（行为不变）');
+      assert.strictEqual(canView(mk(['市场部']), u), true, '纯文本名单：文本命中（行为不变）');
+      assert.strictEqual(canView(mk(['研发部']), u), false, '纯文本名单：不匹配不可见（行为不变）');
+    });
+    await t('kb_search 工具：ctx.metadataFilter 透传——工具链路检索同样受元数据过滤约束（V1.2 审查加固）', async () => {
+      // 防回归：chat 主链路被过滤但 LLM 经 function calling 调 kb_search 全库检索的会话内旁路（tools.js:31）
+      const tools = require('../src-server/lib/tools');
+      db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('工具过滤测试库','',1,'httpu1',datetime('now','localtime'))`).run();
+      const kbid = db.prepare(`SELECT id FROM kbs WHERE name='工具过滤测试库'`).get().id;
+      db.prepare(`INSERT INTO kb_files (kb_id,name,size,status,chunk_count,created_at) VALUES (?,'tool-meta.md',100,'success',2,datetime('now','localtime'))`).run(kbid);
+      const fid = db.prepare(`SELECT id FROM kb_files WHERE kb_id=? ORDER BY id DESC`).get(kbid).id;
+      const ins = db.prepare('INSERT INTO kb_chunks (file_id,kb_id,content,metadata) VALUES (?,?,?,?)');
+      ins.run(fid, kbid, '迟到管理工具甲标记词', JSON.stringify({ dept: '产品部', level: '公开' }));
+      ins.run(fid, kbid, '迟到管理工具乙标记词', null); // 无元数据
+      const withFilter = String(await tools.TOOL_DEFS.kb_search.run({ query: '迟到管理工具' }, { kbId: kbid, metadataFilter: { dept: '产品部' } }));
+      assert.ok(withFilter.includes('甲'), '带 filter：有元数据且命中 dept 的块应返回');
+      assert.ok(!withFilter.includes('乙'), '带 filter：无元数据块应被 fail-closed 滤除（此前 kb_search 不传 filter 全库返回）：' + withFilter.slice(0, 60));
+      const noFilter = String(await tools.TOOL_DEFS.kb_search.run({ query: '迟到管理工具' }, { kbId: kbid }));
+      assert.ok(noFilter.includes('甲') && noFilter.includes('乙'), '不带 filter：全部块返回（无过滤行为与现状一致）');
+      db.prepare(`DELETE FROM kb_chunks WHERE file_id=?`).run(fid);
+      db.prepare(`DELETE FROM kb_files WHERE id=?`).run(fid);
+      db.prepare(`DELETE FROM kbs WHERE id=?`).run(kbid);
+    });
         await t('HTTP：任务归属——创建者自有，他人不可见不可删（P5.31）', async () => {
           const aid = db.prepare(`SELECT id FROM users WHERE username='httpadmin'`).get().id;
           const tokA2 = sign({ uid: aid, exp: Date.now() + 3600000 });

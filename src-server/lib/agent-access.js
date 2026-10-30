@@ -29,17 +29,16 @@ function canView(a, user) {
   if (members.includes(user.username)) return true;
   const depts = parseJsonArr(a.visible_depts);
   if (depts.length) {
-    // P0-3 (2026-10-29)：visible_depts 兼容新旧两种格式——
-    // - 旧格式：["部门名"]，用 user.dept 文本部门名匹配
-    // - 新格式：["1","2"]（departments 表 ID 字符串），用 user.dept_id 匹配
-    // 优先尝试 dept_id 匹配（精准），失败回落文本部门名
-    if (depts.every(v => /^\d+$/.test(v))) {
-      // 全部为纯数字 → 新格式 ID
-      if (user.dept_id != null && depts.includes(String(user.dept_id))) return true;
-    } else {
-      // 包含非数字 → 旧格式文本部门名
-      if (user.dept && depts.includes(user.dept)) return true;
-    }
+    // V1.2 #2 2026-10-30：visible_depts 双模式并列命中（OR）——
+    // - ID 模式：名单含纯数字成员（departments 表 ID 字符串）→ 按 user.dept_id 匹配
+    // - 文本模式：名单含非数字成员（部门文本名）→ 按 user.dept 文本匹配
+    // - 混合名单：任一命中即可见（相比旧「every 判格式后二选一」只扩不缩：纯数字/纯文本
+    //   名单行为完全不变，混合名单下 ID 或文本任一命中均放行——服务部门 ID 迁移过渡期）
+    const hasId = depts.some(v => /^\d+$/.test(v));
+    const hasText = depts.some(v => !/^\d+$/.test(v));
+    const idHit = hasId && user.dept_id != null && depts.includes(String(user.dept_id));
+    const textHit = hasText && !!user.dept && depts.includes(user.dept);
+    if (idHit || textHit) return true;
   }
   return false;
 }

@@ -7,6 +7,9 @@
  * 3. 融合：加权 RRF（Reciprocal Rank Fusion），score = Σ w/(60+rank)；向量权重 vecWeight 可调（0=纯关键词，1=纯向量，默认 0.5）
  * 4. Rerank（2026-10-28 P2 重排升级）：RRF 粗召回 Top 30 → cross-encoder 重排取 Top 5，模型可选、可关闭
  * 5. 可视化（2026-10-29）：每条结果带 channels（bm25/vec/both 命中通道）与 hit_terms（命中查询词，前端高亮用）
+ * 6. 元数据过滤（V1.2 #2 2026-10-30）：opts.metadataFilter（JSON 对象，AND 语义）——分块行通过当且仅当
+ *    过滤的每个键都满足 meta[key] === 过滤值，或 meta[key] 为数组且包含该值；无元数据/缺键的行被
+ *    滤除（fail-closed，防误授权）；不传或空对象时行为与无过滤完全一致（黄金基线护栏红线）
  * 返回 [{content, file, kb, kb_id, score(融合), bm25, vec, engine, channels, hit_terms, rerank_score}]
  */
 const { db } = require('../db');
@@ -222,18 +225,47 @@ function bm25Scores(rows, qTerms) {
  *   - vecWeight：向量通道融合权重 0~1（0=纯 BM25，1=纯向量，默认 0.5 均衡，与旧行为一致）
  *   - rerankModel：重排模型名（默认 bge-reranker-v2-m3）
  *   - rerankEnabled：是否启用重排（默认 true；false 时直接返回 RRF 排名，便于对比效果）
+ *   - metadataFilter（V1.2 #2 2026-10-30）：元数据过滤对象（AND 语义，键值须全满足；空对象=不过滤）
  * 调用方全部 await retrieve(...)（原同步调用点已同步改造）。
  */
 async function retrieve(query, kbId = null, topN = 5, threshold = 0.01, opts = {}) {
   const vecWeight = Math.min(1, Math.max(0, Number(opts.vecWeight ?? 0.5)));
   const rows = db.prepare(`
-    SELECT c.id, c.content, c.kb_id, c.file_id, c.parent_id, c.chapter_id, c.embedding, c.keywords, f.name AS file, k.name AS kb
+    SELECT c.id, c.content, c.kb_id, c.file_id, c.parent_id, c.chapter_id, c.embedding, c.keywords, c.metadata, f.name AS file, k.name AS kb
     FROM kb_chunks c
     LEFT JOIN kb_files f ON f.id = c.file_id
     LEFT JOIN kbs k ON k.id = c.kb_id
     WHERE (? IS NULL OR c.kb_id = ?) AND (k.enabled IS NULL OR k.enabled = 1)
   `).all(kbId, kbId);
   if (!rows.length) return [];
+  // V1.2 #2 2026-10-30：元数据过滤（AND 语义）——rows 取回后、任何打分/通道计算前逐行判定，覆盖全部分支
+  // （annRows 从 rows 派生，先在此过滤即可）。fail-closed：无元数据/缺键/值不匹配的行直接滤除（防误授权）。
+  // 无 metadataFilter 或空过滤对象时全部通过——与无过滤行为完全一致（黄金基线护栏红线，勿动语义）。
+  const fObj = (opts.metadataFilter && typeof opts.metadataFilter === 'object' && !Array.isArray(opts.metadataFilter)) ? opts.metadataFilter : null;
+  const fKeys = fObj ? Object.keys(fObj).filter(k => k && fObj[k] !== undefined && fObj[k] !== null && fObj[k] !== '') : [];
+  if (fKeys.length) {
+    const kept = rows.filter(r => {
+      let meta = null;
+      try { if (r.metadata && r.metadata !== '{}') meta = JSON.parse(r.metadata); } catch { meta = null; } // NULL/''/损坏 JSON 均视为无元数据
+      if (!meta || typeof meta !== 'object' || Array.isArray(meta)) return false; // fail-closed：无元数据被滤除
+      for (const k of fKeys) {
+        const v = fObj[k];
+        const mv = meta[k];
+        if (Array.isArray(v)) {
+          // V1.2 审查加固 2026-10-30：过滤值为数组 → OR 语义（元数据标量 ∈ 数组，或两数组有交集）
+          if (v.includes(mv)) continue;
+          if (Array.isArray(mv) && mv.some(x => v.includes(x))) continue;
+          return false;
+        }
+        if (mv === v) continue; // 标量相等
+        if (Array.isArray(mv) && mv.includes(v)) continue; // 数组包含（dept 多部门场景）
+        return false; // 缺键/值不匹配 → 滤除（fail-closed）
+      }
+      return true;
+    });
+    if (!kept.length) return []; // 有过滤且全被滤除 → 无命中（fail-closed 设计语义，不兜底放开）
+    rows.splice(0, rows.length, ...kept); // 原数组原地替换（rows 引用贯穿后续所有分支）
+  }
   // 自动关键词/问法扩展（2026-10-29）：BM25 索引文本 = 原文 + keywords/questions；输出仍用原文（finish 取 r.content）
   for (const r of rows) {
     if (r.keywords) {
@@ -400,6 +432,7 @@ function finish(rows, bm25, vecs, qVec, engine, topN, threshold, vecWeight = 0.5
   const out = rows.map((r, i) => ({
     id: r.id, parent_id: r.parent_id ?? null, chapter_id: r.chapter_id ?? null, // P1/P0-TOC 修复：携带分块ID与归属，供上下文挂载
     content: r.content, file: r.file, kb: r.kb, kb_id: r.kb_id,
+    metadata: r.metadata ?? null, // V1.2 审查加固 2026-10-30：携带分块元数据（召回结果前端徽章/调用方判定用；原 JSON 字符串）
     score: Math.round(rrf[i] * 10000) / 10000,
     bm25: Math.round(bm25[i] * 1000) / 1000,
     vec: Math.round(vec[i] * 1000) / 1000,

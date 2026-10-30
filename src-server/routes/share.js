@@ -8,6 +8,7 @@ const express = require('express');
 const { db, now } = require('../db');
 const { chat } = require('../lib/llm');
 const { retrieve } = require('../lib/retriever');
+const { resolveKbFilter } = require('../lib/kb-metadata'); // V1.2 审查加固 2026-10-30：分享链路检索过滤收口
 const { check, countHits, mask } = require('../lib/security');
 const dify = require('../lib/dify');
 const { createLimiter, clientIp } = require('../lib/rate-limit');
@@ -119,7 +120,10 @@ router.post('/:token/chat', shareChatLimit, async (req, res) => {
     // ---------- 平台内置智能体 ----------
     let kbContext = [];
     if (a.kb_id) {
-      const hits = await retrieve(input, a.kb_id, 5);
+      // V1.2 审查加固 2026-10-30：免登录链路同样受智能体元数据过滤约束（fail-closed）——
+      // 此前不传 filter，带 $user.dept 过滤的智能体在分享页对免登录访客返回全库含机密内容。
+      // 无用户链路：占位符键置哨兵恒不命中（部门内容不对免登录访客开放），固定值键照常生效
+      const hits = await retrieve(input, a.kb_id, 5, 0.01, { metadataFilter: resolveKbFilter(a, null) || undefined });
       kbContext = hits.map(x => x.content);
       if (hits.length) send('kb', { hits });
     }

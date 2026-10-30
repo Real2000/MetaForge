@@ -4,6 +4,7 @@ const { db, now } = require('../db');
 const { auth } = require('../lib/auth');
 const { chatOnce } = require('../lib/llm');
 const { canView, canEdit, isOwnerLevel, parseJsonArr } = require('../lib/agent-access');
+const { sanitizeMetadata } = require('../lib/kb-metadata'); // V1.2 #2 2026-10-30：kb_metadata_filter 入参清洗
 const { runTool, validateAgentTools, TOOL_DEFS, AGENT_TOOL_DENY } = require('../lib/tools'); // P5.34b copy 过滤依赖 AGENT_TOOL_DENY（此前漏导入被 catch 吞错致副本工具恒空——测试轮实锤修复）
 
 const router = express.Router();
@@ -39,6 +40,17 @@ router.get('/members', (req, res) => {
   const rows = db.prepare("SELECT username, nickname, dept, role FROM users WHERE status=1 ORDER BY role='admin' DESC, username").all();
   res.json({ code: 0, data: rows });
 });
+
+// V1.2 审查加固 2026-10-30：智能体挂载知识库归属校验——kb_id 存在时须为本人库或管理员。
+// 此前 POST/PUT 均无校验：普通用户可挂他人私有库（自增 ID 可枚举），chat/openapi/share/workflow
+// 四条检索链路均不校验库归属（仅校验智能体可见性）→ 越权读取他人库全量内容（内容级 ACL 的行级地基）
+function denyKbNotOwned(kbId, user) {
+  if (!kbId) return null;
+  const kb = db.prepare('SELECT owner FROM kbs WHERE id=?').get(kbId);
+  if (!kb) return { code: 400, msg: '知识库不存在' };
+  if (user.role === 'admin' || kb.owner === user.username) return null;
+  return { code: 403, msg: '无权挂载他人的知识库（仅创建者或管理员）' };
+}
 
 function parseBody(b) {
   let tools = [];
@@ -99,6 +111,8 @@ router.post('/', (req, res) => {
   const a = parseBody(req.body || {});
   if (!a.name) return res.json({ code: 400, msg: '智能体名称不能为空' });
   if (a.tool_error) return res.json({ code: 400, msg: a.tool_error }); // P5.34：工具白名单
+  const kbDeny = denyKbNotOwned(a.kb_id, req.user); // V1.2 审查加固：挂库归属校验
+  if (kbDeny) return res.json(kbDeny);
   // 商业化软约束：免费版智能体数达上限不硬拦，返回升级提示（upgrade_hint 前端弹引导）
   const { planUsage } = require('../lib/plans');
   const pu = planUsage(req.user.username);
@@ -132,6 +146,7 @@ router.get('/:id/apidoc', (req, res) => {
 });
 
 router.get('/:id/detail', (req, res) => {
+  // SELECT * 含 kb_metadata_filter（V1.2 #2 2026-10-30）：编排页元数据过滤声明自然带出，无需额外拼接
   const a = db.prepare('SELECT * FROM agents WHERE id=?').get(req.params.id);
   if (!a) return res.json({ code: 404, msg: '智能体不存在' });
   if (!canView(a, req.user)) return res.json({ code: 403, msg: '无权访问该智能体（未对你开放）' });
@@ -186,6 +201,8 @@ router.put('/:id', (req, res) => {
   const a = parseBody(b);
   if (!a.name) return res.json({ code: 400, msg: '智能体名称不能为空' });
   if (a.tool_error) return res.json({ code: 400, msg: a.tool_error }); // P5.34：工具白名单
+  const kbDeny = denyKbNotOwned(a.kb_id, req.user); // V1.2 审查加固：挂库归属校验（PUT 改绑同样拦截）
+  if (kbDeny) return res.json(kbDeny);
   if (a.workflow && a.workflow.error) return res.json({ code: 400, msg: '画布工作流结构错误：' + a.workflow.error });
   // 有画布数据但无 start 节点 → 结构错误拒绝（前端画布模式应保证有 start）
   // 可见性与协作者名单：仅归属级（创建者/管理员）可改；协作者保存时保留原值（不能自我提权/改可见范围）
@@ -206,8 +223,19 @@ router.put('/:id', (req, res) => {
     visibility = b.visibility === 'restricted' ? 'restricted' : 'public';
     vDepts = JSON.stringify(depts); vMembers = JSON.stringify(members); collabs = JSON.stringify(coll);
   }
-  db.prepare(`UPDATE agents SET name=?,description=?,type=?,space_id=?,category=?,prompt=?,user_prompt=?,model=?,temperature=?,top_p=?,diversity_mode=?,icon=?,context_rounds=?,max_reply=?,opening=?,opening_questions=?,kb_id=?,tools=?,mcp_servers=?,long_memory=?,allow_user_model=?,suggest_enabled=?,variables=?,child_ids=?,routing_mode=?,workflow=?,edit_mode=?,visibility=?,visible_depts=?,visible_members=?,collaborators=?,updated_at=datetime('now','localtime') WHERE id=?`)
-    .run(a.name, a.description, a.type, a.space_id, a.category, a.prompt, a.user_prompt, a.model || old.model, a.temperature, a.top_p, a.diversity_mode, a.icon, a.context_rounds, a.max_reply, a.opening, a.opening_questions, a.kb_id, a.tools, a.mcp_servers, a.long_memory, a.allow_user_model, a.suggest_enabled, a.variables, a.child_ids, a.routing_mode, a.workflow, a.edit_mode, visibility, vDepts, vMembers, collabs, old.id);
+  // V1.2 审查加固 2026-10-30：kb_metadata_filter 移入归属级（permEditable）保护——此前协作者可改/清空
+  // 他人智能体的检索过滤声明（内容级 ACL 降权面：清空后 public 智能体对全员全库检索）；协作者保存时
+  // 保留原值（与可见性/协作者名单同模式）。对象或 JSON 字符串均可，sanitizeMetadata 清洗（$user.dept 占位符
+  // 为短字符串不会被截断，原样保留）；空对象/无效存 NULL
+  let kbMetaFilter = old.kb_metadata_filter ?? null;
+  if (permEditable) {
+    const kbMetaClean = sanitizeMetadata(b.kb_metadata_filter); // null/undefined → {}（下面统一归 NULL）
+    kbMetaFilter = b.kb_metadata_filter == null
+      ? null // 未传 → 清除（与 parseBody 全量覆盖语义一致，前端总是提交完整表单）
+      : (Object.keys(kbMetaClean).length ? JSON.stringify(kbMetaClean) : null);
+  }
+  db.prepare(`UPDATE agents SET name=?,description=?,type=?,space_id=?,category=?,prompt=?,user_prompt=?,model=?,temperature=?,top_p=?,diversity_mode=?,icon=?,context_rounds=?,max_reply=?,opening=?,opening_questions=?,kb_id=?,tools=?,mcp_servers=?,long_memory=?,allow_user_model=?,suggest_enabled=?,variables=?,child_ids=?,routing_mode=?,workflow=?,edit_mode=?,visibility=?,visible_depts=?,visible_members=?,collaborators=?,kb_metadata_filter=?,updated_at=datetime('now','localtime') WHERE id=?`)
+    .run(a.name, a.description, a.type, a.space_id, a.category, a.prompt, a.user_prompt, a.model || old.model, a.temperature, a.top_p, a.diversity_mode, a.icon, a.context_rounds, a.max_reply, a.opening, a.opening_questions, a.kb_id, a.tools, a.mcp_servers, a.long_memory, a.allow_user_model, a.suggest_enabled, a.variables, a.child_ids, a.routing_mode, a.workflow, a.edit_mode, visibility, vDepts, vMembers, collabs, kbMetaFilter, old.id);
   db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)').run(req.user.username, '编辑智能体', a.name, req.ip, now());
   const nu = db.prepare('SELECT updated_at FROM agents WHERE id=?').get(old.id);
   // P5.12 服务端二次校验（不拦截）：悬空引用清单随保存返回（前端已先校验，双保险/覆盖 API 直改场景）

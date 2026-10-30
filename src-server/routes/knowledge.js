@@ -4,6 +4,7 @@ const { db, now } = require('../db');
 const { auth } = require('../lib/auth');
 const { retrieve, rerankModels } = require('../lib/retriever');
 const { generateForFile } = require('../lib/keywordgen');
+const { extractMetadataForFile, sanitizeMetadata } = require('../lib/kb-metadata'); // V1.2 #2 2026-10-30：自动元数据抽取 + 入参清洗
 const { retrieveGraph } = require('../lib/graphrag');
 
 const router = express.Router();
@@ -34,9 +35,11 @@ function insertFailedFile(kb, name, byteSize, source, errMsg, req) {
 }
 
 router.get('/', (req, res) => {
+  // V1.2 审查加固 2026-10-30：库列表加 owner 过滤——此前任意登录用户可看全平台库名/描述/配置（含
+  // auto_metadata、分块参数），与 agents 挂库归属校验组合是攻击链的侦察环节；管理员仍见全部（管理页需要）
   const rows = db.prepare(`
     SELECT k.*, (SELECT COUNT(*) FROM kb_files f WHERE f.kb_id=k.id) AS file_count
-    FROM kbs k ORDER BY k.id DESC`).all();
+    FROM kbs k WHERE (?='admin' OR k.owner=?) ORDER BY k.id DESC`).all(req.user.role, req.user.username);
   res.json({ code: 0, data: rows });
 });
 
@@ -50,13 +53,15 @@ router.post('/', (req, res) => {
 });
 
 router.put('/:id', (req, res) => {
-  const { name, description, enabled, chunk_size, chunk_overlap, chunk_separator } = req.body || {};
+  const { name, description, enabled, chunk_size, chunk_overlap, chunk_separator, auto_metadata } = req.body || {};
   const old = db.prepare('SELECT * FROM kbs WHERE id=?').get(req.params.id);
   const deny = denyIfNotAllowed(old, req.user);
   if (deny) return res.json(deny);
-  db.prepare('UPDATE kbs SET name=?,description=?,enabled=?,chunk_size=?,chunk_overlap=?,chunk_separator=? WHERE id=?')
+  // V1.2 #2 2026-10-30：auto_metadata 开关归一（0/1；未传保留原值）——开启后上传文件后台 LLM 自动抽取元数据
+  const autoMeta = auto_metadata == null ? (old.auto_metadata ?? 0) : (auto_metadata ? 1 : 0);
+  db.prepare('UPDATE kbs SET name=?,description=?,enabled=?,chunk_size=?,chunk_overlap=?,chunk_separator=?,auto_metadata=? WHERE id=?')
     .run(name || old.name, description ?? old.description, enabled ?? old.enabled,
-      chunk_size ?? old.chunk_size, chunk_overlap ?? old.chunk_overlap, chunk_separator ?? old.chunk_separator, old.id);
+      chunk_size ?? old.chunk_size, chunk_overlap ?? old.chunk_overlap, chunk_separator ?? old.chunk_separator, autoMeta, old.id);
   res.json({ code: 0, msg: '已保存' });
 });
 
@@ -243,6 +248,9 @@ router.post('/:id/files', async (req, res) => {
     .run(req.user.username, '上传知识库文件', `${kb.name} / ${name}（${chunks.length} 片段）`, req.ip, now());
   // 自动关键词/问法生成（2026-10-29）：上传响应后后台 best-effort 生成，不阻塞上传；无模型/失败静默跳过
   generateForFile(info.lastInsertRowid).catch(() => { });
+  // V1.2 #2 2026-10-30：自动元数据抽取——库开启 auto_metadata 时上传后 fire-and-forget 后台抽取
+  // （与 generateForFile 并列）；未开启/无供应商/失败均静默跳过，不阻塞上传
+  if (kb.auto_metadata) extractMetadataForFile(info.lastInsertRowid).catch(() => { });
   res.json({ code: 0, data: { id: info.lastInsertRowid, chunks: chunks.length } });
 });
 
@@ -274,11 +282,28 @@ router.get('/files/:fileId/chunks', (req, res) => {
   const kb = db.prepare('SELECT * FROM kbs WHERE id=?').get(f.kb_id);
   const deny = denyIfNotAllowed(kb, req.user);
   if (deny) return res.json(deny);
-  const rows = db.prepare('SELECT c.id, c.content, c.file_id, c.kb_id, c.keywords FROM kb_chunks c WHERE c.file_id=? ORDER BY c.id').all(req.params.fileId);
+  const rows = db.prepare('SELECT c.id, c.content, c.file_id, c.kb_id, c.keywords, c.metadata FROM kb_chunks c WHERE c.file_id=? ORDER BY c.id').all(req.params.fileId); // V1.2 #2：带出 metadata（分块编辑回显）
   res.json({ code: 0, data: { file: { id: f.id, name: f.name, kb_id: f.kb_id }, chunks: rows } });
 });
 
 // 手动补生成/重新生成关键词+问法（对存量分块，或内容编辑后刷新；无模型时友好提示）
+router.post('/files/:fileId/generate-metadata', async (req, res) => {
+  // V1.2 审查加固 2026-10-30：手动补抽取元数据（复刻 generate-keywords 交互）——先传文件后开
+  // auto_metadata 的存量文件补抽取途径；库未开启开关时显式提示（防误以为已抽取）
+  const f = db.prepare('SELECT * FROM kb_files WHERE id=?').get(req.params.fileId);
+  if (!f) return res.json({ code: 404, msg: '文件不存在' });
+  const kb = db.prepare('SELECT * FROM kbs WHERE id=?').get(f.kb_id);
+  const deny = denyIfNotAllowed(kb, req.user);
+  if (deny) return res.json(deny);
+  const r = await extractMetadataForFile(f.id);
+  if (!r.ok) return res.json({ code: 400, msg: r.msg });
+  if (r.skipped === 'no_provider') return res.json({ code: 0, data: { ...r, msg: '未配置可用模型供应商，已跳过抽取' } });
+  if (r.skipped === 'disabled') return res.json({ code: 400, msg: '该库未开启「自动元数据」，请先在库设置中开启' });
+  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
+    .run(req.user.username, '补抽取元数据', `${kb.name} / ${f.name}（成功 ${r.extracted}/${r.total}）`, req.ip, now());
+  res.json({ code: 0, data: r });
+});
+
 router.post('/files/:fileId/generate-keywords', async (req, res) => {
   const f = db.prepare('SELECT * FROM kb_files WHERE id=?').get(req.params.fileId);
   if (!f) return res.json({ code: 404, msg: '文件不存在' });
@@ -293,16 +318,22 @@ router.post('/files/:fileId/generate-keywords', async (req, res) => {
   res.json({ code: 0, data: r });
 });
 
-// 更新单个 chunk 内容
+// 更新单个 chunk 内容（V1.2 #2 2026-10-30：同步接受 metadata 手工编辑——sanitizeMetadata 清洗后存 JSON 字符串；null/空对象存 NULL 即清除）
 router.put('/chunks/:chunkId', (req, res) => {
   const c = db.prepare('SELECT * FROM kb_chunks WHERE id=?').get(req.params.chunkId);
   if (!c) return res.json({ code: 404, msg: '分块不存在' });
   const kb = db.prepare('SELECT * FROM kbs WHERE id=?').get(c.kb_id);
   const deny = denyIfNotAllowed(kb, req.user);
   if (deny) return res.json(deny);
-  const { content } = req.body || {};
+  const { content, metadata } = req.body || {};
   if (content == null) return res.json({ code: 400, msg: '请提供内容' });
-  db.prepare('UPDATE kb_chunks SET content=? WHERE id=?').run(String(content || ''), c.id);
+  if (metadata !== undefined) {
+    const clean = sanitizeMetadata(metadata);
+    const metaSql = Object.keys(clean).length ? JSON.stringify(clean) : null;
+    db.prepare('UPDATE kb_chunks SET content=?, metadata=? WHERE id=?').run(String(content || ''), metaSql, c.id);
+  } else {
+    db.prepare('UPDATE kb_chunks SET content=? WHERE id=?').run(String(content || ''), c.id);
+  }
   // 更新文件 chunk_count（不做严格同步，简单 +1 即可）
   res.json({ code: 0, msg: '分块已更新' });
 });
@@ -341,17 +372,29 @@ router.get('/rerank-models', (req, res) => {
 
 // 召回测试（混合检索：BM25 + 向量加权 RRF 融合 + 可选 Rerank；P2 升级 async 双引擎，2026-10-29 支持权重/重排可视化参数）
 router.post('/recall-test', async (req, res) => {
-  const { kb_id, file_id, query, top_n, threshold, vector_weight, rerank_model, rerank_enabled } = req.body || {};
+  const { kb_id, file_id, query, top_n, threshold, vector_weight, rerank_model, rerank_enabled, metadataFilter } = req.body || {};
   if (!query?.trim()) return res.json({ code: 400, msg: '请输入测试问题' });
   let kbId = kb_id || null;
   if (file_id) {
     const f = db.prepare('SELECT * FROM kb_files WHERE id=?').get(file_id);
     kbId = f ? f.kb_id : kbId;
   }
+  // V1.1 读侧收口（V1.2 #2 2026-10-30 补齐）：召回测试可检索他人库内容，同样属读越权——
+  // 与 logs/files 同模式先查 kb 校验归属；未指定库（全库检索）无归属可校验，仅管理员放行（fail-closed）
+  if (kbId) {
+    const kb = db.prepare('SELECT * FROM kbs WHERE id=?').get(kbId);
+    const deny = denyIfNotAllowed(kb, req.user);
+    if (deny) return res.json(deny);
+  } else if (req.user.role !== 'admin') {
+    return res.json({ code: 403, msg: '请选择知识库后测试（全库检索仅管理员可用）' });
+  }
+  // V1.2 #2 2026-10-30：元数据过滤参数——sanitizeMetadata 清洗后传 retrieve；空对象不传（与无过滤行为一致）
+  const mFilter = sanitizeMetadata(metadataFilter);
   const hits = await retrieve(query, kbId, top_n || 5, threshold ?? 0.01, {
     vecWeight: vector_weight,               // 向量权重 0~1（默认 0.5，滑块实时调）
     rerankModel: rerank_model || null,      // 重排模型（下拉选择）
     rerankEnabled: rerank_enabled !== false, // 重排开关（对比效果用）
+    ...(Object.keys(mFilter).length ? { metadataFilter: mFilter } : {}), // V1.2 #2：非空才下发（AND 语义，fail-closed）
   });
   res.json({ code: 0, data: { query, hits, count: hits.length, mode: 'hybrid' } });
 });
@@ -360,8 +403,39 @@ router.post('/recall-test', async (req, res) => {
 router.post('/:id/graph-search', async (req, res) => {
   const { query, top_k } = req.body || {};
   if (!query?.trim()) return res.json({ code: 400, msg: '请输入查询内容' });
+  // V1.1 读侧收口（V1.2 #2 2026-10-30 补齐）：图谱检索同样暴露库内容，与 logs/files 同模式校验归属
+  const kb = db.prepare('SELECT * FROM kbs WHERE id=?').get(req.params.id);
+  const deny = denyIfNotAllowed(kb, req.user);
+  if (deny) return res.json(deny);
   const data = retrieveGraph(query, req.params.id, top_k || 5);
   res.json({ code: 0, data });
+});
+
+// V1.2 #2 2026-10-30：元数据筛选选项——返回该库全部分块的 distinct 元数据键值聚合（前端筛选下拉数据源）。
+// metadata 为 JSON 文本，从 JS 侧解析聚合（SQL 不便按键展开）；损坏 JSON/非对象值跳过；owner/admin 可见（denyIfNotAllowed 同权）
+router.get('/:id/meta-options', (req, res) => {
+  const kb = db.prepare('SELECT * FROM kbs WHERE id=?').get(req.params.id);
+  const deny = denyIfNotAllowed(kb, req.user);
+  if (deny) return res.json(deny);
+  const rows = db.prepare("SELECT c.metadata FROM kb_chunks c WHERE c.kb_id=? AND c.metadata IS NOT NULL AND c.metadata != ''").all(kb.id);
+  const byKey = new Map(); // 键 → Set(去重值集）
+  for (const r of rows) {
+    let meta = null;
+    try { meta = JSON.parse(r.metadata); } catch { continue; } // 损坏 JSON 跳过
+    if (!meta || typeof meta !== 'object' || Array.isArray(meta)) continue;
+    for (const [k, v] of Object.entries(meta)) {
+      if (!k || !k.trim()) continue;
+      if (!byKey.has(k)) byKey.set(k, new Set());
+      const set = byKey.get(k);
+      if (typeof v === 'string') { if (v) set.add(v); }
+      else if (Array.isArray(v)) v.forEach(x => { if (typeof x === 'string' && x) set.add(x); }); // 数组值摊平进选项集
+    }
+  }
+  // V1.2 审查加固 2026-10-30：返回 {keys, options} 双结构——原平铺写法在自定义键恰为 "keys" 时会覆盖
+  // 键列表字段（sanitizeMetadata 键白名单不设限）；options 内为全部键的 distinct 值集，keys 为键名列表
+  const options = {};
+  for (const [k, set] of byKey) options[k] = [...set];
+  res.json({ code: 0, data: { keys: [...byKey.keys()], options } });
 });
 
 module.exports = router;

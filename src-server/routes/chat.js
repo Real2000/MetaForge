@@ -18,6 +18,10 @@ const { finishExternalTurn } = require('../lib/chat-sink'); // P5.33：外部/�
 
 const router = express.Router();
 
+// V1.2 审查加固 2026-10-30：resolveKbFilter 迁至 lib/kb-metadata.js（chat/share/openapi/workflow 四链路共用；
+// 挂 router 导出会引发 workflow→chat 循环依赖）；此处引用，文件尾透传导出（smoke 单测沿用 chat.js 入口）
+const { resolveKbFilter } = require('../lib/kb-metadata');
+
 // P5.25 工具确认等待队列（模块级）：stream 请求注册等待 → /confirm 决议路由跨请求唤醒
 const toolConfirmRegistry = new Map(); // key → { resolve, username, expires }
 router.use(auth);
@@ -169,7 +173,8 @@ function buildChildTools(childIds) {
   try { ids = JSON.parse(childIds || '[]'); } catch { }
   if (!ids.length) return [];
   // P3 修复（2026-10-22）：补 tools/mcp_servers 列——子智能体编排执行时同样启用其挂载的工具
-  const children = db.prepare(`SELECT id,name,description,prompt,model,temperature,top_p,max_reply,kb_id,tools,mcp_servers FROM agents WHERE id IN (${ids.map(() => '?').join(',')}) AND status='published'`).all(...ids);
+  // V1.2 #2 2026-10-30：补 kb_metadata_filter 列——子智能体知识库检索同样联动其元数据过滤声明
+  const children = db.prepare(`SELECT id,name,description,prompt,model,temperature,top_p,max_reply,kb_id,kb_metadata_filter,tools,mcp_servers FROM agents WHERE id IN (${ids.map(() => '?').join(',')}) AND status='published'`).all(...ids);
   return children.map(c => ({
     schema: {
       type: 'function',
@@ -188,11 +193,13 @@ function buildChildTools(childIds) {
 }
 
 /** 执行子智能体：注入其提示词 + 知识库检索；P3 修复（2026-10-22）：子智能体配置了工具/MCP 时
- *  走 chat() 完整工具循环（真实执行 function calling），而非 chatOnce 纯文本一次性调用（防 LLM 编造工具输出）；无工具时保持原链路 */
-async function runChildAgent(child, task, maxReply) {
+ *  走 chat() 完整工具循环（真实执行 function calling），而非 chatOnce 纯文本一次性调用（防 LLM 编造工具输出）；无工具时保持原链路
+ *  V1.2 #2 2026-10-30：user 参数——子智能体检索同样按其 kb_metadata_filter 过滤（$user.dept 按发起用户部门解析） */
+async function runChildAgent(child, task, maxReply, user) {
   let system = child.prompt || '你是「' + child.name + '」，请专业、准确地完成交给你的任务。';
   if (child.kb_id) {
-    const hits = await retrieve(task, child.kb_id, 4);
+    // V1.2 #2：子智能体知识库检索联动元数据过滤（原调用仅 3 参，threshold 0.01 为其原默认值）
+    const hits = await retrieve(task, child.kb_id, 4, 0.01, { metadataFilter: resolveKbFilter(child, user) || undefined });
     if (hits.length) {
       system += `\n\n以下是知识库检索到的相关内容，请优先依据这些内容：\n${hits.map((h, i) => `[${i + 1}] ${h.content}`).join('\n')}`;
     }
@@ -216,7 +223,8 @@ async function runChildAgent(child, task, maxReply) {
         if (name === 'create_task' || name === 'local_exec') {
           return `⛔ 工具 ${name} 不允许在子智能体执行上下文中调用——请直接完成当前任务，不要尝试创建新任务或操作本地设备。`;
         }
-        return runTool(name, argsJson, { kbId: child.kb_id || null, mcpServers: child.mcp_servers || '[]' });
+        // V1.2 审查加固 2026-10-30：子智能体工具执行同样受元数据过滤约束（kb_search 旁路收口）
+        return runTool(name, argsJson, { kbId: child.kb_id || null, mcpServers: child.mcp_servers || '[]', metadataFilter: resolveKbFilter(child, user) || undefined });
       },
     });
     let full = '';
@@ -669,7 +677,10 @@ router.post('/stream', async (req, res) => {
     let kbContext = [];
     let kbHits = [];
     if (agent && agent.kb_id) {
-      kbHits = await retrieve(chatInput.trim() || input, agent.kb_id, 5);
+      // V1.2 #2 2026-10-30：元数据过滤联动——resolveKbFilter 解析 agent.kb_metadata_filter
+      // （$user.dept 占位符按请求用户部门替换）；有过滤且无命中即无上下文（fail-closed 设计语义，不兑底放开）。
+      // threshold 0.01 为原 3 参调用的默认值，显式写出保语义不变
+      kbHits = await retrieve(chatInput.trim() || input, agent.kb_id, 5, 0.01, { metadataFilter: resolveKbFilter(agent, req.user) || undefined });
       kbContext = kbHits.map(h => h.content);
       if (kbHits.length) send('kb', { hits: kbHits });
     }
@@ -861,7 +872,7 @@ router.post('/stream', async (req, res) => {
         const tname = `agent_call_${hit.child.id}`;
         send('tool', { name: tname, status: 'executing' });
         try {
-          const r = await runChildAgent(hit.child, input, agent?.max_reply);
+          const r = await runChildAgent(hit.child, input, agent?.max_reply, req.user);
           toolTrace.push({ name: tname, result: `分类器直达（置信度 ${Math.round(hit.confidence * 100)}%：${hit.reason}）` });
           send('tool', { name: tname, status: 'finished', result: r.slice(0, 200) });
           const outText = r + `\n\n> 🧭 由子智能体「${hit.child.name}」直接处理（路由置信度 ${Math.round(hit.confidence * 100)}%）`;
@@ -907,10 +918,12 @@ router.post('/stream', async (req, res) => {
         if (!c) return '未知子智能体：' + name;
         let args = {};
         try { args = JSON.parse(argsJson || '{}'); } catch { }
-        return runChildAgent(c.child, args.task, agent?.max_reply).then(r => `子智能体「${c.child.name}」的执行结果：\n${r}`);
+        return runChildAgent(c.child, args.task, agent?.max_reply, req.user).then(r => `子智能体「${c.child.name}」的执行结果：\n${r}`);
       }
       // P5.27：ctx 补 username——local_exec 按用户路由到其默认设备
-      return runTool(name, argsJson, { kbId: agent?.kb_id || null, mcpServers: agent?.mcp_servers || '[]', username: req.user.username });
+      // V1.2 审查加固 2026-10-30：主链路工具执行同样受智能体元数据过滤约束（kb_search 旁路收口——
+      // 否则主链路检索被过滤，LLM 经 function calling 调 kb_search 却全库检索，机密分块经工具结果回流对话）
+      return runTool(name, argsJson, { kbId: agent?.kb_id || null, mcpServers: agent?.mcp_servers || '[]', username: req.user.username, metadataFilter: resolveKbFilter(agent, req.user) || undefined });
     };
     const gen = workflowGen || classifierGen || chat(messages, {
       model: model || agent?.model,
@@ -1086,4 +1099,6 @@ router.get('/video/tasks/:taskId/content', async (req, res) => {
   res.status(502).json({ code: 502, msg: '获取视频内容失败' + (lastErr ? '（' + lastErr + '）' : '') });
 });
 
+// V1.2 #2 2026-10-30：resolveKbFilter 挂到 router 导出上（冒烟用例直测占位符替换/fail-closed 语义，无需起服务）
 module.exports = router;
+module.exports.resolveKbFilter = resolveKbFilter;

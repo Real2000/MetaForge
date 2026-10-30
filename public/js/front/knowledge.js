@@ -117,7 +117,27 @@ export async function render(el) {
     paneKb.querySelectorAll('[data-chunks]').forEach(b => b.onclick = () => openChunks(+b.dataset.chunks));
   }
 
-  // 查看分块弹窗（2026-10-29 增补：关键词/问法标签展示 + AI 生成关键词）
+  // ---------- 分块元数据工具（V1.2 #2 2026-10-30）----------
+  // kb_chunks.metadata 为 JSON 对象（约定键 dept/level/doc_type）；兼容后端返回对象或 JSON 字符串两种形态
+  function parseChunkMeta(m) {
+    if (m == null) return null;
+    if (typeof m === 'object' && !Array.isArray(m)) return m;
+    if (typeof m === 'string') { try { const v = JSON.parse(m); return (v && typeof v === 'object' && !Array.isArray(v)) ? v : null; } catch { return null; } }
+    return null;
+  }
+  // 约定键中文标签（非约定键展示 原键:值）
+  const META_KEY_LABEL = { dept: '部门', level: '密级', doc_type: '文档类型' };
+  // 元数据徽章串：约定键只显示值（如 🏷 产品部 · 公开），其余键显示 键:值
+  function metaBadgeHtml(m) {
+    const obj = parseChunkMeta(m);
+    if (!obj) return '';
+    const parts = Object.entries(obj).slice(0, 6).map(([k, v]) =>
+      META_KEY_LABEL[k] ? esc(String(v)) : `${esc(k)}:${esc(String(v))}`).join(' · ');
+    if (!parts) return '';
+    return `<div style="margin-top:6px"><span class="tag gray" style="font-size:10px" title="${esc(Object.entries(obj).map(([k, v]) => `${k}=${v}`).join('；'))}">🏷 ${parts}</span></div>`;
+  }
+
+  // 查看分块弹窗（2026-10-29 增补：关键词/问法标签展示 + AI 生成关键词；V1.2 #2：元数据展示 + 结构化编辑）
   async function openChunks(fileId) {
     const j = await api(`/knowledge/files/${fileId}/chunks`);
     const { file, chunks } = j.data;
@@ -133,7 +153,10 @@ export async function render(el) {
     const body = `
         <div style="font-size:13px;color:var(--text-3);margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
           <span>文件：${esc(file.name)}（共 ${chunks.length} 个片段）</span>
-          <button class="btn sm" data-gen-kw="${file.id}" title="用已配置模型为每个分块生成检索关键词与问法">✨ AI 生成关键词</button>
+          <div style="display:flex;gap:6px">
+            <button class="btn sm" data-gen-meta="${file.id}" title="用已配置模型为每个分块抽取部门/密级/文档类型元数据（V1.2 审查加固：先传文件后开开关的存量文件补抽取途径）">🏷 AI 补抽取元数据</button>
+            <button class="btn sm" data-gen-kw="${file.id}" title="用已配置模型为每个分块生成检索关键词与问法">✨ AI 生成关键词</button>
+          </div>
         </div>
         <div style="max-height:500px;overflow-y:auto">${chunks.map((c, i) => `
           <div class="card" style="box-shadow:none;border:1px solid var(--border);margin-bottom:8px" data-chunk-id="${c.id}">
@@ -146,6 +169,7 @@ export async function render(el) {
               </div>
             </div>
             <div style="font-size:12px;color:var(--text-2);line-height:1.7;white-space:pre-wrap;word-break:break-word">${esc(c.content)}</div>
+            ${metaBadgeHtml(c.metadata)}
             ${metaTags(c.keywords)}
           </div>`).join('')}
         </div>`;
@@ -164,17 +188,22 @@ export async function render(el) {
             close(); openChunks(fileId); // 重新打开以刷新关键词标签
           } catch (e) { toast(e.message, 'err'); btn.disabled = false; btn.textContent = '✨ AI 生成关键词'; }
         });
-          mask.querySelectorAll('[data-edit-chunk]').forEach(btn => btn.onclick = async () => {
+        // V1.2 审查加固 2026-10-30：AI 补抽取元数据（存量文件在开启 auto_metadata 前上传的补抽取途径）
+        mask.querySelectorAll('[data-gen-meta]').forEach(btn => btn.onclick = async () => {
+          if (!await confirmBox('将为该文件全部分块调用模型抽取部门/密级/文档类型元数据（已有手工值优先，仅填缺失键），继续？')) return;
+          btn.disabled = true; btn.textContent = '⏳ 抽取中…';
+          try {
+            const r = await api(`/knowledge/files/${fileId}/generate-metadata`, { method: 'POST' });
+            if (r.data?.skipped === 'no_provider') toast('未配置可用模型供应商，已跳过', 'err');
+            else toast(`抽取完成：成功 ${r.data?.extracted ?? 0} / 共 ${r.data?.total ?? 0} 个分块`);
+            close(); openChunks(fileId); // 重新打开以刷新元数据徽章
+          } catch (e) { toast(e.message, 'err'); btn.disabled = false; btn.textContent = '🏷 AI 补抽取元数据'; }
+        });
+          mask.querySelectorAll('[data-edit-chunk]').forEach(btn => btn.onclick = () => {
             const cid = btn.dataset.editChunk;
-            const card = mask.querySelector(`[data-chunk-id="${cid}"]`);
-            const contentDiv = card?.querySelector('div:last-child');
-            if (!contentDiv) return;
-            const cur = contentDiv.textContent;
-            const newContent = prompt('编辑分块内容：', cur);
-            if (newContent == null || newContent === cur) return;
-            await api(`/knowledge/chunks/${cid}`, { method: 'PUT', body: { content: newContent } });
-            toast('已更新');
-            contentDiv.textContent = newContent;
+            const chunk = chunks.find(c => String(c.id) === String(cid));
+            if (!chunk) return;
+            openChunkEdit(chunk, fileId); // V1.2 #2：prompt 简易编辑升级为内容 + 元数据结构化编辑弹窗
           });
           mask.querySelectorAll('[data-del-chunk]').forEach(btn => btn.onclick = async () => {
             if (!await confirmBox('确定删除该分块？')) return;
@@ -199,6 +228,70 @@ export async function render(el) {
           });
         },
       });
+  }
+
+  // 分块编辑弹窗（V1.2 #2 2026-10-30）：内容 + 元数据结构化编辑（部门/密级/文档类型 + 「更多键」折叠 JSON）
+  function openChunkEdit(chunk, fileId) {
+    const meta = parseChunkMeta(chunk.metadata) || {};
+    const LEVEL_OPTS = ['公开', '内部', '机密'];
+    const body = `
+      <div class="form-item"><label>分块内容</label>
+        <textarea class="input" id="ce_content" style="min-height:140px;font-size:12px;line-height:1.7">${esc(chunk.content)}</textarea>
+      </div>
+      <hr>
+      <div style="font-size:13px;font-weight:600;color:var(--text);margin:10px 0 6px">🏷 元数据<span style="font-weight:400;font-size:11px;color:var(--text-3)">（用于检索权限过滤，可留空）</span></div>
+      <div class="form-row">
+        <div class="form-item"><label>部门（dept）</label><input class="input" id="ce_dept" maxlength="32" value="${esc(String(meta.dept ?? ''))}" placeholder="如：产品部"></div>
+        <div class="form-item"><label>密级（level）</label>
+          <select class="input" id="ce_level">
+            <option value="">无</option>
+            ${LEVEL_OPTS.map(l => `<option value="${l}" ${meta.level === l ? 'selected' : ''}>${l}</option>`).join('')}
+          </select>
+        </div>
+      </div>
+      <div class="form-item"><label>文档类型（doc_type）</label><input class="input" id="ce_doc_type" maxlength="32" value="${esc(String(meta.doc_type ?? ''))}" placeholder="如：员工手册"></div>
+      <details style="margin-top:4px">
+        <summary style="font-size:12px;color:var(--text-2);cursor:pointer;user-select:none">⚙️ 更多键（高级：直接编辑完整 JSON 对象）</summary>
+        <div class="form-item" style="margin-top:8px">
+          <textarea class="input" id="ce_json" style="min-height:110px;font-family:monospace;font-size:12px" spellcheck="false">${esc(JSON.stringify(meta, null, 2))}</textarea>
+          <div class="hint">完整元数据对象（含上述三个键与自定义键）；修改后保存时以本 JSON 为准。全部删除并留空 {} 将清空该分块元数据。</div>
+        </div>
+      </details>`;
+    modal({
+      title: `编辑分块 #${chunk.id}`, body, wide: true,
+      foot: '<button class="btn" data-cancel>取消</button><button class="btn primary" data-save>保存</button>',
+      onMount(mask, close) {
+        let jsonDirty = false; // 用户是否手动改过高级 JSON（改过则以 JSON 为准，三个快捷输入不再覆盖）
+        const jsonTa = mask.querySelector('#ce_json');
+        jsonTa.addEventListener('input', () => { jsonDirty = true; });
+        mask.querySelector('[data-cancel]').onclick = close;
+        mask.querySelector('[data-save]').onclick = async () => {
+          // 组装 metadata：动过高级 JSON → 以解析结果为准（校验失败拦截保存）；未动过 → 三个快捷输入覆盖约定键，其余键原样保留
+          let newMeta;
+          if (jsonDirty) {
+            try {
+              newMeta = JSON.parse(jsonTa.value);
+              if (!newMeta || typeof newMeta !== 'object' || Array.isArray(newMeta)) throw new Error('不是 JSON 对象');
+            } catch (e) { toast(`高级 JSON 格式错误：${e.message}，请修正后再保存`, 'err'); return; }
+          } else {
+            newMeta = { ...meta }; // 保留非约定键
+            const dept = mask.querySelector('#ce_dept').value.trim();
+            const level = mask.querySelector('#ce_level').value;
+            const docType = mask.querySelector('#ce_doc_type').value.trim();
+            if (dept) newMeta.dept = dept; else delete newMeta.dept;
+            if (level) newMeta.level = level; else delete newMeta.level;
+            if (docType) newMeta.doc_type = docType; else delete newMeta.doc_type;
+          }
+          // 空对象 → null（契约：清空元数据）
+          if (!newMeta || !Object.keys(newMeta).length) newMeta = null;
+          try {
+            await api(`/knowledge/chunks/${chunk.id}`, { method: 'PUT', body: { content: mask.querySelector('#ce_content').value, metadata: newMeta } });
+            toast('分块已保存'); close();
+            openChunks(fileId); // 重新打开以刷新元数据徽章
+          } catch (e) { toast(e.message, 'err'); }
+        };
+      },
+    });
   }
 
   function openNewKb() {
@@ -237,7 +330,18 @@ export async function render(el) {
         <input class="input" id="kb_chunk_overlap" type="range" min="0" max="${(kb.chunk_size || 500) - 1}" value="${kb.chunk_overlap || 0}" style="vertical-align:middle">
         <span class="tag gray" id="kb_chunk_overlap_val" style="font-size:13px;margin-left:8px">${kb.chunk_overlap || 0}</span>
       </div>
-      <div class="form-item"><label>分隔符（正则）</label><input class="input" id="kb_chunk_sep" value="${esc(kb.chunk_separator || '\\n\\s*\\n')}" placeholder="默认：\\n\\s*\\n"><div style="font-size:11px;color:var(--text-3)">用于按段落切分，正则表达式格式，默认按空行分段。</div></div>`;
+      <div class="form-item"><label>分隔符（正则）</label><input class="input" id="kb_chunk_sep" value="${esc(kb.chunk_separator || '\\n\\s*\\n')}" placeholder="默认：\\n\\s*\\n"><div style="font-size:11px;color:var(--text-3)">用于按段落切分，正则表达式格式，默认按空行分段。</div></div>
+      <hr>
+      <div style="font-size:13px;font-weight:600;color:var(--text);margin:10px 0 6px">元数据</div>
+      <div class="form-item"><label>自动元数据</label>
+        <div style="display:flex;align-items:center;gap:10px;padding:10px;border:1px solid var(--border);border-radius:8px">
+          <span class="switch ${kb.auto_metadata ? 'on' : ''}" id="kb_auto_meta"></span>
+          <div style="flex:1">
+            <b style="font-size:13px">AI 自动抽取元数据</b>
+            <div class="hint">开启后上传文件由 AI 自动抽取部门/密级/文档类型元数据，用于检索权限过滤（需已配置模型）</div>
+          </div>
+        </div>
+      </div>`;
     modal({
       title: '编辑知识库', body,
       foot: '<button class="btn" data-cancel>取消</button><button class="btn primary" data-save>保存</button>',
@@ -254,6 +358,9 @@ export async function render(el) {
         const overlapInput = mask.querySelector('#kb_chunk_overlap');
         const overlapVal = mask.querySelector('#kb_chunk_overlap_val');
         overlapInput.oninput = () => { overlapVal.textContent = overlapInput.value; };
+        // V1.2 #2：自动元数据开关（点按切换，不随其它字段联动）
+        const autoMetaSw = mask.querySelector('#kb_auto_meta');
+        autoMetaSw.onclick = () => autoMetaSw.classList.toggle('on');
         mask.querySelector('[data-save]').onclick = async () => {
           const chunkSize = Math.min(2000, Math.max(100, +sizeInput.value)) || 500;
           const chunkOverlap = Math.min(chunkSize - 1, Math.max(0, +mask.querySelector('#kb_chunk_overlap').value)) || 0;
@@ -264,6 +371,7 @@ export async function render(el) {
             chunk_size: chunkSize,
             chunk_overlap: chunkOverlap,
             chunk_separator: mask.querySelector('#kb_chunk_sep').value || '\\n\\s*\\n',
+            auto_metadata: autoMetaSw.classList.contains('on') ? 1 : 0, // V1.2 #2：自动元数据开关
           } });
           toast('已保存'); close(); loadKbs().then(() => { current = kbs.find(x => x.id === kb.id); renderKbList(); });
         };
@@ -444,6 +552,41 @@ export async function render(el) {
   }
 
   // ---------- 召回测试（2026-10-29 可视化升级：向量权重滑块 + Rerank 模型下拉 + 阈值滑块 + 命中高亮 + 命中通道标识） ----------
+  // V1.2 #2 2026-10-30：检索过滤（元数据）——选中具体库后懒加载 GET /knowledge/:id/meta-options（一次缓存）；
+  // 失败/未选库（全部启用）时静默隐藏该区；查询把非空选择组装成 metadataFilter 传 recall-test
+  let metaOpts = null;       // {dept:[],level:[]} | null（未加载或不可用）
+  let metaOptsKbId = null;   // 已缓存的库 id（懒加载一次）
+
+  async function loadMetaOptions(kbId) {
+    if (kbId === metaOptsKbId) return; // 已缓存
+    metaOpts = null; metaOptsKbId = null;
+    if (!kbId) { toggleMetaFilterArea(false); return; } // 「全部启用的知识库」无可过滤维度
+    try {
+      const j = await api(`/knowledge/${kbId}/meta-options`);
+      const d = j.data || {};
+      // V1.2 审查加固 2026-10-30：适配 {keys, options} 双结构（原平铺结构自定义键 "keys" 会覆盖键列表）
+      const opt = d.options || d;
+      metaOpts = { dept: opt.dept || [], level: opt.level || [] };
+      metaOptsKbId = kbId;
+      renderMetaFilterSelects();
+      toggleMetaFilterArea(true);
+    } catch { toggleMetaFilterArea(false); } // 404/403/网络失败：静默隐藏，不阻塞召回测试主流程
+  }
+
+  function toggleMetaFilterArea(show) {
+    const area = paneRecall.querySelector('#r_meta_filter');
+    if (area) area.style.display = show && metaOpts ? '' : 'none';
+  }
+
+  function renderMetaFilterSelects() {
+    const selDept = paneRecall.querySelector('#r_mf_dept');
+    const selLevel = paneRecall.querySelector('#r_mf_level');
+    if (!selDept || !selLevel || !metaOpts) return;
+    selDept.innerHTML = `<option value="">部门：不过滤</option>` +
+      metaOpts.dept.map(d => `<option value="${esc(d)}">${esc(d)}</option>`).join('');
+    selLevel.innerHTML = `<option value="">密级：不过滤</option>` +
+      metaOpts.level.map(l => `<option value="${esc(l)}">${esc(l)}</option>`).join('');
+  }
 
   /** 命中词高亮：先转义再替换（安全），长词优先避免碎片化 */
   function highlightTerms(text, hitTerms) {
@@ -482,6 +625,15 @@ export async function render(el) {
           <div class="form-item"><label>知识库范围</label>
             <select class="input" id="r_kb"><option value="">全部启用的知识库</option>${kbs.map(k => `<option value="${k.id}">${esc(k.name)}</option>`).join('')}</select>
           </div>
+          <div class="form-item" id="r_meta_filter" style="display:none">
+            <label>检索过滤（元数据）</label>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+              <select class="input" id="r_mf_dept" style="flex:1;min-width:130px"><option value="">部门：不过滤</option></select>
+              <select class="input" id="r_mf_level" style="flex:1;min-width:130px"><option value="">密级：不过滤</option></select>
+              <button class="btn" id="r_mf_clear" title="清空两个过滤下拉">清除过滤</button>
+            </div>
+            <div class="hint">按分块元数据过滤命中结果（部门/密级）；选项来自该库已录入的元数据值</div>
+          </div>
           <div class="form-row">
             <div class="form-item"><label>Top N</label><input class="input" id="r_top" type="number" value="5" min="1" max="20"></div>
             <div class="form-item"><label>混合得分阈值（RRF）</label>
@@ -512,6 +664,15 @@ export async function render(el) {
         </div>
       </div>`;
 
+    // V1.2 #2：选中具体库后懒加载元数据选项（一次缓存；失败静默隐藏过滤区）
+    const kbSel = paneRecall.querySelector('#r_kb');
+    kbSel.onchange = () => loadMetaOptions(+kbSel.value || null);
+    paneRecall.querySelector('#r_mf_clear').onclick = () => {
+      const d = paneRecall.querySelector('#r_mf_dept'); const l = paneRecall.querySelector('#r_mf_level');
+      if (d) d.value = ''; if (l) l.value = '';
+      toast('已清除检索过滤');
+    };
+
     // 滑块实时数值联动
     const vwEl = paneRecall.querySelector('#r_vw');
     vwEl.oninput = () => {
@@ -524,6 +685,12 @@ export async function render(el) {
     paneRecall.querySelector('#r_run').onclick = async () => {
       const q = paneRecall.querySelector('#r_q').value.trim();
       if (!q) return toast('请输入测试问题', 'err');
+      // V1.2 #2：组装 metadataFilter（仅收集非空选择；未加载/隐藏时下拉取值为空自然不带）
+      const mfDept = paneRecall.querySelector('#r_mf_dept')?.value || '';
+      const mfLevel = paneRecall.querySelector('#r_mf_level')?.value || '';
+      const metadataFilter = {};
+      if (mfDept) metadataFilter.dept = mfDept;
+      if (mfLevel) metadataFilter.level = mfLevel;
       try {
         const j = await api('/knowledge/recall-test', {
           method: 'POST',
@@ -535,6 +702,7 @@ export async function render(el) {
             vector_weight: +vwEl.value,
             rerank_model: paneRecall.querySelector('#r_rm').value || null,
             rerank_enabled: paneRecall.querySelector('#r_rr').checked,
+            ...(Object.keys(metadataFilter).length ? { metadataFilter } : {}), // 空过滤不携带该字段
           },
         });
         paneRecall.querySelector('#r_stat').textContent = `命中 ${j.data.count} 条`;
@@ -548,9 +716,21 @@ export async function render(el) {
               <span>${channelTag(h.channels)} <span class="tag blue">融合 ${h.score}</span> <span class="tag gray" style="font-size:10px">BM25 ${h.bm25}</span> <span class="tag gray" style="font-size:10px">向量 ${h.vec}</span> ${rrTag} ${engTag}</span>
             </div>
             <div style="font-size:13px;color:var(--text-2);line-height:1.7">${highlightTerms(h.content, h.hit_terms)}</div>
+            ${metaBadgeHtml(h.metadata)}
           </div>`;
         }).join('') || '<div class="empty-box"><div class="big">🈳</div>未命中任何片段，可调整阈值或补充知识库内容</div>';
-      } catch (e) { toast(e.message, 'err'); }
+      } catch (e) {
+        // V1.2 #2：recall-test 已收紧为 owner/admin——非 owner 调用业务码 403 时优雅提示并清空结果区，不卡 UI；
+        // V1.2 审查加固：文案透传后端 msg（区分「无权测试该库」与「全库检索仅管理员」两种 403）
+        if (e.code === 403) {
+          const m403 = e.message || '无权测试该知识库（仅创建者或管理员）';
+          toast(m403, 'err');
+          paneRecall.querySelector('#r_stat').textContent = '';
+          paneRecall.querySelector('#r_hits').innerHTML = `<div class="empty-box"><div class="big">🔒</div>${esc(m403)}</div>`;
+          return;
+        }
+        toast(e.message, 'err');
+      }
     };
   }
 
