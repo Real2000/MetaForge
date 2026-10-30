@@ -4,6 +4,7 @@ const { db, now } = require('../db');
 const { auth } = require('../lib/auth');
 const { retrieve, rerankModels } = require('../lib/retriever');
 const { generateForFile } = require('../lib/keywordgen');
+const { retrieveGraph } = require('../lib/graphrag');
 
 const router = express.Router();
 router.use(auth);
@@ -270,6 +271,14 @@ router.post('/recall-test', async (req, res) => {
     rerankEnabled: rerank_enabled !== false, // 重排开关（对比效果用）
   });
   res.json({ code: 0, data: { query, hits, count: hits.length, mode: 'hybrid' } });
+});
+
+// 知识图谱检索（GraphRAG）：给定查询文本，返回已知实体与关联关系上下文
+router.post('/:id/graph-search', async (req, res) => {
+  const { query, top_k } = req.body || {};
+  if (!query?.trim()) return res.json({ code: 400, msg: '请输入查询内容' });
+  const data = retrieveGraph(query, req.params.id, top_k || 5);
+  res.json({ code: 0, data });
 });
 
 module.exports = router;

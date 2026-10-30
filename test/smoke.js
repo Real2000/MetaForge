@@ -2784,7 +2784,7 @@ function t(name, fn) {
       const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all();
       // token_blacklist 是临时表才存在，种子数据不存在时不计数
       const tableNames = tables.map(r => r.name);
-      const expected = 40; // 对照：db.js 中 CREATE TABLE 语句数
+      const expected = 42; // 对照：db.js 中 CREATE TABLE 语句数，P0-5 新增 entities + entity_relations
       const hasTokenBlacklist = tableNames.includes('token_blacklist');
       // token_blacklist 是动态决定是否存在的，不算标准建表数
       assert.ok(tables.length >= expected, `建表数 ${tables.length} 应 ≥ ${expected}（当前可能缺表：${tableNames.filter(n => !tables.some(t => t.name === n)).join(',')}）`);

@@ -1217,9 +1217,54 @@ CREATE TABLE IF NOT EXISTS token_blacklist (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_token_blacklist_jti ON token_blacklist(jti);
+-- P0-5 2026-10-30 GraphRAG 知识图谱索引——实体表+关系表
+CREATE TABLE IF NOT EXISTS entities (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  type TEXT NOT NULL,             -- organization / person / geo / event / category / other
+  description TEXT DEFAULT '',
+  kb_ids TEXT DEFAULT '[]',        -- 关联的知识库 ID 列表 [1,2,3]
+  created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS entity_relations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_id INTEGER NOT NULL,
+  target_id INTEGER NOT NULL,
+  relation TEXT NOT NULL,          -- 关系类型（如「属于」「负责」「关联」等）
+  weight REAL DEFAULT 1.0,        -- 关系强度权重
+  source_chunk_ids TEXT DEFAULT '[]', -- 支撑此关系的事实来源分块 ID 列表
+  created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_entity_relations_source ON entity_relations(source_id);
+CREATE INDEX IF NOT EXISTS idx_entity_relations_target ON entity_relations(target_id);
+CREATE INDEX IF NOT EXISTS idx_entity_name_type ON entities(name, type);
+ -- P0-5 2026-10-30 GraphRAG 知识图谱索引——实体表+关系表
+CREATE TABLE IF NOT EXISTS entities (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  type TEXT NOT NULL,             -- organization / person / geo / event / category / other
+  description TEXT DEFAULT '',
+  kb_ids TEXT DEFAULT '[]',        -- 关联的知识库 ID 列表 [1,2,3]
+  created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS entity_relations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_id INTEGER NOT NULL,
+  target_id INTEGER NOT NULL,
+  relation TEXT NOT NULL,          -- 关系类型（如「属于」「负责」「关联」等）
+  weight REAL DEFAULT 1.0,        -- 关系强度权重
+  source_chunk_ids TEXT DEFAULT '[]', -- 支撑此关系的事实来源分块 ID 列表
+  created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_entity_relations_source ON entity_relations(source_id);
+CREATE INDEX IF NOT EXISTS idx_entity_relations_target ON entity_relations(target_id);
+CREATE INDEX IF NOT EXISTS idx_entity_name_type ON entities(name, type);
 `);
 
-module.exports = { db, hashPwd, hashPwdAsync, verifyPwd, now, daysAgo };
+const tableEntities = 'entities';
+const tableEntityRelations = 'entity_relations';
+
+module.exports = { db, hashPwd, hashPwdAsync, verifyPwd, now, daysAgo, tableEntities, tableEntityRelations };
 
 // ---------------- P5.27 本地桥设备与任务队列（2026-10-27）----------------
 // 轮询模式：网页对话发 local_exec → 任务入队 → 本地桥 daemon poll 拉取执行 → result 回推
