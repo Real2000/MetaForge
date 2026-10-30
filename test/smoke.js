@@ -389,6 +389,29 @@ function t(name, fn) {
     assert.strictEqual(canView(legacy, { username: 'bob', role: 'user' }), true);
     assert.strictEqual(canEdit(legacy, { username: 'bob', role: 'user' }), false);
   });
+  await t('canView：visible_depts 纯数字 ID 模式（6af7cb5）——dept_id 命中/未命中/类型转换/不回落文本名', () => {
+    const byId = { owner: 'alice', status: 'published', visibility: 'restricted',
+      collaborators: '[]', visible_members: '[]', visible_depts: JSON.stringify(['1', '2']) };
+    assert.strictEqual(canView(byId, { username: 'bob', role: 'user', dept_id: 2 }), true,
+      'ID 模式：dept_id=2 命中名单 ["1","2"] 可见');
+    assert.strictEqual(canView(byId, { username: 'bob', role: 'user', dept_id: 1 }), true,
+      'ID 模式：数字类型 1 经 String() 转换后命中字符串 "1"（类型转换兼容）');
+    assert.strictEqual(canView(byId, { username: 'bob', role: 'user', dept_id: 99 }), false,
+      'ID 模式：dept_id=99 未命中名单不可见');
+    assert.strictEqual(canView(byId, { username: 'bob', role: 'user', dept_id: null, dept: '市场部' }), false,
+      '安全关键：纯数字名单不回落文本部门名——dept_id=null 时即使 dept="市场部" 也不可见（防误授权）');
+  });
+  await t('canView：visible_depts 混合格式走文本模式（6af7cb5 回归保护）', () => {
+    const mixed = { owner: 'alice', status: 'published', visibility: 'restricted',
+      collaborators: '[]', visible_members: '[]', visible_depts: JSON.stringify(['1', '市场部']) };
+    assert.strictEqual(canView(mixed, { username: 'bob', role: 'user', dept: '市场部' }), true,
+      '混合格式（含非数字）→ 文本分支：dept 文本命中可见');
+    assert.strictEqual(canView(mixed, { username: 'bob', role: 'user', dept_id: 1, dept: '研发部' }), false,
+      '混合格式按文本判定：dept_id=1 不参与（dept="研发部" 未命中不可见，防 ID 绕过文本名单）');
+    const legacyName = { ...mixed, visible_depts: JSON.stringify(['市场部']) };
+    assert.strictEqual(canView(legacyName, { username: 'bob', role: 'user', dept: '市场部', dept_id: 99 }), true,
+      '旧格式纯文本名单与 dept_id 字段共存不受影响：dept 命中即可见');
+  });
 
   // ================ P3 扩展工具（2026-10-22）：Text2SQL / 图表 / Word / MCP Server / 分类器路由 ================
   console.log('【N】P3 扩展工具（Text2SQL / 图表 / Word / MCP Server / 分类器路由）');
