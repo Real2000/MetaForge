@@ -46,6 +46,7 @@ app.use('/api/stats', require('./src-server/routes/stats'));
 // API 发布（OpenAI 兼容，密钥自鉴权）与分享链接（免登录）
 app.use('/openapi', require('./src-server/routes/openapi'));
 app.use('/api/share', require('./src-server/routes/share'));
+app.use('/api/departments', require('./src-server/routes/departments')); // P0 组织部门树
 // P5.14 文件一等变量：工作流文件上传/下载（画布 file 变量 + 聊天附件共用）
 app.use('/api/files', require('./src-server/routes/files'));
 // MCP 服务管理与行业模板库（P2）

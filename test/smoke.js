@@ -2737,6 +2737,48 @@ function t(name, fn) {
       db.prepare(`DELETE FROM kb_files WHERE id=?`).run(fid);
       db.prepare(`DELETE FROM kbs WHERE id=?`).run(kbid);
     });
+    // 【P6】PDF 表格结构化解析（增强型 PDF 解析）
+    await t('P6 PDF表格检测：Pipe表格（竖线分隔）→ Markdown', () => {
+      const { enhancePdfText } = require('../src-server/lib/enhancedPdfText');
+      const raw = `| 姓名 | 部门 | 职位 |
+| --- | --- | --- |
+| 张三 | 产品部 | 产品经理 |
+| 李四 | 研发部 | 高级工程师 |
+| 王五 | 市场部 | 市场总监 |
+`;
+      const r = enhancePdfText(raw);
+      assert.ok(r.text.includes('| 姓名'), 'Pipe表格应保留| 姓名表头');
+      assert.ok(r.text.includes('| ---'), 'Pipe表格应保留分隔线');
+      assert.ok(r.text.includes('| 张三'), 'Pipe表格应保留行内容');
+      assert.ok(r.tables.length >= 1, '应检测到至少1个表格');
+      assert.deepStrictEqual(r.tables[0].headers, ['姓名', '部门', '职位']);
+      assert.strictEqual(r.tables[0].rows.length, 3);
+    });
+    await t('P6 PDF表格检测：对齐表格（空格分隔）→ Markdown', () => {
+      const { enhancePdfText } = require('../src-server/lib/enhancedPdfText');
+      // 用两个以上空格模拟对齐表格
+      const raw = `姓名    部门    职位
+张三    产品部    产品经理
+李四    研发部    高级工程师
+王五    市场部    市场总监`;
+      const r = enhancePdfText(raw);
+      assert.ok(r.tables.length >= 1, '对齐表格应被检测到：' + JSON.stringify(r.tables));
+      const t = r.tables[0];
+      assert.deepStrictEqual(t.headers, ['姓名', '部门', '职位']);
+      assert.strictEqual(t.rows.length, 3);
+    });
+    await t('P6 PDF无表格内容：返回纯文本不分词', () => {
+      const { enhancePdfText } = require('../src-server/lib/enhancedPdfText');
+      const r = enhancePdfText('这是纯段落文本，没有表格，只有一行内容。');
+      assert.strictEqual(r.tables.length, 0);
+      assert.ok(r.text.includes('纯段落文本'));
+    });
+    await t('P6 PDF空输入：返回空结果', () => {
+      const { enhancePdfText } = require('../src-server/lib/enhancedPdfText');
+      const r = enhancePdfText('');
+      assert.strictEqual(r.text, '');
+      assert.strictEqual(r.tables.length, 0);
+    });
     // 【P3】P3 工程化：建表数 tripwire
     await t('P3 工程化：新库建表数 = 40（防 schema 误删/迁移遗漏）', () => {
       const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all();

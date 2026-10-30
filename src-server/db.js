@@ -158,6 +158,14 @@ CREATE TABLE IF NOT EXISTS users (
   quota_used INTEGER DEFAULT 0,
   created_at TEXT
 );
+CREATE TABLE IF NOT EXISTS departments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  parent_id INTEGER DEFAULT NULL,
+  name TEXT NOT NULL,
+  path TEXT DEFAULT '',
+  order_num INTEGER DEFAULT 0,
+  created_at TEXT
+);
 CREATE TABLE IF NOT EXISTS spaces (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,
@@ -407,6 +415,11 @@ CREATE TABLE IF NOT EXISTS evaluations (
   if (!userCols3.includes('plan')) {
     db.exec("ALTER TABLE users ADD COLUMN plan TEXT DEFAULT 'free'");
     console.log('[db] users 表已迁移：新增 plan 字段');
+  }
+  // users 表增加 dept_id（P0 部门组织架构，2026-10-29）
+  if (!userCols3.includes('dept_id')) {
+    db.exec('ALTER TABLE users ADD COLUMN dept_id INTEGER DEFAULT NULL');
+    console.log('[db] users 表已迁移：新增 dept_id 字段');
   }
 }
 // 企业定制线索表（2026-10-20 商业化）：对外价格页「联系销售」表单收集，免登录提交
@@ -690,6 +703,24 @@ if (!chunkCols2.includes('parent_id')) {
 if (!chunkCols2.includes('keywords')) {
   db.exec(`ALTER TABLE kb_chunks ADD COLUMN keywords TEXT DEFAULT NULL`);
   console.log('[db] kb_chunks 表已迁移：新增 keywords 字段（自动关键词/问法）');
+}
+// kb_files 表增加解析日志相关字段（2026-10-29：解析日志与状态可视化）
+const fileCols = db.prepare('PRAGMA table_info(kb_files)').all().map(c => c.name);
+if (!fileCols.includes('source')) {
+  db.exec(`ALTER TABLE kb_files ADD COLUMN source TEXT DEFAULT 'upload'`);
+  console.log('[db] kb_files 表已迁移：新增 source 字段（来源标识）');
+}
+if (!fileCols.includes('error_msg')) {
+  db.exec(`ALTER TABLE kb_files ADD COLUMN error_msg TEXT DEFAULT NULL`);
+  console.log('[db] kb_files 表已迁移：新增 error_msg 字段（解析失败原因）');
+}
+if (!fileCols.includes('parsed_at')) {
+  db.exec(`ALTER TABLE kb_files ADD COLUMN parsed_at TEXT DEFAULT NULL`);
+  console.log('[db] kb_files 表已迁移：新增 parsed_at 字段（解析完成时间）');
+}
+if (!fileCols.includes('updated_at')) {
+  db.exec(`ALTER TABLE kb_files ADD COLUMN updated_at TEXT DEFAULT NULL`);
+  console.log('[db] kb_files 表已迁移：新增 updated_at 字段（更新时间）');
 }
 // P0-1: kbs.owner 存量数据迁移 nickname→username（此前创建时写入 nickname||username，denyIfNotAllowed 需精确匹配 username）
 {

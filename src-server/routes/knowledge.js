@@ -69,7 +69,7 @@ router.post('/:id/files', async (req, res) => {
   if (!kb) return res.json({ code: 404, msg: '知识库不存在' });
   const deny = denyIfNotAllowed(kb, req.user); // P5.30：防向他人知识库注入内容
   if (deny) return res.json(deny);
-  const { name, content, file_b64 } = req.body || {};
+  const { name, content, file_b64, source } = req.body || {};
   if (!name) return res.json({ code: 400, msg: '请提供文件名' });
 
   let text = '';
@@ -142,8 +142,8 @@ router.post('/:id/files', async (req, res) => {
     childToParent = chunks.map(() => -1);
   }
 
-  const info = db.prepare(`INSERT INTO kb_files (kb_id,name,size,status,chunk_count,created_at) VALUES (?,?,?,?,?,datetime('now','localtime'))`)
-    .run(kb.id, name, byteSize, 'success', chunks.length);
+  const info = db.prepare(`INSERT INTO kb_files (kb_id,name,size,status,chunk_count,source,parsed_at,created_at) VALUES (?,?,?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))`)
+    .run(kb.id, name, byteSize, 'success', chunks.length, source || 'upload');
   // 先插父分片，再插子分片
   if (hasParentSlice && parentChunks.length) {
     const insParent = db.prepare('INSERT INTO kb_chunks (file_id,kb_id,content,parent_id) VALUES (?,?,?,?)');

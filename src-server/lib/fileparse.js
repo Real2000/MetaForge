@@ -4,6 +4,7 @@
  * 从 knowledge.js 上传逻辑提取的公共函数：PDF / DOCX / XLSX / TXT / MD → 纯文本
  * 供两处共用：知识库上传（切片入库）+ 工作流文件上传（wf_files 表，节点间流转）
  * P5.28：新增 XLSX/XLS/CSV 解析（星辰「整理文件」场景——Excel 信息提取；xlsx 库逐 sheet 转 Markdown 表格文本）
+ * P6 2026-10-29：PDF 解析从纯文本升级为增强型——自动检测表格结构并转为 Markdown 表格文本（enhancedPdfText.js）
  */
 const FILE_EXTS = ['pdf', 'docx', 'xlsx', 'xls', 'csv', 'txt', 'md', 'markdown', 'pptx']; // 白名单
 
@@ -19,7 +20,13 @@ async function parseFileBuffer(name, buf) {
     const parser = new PDFParse({ data: buf });
     try {
       const parsed = await parser.getText();
-      text = parsed?.text || '';
+      const rawText = parsed?.text || '';
+      // P6 2026-10-29：用增强型 PDF 文本解析替换纯文本 — 自动检测表格转为 Markdown
+      const { enhancePdfText } = require('./enhancedPdfText');
+      const enhanced = enhancePdfText(rawText);
+      text = enhanced.text;
+      // 元数据注入：tables 字段通过 parsed 对象的附加属性传递（调用方可选使用）
+      if (enhanced.tables.length) { parsed._tables = enhanced.tables; parsed._hasTables = true; }
     } finally {
       try { await parser.destroy(); } catch { }
     }
