@@ -15,12 +15,27 @@ export async function render(el) {
     <div class="tabs" id="mainTabs">
       <div class="tab active" data-t="kb">知识库列表</div>
       <div class="tab" data-t="recall">召回测试</div>
+      <div class="tab" data-t="logs">解析日志</div>
     </div>
     <div id="paneKb"></div>
-    <div id="paneRecall" style="display:none"></div>`;
+    <div id="paneRecall" style="display:none"></div>
+    <div id="paneLogs" style="display:none"></div>`;
 
+  let activeTab = 'kb'; // V1.1 #1 2026-10-30：当前主 tab（上传成功/失败后按所在 tab 决定刷新目标）
   const paneKb = el.querySelector('#paneKb');
   const paneRecall = el.querySelector('#paneRecall');
+  const paneLogs = el.querySelector('#paneLogs');
+
+  // V1.1 #1 2026-10-30：文件状态四态徽章（success/failed/pending/processing）
+  // pending/processing 为 #5 摄取管道异步化后的预留态，当前同步架构下不产生（非缺陷）；失败落库后文件列表会出现 failed 行
+  function kbFileStatusTag(s) {
+    return {
+      success: '<span class="tag green">解析完成</span>',
+      failed: '<span class="tag red">解析失败</span>',
+      processing: '<span class="tag blue">处理中</span>',
+      pending: '<span class="tag orange">排队中</span>',
+    }[s] || `<span class="tag gray">${esc(s || '未知')}</span>`;
+  }
 
   // ---------- 知识库列表 ----------
   function renderKbList() {
@@ -46,7 +61,10 @@ export async function render(el) {
       paneKb.querySelector('#newKb').onclick = openNewKb;
       paneKb.querySelectorAll('.agent-card[data-id]').forEach(c => c.onclick = async () => {
         current = kbs.find(k => k.id === +c.dataset.id);
-        await loadFiles();
+        // V1.1 审查加固 2026-10-30：文件列表已收紧为 owner/admin——非 owner 点他人库 403 时不再卡死 UI，提示后仍渲染空文件态
+        files = [];
+        try { await loadFiles(); }
+        catch (e) { toast(e.code === 403 ? '无权查看该知识库的文件（仅创建者或管理员）' : (e.message || '文件加载失败'), 'err'); }
         renderKbList();
       });
       return;
@@ -72,11 +90,11 @@ export async function render(el) {
               <td>📄 ${esc(f.name)}</td>
               <td>${fmtBytes(f.size)}</td>
               <td>${f.chunk_count}</td>
-              <td><span class="tag green">解析完成</span></td>
+              <td>${kbFileStatusTag(f.status)}</td>
               <td style="color:var(--text-3)">${esc(f.created_at)}</td>
               <td>
-                <button class="btn link" data-re="${f.id}">重新解析</button>
-                <button class="btn link" data-chunks="${f.id}">查看分块</button>
+                ${f.status === 'failed' ? '' : `<button class="btn link" data-re="${f.id}">重新解析</button>
+                <button class="btn link" data-chunks="${f.id}">查看分块</button>`}
                 <button class="btn link" style="color:var(--danger)" data-df="${f.id}">删除</button>
               </td>
             </tr>`).join('') || '<tr><td colspan="6" class="empty">暂无文件，点击「上传文件」导入（支持粘贴文本内容）</td></tr>'}
@@ -253,7 +271,7 @@ export async function render(el) {
     });
   }
 
-  function openUpload() {
+  function openUpload(prefillName) { // V1.1 #1：prefillName——日志页「重传」时预填失败文件名
     const body = `
       <div class="form-item"><label>上传方式</label>
         <div style="display:flex;gap:8px">
@@ -269,7 +287,7 @@ export async function render(el) {
         </div>
       </div>
       <div id="u_text_pane" style="display:none">
-        <div class="form-item"><label>文件名<span class="req">*</span></label><input class="input" id="f_name" placeholder="如：员工手册.txt"></div>
+        <div class="form-item"><label>文件名<span class="req">*</span></label><input class="input" id="f_name" value="${esc(prefillName || '')}" placeholder="如：员工手册.txt"></div>
         <div class="form-item"><label>文本内容<span class="req">*</span></label>
           <textarea class="input" id="f_content" style="min-height:180px" placeholder="粘贴文件全文，将按空行自动分段切片"></textarea>
         </div>
@@ -313,8 +331,14 @@ export async function render(el) {
               j = await api(`/knowledge/${current.id}/files`, { method: 'POST', body: { name, content } });
             }
             toast(`上传成功，解析为 ${j.data.chunks} 个片段`);
-            close(); loadFiles().then(renderKbList);
-          } catch (e) { toast(e.message, 'err'); mask.querySelector('[data-save]').disabled = false; mask.querySelector('[data-save]').textContent = '上传并解析'; }
+            close();
+            if (activeTab === 'logs') renderLogs(1); // V1.1 #1：日志页上传后自动刷新（回第 1 页看最新记录）
+            loadFiles().then(renderKbList);
+          } catch (e) {
+            toast(e.message, 'err');
+            if (activeTab === 'logs') renderLogs(1); // V1.1 审查加固：失败记录 ORDER BY id DESC 固定在第 1 页，必须回第 1 页才能看到失败原因
+            mask.querySelector('[data-save]').disabled = false; mask.querySelector('[data-save]').textContent = '上传并解析';
+          }
         };
       },
     });
@@ -322,6 +346,102 @@ export async function render(el) {
 
   async function loadKbs() { const j = await api('/knowledge'); kbs = j.data; renderKbList(); }
   async function loadFiles() { const j = await api(`/knowledge/${current.id}/files`); files = j.data; }
+
+  // ---------- 解析日志（V1.1 #1 2026-10-30：三张统计卡 + 日志表格 + 分页 + 失败行重传/删除） ----------
+  // 四态预设计：pending/processing 为 #5 摄取管道异步化后的预留演进位，当前同步解析架构下「处理中」恒为 0（非缺陷）
+  let logsPage = 1;
+
+  async function renderLogs(page) {
+    if (!current) {
+      paneLogs.innerHTML = `<div class="card"><div class="hint" style="padding:28px 0;text-align:center;font-size:13px">请先在知识库列表选择知识库</div></div>`;
+      return;
+    }
+    const p = Math.max(1, page || logsPage);
+    let j;
+    try { j = await api(`/knowledge/${current.id}/logs?page=${p}&page_size=20`); }
+    catch (e) { paneLogs.innerHTML = `<div class="card"><div class="hint" style="color:var(--danger)">日志加载失败：${esc(e.message)}</div></div>`; return; }
+    const { list, total, page: cur, page_size, stats } = j.data;
+    logsPage = cur;
+    // V1.1 审查加固：删除末页最后一条后自动回退一页（避免停留在空页「第 2 / 1 页」）
+    if (!list.length && cur > 1) return renderLogs(cur - 1);
+    const pages = Math.max(1, Math.ceil(total / (page_size || 20)));
+    // 来源标签（upload→上传，可扩展：api/管道导入等）
+    const srcLabel = (s) => ({ upload: '上传', api: 'API', pipeline: '管道' })[s] || (s || '上传');
+    // 失败原因列：超长截断 + title 悬浮全文
+    const errCell = (msg) => {
+      if (!msg) return '<span style="color:var(--text-3)">—</span>';
+      const short = msg.length > 60 ? msg.slice(0, 60) + '…' : msg;
+      return `<span title="${esc(msg)}" style="color:var(--danger)">${esc(short)}</span>`;
+    };
+
+    paneLogs.innerHTML = `
+      <div class="toolbar">
+        <div class="filters">
+          <button class="btn" id="logsBack">← 返回</button>
+          <b style="font-size:15px">${esc(current.name)}</b>
+          <span class="tag blue">解析日志</span>
+        </div>
+        <button class="btn primary" id="logsUpload">⬆ 上传文件</button>
+      </div>
+      <div class="grid-3">
+        <div class="stat-card">
+          <div class="label">📁 文件总数</div>
+          <div class="num">${stats.total}</div>
+          <div class="sub">成功 ${stats.success} · 失败 ${stats.failed}</div>
+        </div>
+        <div class="stat-card">
+          <div class="label">❌ 解析失败</div>
+          <div class="num" style="color:var(--danger)">${stats.failed}</div>
+          <div class="sub">失败行可重传或删除</div>
+        </div>
+        <div class="stat-card">
+          <div class="label">⏳ 处理中</div>
+          <div class="num" style="color:var(--brand)">${stats.processing}</div>
+          <div class="sub">异步管道化（#5）后生效，当前同步解析恒为 0</div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="table-wrap"><table class="tbl">
+          <thead><tr><th>ID</th><th>文件名</th><th>来源</th><th>大小</th><th>分块数</th><th>状态</th><th>解析完成时间</th><th>失败原因</th><th>操作</th></tr></thead>
+          <tbody>${list.map(f => `
+            <tr>
+              <td style="color:var(--text-3)">${f.id}</td>
+              <td>📄 ${esc(f.name)}</td>
+              <td><span class="tag gray">${esc(srcLabel(f.source))}</span></td>
+              <td>${fmtBytes(f.size || 0)}</td>
+              <td>${f.chunk_count || 0}</td>
+              <td>${kbFileStatusTag(f.status)}</td>
+              <td style="color:var(--text-3)">${f.parsed_at ? esc(f.parsed_at) : '—'}</td>
+              <td>${errCell(f.error_msg)}</td>
+              <td>${f.status === 'failed' ? `
+                <button class="btn link" data-ru="${f.id}" data-rn="${esc(f.name)}">重传</button>
+                <button class="btn link" style="color:var(--danger)" data-ld="${f.id}">删除</button>` : '<span style="color:var(--text-3)">—</span>'}
+              </td>
+            </tr>`).join('') || '<tr><td colspan="9" class="empty">暂无解析记录，上传文件后在此查看解析状态与失败原因</td></tr>'}
+          </tbody>
+        </table></div>
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-top:12px;flex-wrap:wrap;gap:8px">
+          <span class="hint">共 ${total} 条记录 · 第 ${cur} / ${pages} 页</span>
+          <div style="display:flex;gap:8px">
+            <button class="btn" data-pg="prev" ${cur <= 1 ? 'disabled' : ''}>← 上一页</button>
+            <button class="btn" data-pg="next" ${cur >= pages ? 'disabled' : ''}>下一页 →</button>
+          </div>
+        </div>
+      </div>`;
+
+    paneLogs.querySelector('#logsBack').onclick = () => { current = null; switchTab('kb'); renderKbList(); };
+    paneLogs.querySelector('#logsUpload').onclick = () => openUpload();
+    paneLogs.querySelectorAll('[data-ru]').forEach(b => b.onclick = () => openUpload(b.dataset.rn)); // 重传：复用上传弹窗并预填失败文件名
+    paneLogs.querySelectorAll('[data-ld]').forEach(b => b.onclick = async () => {
+      if (!await confirmBox('删除该失败记录？（及其可能残留的分片）')) return;
+      await api(`/knowledge/files/${b.dataset.ld}`, { method: 'DELETE' });
+      toast('已删除'); renderLogs();
+    });
+    const prev = paneLogs.querySelector('[data-pg="prev"]');
+    const next = paneLogs.querySelector('[data-pg="next"]');
+    if (prev) prev.onclick = () => { if (cur > 1) renderLogs(cur - 1); };
+    if (next) next.onclick = () => { if (cur < pages) renderLogs(cur + 1); };
+  }
 
   // ---------- 召回测试（2026-10-29 可视化升级：向量权重滑块 + Rerank 模型下拉 + 阈值滑块 + 命中高亮 + 命中通道标识） ----------
 
@@ -434,11 +554,18 @@ export async function render(el) {
     };
   }
 
+  // 主 tab 切换（V1.1 #1：新增第三个 tab「解析日志」；切到日志页时按需加载）
+  function switchTab(t) {
+    activeTab = t;
+    el.querySelectorAll('#mainTabs .tab').forEach(x => x.classList.toggle('active', x.dataset.t === t));
+    paneKb.style.display = t === 'kb' ? '' : 'none';
+    paneRecall.style.display = t === 'recall' ? '' : 'none';
+    paneLogs.style.display = t === 'logs' ? '' : 'none';
+  }
+
   el.querySelectorAll('#mainTabs .tab').forEach(t => t.onclick = () => {
-    el.querySelectorAll('#mainTabs .tab').forEach(x => x.classList.remove('active'));
-    t.classList.add('active');
-    paneKb.style.display = t.dataset.t === 'kb' ? '' : 'none';
-    paneRecall.style.display = t.dataset.t === 'recall' ? '' : 'none';
+    switchTab(t.dataset.t);
+    if (t.dataset.t === 'logs') renderLogs(1); // V1.1 #1：切到日志页时刷新（回第 1 页看最新记录）
   });
 
   await loadKbs();

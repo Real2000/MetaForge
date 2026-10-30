@@ -71,7 +71,9 @@ function auth(req, res, next) {
   const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
   const payload = verify(token);
   if (!payload) return res.status(401).json({ code: 401, msg: '未登录或登录已过期' });
-  const user = db.prepare('SELECT id, username, nickname, role, dept, onboarded FROM users WHERE id=? AND status=1').get(payload.uid);
+  // P0-3 收尾 2026-10-30：SELECT 补 dept_id——此前缺该字段导致 req.user.dept_id 恒 undefined，
+  // visible_depts 纯数字 ID 模式在 HTTP 链路判定空转（部门树勾选保存正常但部门用户实际看不到智能体）
+  const user = db.prepare('SELECT id, username, nickname, role, dept, dept_id, onboarded FROM users WHERE id=? AND status=1').get(payload.uid);
   if (!user) return res.status(401).json({ code: 401, msg: '账号不可用' });
   req.user = user;
   next();

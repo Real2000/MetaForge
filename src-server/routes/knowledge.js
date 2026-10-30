@@ -18,6 +18,21 @@ function denyIfNotAllowed(kb, user) {
   return { code: 403, msg: '无权管理该知识库（仅创建者或管理员）' };
 }
 
+// V1.1 #1 2026-10-30：解析失败落库——此前三个失败出口（解析异常/文本过短/切片为空）直接 return 400 不留痕，
+// error_msg 恒空无从排查。失败记录 status='failed' + error_msg（截断 500 字符防超长）+ chunk_count=0，
+// 供「解析日志」页展示失败原因、支持重传/删除。三处失败点 kb 校验已过、kb.id 可用
+function insertFailedFile(kb, name, byteSize, source, errMsg, req) {
+  const msg = String(errMsg || '未知原因').slice(0, 500);
+  // V1.1 审查加固 2026-10-30：name 截 200（对齐 files.js 先例）/ source 白名单，防存储滥用
+  const safeName = String(name || '未命名').slice(0, 200);
+  const safeSource = ['upload', 'api', 'pipeline'].includes(source) ? source : 'upload';
+  db.prepare(`INSERT INTO kb_files (kb_id,name,size,status,chunk_count,source,error_msg,parsed_at,created_at)
+    VALUES (?,?,?,'failed',0,?,?,NULL,datetime('now','localtime'))`)
+    .run(kb.id, safeName, byteSize || 0, safeSource, msg);
+  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
+    .run(req.user.username, '知识库文件解析失败', `${kb.name} / ${safeName}：${msg.slice(0, 200)}`, req.ip, now());
+}
+
 router.get('/', (req, res) => {
   const rows = db.prepare(`
     SELECT k.*, (SELECT COUNT(*) FROM kb_files f WHERE f.kb_id=k.id) AS file_count
@@ -56,9 +71,42 @@ router.delete('/:id', (req, res) => {
   res.json({ code: 0, msg: '已删除' });
 });
 
-// 文件列表
+// 文件列表（SELECT * 已含迁移列 source/error_msg/parsed_at/updated_at，前端直接可用，无需额外字段拼接）
+// V1.1 审查加固 2026-10-30：补归属校验——此前无校验，任意登录用户可看他人库文件元数据；
+// 本轮 error_msg（含解析器内部报错）入库后若继续敞开，/:id/logs 的收紧设计将被旁路，故与 logs 同权
 router.get('/:id/files', (req, res) => {
+  const kb = db.prepare('SELECT * FROM kbs WHERE id=?').get(req.params.id);
+  const deny = denyIfNotAllowed(kb, req.user);
+  if (deny) return res.json(deny);
   res.json({ code: 0, data: db.prepare('SELECT * FROM kb_files WHERE kb_id=? ORDER BY id DESC').all(req.params.id) });
+});
+
+// V1.1 #1 2026-10-30：解析日志——分页列表 + 四态汇总统计（前端「解析日志」页数据源）
+// 权限比 files 列表更严（admin/owner 才可看）：日志含失败原因细节（可能带解析器内部报错信息），不向普通用户开放
+// processing/pending 态在当前同步架构下恒为 0，为 #5 摄取管道异步化后的预留演进位（非缺陷）
+router.get('/:id/logs', (req, res) => {
+  const kb = db.prepare('SELECT * FROM kbs WHERE id=?').get(req.params.id);
+  const deny = denyIfNotAllowed(kb, req.user);
+  if (deny) return res.json(deny);
+  const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+  const pageSize = Math.min(100, Math.max(1, parseInt(req.query.page_size, 10) || 20));
+  const total = db.prepare('SELECT COUNT(*) AS c FROM kb_files WHERE kb_id=?').get(kb.id).c;
+  const list = db.prepare(`SELECT id,name,source,size,status,chunk_count,error_msg,parsed_at,created_at
+    FROM kb_files WHERE kb_id=? ORDER BY id DESC LIMIT ? OFFSET ?`).all(kb.id, pageSize, (page - 1) * pageSize);
+  // V1.1 审查加固 2026-10-30：stats 由 5 次独立 COUNT 合并为单条 GROUP BY（配合 idx_kb_files_kb 索引，防行数膨胀后同步驱动阻塞事件循环）
+  const stats = { total, success: 0, failed: 0, processing: 0 };
+  db.prepare('SELECT status, COUNT(*) AS c FROM kb_files WHERE kb_id=? GROUP BY status').all(kb.id).forEach(r => {
+    if (r.status === 'success') stats.success = r.c;
+    else if (r.status === 'failed') stats.failed = r.c;
+    else if (r.status === 'processing' || r.status === 'pending') stats.processing += r.c; // 四态预设计：#5 管道异步化后的预留态
+  });
+  res.json({
+    code: 0,
+    data: {
+      list, total, page, page_size: pageSize,
+      stats,
+    },
+  });
 });
 
 // 上传并解析。两种方式：
@@ -88,10 +136,14 @@ router.post('/:id/files', async (req, res) => {
       return res.json({ code: 400, msg: '请提供文件内容（粘贴文本或上传文件）' });
     }
   } catch (e) {
+    insertFailedFile(kb, name, byteSize, source, '文件解析失败：' + e.message, req); // V1.1 #1：解析异常也落库留痕
     return res.json({ code: 400, msg: '文件解析失败：' + e.message });
   }
   text = (text || '').replace(/\r\n/g, '\n').replace(/\u0000/g, '').trim();
-  if (text.length < 8) return res.json({ code: 400, msg: '解析后无有效文本内容（扫描版 PDF 需先 OCR）' });
+  if (text.length < 8) {
+    insertFailedFile(kb, name, byteSize, source, '解析后无有效文本内容（扫描版 PDF 需先 OCR）', req); // V1.1 #1：失败落库
+    return res.json({ code: 400, msg: '解析后无有效文本内容（扫描版 PDF 需先 OCR）' });
+  }
 
   // 智能切片（使用知识库配置参数）
   const chunkSize = kb.chunk_size || 500;
@@ -121,7 +173,10 @@ router.post('/:id/files', async (req, res) => {
       }
     }
   }
-  if (!chunks.length) return res.json({ code: 400, msg: '切片后无有效片段' });
+  if (!chunks.length) {
+    insertFailedFile(kb, name, byteSize, source, '切片后无有效片段', req); // V1.1 #1：失败落库
+    return res.json({ code: 400, msg: '切片后无有效片段' });
+  }
 
   // TOC目录增强（2026-10-30）：用LLM提取目录结构，按章节标记分块（失败不阻塞上传）
   // 注意：chunks 统一保持字符串数组，章节归属单独存 chapterIds —— 避免对象混入导致 join 产生 [object Object]

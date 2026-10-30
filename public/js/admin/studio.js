@@ -95,6 +95,9 @@ export async function render(el, params) {
   let isCollaborator = S.collaborators.includes(me.username);
   let view = 'prompt'; // prompt | tools | kb | memory | exp | ui
   let promptTab = 'system'; // system | user
+  // P0-3 收尾 2026-10-30：部门树缓存（collab 视图「可见部门」数据源）——
+  // null=未加载/加载中，Array=树节点（[] 为空表），deptTreeFailed=true=加载失败降级文本 chips
+  let deptTree = null, deptTreeFailed = false, deptTreeLoaded = false;
   let saveTimer = null, lastSavedAt = '', dirty = false;
 
   // ---------- 页面骨架 ----------
@@ -164,6 +167,17 @@ export async function render(el, params) {
     .chip-pick .chip{padding:4px 10px;border:1px solid var(--border,#d1d5db);border-radius:999px;font-size:12px;cursor:pointer;color:var(--text-2,#6b7280);background:var(--card,#fff)}
     .chip-pick .chip.on{background:var(--brand,#2563eb);border-color:var(--brand,#2563eb);color:#fff}
     .collab-row{display:flex;align-items:center;gap:8px;padding:7px 10px;border:1px solid var(--border,#e5e7eb);border-radius:8px;margin-bottom:6px;font-size:12px;background:var(--card,#fff)}
+    /* P0-3 收尾 2026-10-30：可见部门树多选组件（沿用现有 CSS 变量；变量未定义时内联兑底） */
+    .dtree{border:1px solid var(--border,#e5e7eb);border-radius:8px;background:var(--card,#fff);max-height:260px;overflow-y:auto;padding:4px 0;margin-top:6px;font-size:12px}
+    .dt-row{display:flex;align-items:center;gap:6px;padding:5px 10px;cursor:pointer;color:var(--text,#374151)}
+    .dt-row:hover{background:var(--surface-2,#f3f4f6)}
+    .dt-row input[type=checkbox]{flex-shrink:0;cursor:pointer}
+    .dt-row input[type=checkbox]:disabled{cursor:not-allowed}
+    .dt-fold{width:16px;flex-shrink:0;text-align:center;color:var(--text-3,#9ca3af);cursor:pointer;font-size:10px;user-select:none}
+    .dt-fold.leaf{cursor:default}
+    .dt-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .dt-cnt{font-size:10px;color:var(--text-3,#9ca3af);background:var(--surface-2,#f3f4f6);border-radius:999px;padding:1px 6px;flex-shrink:0}
+    .dt-kids.collapsed{display:none}
   </style>
   <div class="studio">
     <div class="studio-top">
@@ -435,9 +449,49 @@ export async function render(el, params) {
 
     // ---------- P3 协作与可见性 ----------
     if (view === 'collab') {
-      const allDepts = [...new Set(members.map(m => m.dept).filter(Boolean))];
+      // P0-3 收尾 2026-10-30：可见部门数据源改为部门树（GET /departments/tree，进入视图懒加载一次）；
+      // 请求失败静默回落 members 文本派生 chips（下方 deptTreeFailed 分支，降级路径必须保留）
+      if (!deptTreeLoaded) {
+        deptTreeLoaded = true;
+        api('/departments/tree')
+          .then(j => { deptTree = Array.isArray(j.data) ? j.data : []; if (view === 'collab') renderEdit(); })
+          .catch(() => { deptTreeFailed = true; if (view === 'collab') renderEdit(); }); // 静默降级不弹错
+      }
       const memberName = u => { const m = members.find(x => x.username === u); return m ? (m.nickname || m.username) : u; };
       const notMe = u => u !== me.username;
+      // P0-3 收尾 2026-10-30：visible_depts 分流——纯数字 = 部门树 ID（新格式，树勾选产生）；
+      // 非纯数字 = 历史文本部门名（旧格式 users.dept 文本，单独 chip 展示可移除）
+      const legacyDepts = S.visible_depts.map(String).filter(x => !/^\d+$/.test(x));
+      const idPicked = S.visible_depts.map(String).filter(x => /^\d+$/.test(x));
+      // 部门树节点递归渲染：层级深度缩进 + 折叠箭头（默认全展开）+ 复选框（ID 已选初始勾选；协作者只读 disabled）
+      const nodeHtml = (n, depth) => `
+        <div class="dt-node">
+          <label class="dt-row" style="padding-left:${10 + depth * 18}px">
+            <span class="dt-fold ${n.children?.length ? '' : 'leaf'}" data-fold="${n.id}">${n.children?.length ? '▾' : '·'}</span>
+            <input type="checkbox" data-dtid="${n.id}" ${idPicked.includes(String(n.id)) ? 'checked' : ''} ${permEditable ? '' : 'disabled'}>
+            <span class="dt-name" title="${esc(n.path || '')}">${esc(n.name)}</span>
+            ${n.children?.length ? `<span class="dt-cnt">${n.children.length}</span>` : ''}
+          </label>
+          ${n.children?.length ? `<div class="dt-kids" data-kids="${n.id}">${n.children.map(c => nodeHtml(c, depth + 1)).join('')}</div>` : ''}
+        </div>`;
+      // 可见部门区块：树优先 → 空表提示 → 加载中 → 失败降级文本 chips（旧交互完整保留）
+      let deptArea = '';
+      if (deptTreeFailed) {
+        const allDepts = [...new Set(members.map(m => m.dept).filter(Boolean))];
+        deptArea = `<div class="chip-pick" id="deptChips">${allDepts.length ? allDepts.map(d => `<span class="chip ${S.visible_depts.map(String).includes(d) ? 'on' : ''}" data-dept="${esc(d)}">${esc(d)}</span>`).join('') : `<span class="hint">${t('暂无部门数据（先在用户管理中为用户设置部门）')}</span>`}</div>
+            <div class="hint">⚠️ ${t('部门树加载失败，已降级为文本部门选择')}</div>`;
+      } else if (deptTree === null) {
+        deptArea = `<div class="hint">⏳ ${t('部门树加载中…')}</div>`;
+      } else if (!deptTree.length) {
+        deptArea = `<div class="hint">🏢 ${t('暂无部门数据，请先在管理后台维护组织架构')}</div>`;
+      } else {
+        deptArea = `<div class="dtree" id="deptTree">${deptTree.map(n => nodeHtml(n, 0)).join('')}</div>`;
+      }
+      // 历史文本部门（部门树上线前保存的旧格式）：单独 chip 列表展示，✕ 可移除
+      const legacyArea = legacyDepts.length ? `
+            <div style="font-size:12px;font-weight:600;color:var(--text,#374151);margin:10px 0 4px">${t('历史部门')}（${legacyDepts.length}）</div>
+            <div class="chip-pick" id="legacyDeptChips">${legacyDepts.map(d => `<span class="chip on" data-legacy="${esc(d)}">${esc(d)}${permEditable ? ' ✕' : ''}</span>`).join('')}</div>
+            <div class="hint">${t('历史文本部门，建议在组织架构中建对应部门后改用部门树')}</div>` : '';
       box.innerHTML = `
         <div class="st-field"><label>👥 ${t('协作与可见性')}</label>
           <div class="hint" style="margin-bottom:10px">${t('控制谁能在智能体列表与对话中看到该智能体；创建者与协作者始终可见（含草稿）。')}</div>
@@ -451,7 +505,7 @@ export async function render(el, params) {
           </label>
           <div id="restrictArea" style="display:${S.visibility === 'restricted' ? '' : 'none'};margin-top:10px;padding:12px;border:1px dashed var(--border,#d1d5db);border-radius:10px">
             <div style="font-size:12px;font-weight:600;color:var(--text,#374151);margin-bottom:6px">${t('可见部门')}</div>
-            <div class="chip-pick" id="deptChips">${allDepts.length ? allDepts.map(d => `<span class="chip ${S.visible_depts.includes(d) ? 'on' : ''}" data-dept="${esc(d)}">${esc(d)}</span>`).join('') : `<span class="hint">${t('暂无部门数据（先在用户管理中为用户设置部门）')}</span>`}</div>
+            ${deptArea}${legacyArea}
             <div style="font-size:12px;font-weight:600;color:var(--text,#374151);margin:12px 0 6px">${t('可见成员')}</div>
             <select class="st-select" id="memberPick" style="max-width:280px">
               <option value="">${t('＋ 添加可见成员…')}</option>
@@ -478,10 +532,32 @@ export async function render(el, params) {
       box.querySelectorAll('input[name="vis"]').forEach(r => r.onchange = () => {
         S.visibility = r.value; scheduleSave(); renderEdit(); renderLeft();
       });
-      // 部门 chips
+      // P0-3 收尾 2026-10-30：部门树勾选——勾选把 String(dept.id) 存入 S.visible_depts，取消移除；2 秒自动保存
+      box.querySelectorAll('#deptTree input[data-dtid]').forEach(c => c.onchange = () => {
+        const idStr = String(c.dataset.dtid);
+        if (c.checked) { if (!S.visible_depts.map(String).includes(idStr)) S.visible_depts.push(idStr); }
+        else S.visible_depts = S.visible_depts.filter(x => String(x) !== idStr);
+        scheduleSave();
+      });
+      // 部门树折叠/展开（默认全展开）：阻止 label 默认行为，避免点箭头误切换复选框
+      box.querySelectorAll('#deptTree .dt-fold:not(.leaf)').forEach(f => f.onclick = e => {
+        e.preventDefault(); e.stopPropagation();
+        const kids = box.querySelector(`#deptTree .dt-kids[data-kids="${f.dataset.fold}"]`);
+        if (!kids) return;
+        const collapsed = kids.classList.toggle('collapsed');
+        f.textContent = collapsed ? '▸' : '▾';
+      });
+      // 历史文本部门 chip：点击移除（协作者只读无 ✕，与现有 radio disabled 一致）
+      box.querySelectorAll('#legacyDeptChips .chip').forEach(c => c.onclick = () => {
+        if (!permEditable) return;
+        S.visible_depts = S.visible_depts.filter(x => String(x) !== c.dataset.legacy);
+        scheduleSave(); renderEdit();
+      });
+      // 降级路径：文本部门 chips（树加载失败时旧交互保留；协作者只读保护与 radio disabled 一致）
       box.querySelectorAll('#deptChips .chip').forEach(c => c.onclick = () => {
+        if (!permEditable) return;
         const d = c.dataset.dept;
-        if (S.visible_depts.includes(d)) S.visible_depts = S.visible_depts.filter(x => x !== d);
+        if (S.visible_depts.map(String).includes(d)) S.visible_depts = S.visible_depts.filter(x => String(x) !== d);
         else S.visible_depts.push(d);
         c.classList.toggle('on'); scheduleSave();
       });

@@ -1208,6 +1208,7 @@ CREATE INDEX IF NOT EXISTS idx_chat_traces_msg ON chat_traces(message_id);
 CREATE INDEX IF NOT EXISTS idx_chat_traces_agent ON chat_traces(agent_id);
 CREATE INDEX IF NOT EXISTS idx_kb_chunks_kb ON kb_chunks(kb_id);
 CREATE INDEX IF NOT EXISTS idx_kb_chunks_file ON kb_chunks(file_id);
+CREATE INDEX IF NOT EXISTS idx_kb_files_kb ON kb_files(kb_id, status); -- V1.1 #1 2026-10-30：解析日志页 stats/list 查询索引（此前 kb_files 无任何索引，行数膨胀后同步驱动全表扫阻塞事件循环）
 CREATE INDEX IF NOT EXISTS idx_op_logs_created ON op_logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_err_logs_created ON err_logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(username, updated_at);

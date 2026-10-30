@@ -413,6 +413,76 @@ function t(name, fn) {
       '旧格式纯文本名单与 dept_id 字段共存不受影响：dept 命中即可见');
   });
 
+  // P0-3 收尾 2026-10-30：可见部门部门树多选（buildTree 纯逻辑 + ID/文本双格式保存链路）
+  const { buildTree } = require('../src-server/routes/departments');
+  await t('buildTree：平铺行组装嵌套树（3 级嵌套 + 同级 order_num 乱序 + 空表/孤儿兜底）', () => {
+    const rows = [
+      { id: 1, parent_id: null, name: '研发中心', path: '/1', order_num: 2 },
+      { id: 2, parent_id: null, name: '市场中心', path: '/2', order_num: 1 },
+      { id: 3, parent_id: 1, name: '前端组', path: '/1/3', order_num: 2 },
+      { id: 4, parent_id: 1, name: '后端组', path: '/1/4', order_num: 1 },
+      { id: 5, parent_id: 4, name: '数据库小组', path: '/1/4/5', order_num: 0 },
+      { id: 6, parent_id: 2, name: '品牌组', path: '/2/6', order_num: 0 },
+    ];
+    const tree = buildTree(rows);
+    assert.deepStrictEqual(tree.map(n => n.id), [2, 1], '根级按 order_num 排序（市场中心 order 1 在研发中心 order 2 前）');
+    assert.deepStrictEqual(tree[1].children.map(n => n.id), [4, 3], '同级子节点按 order_num 再按 id 排序（后端组在前端组前）');
+    assert.deepStrictEqual(tree[1].children[0].children.map(n => n.id), [5], '三级嵌套：数据库小组挂后端组下');
+    assert.ok(Array.isArray(tree[1].children), 'children 应为数组');
+    assert.deepStrictEqual(
+      { id: tree[1].id, parent_id: tree[1].parent_id, name: tree[1].name, path: tree[1].path, order_num: tree[1].order_num },
+      { id: 1, parent_id: null, name: '研发中心', path: '/1', order_num: 2 }, '节点字段结构齐全（id/parent_id/name/path/order_num/children）');
+    assert.deepStrictEqual(buildTree([]), [], '空表返回 []');
+    const orphan = buildTree([
+      { id: 10, parent_id: null, name: '总部', path: '/10', order_num: 0 },
+      { id: 11, parent_id: 999, name: '孤儿部', path: '/10/11', order_num: 1 },
+    ]);
+    assert.deepStrictEqual(orphan.map(n => n.id), [10, 11], '孤儿行（parent_id 悬空，仅手工改库会产生）兜底挂根级不丢数据');
+  });
+  await t('buildTree：环状引用兜底（互指环不丢节点不无限递归，V1.1 审查加固）', () => {
+    // 两节点互指成环（PUT 无环校验时可构造）：修复前环上节点从 roots 不可达→整棵树静默丢失；修复后兜底挂根级且 children 清空不再成环
+    const tree = buildTree([
+      { id: 1, parent_id: 2, name: '环A', path: '/1', order_num: 0 },
+      { id: 2, parent_id: 1, name: '环B', path: '/2', order_num: 1 },
+      { id: 3, parent_id: null, name: '正常根', path: '/3', order_num: 2 },
+    ]);
+    assert.deepStrictEqual(tree.map(n => n.id).sort((a, b) => a - b), [1, 2, 3], '环上节点兜底挂根级不丢数据（含正常根共 3 个）');
+    assert.ok(tree.every(n => n.children.length === 0), '环上节点 children 已清空（不再成环，后续排序/渲染安全）');
+    // 三节点环同样兜底
+    const tri = buildTree([
+      { id: 4, parent_id: 6, name: '甲', path: '/4', order_num: 0 },
+      { id: 5, parent_id: 4, name: '乙', path: '/5', order_num: 0 },
+      { id: 6, parent_id: 5, name: '丙', path: '/6', order_num: 0 },
+    ]);
+    assert.strictEqual(tri.length, 3, '三节点环全部兜底挂根级');
+    assert.ok(tri.every(n => n.children.length === 0), '三节点环 children 均清空');
+  });
+  await t('visible_depts ID 保存链路：前端勾选 → agents.js map(String) 归一 → canView dept_id 命中', () => {
+    // 模拟前端勾选部门树节点提交的 String(id) 数组，经 agents.js PUT 的归一链路（map(String).filter(Boolean) → JSON.stringify）入库
+    const saved = JSON.stringify(['1', '2'].map(String).filter(Boolean));
+    assert.strictEqual(saved, '["1","2"]', '保存链路归一为纯数字 ID 字符串数组');
+    const byId = { owner: 'alice', status: 'published', visibility: 'restricted', collaborators: '[]', visible_members: '[]', visible_depts: saved };
+    assert.strictEqual(canView(byId, { username: 'bob', role: 'user', dept_id: 2 }), true, 'ID 模式：dept_id=2 命中名单可见');
+    assert.strictEqual(canView(byId, { username: 'bob', role: 'user', dept_id: 99 }), false, '未命中 ID 不可见');
+    assert.strictEqual(canView(byId, { username: 'bob', role: 'user', dept_id: null, dept: '市场部' }), false, '纯数字名单不回落文本名（防误授权）');
+    const savedNum = JSON.stringify([1, 2].map(String).filter(Boolean));
+    assert.strictEqual(savedNum, saved, '数字类型勾选值同样被 agents.js map(String) 归一为字符串 ID（类型兜底）');
+  });
+  await t('visible_depts 历史文本名兼容：保存链路不清空不转换，dept 文本命中不受 dept_id 干扰', () => {
+    // 旧数据源（members 文本部门 chips）勾选产生的 ['市场部']，经 agents.js 同款归一链路入库
+    const saved = JSON.stringify(['市场部'].map(String).filter(Boolean));
+    assert.strictEqual(saved, '["市场部"]', 'map(String)/filter(Boolean) 不改写、不清空历史文本部门名');
+    const byText = { owner: 'alice', status: 'published', visibility: 'restricted', collaborators: '[]', visible_members: '[]', visible_depts: saved };
+    assert.strictEqual(canView(byText, { username: 'bob', role: 'user', dept: '市场部' }), true, '历史文本部门保存后仍按 user.dept 文本命中');
+    assert.strictEqual(canView(byText, { username: 'bob', role: 'user', dept: '市场部', dept_id: 99 }), true, 'dept_id 数字字段共存不干扰文本匹配（老用户补 dept_id 后不受影响）');
+    assert.strictEqual(canView(byText, { username: 'bob', role: 'user', dept: '研发部', dept_id: 1 }), false, '文本未命中且 ID 不参与（文本模式下不可见）');
+    // 混合存量（历史文本 + 新勾选 ID 并存）：按 agent-access 既有语义走文本分支，ID 成员暂不生效（前端 hint 引导清理迁移）
+    const mixed = JSON.stringify(['市场部', '2'].map(String).filter(Boolean));
+    const byMixed = { ...byText, visible_depts: mixed };
+    assert.strictEqual(canView(byMixed, { username: 'bob', role: 'user', dept: '市场部' }), true, '混合名单文本命中仍生效（保存链路不丢历史项）');
+    assert.strictEqual(canView(byMixed, { username: 'eve', role: 'user', dept_id: 2 }), false, '混合名单 ID 暂不生效（含非数字走文本模式，迁移完成后转纯 ID 才走 dept_id）');
+  });
+
   // ================ P3 扩展工具（2026-10-22）：Text2SQL / 图表 / Word / MCP Server / 分类器路由 ================
   console.log('【N】P3 扩展工具（Text2SQL / 图表 / Word / MCP Server / 分类器路由）');
   const extra = require('../src-server/lib/tools-extra');
@@ -2148,6 +2218,63 @@ function t(name, fn) {
           assert.ok(own.j && own.j.code === 0, '创建者（owner 为其昵称）应放行：' + JSON.stringify(own.j));
           const del = await jfetch(`/api/knowledge/${kbid}`, { method: 'DELETE' }, tok2);
           assert.strictEqual(del.j && del.j.code, 403, '非创建者删除应 403：' + JSON.stringify(del.j));
+        });
+        // ===== V1.1 #1 解析日志（2026-10-30）：三条共用「日志测试库」，顺序依赖（空态→成功→失败） =====
+        await t('HTTP：解析日志——空态与权限（V1.1 #1：owner 空态 stats 全 0，他人 403）', async () => {
+          db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('日志测试库','',1,'httpu1',datetime('now','localtime'))`).run();
+          const kbid = db.prepare(`SELECT id FROM kbs WHERE name='日志测试库'`).get().id;
+          const own = await jfetch(`/api/knowledge/${kbid}/logs`, {}, tok1);
+          assert.ok(own.j && own.j.code === 0, 'owner GET logs 应成功：' + JSON.stringify(own.j).slice(0, 120));
+          assert.deepStrictEqual(own.j.data.stats, { total: 0, success: 0, failed: 0, processing: 0 }, '空态 stats 应全 0：' + JSON.stringify(own.j.data.stats));
+          assert.strictEqual(own.j.data.list.length, 0, '空态 list 应为空');
+          assert.strictEqual(own.j.data.page, 1, '默认 page 应为 1');
+          const other = await jfetch(`/api/knowledge/${kbid}/logs`, {}, tok2);
+          assert.strictEqual(other.j && other.j.code, 403, '他人 GET logs 应 403（日志含失败细节，比 files 更严）：' + JSON.stringify(other.j));
+        });
+        await t('HTTP：解析日志——上传成功落日志（V1.1 #1：status=success + parsed_at 非空）', async () => {
+          const kbid = db.prepare(`SELECT id FROM kbs WHERE name='日志测试库'`).get().id;
+          const up = await jfetch(`/api/knowledge/${kbid}/files`, { method: 'POST', body: JSON.stringify({ name: '成功文档.txt', content: '第一章 总则\n\n本制度适用于全体正式员工。\n\n第二章 考勤\n\n员工须按时上下班并打卡。' }) }, tok1);
+          assert.ok(up.j && up.j.code === 0, '粘贴文本上传应成功：' + JSON.stringify(up.j).slice(0, 120));
+          const logs = await jfetch(`/api/knowledge/${kbid}/logs`, {}, tok1);
+          const row = logs.j.data.list.find(x => x.name === '成功文档.txt');
+          assert.ok(row, '日志列表应出现该文件');
+          assert.strictEqual(row.status, 'success', '状态应为 success：' + row.status);
+          assert.ok(row.parsed_at, 'parsed_at 应非空（解析完成时间）：' + JSON.stringify(row.parsed_at));
+          assert.strictEqual(logs.j.data.stats.success, 1, 'stats.success 应为 1：' + JSON.stringify(logs.j.data.stats));
+        });
+        await t('HTTP：解析日志——解析失败落库可查可删（V1.1 #1：error_msg 非空 + 失败行可删）', async () => {
+          const kbid = db.prepare(`SELECT id FROM kbs WHERE name='日志测试库'`).get().id;
+          const fail = await jfetch(`/api/knowledge/${kbid}/files`, { method: 'POST', body: JSON.stringify({ name: '短文本.txt', content: '只有五个字' }) }, tok1);
+          assert.strictEqual(fail.j && fail.j.code, 400, '<8 字文本应业务码 400：' + JSON.stringify(fail.j));
+          const logs = await jfetch(`/api/knowledge/${kbid}/logs`, {}, tok1);
+          const row = logs.j.data.list.find(x => x.name === '短文本.txt');
+          assert.ok(row, '失败记录应出现在日志列表（此前失败不落库、error_msg 恒空）');
+          assert.strictEqual(row.status, 'failed', '失败记录 status 应为 failed：' + row.status);
+          assert.ok(row.error_msg && row.error_msg.length > 0, 'error_msg 应含失败原因：' + JSON.stringify(row.error_msg));
+          assert.strictEqual(logs.j.data.stats.failed, 1, 'stats.failed 应为 1：' + JSON.stringify(logs.j.data.stats));
+          const del = await jfetch(`/api/knowledge/files/${row.id}`, { method: 'DELETE' }, tok1);
+          assert.ok(del.j && del.j.code === 0, '失败记录应可删除：' + JSON.stringify(del.j));
+        });
+        // ===== V1.1 审查加固（2026-10-30）：文件列表归属 + 部门管理权限/环校验 =====
+        await t('HTTP：文件列表归属校验（V1.1 加固：非 owner GET /:id/files 403，error_msg 不经元数据外泄）', async () => {
+          const kbid = db.prepare(`SELECT id FROM kbs WHERE name='日志测试库'`).get().id;
+          const own = await jfetch(`/api/knowledge/${kbid}/files`, {}, tok1);
+          assert.ok(own.j && own.j.code === 0, 'owner GET files 应成功：' + JSON.stringify(own.j).slice(0, 120));
+          const other = await jfetch(`/api/knowledge/${kbid}/files`, {}, tok2);
+          assert.ok(other.j && other.j.code === 403, '他人 GET files 应 403（此前无校验，任意登录用户可看他人库文件元数据+error_msg）：' + JSON.stringify(other.j));
+        });
+        await t('HTTP：部门管理仅管理员 + 环校验（V1.1 加固：普通用户 POST 403；父挂子下被拒）', async () => {
+          const bad = await jfetch('/api/departments', { method: 'POST', body: JSON.stringify({ name: '越权部门' }) }, tok1);
+          assert.ok(bad.j && bad.j.code === 403, '普通用户 POST 部门应 403（组织架构属管理职能）：' + JSON.stringify(bad.j));
+          // 复用 P5.30 providers 脱敏用例已创建的 httpadmin（顺序在前），避免 UNIQUE 冲突
+          const adminUid = db.prepare(`SELECT id FROM users WHERE username='httpadmin'`).get().id;
+          const tokAdmin = sign({ uid: adminUid, exp: Date.now() + 3600000 });
+          const parent = await jfetch('/api/departments', { method: 'POST', body: JSON.stringify({ name: '环测试父' }) }, tokAdmin);
+          assert.ok(parent.j && parent.j.code === 0, '管理员 POST 部门应成功：' + JSON.stringify(parent.j));
+          const child = await jfetch('/api/departments', { method: 'POST', body: JSON.stringify({ name: '环测试子', parent_id: parent.j.data.id }) }, tokAdmin);
+          assert.ok(child.j && child.j.code === 0, '管理员 POST 子部门应成功：' + JSON.stringify(child.j));
+          const cyc = await jfetch(`/api/departments/${parent.j.data.id}`, { method: 'PUT', body: JSON.stringify({ name: '环测试父', parent_id: child.j.data.id }) }, tokAdmin);
+          assert.ok(cyc.j && cyc.j.code === 400, '父部门挂到子部门下应被环校验拒绝（防 walk 栈溢出无法自愈）：' + JSON.stringify(cyc.j));
         });
         await t('HTTP：召回测试可视化——rerank-models 接口返回模型列表（2026-10-29）', async () => {
           const r = await jfetch('/api/knowledge/rerank-models', {}, tok1);

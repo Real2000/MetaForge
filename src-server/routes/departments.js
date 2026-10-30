@@ -14,7 +14,7 @@
  */
 const express = require('express');
 const { db, now } = require('../db');
-const { auth } = require('../lib/auth');
+const { auth, adminOnly } = require('../lib/auth'); // V1.1 审查加固 2026-10-30：写操作加 adminOnly（组织架构属管理职能，部门 ID 已成授权语义输入）
 
 const router = express.Router();
 router.use(auth);
@@ -30,11 +30,45 @@ function nextOrder(parentId) {
   return r ? r.n : 0;
 }
 
+// P0-3 收尾 2026-10-30：平铺部门行 → 嵌套树（GET /tree 数据组装；纯函数一并导出便于单测）
+// 每节点 { id, parent_id, name, path, order_num, children:[...] }；根 = parent_id 为空的行；
+// 同级按 order_num 再按 id 升序（与列表接口排序一致）；孤儿行（parent_id 指向不存在的部门，
+// 仅手工改库会产生）兕底挂到根级，避免树接口静默丢数据；空表/空入参返回 []
+// V1.1 审查加固 2026-10-30：环状引用（互指成环，PUT 无校验时可构造）时环上节点从 roots 不可达——
+// DFS 标记可达集，不可达节点清空 children 后挂根级，防整棵树静默消失且与注释承诺一致
+function buildTree(rows) {
+  const list = (rows || []).map(r => ({ id: r.id, parent_id: r.parent_id ?? null, name: r.name, path: r.path, order_num: r.order_num ?? 0, children: [] }));
+  const byId = new Map(list.map(n => [n.id, n]));
+  const roots = [];
+  for (const n of list) {
+    const p = n.parent_id != null && n.parent_id !== n.id ? byId.get(n.parent_id) : null;
+    if (p) p.children.push(n); else roots.push(n); // 父存在→挂子；否则（根/孤儿/自指）挂根级
+  }
+  // 环兕底：从 roots DFS 标记可达节点；不可达（环上）节点清空 children 后挂根级，不再成环
+  const seen = new Set();
+  const mark = n => { if (seen.has(n.id)) return; seen.add(n.id); n.children.forEach(mark); };
+  roots.forEach(mark);
+  for (const n of list) {
+    if (!seen.has(n.id)) { n.children.length = 0; roots.push(n); }
+  }
+  const sortSib = arr => { arr.sort((a, b) => (a.order_num - b.order_num) || (a.id - b.id)); arr.forEach(n => sortSib(n.children)); };
+  sortSib(roots);
+  return roots;
+}
+
 // ---------- 列表（递归树，前端弹窗需要） ----------
 router.get('/', (req, res) => {
   const rows = db.prepare('SELECT * FROM departments ORDER BY order_num, id').all();
   // 组装成树（平铺结构，前端自己展开）
   res.json({ code: 0, data: rows });
+});
+
+// ---------- 部门树（P0-3 收尾 2026-10-30：agents 编排页「可见部门」部门树多选数据源） ----------
+// 注意：必须注册在 GET /:id 之前——Express 按注册顺序匹配，否则 /tree 的 "tree" 会被当成
+// :id 参数命中单条路由，返回 404「部门不存在」（经典路由顺序坑）
+router.get('/tree', (req, res) => {
+  const rows = db.prepare('SELECT * FROM departments ORDER BY order_num, id').all();
+  res.json({ code: 0, data: buildTree(rows) });
 });
 
 // ---------- 单条 ----------
@@ -44,8 +78,8 @@ router.get('/:id', (req, res) => {
   res.json({ code: 0, data: d });
 });
 
-// ---------- 创建 ----------
-router.post('/', (req, res) => {
+// ---------- 创建（V1.1 审查加固：仅管理员） ----------
+router.post('/', adminOnly, (req, res) => {
   const { name, parent_id } = req.body || {};
   if (!name?.trim()) return res.json({ code: 400, msg: '部门名称不能为空' });
   const info = db.prepare(`INSERT INTO departments (parent_id,name,path,order_num,created_at) VALUES (?,?,?,?,datetime('now','localtime'))`).run(parent_id || null, name.trim(), '', nextOrder(parent_id));
@@ -56,13 +90,23 @@ router.post('/', (req, res) => {
   res.json({ code: 0, data: { id } });
 });
 
-// ---------- 修改 ----------
-router.put('/:id', (req, res) => {
+// ---------- 修改（V1.1 审查加固：仅管理员 + 环校验） ----------
+router.put('/:id', adminOnly, (req, res) => {
   const old = db.prepare('SELECT * FROM departments WHERE id=?').get(req.params.id);
   if (!old) return res.json({ code: 404, msg: '部门不存在' });
   const { name, parent_id } = req.body || {};
   const n = (name || '').trim();
   if (!n) return res.json({ code: 400, msg: '部门名称不能为空' });
+  // V1.1 审查加固 2026-10-30：环校验——沿 parent_id 链上溯遇自身即拒绝；
+  // 不校验时两步 PUT 可构造互指环，存量 walk() 递归更新 path 会栈溢出 500，且环上部门无法通过 API 删除自愈
+  let cur = parent_id || null, hops = 0;
+  while (cur != null) {
+    if (cur === old.id) return res.json({ code: 400, msg: '不能将部门挂到自身或其子部门下' });
+    const p = db.prepare('SELECT parent_id FROM departments WHERE id=?').get(cur);
+    if (!p) break;
+    cur = p.parent_id;
+    if (++hops > 100) break; // 防御：数据异常时跳出，不阻塞请求
+  }
   db.prepare('UPDATE departments SET name=?,parent_id=? WHERE id=?').run(n, parent_id || null, old.id);
   // 更新本节点 path
   const path = buildPath(old.id, parent_id || null);
@@ -80,8 +124,8 @@ router.put('/:id', (req, res) => {
   res.json({ code: 0, msg: '已更新' });
 });
 
-// ---------- 删除（级联删除子部门） ----------
-router.delete('/:id', (req, res) => {
+// ---------- 删除（级联删除子部门；V1.1 审查加固：仅管理员） ----------
+router.delete('/:id', adminOnly, (req, res) => {
   const old = db.prepare('SELECT * FROM departments WHERE id=?').get(req.params.id);
   if (!old) return res.json({ code: 404, msg: '部门不存在' });
   // 禁止删除有用户的部门（防止孤立 dept_id）
@@ -100,3 +144,6 @@ router.delete('/:id', (req, res) => {
 });
 
 module.exports = router;
+// P0-3 收尾 2026-10-30：树组装纯函数一并导出（单测 require('.../departments').buildTree；
+// 默认导出保持 router 不变，server.js 的 app.use('/api/departments', require(...)) 无需改动）
+module.exports.buildTree = buildTree;
