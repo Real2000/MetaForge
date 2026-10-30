@@ -15,6 +15,7 @@ const routes = {
   '/agents': { page: () => import('./front/agents.js'), layout: 'front', title: '智能体' },
   '/square': { page: () => import('./front/square.js'), layout: 'front', title: '智能体广场' },
   '/skills': { page: () => import('./front/skills.js'), layout: 'front', title: '技能' },
+  '/skills-market': { page: () => import('./front/market.js'), layout: 'front', title: '技能市场' }, // V2.2 #7 四区聚合运营位
   '/models': { page: () => import('./front/models.js'), layout: 'front', title: '我的模型' },
   '/chat': { page: () => import('./front/chat.js'), layout: 'chat', title: '智能体对话' },
   '/knowledge': { page: () => import('./front/knowledge.js'), layout: 'front', title: '知识库' },
@@ -47,6 +48,7 @@ const frontNav = [
   { href: '#/agents', ic: '🤖', label: '智能体' },
   { href: '#/square', ic: '🛍️', label: '广场' },
   { href: '#/skills', ic: '✨', label: '技能' },
+  { href: '#/skills-market', ic: '🛒', label: '技能市场' },
   { href: '#/models', ic: '🧩', label: '我的模型' },
   { href: '#/knowledge', ic: '📚', label: '知识库' },
   { href: '#/tasks', ic: '⏰', label: '任务管理' },

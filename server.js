@@ -6,6 +6,7 @@
 const express = require('express');
 const path = require('path');
 const { startScheduler } = require('./src-server/lib/scheduler');
+const { editionBanner, checkExpiryNotice } = require('./src-server/lib/edition'); // V2.2 #8 2026-10-31：版本分级（License 缺失/无效自动降级社区版，不阻塞启动）
 const fs = require('fs');
 
 const app = express();
@@ -63,6 +64,8 @@ app.use('/api/quota', require('./src-server/routes/quota'));
 app.use('/api/usermodels', require('./src-server/routes/usermodels'));
 // 技能资产（P3）：提示词+工具组合资产化，对话中 @技能名 调用
 app.use('/api/skillassets', require('./src-server/routes/skillassets'));
+// V2.2 #7 技能/模版市场：工作流模版/技能资产/MCP 工具/异构应用四区聚合 + 收藏 + 一键克隆
+app.use('/api/skills-market', require('./src-server/routes/skills-market'));
 // 用户管理：管理员对用户的增删改查/角色管理/重置密码/启停
 app.use('/api/users', require('./src-server/routes/users'));
 // 意见反馈（帮助体系）：全站反馈通道 + 管理员闭环处理（站内信回告提交者）
@@ -100,8 +103,11 @@ const server = app.listen(PORT, () => {
   console.log(`  前台入口:  http://localhost:${PORT}/`);
   console.log('  默认账号:  admin（首次登录强制改密）');
   console.log('             demo（首次登录强制改密）');
+  console.log(`  当前版本:  ${editionBanner()}`); // V2.2 #8：License 验签后横幅（专业版/企业版含到期信息，降级时展示原因）
   console.log('==============================================');
   startScheduler();
+  setTimeout(checkExpiryNotice, 60 * 1000).unref(); // V2.2 #8：License 到期提醒（启动 1 分钟后首查）
+  setInterval(checkExpiryNotice, 24 * 3600 * 1000).unref(); // 每 24h 复查（unref 不阻退出；notifications 当日同标题去重）
 });
 
 // 优雅停机（2026-10-20 P1）：SIGTERM/SIGINT 时停止接新连接、等待存量请求收尾、数据库落盘

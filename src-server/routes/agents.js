@@ -5,6 +5,7 @@ const { auth } = require('../lib/auth');
 const { chatOnce } = require('../lib/llm');
 const { canView, canEdit, isOwnerLevel, parseJsonArr } = require('../lib/agent-access');
 const { sanitizeMetadata } = require('../lib/kb-metadata'); // V1.2 #2 2026-10-30：kb_metadata_filter 入参清洗
+const { requireFeature } = require('../lib/edition'); // V2.2 #8 2026-10-31：License 特性闸门（中间件工厂）
 const { runTool, validateAgentTools, TOOL_DEFS, AGENT_TOOL_DENY } = require('../lib/tools'); // P5.34b copy 过滤依赖 AGENT_TOOL_DENY（此前漏导入被 catch 吞错致副本工具恒空——测试轮实锤修复）
 
 const router = express.Router();
@@ -107,7 +108,10 @@ function parseBody(b) {
   };
 }
 
-router.post('/', (req, res) => {
+// V2.2 #8 2026-10-31 License 功能闸门（接线示范）：community 即含 agents 特性，当前实际不拦——
+// 机制先行、付费墙后置（避免误伤存量用户）；后续钉钉/租户/审核流上线时在对应路由挂
+// requireFeature('dingtalk') / requireFeature('tenant') / requireFeature('audit_flow') 即生效
+router.post('/', requireFeature('agents'), (req, res) => {
   const a = parseBody(req.body || {});
   if (!a.name) return res.json({ code: 400, msg: '智能体名称不能为空' });
   if (a.tool_error) return res.json({ code: 400, msg: a.tool_error }); // P5.34：工具白名单

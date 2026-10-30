@@ -2699,6 +2699,119 @@ function t(name, fn) {
       assert.strictEqual(db.prepare(`SELECT nickname FROM users WHERE id=?`).get(uid).nickname, '新昵称', 'nickname 更新照常生效（COALESCE 只保护 dept_id，不影响其他字段）');
       db.prepare(`DELETE FROM users WHERE username='dingtalk_smoke-dt-u1'`).run();
     });
+    // ===== V2.2 #8 版本分级 + License 授权控制（2026-10-31，三态用例：合法/篡改/缺失——测试先行）=====
+    await t('License 缺失 → community 降级不抛错 + hasFeature 矩阵（V2.2 #8）', () => {
+      const E = require('../src-server/lib/edition');
+      const cur = E.refreshLicense(); // smoke 临时数据目录下无 license.json
+      assert.strictEqual(cur.edition, 'community', '缺失 License 应降级 community');
+      assert.strictEqual(cur.reason, 'missing');
+      assert.strictEqual(E.hasFeature('agents'), true, 'community 基础五特性照常（不锁死不裸奔）');
+      assert.strictEqual(E.hasFeature('kb'), true);
+      assert.strictEqual(E.hasFeature('workflow'), true);
+      assert.strictEqual(E.hasFeature('mcp'), true);
+      assert.strictEqual(E.hasFeature('openapi'), true);
+      assert.strictEqual(E.hasFeature('dingtalk'), false, 'community 无高级特性');
+      assert.strictEqual(E.hasFeature('tenant'), false, 'community 无企业特性');
+    });
+    await t('License 合法签发（测试密钥对 + LICENSE_PUBKEY_HEX 覆盖）→ edition 正确 + dingtalk true（V2.2 #8）', () => {
+      const crypto = require('crypto'), fs = require('fs'), path = require('path');
+      const E = require('../src-server/lib/edition');
+      // 测试密钥对现生成，经环境变量覆盖内置公钥（与生产密钥轮换同口）
+      const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
+      process.env.LICENSE_PUBKEY_HEX = publicKey.export({ type: 'spki', format: 'der' }).subarray(-32).toString('hex');
+      const p = (n) => String(n).padStart(2, '0');
+      const dstr = (d) => `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+      const exp = new Date(); exp.setDate(exp.getDate() + 365);
+      // 五字段按字母序键手工展开（canonical 规则，独立于被测 canonicalOf 构造）
+      const fields = { customer: '冒烟测试公司', edition: 'professional', expires_at: dstr(exp), issued_at: dstr(new Date()), license_key: '0f'.repeat(16) };
+      const signature = crypto.sign(null, Buffer.from(JSON.stringify(fields), 'utf8'), privateKey).toString('hex');
+      fs.writeFileSync(path.join(process.env.AGENT_DATA_DIR, 'license.json'), JSON.stringify({ ...fields, signature }));
+      const cur = E.refreshLicense();
+      assert.strictEqual(cur.edition, 'professional', '合法 License 验签通过');
+      assert.strictEqual(cur.customer, '冒烟测试公司');
+      assert.strictEqual(cur.days_left, 365);
+      assert.strictEqual(E.hasFeature('dingtalk'), true, '专业版应含 dingtalk');
+      assert.strictEqual(E.hasFeature('tenant'), false, '专业版不含 tenant');
+    });
+    await t('License 篡改 customer → 验签失败降级 community（V2.2 #8）', () => {
+      const fs = require('fs'), path = require('path');
+      const E = require('../src-server/lib/edition');
+      const licFile = path.join(process.env.AGENT_DATA_DIR, 'license.json');
+      const lic = JSON.parse(fs.readFileSync(licFile, 'utf8'));
+      lic.customer = '改票公司'; // 签发后篡改客户名
+      fs.writeFileSync(licFile, JSON.stringify(lic));
+      const cur = E.refreshLicense();
+      assert.strictEqual(cur.edition, 'community', '篡改后应降级社区版');
+      assert.strictEqual(cur.reason, 'badsig');
+      assert.strictEqual(cur.customer, null, '篡改票信息不得外泄');
+      assert.strictEqual(E.hasFeature('agents'), true, '降级后基础功能照常');
+    });
+    await t('License 过期（expires_at 昨天）→ community 降级（V2.2 #8）', () => {
+      const crypto = require('crypto'), fs = require('fs'), path = require('path');
+      const E = require('../src-server/lib/edition');
+      const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
+      process.env.LICENSE_PUBKEY_HEX = publicKey.export({ type: 'spki', format: 'der' }).subarray(-32).toString('hex');
+      const p = (n) => String(n).padStart(2, '0');
+      const dstr = (d) => `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+      const y = new Date(); y.setDate(y.getDate() - 1);
+      const fields = { customer: '过期公司', edition: 'enterprise', expires_at: dstr(y), issued_at: dstr(y), license_key: '11'.repeat(16) };
+      const signature = crypto.sign(null, Buffer.from(JSON.stringify(fields), 'utf8'), privateKey).toString('hex');
+      fs.writeFileSync(path.join(process.env.AGENT_DATA_DIR, 'license.json'), JSON.stringify({ ...fields, signature }));
+      const cur = E.refreshLicense();
+      assert.strictEqual(cur.edition, 'community', '过期 License 应降级社区版');
+      assert.strictEqual(cur.reason, 'expired');
+      delete process.env.LICENSE_PUBKEY_HEX; // 清理：不污染后续用例与生产内置公钥态
+    });
+    // ===== V2.2 审查加固防回归（2026-10-31）：Y1 公钥异常独立分类 / R1 运行期文件变更感知 =====
+    await t('License 公钥配置异常（LICENSE_PUBKEY_HEX 非 hex）→ badpubkey 独立分类，不误报 badsig（V2.2 审查加固 Y1）', () => {
+      const fs = require('fs'), path = require('path');
+      const E = require('../src-server/lib/edition');
+      const licFile = path.join(process.env.AGENT_DATA_DIR, 'license.json');
+      assert.ok(fs.existsSync(licFile), '前置：数据目录应有上条过期用例留下的 license.json');
+      process.env.LICENSE_PUBKEY_HEX = 'zz-not-hex';
+      const cur = E.refreshLicense();
+      assert.strictEqual(cur.reason, 'badpubkey', '公钥异常应独立分类 badpubkey（原实现误报 badsig，误导排查方向）：' + cur.reason);
+      assert.strictEqual(cur.edition, 'community', '公钥异常应 fail-closed 降级 community');
+      delete process.env.LICENSE_PUBKEY_HEX;
+      assert.strictEqual(E.refreshLicense().reason, 'badsig', '清理 env 恢复内置公钥后：测试钥签名的文件验签失败（badsig，验签先于到期判断，fail-closed 语义正确）');
+    });
+    await t('License 运行期文件变更感知：checkExpiryNotice 调度链路可感知覆写降级（V2.2 审查加固 R1 防回归——禁止吃启动/缓存快照）', () => {
+      const crypto = require('crypto'), fs = require('fs'), path = require('path');
+      const E = require('../src-server/lib/edition');
+      const licFile = path.join(process.env.AGENT_DATA_DIR, 'license.json');
+      const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
+      process.env.LICENSE_PUBKEY_HEX = publicKey.export({ type: 'spki', format: 'der' }).subarray(-32).toString('hex');
+      const p = (n) => String(n).padStart(2, '0');
+      const dstr = (d) => `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+      const mk = (days) => {
+        const d = new Date(); d.setDate(d.getDate() + days);
+        const f = { customer: '运行态感知公司', edition: 'professional', expires_at: dstr(d), issued_at: dstr(new Date()), license_key: '22'.repeat(16) };
+        return { ...f, signature: crypto.sign(null, Buffer.from(JSON.stringify(f), 'utf8'), privateKey).toString('hex') };
+      };
+      fs.writeFileSync(licFile, JSON.stringify(mk(20)));
+      assert.strictEqual(E.refreshLicense().licensed, true, '前置：覆写合法 License 后 refresh 应生效（licensed=true）');
+      // 运行期文件被替换为过期 License（续期失败/授权被回收场景）——调度链路必须即时感知
+      fs.writeFileSync(licFile, JSON.stringify(mk(-1)));
+      assert.strictEqual(E.checkExpiryNotice(), false, '过期态 checkExpiryNotice 不写提醒（days_left<0）');
+      assert.strictEqual(E.currentEdition().licensed, false, 'R1 核心：调度链路运行后缓存必须已降级（修复前 checkExpiryNotice 吃 currentEdition() 启动快照，长期运行进程过期永不降级）');
+      assert.strictEqual(E.currentEdition().reason, 'expired');
+      delete process.env.LICENSE_PUBKEY_HEX;
+      assert.strictEqual(E.refreshLicense().edition, 'community', '清理 env 后恢复文件真实态（为后续 requireFeature 用例保持 community 前置）');
+    });
+    await t('requireFeature 中间件：无权特性 403 + upgrade_hint / 有权特性 next() 放行（V2.2 #8）', () => {
+      const E = require('../src-server/lib/edition');
+      assert.strictEqual(E.currentEdition().edition, 'community', '前置：当前为降级态（过期用例后）');
+      let blocked = false;
+      const res = { body: null, json(j) { this.body = j; return this; } };
+      E.requireFeature('dingtalk')({}, res, () => { blocked = true; }); // community 无 dingtalk
+      assert.strictEqual(blocked, false, '无权特性不得进入业务 handler');
+      assert.strictEqual(res.body.code, 403);
+      assert.strictEqual(res.body.msg, '该功能需要专业版授权（当前：社区版）', '升级引导指向该特性所属最低版本');
+      assert.deepStrictEqual(res.body.data, { upgrade_hint: true, feature: 'dingtalk', edition: 'community' });
+      let passedGate = false;
+      E.requireFeature('agents')({}, { json() { throw new Error('有权特性不应走 json 分支'); } }, () => { passedGate = true; });
+      assert.strictEqual(passedGate, true, 'community 含 agents 特性应放行 next()');
+    });
     await t('resolveKbFilter：$user.dept 占位符替换 / 无 dept 与无用户链路 fail-closed / 无效 JSON 返回 null（V1.2 #2）', () => {
       const { resolveKbFilter, sanitizeMetadata, NO_DEPT_SENTINEL } = require('../src-server/lib/kb-metadata');
       const f1 = resolveKbFilter({ kb_metadata_filter: JSON.stringify({ level: '公开', dept: '$user.dept' }) }, { dept: '产品部' });
@@ -2898,6 +3011,76 @@ function t(name, fn) {
           const j2 = await r2.json().catch(() => null);
           assert.ok(j2 && j2.code === 0 && j2.data.url.includes('login.dingtalk.com'), '同源 Origin 应正常签发授权 URL：' + JSON.stringify(j2).slice(0, 120));
           assert.ok(j2.data.url.includes(encodeURIComponent(base + '/api/auth/dingtalk/callback')), 'redirect_uri 应为同源地址');
+        });
+        // ===== V2.2 #7 技能市场（2026-10-31）：三区聚合 + 收藏 + 一键克隆 =====
+        {
+          const wfJson = JSON.stringify({ nodes: [
+            { id: 'start', type: 'start', position: { x: 0, y: 0 }, data: { title: '开始', variables: [] } },
+            { id: 'end', type: 'end', position: { x: 300, y: 0 }, data: { title: '输出', outputs: [] } },
+          ], edges: [{ id: 'e1', source: 'start', target: 'end' }] });
+          db.prepare(`INSERT INTO workflow_templates (slug,name,icon,category,description,scene,workflow,builtin,use_count,created_by,created_at) VALUES ('mk-smoke-a','市场模版A','🎨','测试','聚合排序A','场景',?,0,50,'httpu1',datetime('now','localtime'))`).run(wfJson);
+          db.prepare(`INSERT INTO workflow_templates (slug,name,icon,category,description,scene,workflow,builtin,use_count,created_by,created_at) VALUES ('mk-smoke-b','市场模版B','🎨','测试','聚合排序B','场景',?,0,5,'httpu1',datetime('now','localtime'))`).run(wfJson);
+          db.prepare(`INSERT INTO skill_assets (owner,name,description,icon,prompt,tools,status,created_at) VALUES ('httpu1','市场克隆技能','供克隆','✨','市场克隆提示词','["calculator"]',1,datetime('now','localtime'))`).run();
+        }
+        await t('HTTP：技能市场——三区聚合 + 热度排序 + stats（V2.2 #7）', async () => {
+          const r = await jfetch('/api/skills-market', {}, tok1);
+          assert.ok(r.j && r.j.code === 0, '聚合端点应 code=0：' + JSON.stringify(r.j).slice(0, 120));
+          const d = r.j.data;
+          assert.ok(Array.isArray(d.wf_templates) && Array.isArray(d.skill_assets) && Array.isArray(d.mcp_tools) && Array.isArray(d.platforms), '四区数组齐备');
+          const a = d.wf_templates.find(x => x.slug === 'mk-smoke-a'), b = d.wf_templates.find(x => x.slug === 'mk-smoke-b');
+          assert.ok(a && b && d.wf_templates.indexOf(a) < d.wf_templates.indexOf(b), 'wf_templates 按 use_count DESC（模版A=50 在模版B=5 前）');
+          assert.ok(d.wf_templates.every((x, i, arr) => i === 0 || arr[i - 1].use_count >= x.use_count), 'use_count 全表单调不增');
+          const mySkill = d.skill_assets.find(x => x.name === '市场克隆技能');
+          assert.ok(!!mySkill && mySkill.owned_by_me, 'skill_assets 含本人资产且 owned_by_me=true');
+          assert.ok(d.stats.total === d.wf_templates.length + d.skill_assets.length + d.mcp_tools.length + d.platforms.length && d.stats.my_favorites === 0, 'stats.total=四区条数和、my_favorites=0');
+        });
+        await t('HTTP：技能市场——收藏 / 幂等 / 列表 / 取消（V2.2 #7）', async () => {
+          const tplId = db.prepare(`SELECT id FROM workflow_templates WHERE slug='mk-smoke-a'`).get().id;
+          const c1 = await jfetch('/api/skills-market/favorites', { method: 'POST', body: JSON.stringify({ item_type: 'wf_template', item_id: String(tplId) }) }, tok1);
+          assert.ok(c1.j && c1.j.code === 0, '收藏应成功：' + JSON.stringify(c1.j).slice(0, 120));
+          const c2 = await jfetch('/api/skills-market/favorites', { method: 'POST', body: JSON.stringify({ item_type: 'wf_template', item_id: String(tplId) }) }, tok1);
+          const rows = db.prepare(`SELECT COUNT(*) c FROM market_favorites WHERE username='httpu1' AND item_type='wf_template' AND item_id=?`).get(String(tplId)).c;
+          assert.ok(c2.j && c2.j.code === 0 && rows === 1, `重复收藏应幂等（code=0 且仅 1 行，实际 ${rows}）`);
+          const f = await jfetch('/api/skills-market/favorites', {}, tok1);
+          const row = (f.j.data || []).find(x => x.item_type === 'wf_template' && x.item_id === String(tplId));
+          assert.ok(!!row && row.name === '市场模版A' && row.available === true, '收藏列表应 join 回资产详情');
+          const del = await jfetch('/api/skills-market/favorites', { method: 'DELETE', body: JSON.stringify({ item_type: 'wf_template', item_id: String(tplId) }) }, tok1);
+          const f2 = await jfetch('/api/skills-market/favorites', {}, tok1);
+          assert.ok(del.j && del.j.code === 0 && !(f2.j.data || []).some(x => x.item_id === String(tplId)), '取消后列表不应再出现');
+        });
+        await t('HTTP：技能市场——一键克隆落库 / mcp_tool 拒绝（V2.2 #7）', async () => {
+          const sid = db.prepare(`SELECT id FROM skill_assets WHERE name='市场克隆技能' AND owner='httpu1'`).get().id;
+          const k = await jfetch('/api/skills-market/clone', { method: 'POST', body: JSON.stringify({ item_type: 'skill_asset', item_id: String(sid) }) }, tok1);
+          assert.ok(k.j && k.j.code === 0 && k.j.data.agent_id > 0, '克隆技能应成功返回 agent_id：' + JSON.stringify(k.j).slice(0, 120));
+          const a = db.prepare('SELECT name,prompt,tools,owner,status,category FROM agents WHERE id=?').get(k.j.data.agent_id);
+          assert.ok(a && a.name === '市场克隆技能（副本）' && a.prompt === '市场克隆提示词', `新 agent 应含「（副本）」后缀且 prompt 复制（name=${a && a.name}）`);
+          assert.ok(JSON.parse(a.tools || '[]').includes('calculator') && a.owner === 'httpu1' && a.status === 'draft', 'tools 复制 + owner=登录用户 + status=draft');
+          assert.ok(!!db.prepare(`SELECT 1 FROM op_logs WHERE action='市场克隆技能' AND username='httpu1'`).get(), 'op_logs 应记「市场克隆技能」');
+          const mcpToolId = db.prepare('SELECT id FROM mcp_servers LIMIT 1').get().id;
+          const bad = await jfetch('/api/skills-market/clone', { method: 'POST', body: JSON.stringify({ item_type: 'mcp_tool', item_id: `${mcpToolId}:get_x` }) }, tok1);
+          assert.ok(bad.j && bad.j.code === 400 && /暂不支持克隆/.test(bad.j.msg || ''), 'mcp_tool 克隆应 400「暂不支持克隆」');
+        });
+        await t('HTTP：技能市场——wf_template 一键克隆落库 + use_count 自增 + community 闸门放行（V2.2 审查加固 F3 防回归）', async () => {
+          const tplId = db.prepare(`SELECT id FROM workflow_templates WHERE slug='mk-smoke-b'`).get().id;
+          const k = await jfetch('/api/skills-market/clone', { method: 'POST', body: JSON.stringify({ item_type: 'wf_template', item_id: String(tplId) }) }, tok1);
+          assert.ok(k.j && k.j.code === 0 && k.j.data.agent_id > 0, '克隆模板应成功：' + JSON.stringify(k.j).slice(0, 160));
+          const a = db.prepare('SELECT name,type,edit_mode,routing_mode,status,owner FROM agents WHERE id=?').get(k.j.data.agent_id);
+          assert.ok(a && a.name === '市场模版B（副本）' && a.type === 'digital' && a.edit_mode === 'canvas' && a.routing_mode === 'workflow' && a.status === 'draft' && a.owner === 'httpu1', `模板克隆应落画布工作流草稿（name=${a && a.name}）`);
+          assert.strictEqual(db.prepare('SELECT use_count FROM workflow_templates WHERE id=?').get(tplId).use_count, 6, 'use_count 应自增 5→6');
+          assert.ok(!!db.prepare(`SELECT 1 FROM op_logs WHERE action='市场克隆模板' AND username='httpu1'`).get(), 'op_logs 应记「市场克隆模板」');
+          // F3 语义：HTTP 实例无 License 即 community，克隆成功本身证明 clone 新挂的 requireFeature('agents') 闸门未误伤基础功能
+        });
+        await t('HTTP：技能市场——长名资产克隆先截断后拼后缀，查重名=入库名（V2.2 审查加固 Y2 防回归）', async () => {
+          db.prepare(`DELETE FROM agents WHERE owner='httpu1'`).run(); // 清理前序用例克隆产物，腾出免费版配额（3 上限）
+          const longName = '超长名称资产'.repeat(10); // 60 字
+          db.prepare(`INSERT INTO skill_assets (owner,name,description,icon,prompt,tools,status,created_at) VALUES ('httpu1',?,'长名克隆','✨','长名提示词','[]',1,datetime('now','localtime'))`).run(longName);
+          const sid = db.prepare(`SELECT id FROM skill_assets WHERE name=? AND owner='httpu1'`).get(longName).id;
+          const k = await jfetch('/api/skills-market/clone', { method: 'POST', body: JSON.stringify({ item_type: 'skill_asset', item_id: String(sid) }) }, tok1);
+          assert.ok(k.j && k.j.code === 0, '长名克隆应成功：' + JSON.stringify(k.j).slice(0, 120));
+          const n = k.j.data.name;
+          assert.ok(n.length <= 50, `入库名应 ≤50 字符（实际 ${n.length}）`);
+          assert.ok(n.endsWith('（副本）'), `截断后应仍带完整后缀（修复前先查重后截断，后缀会被切掉）：…${n.slice(-8)}`);
+          assert.ok(!db.prepare('SELECT 1 FROM agents WHERE name=?').get(longName), '原始 60 字全名不应直接入库（查重名必须=入库名，防重名自相矛盾）');
         });
       } else {
         failed++; console.error('  ❌ HTTP 测试服务未就绪，本组用例跳过');

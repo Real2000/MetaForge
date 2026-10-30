@@ -1,0 +1,266 @@
+/** 技能/模版市场（V2.2 #7 2026-10-31）：分散资产的统一聚合运营位
+ *  对标 Dify 插件市场 / Coze Skills 商店——工作流模版 / 技能资产 / MCP 工具 / 异构纳管应用四区一页：
+ *  - GET    /api/skills-market               三区聚合 + 异构应用 + 统计（单请求返回，降低前端复杂度；登录即可浏览）
+ *  - GET    /api/skills-market/favorites     我的收藏列表（join 回资产详情，已下架资产标 available:false）
+ *  - POST   /api/skills-market/favorites     收藏（UNIQUE 幂等：重复收藏返回成功）
+ *  - DELETE /api/skills-market/favorites     取消收藏
+ *  - POST   /api/skills-market/clone         一键克隆：skill_asset/wf_template → 新智能体草稿；mcp_tool/platform 不支持
+ *  归属/权限：市场浏览全员（router.use(auth)）；克隆/收藏为写操作走登录用户身份；
+ *  克隆另挂 requireFeature('agents') 部署级版本闸门（V2.2 审查加固 F3：与 POST /api/agents 写入口同口径，
+ *  community 起即含 agents 特性，不误伤基础功能——闸门意义在于未来收敛免费档位时无需再改市场路由）。
+ *  注意：市场收藏走 market_favorites 表（username/item_type/item_id），与智能体收藏 favorites 表是两套，互不影响。
+ */
+const express = require('express');
+const { db, now } = require('../db');
+const { auth } = require('../lib/auth');
+const { TOOL_DEFS, AGENT_TOOL_DENY } = require('../lib/tools');
+const { validateWorkflowV2 } = require('../lib/workflow-schema');
+const dify = require('../lib/dify');
+const coze = require('../lib/coze');
+const { requireFeature } = require('../lib/edition');
+
+const router = express.Router();
+router.use(auth);
+
+/** 收藏品类型白名单（platforms 不可收藏——外部资产无本地稳定主键） */
+const FAV_TYPES = ['wf_template', 'skill_asset', 'mcp_tool'];
+
+/* ---------------- 异构应用清单缓存（模块级 Map + 时间戳，TTL 10 分钟） ----------------
+ * 外部平台 API 慢且可能故障，市场页每次刷新都直调不可接受；
+ * 成功与失败结果都缓存（失败缓存防反复打故障平台拖慢市场页），TTL 过后自动重试。 */
+const PLATFORM_TTL_MS = 10 * 60 * 1000;
+const platformCache = new Map(); // platform_id → { ts, apps: [...], error: '' }
+
+/** 单个接入平台 best-effort 拉取应用清单（try-catch 静默，异常返回 error 标记不抛出） */
+async function fetchPlatformApps(p) {
+  const apps = [];
+  if (p.type === 'dify') {
+    if (!p.console_email || !p.console_password) throw new Error('未配置控制台账号密码');
+    const session = await dify.consoleLogin(p.endpoint, p.console_email, p.console_password);
+    const list = await dify.listApps(p.endpoint, session);
+    for (const app of list) apps.push({ platform_type: 'dify', platform_name: p.name, app_id: String(app.id), app_name: app.name || '', app_desc: app.description || '', mode: app.mode || '' });
+  } else if (p.type === 'coze') {
+    if (!p.token || !String(p.token).startsWith('pat_')) throw new Error('未配置个人访问令牌（PAT）');
+    const { bots } = await coze.listAllBots(p.token); // 内部遍历工作空间调 listBots
+    for (const b of bots) apps.push({ platform_type: 'coze', platform_name: p.name, app_id: String(b.bot_id || b.bot_id_str || b.id || ''), app_name: b.name || '', app_desc: b.description || '', mode: 'chat' });
+  } else {
+    throw new Error(`暂不支持的平台类型：${p.type}`);
+  }
+  return apps;
+}
+
+/** 带缓存读取（命中未过期直接返回，cached=true 供前端/测试验证未触发外部调用） */
+async function loadPlatformApps(p) {
+  const hit = platformCache.get(p.id);
+  if (hit && Date.now() - hit.ts < PLATFORM_TTL_MS) return { apps: hit.apps, error: hit.error, cached: true };
+  let apps = [], error = '';
+  try { apps = await fetchPlatformApps(p); } catch (e) { error = e.message; }
+  platformCache.set(p.id, { ts: Date.now(), apps, error });
+  return { apps, error, cached: false };
+}
+
+/** 解析 MCP 工具级生效风险（P5.34 口径：人工标注 risk_overrides 优先 → 工具启发式 risk → 'auto' 回落） */
+function mcpToolRisk(overrides, tool) {
+  const name = tool.originalName || tool.name;
+  const ov = overrides[name];
+  if (ov === 'low' || ov === 'high' || ov === 'middle') return ov;
+  return tool.risk || 'auto';
+}
+
+/* ---------------- 三区聚合 ---------------- */
+router.get('/', async (req, res) => {
+  const me = req.user.username;
+  const favSet = new Set(db.prepare('SELECT item_type, item_id FROM market_favorites WHERE username=?').all(me)
+    .map(f => `${f.item_type}:${f.item_id}`));
+
+  // 一区：工作流模版（热度优先 use_count DESC, id DESC）
+  const wfTemplates = db.prepare(`SELECT id,slug,name,icon,category,description,scene,use_count,builtin
+    FROM workflow_templates ORDER BY use_count DESC, id DESC`).all()
+    .map(t => ({ ...t, favorited: favSet.has(`wf_template:${t.id}`) }));
+
+  // 二区：技能资产（我的全部 + 他人已发布——与 /api/skillassets 可见性口径一致，私有技能不进市场）
+  const skillAssets = db.prepare('SELECT id,name,description,icon,owner,status FROM skill_assets WHERE owner=? OR status=1 ORDER BY id DESC')
+    .all(me)
+    .map(s => ({ id: s.id, name: s.name, description: s.description, icon: s.icon, owner: s.owner, owned_by_me: s.owner === me, favorited: favSet.has(`skill_asset:${s.id}`) }));
+
+  // 三区：MCP 工具（tools_cache 展开每工具一行；停用服务跳过；item_id = server_id:tool_name 供收藏定位）
+  const mcpTools = [];
+  for (const s of db.prepare('SELECT id,name,tools_cache,risk_overrides,trusted,status FROM mcp_servers WHERE status=1 ORDER BY id DESC').all()) {
+    let tools = [], overrides = {};
+    try { tools = JSON.parse(s.tools_cache || '[]'); } catch { }
+    try { overrides = JSON.parse(s.risk_overrides || '{}') || {}; } catch { overrides = {}; }
+    for (const t of tools) {
+      const toolName = t.originalName || t.name;
+      if (!toolName) continue;
+      mcpTools.push({
+        id: `${s.id}:${toolName}`,
+        server_id: s.id, server_name: s.name, tool_name: toolName,
+        description: t.description || '',
+        risk: mcpToolRisk(overrides, t),
+        server_trusted: s.trusted ? 1 : 0,
+        favorited: favSet.has(`mcp_tool:${s.id}:${toolName}`),
+      });
+    }
+  }
+
+  // 四区：异构纳管应用（best-effort + 10 分钟缓存；外部平台故障不 5xx，记 platform_errors 标记）
+  const platforms = [];
+  const platformErrors = [];
+  let allCached = true;
+  for (const p of db.prepare('SELECT * FROM platforms').all()) {
+    const r = await loadPlatformApps(p);
+    if (!r.cached) allCached = false;
+    platforms.push(...r.apps);
+    if (r.error) {
+      platformErrors.push({ platform_id: p.id, platform_name: p.name, platform_type: p.type, message: r.error });
+      try { db.prepare('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)').run('skills-market', `异构应用拉取失败（${p.name}）：${r.error}`, now()); } catch { }
+    }
+  }
+
+  res.json({
+    code: 0,
+    data: {
+      wf_templates: wfTemplates,
+      skill_assets: skillAssets,
+      mcp_tools: mcpTools,
+      platforms,
+      platform_errors: platformErrors,   // best-effort 观测标记（前端不阻塞渲染）
+      platforms_cached: allCached,       // 调试字段：true=本次未触发任何外部调用（缓存命中）
+      stats: {
+        total: wfTemplates.length + skillAssets.length + mcpTools.length + platforms.length,
+        my_favorites: favSet.size,
+      },
+    },
+  });
+});
+
+/* ---------------- 收藏 ---------------- */
+
+/** 查收藏条目的资产当前详情（join 回详情；不可见/已删除返回 available:false） */
+function favItemDetail(itemType, itemId, username) {
+  if (itemType === 'wf_template') {
+    const t = db.prepare('SELECT id,slug,name,icon,category,description,scene,use_count,builtin FROM workflow_templates WHERE id=?').get(+itemId);
+    return t ? { available: true, name: t.name, icon: t.icon || '🎨', description: t.description || '', extra: { category: t.category, use_count: t.use_count, builtin: t.builtin } } : { available: false, name: '', icon: '🎨', description: '', extra: {} };
+  }
+  if (itemType === 'skill_asset') {
+    // 可见性口径同市场列表：本人资产或已发布；他人转私有的收藏条目自然变为不可见
+    const s = db.prepare('SELECT id,name,description,icon,owner,status FROM skill_assets WHERE id=? AND (owner=? OR status=1)').get(+itemId, username);
+    return s ? { available: true, name: s.name, icon: s.icon || '✨', description: s.description || '', extra: { owner: s.owner } } : { available: false, name: '', icon: '✨', description: '', extra: {} };
+  }
+  if (itemType === 'mcp_tool') {
+    const [sid, ...rest] = String(itemId).split(':');
+    const toolName = rest.join(':'); // 工具名本身可能含冒号，仅按第一个冒号拆分
+    const s = db.prepare('SELECT id,name,tools_cache,trusted,status FROM mcp_servers WHERE id=? AND status=1').get(+sid);
+    if (!s || !toolName) return { available: false, name: '', icon: '🔧', description: '', extra: {} };
+    let tools = [];
+    try { tools = JSON.parse(s.tools_cache || '[]'); } catch { }
+    const t = tools.find(x => (x.originalName || x.name) === toolName);
+    return t ? { available: true, name: toolName, icon: '🔧', description: t.description || '', extra: { server_name: s.name, server_trusted: s.trusted ? 1 : 0 } } : { available: false, name: toolName, icon: '🔧', description: '', extra: {} };
+  }
+  return null;
+}
+
+router.get('/favorites', (req, res) => {
+  const rows = db.prepare('SELECT item_type,item_id,created_at FROM market_favorites WHERE username=? ORDER BY id DESC').all(req.user.username);
+  res.json({
+    code: 0,
+    data: rows.map(f => {
+      const d = favItemDetail(f.item_type, f.item_id, req.user.username);
+      return { item_type: f.item_type, item_id: f.item_id, created_at: f.created_at, ...(d || { available: false, name: '', icon: '📦', description: '', extra: {} }) };
+    }),
+  });
+});
+
+router.post('/favorites', (req, res) => {
+  const { item_type, item_id } = req.body || {};
+  const id = String(item_id ?? '');
+  if (!FAV_TYPES.includes(item_type)) return res.json({ code: 400, msg: '收藏类型仅支持 wf_template / skill_asset / mcp_tool（异构应用暂不可收藏）' });
+  if (!id) return res.json({ code: 400, msg: '缺少收藏对象（item_id）' });
+  if (!favItemDetail(item_type, id, req.user.username)?.available) return res.json({ code: 400, msg: '收藏对象不存在或已下架' });
+  // UNIQUE(username,item_type,item_id) 幂等：重复收藏 = 已收藏，返回成功
+  db.prepare('INSERT OR IGNORE INTO market_favorites (username,item_type,item_id,created_at) VALUES (?,?,?,?)')
+    .run(req.user.username, item_type, id, now());
+  res.json({ code: 0, msg: '已收藏' });
+});
+
+router.delete('/favorites', (req, res) => {
+  // 参数兼容 body（与 POST 对称）与 query 两种传法
+  const { item_type, item_id } = req.body || {};
+  const type = item_type || req.query.item_type;
+  const id = String(item_id ?? req.query.item_id ?? '');
+  if (!FAV_TYPES.includes(type) || !id) return res.json({ code: 400, msg: '缺少取消收藏参数（item_type / item_id）' });
+  db.prepare('DELETE FROM market_favorites WHERE username=? AND item_type=? AND item_id=?').run(req.user.username, type, id);
+  res.json({ code: 0, msg: '已取消收藏' });
+});
+
+/* ---------------- 一键克隆 ---------------- */
+
+/** 防重名：技能/模版名 +「（副本）」后缀；连后缀都撞则追加序号（副本2/副本3…）。
+ *  V2.2 审查加固（Y2）：先截断 base 再拼后缀——原实现查重用全名、返回前才 slice(0,50)，
+ *  长名场景「查重名 ≠ 入库名」（截断后可能与他名碰撞），防重名自相矛盾；
+ *  base 截 43 字预留 7 字后缀空间（最长「（副本100）」），保证查重名 = 入库名且 ≤50 */
+function uniqueAgentName(base) {
+  const b = String(base).slice(0, 43);
+  let name = `${b}（副本）`;
+  for (let i = 2; db.prepare('SELECT 1 FROM agents WHERE name=?').get(name); i++) name = `${b}（副本${i}）`;
+  return name;
+}
+
+router.post('/clone', requireFeature('agents'), (req, res) => {
+  const { item_type, item_id } = req.body || {};
+  const id = String(item_id ?? '');
+
+  if (item_type === 'mcp_tool' || item_type === 'platform' || item_type === 'platforms') {
+    return res.json({ code: 400, msg: '该类型暂不支持克隆，请在 MCP 管理/接入管理中配置' });
+  }
+
+  // 免费版智能体数软约束（与 POST /api/agents 同款商业化口径，防市场克隆绕过配额引导）
+  const { planUsage } = require('../lib/plans');
+  const pu = planUsage(req.user.username);
+  if (pu && !pu.exempt && pu.plan === 'free' && pu.agents >= pu.agentsLimit) {
+    return res.json({ code: 402, msg: `免费版最多创建 ${pu.agentsLimit} 个智能体（当前 ${pu.agents} 个）`, data: { upgrade_hint: true } });
+  }
+
+  if (item_type === 'skill_asset') {
+    // 可见性口径同市场列表（他人私有资产不可克隆）
+    const s = db.prepare('SELECT * FROM skill_assets WHERE id=? AND (owner=? OR status=1)').get(+id, req.user.username);
+    if (!s) return res.json({ code: 404, msg: '技能资产不存在或已下架' });
+    // 工具白名单（P5.34b 同 skillassets POST 口径：剔除违禁与未知工具）
+    let toolIds = [];
+    try { toolIds = JSON.parse(s.tools || '[]'); } catch { }
+    toolIds = toolIds.filter(t => TOOL_DEFS[t] && !AGENT_TOOL_DENY.has(t));
+    const name = uniqueAgentName(s.name);
+    // 组装 POST /api/agents 同款 payload 后内部直接 db INSERT（不 HTTP 自调）——列与默认值照抄 routes/agents.js POST /
+    const info = db.prepare(`INSERT INTO agents (name,description,type,space_id,category,prompt,user_prompt,model,temperature,top_p,diversity_mode,icon,context_rounds,max_reply,opening,opening_questions,kb_id,status,source,tools,mcp_servers,long_memory,allow_user_model,suggest_enabled,variables,child_ids,routing_mode,owner,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))`)
+      .run(name, s.description || '', 'digital', null, '技能', s.prompt, '', '', 0.7, 0.7, 'balanced',
+        String(s.icon || '✨').slice(0, 8), 10, 1024, `您好，我是从技能市场克隆的「${s.name}」，请问有什么可以帮您？`, '[]',
+        null, 'draft', 'self', JSON.stringify(toolIds), '[]', 0, 1, 1, '[]', '[]', 'function', req.user.username);
+    db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
+      .run(req.user.username, '市场克隆技能', `${name}（技能：${s.name}，工具：${toolIds.length ? toolIds.join('/') : '纯提示词'}）`, req.ip, now());
+    return res.json({ code: 0, msg: `已克隆为「${name}」草稿——去编排页调整提示词后发布`, data: { agent_id: Number(info.lastInsertRowid), name } });
+  }
+
+  if (item_type === 'wf_template') {
+    // 同构复用 routes/wf-templates.js POST /:id/create 的核心（该逻辑在 router 闭包内不可 import，照抄实现并注明出处）：
+    // 读模板 workflow → validateWorkflowV2 二次校验 → 创建画布智能体草稿 → use_count+1
+    const t = db.prepare('SELECT * FROM workflow_templates WHERE id=?').get(+id);
+    if (!t) return res.json({ code: 404, msg: '模板不存在' });
+    const v = validateWorkflowV2(t.workflow);
+    if (!v || v.error) return res.json({ code: 500, msg: '模板 workflow 结构异常：' + (v ? v.error : '解析失败') });
+    const name = uniqueAgentName(t.name);
+    const info = db.prepare(`INSERT INTO agents (name,description,type,icon,category,model,prompt,workflow,edit_mode,routing_mode,owner,status,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))`)
+      .run(name, t.description || '', 'digital', t.icon || '🎨', t.category || '通用', '',
+        `【工作流模板：${t.name}】${t.description || ''}\n\n使用说明：${t.scene || '按需调整节点参数'}`,
+        JSON.stringify(v), 'canvas', 'workflow', req.user.username, 'draft');
+    db.prepare('UPDATE workflow_templates SET use_count=use_count+1 WHERE id=?').run(t.id);
+    db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
+      .run(req.user.username, '市场克隆模板', `${name}（模板：${t.name}，来源：技能市场）`, req.ip, now());
+    return res.json({ code: 0, msg: `已从模板创建「${name}」草稿——去编排页改提示词/知识库后发布`, data: { agent_id: Number(info.lastInsertRowid), name } });
+  }
+
+  return res.json({ code: 400, msg: '克隆类型仅支持 skill_asset / wf_template' });
+});
+
+module.exports = router;

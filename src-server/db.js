@@ -763,6 +763,18 @@ try {
   const info = backfill.run();
   if (info.changes > 0) console.log(`[db] users 表已迁移：${info.changes} 条 dept_id 按部门名回填（同名部门歧义的跳过）`);
 } catch (e) { console.error('[db] users.dept_id 回填迁移失败（不阻塞启动）：', e.message); }
+// ---------------- V2.2（2026-10-31）：#7 技能市场收藏 ----------------
+// 市场收藏表（泛化 item_type/item_id）：独立于 favorites 表（后者 agent_id NOT NULL 仅服务智能体收藏，
+// 泛化改造影响面大，故新建专表）。item_type: wf_template(工作流模版)/skill_asset(技能资产)/mcp_tool(MCP 工具)
+// UNIQUE(username, item_type, item_id) 幂等收藏
+db.exec(`CREATE TABLE IF NOT EXISTS market_favorites (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  username TEXT NOT NULL,
+  item_type TEXT NOT NULL,
+  item_id TEXT NOT NULL,
+  created_at TEXT,
+  UNIQUE(username, item_type, item_id)
+);`);
 // ---------------- V1.3（2026-10-30）：#6 评测集 + #4 钉钉 mock ----------------
 // evaluations 加 kb_id/type：知识库级召回评测集与智能体级评测同表共存（type='agent'|'kb'，默认 'agent' 兼容存量）
 // 存量行 type 归一为 'agent'（agent_id 非 NULL）/查询侧补 type 过滤防两类数据互相污染
