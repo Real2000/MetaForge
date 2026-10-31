@@ -264,7 +264,7 @@ router.post('/clone', requireFeature('agents'), (req, res) => {
     // 组装 POST /api/agents 同款 payload 后内部直接 db INSERT（不 HTTP 自调）——列与默认值照抄 routes/agents.js POST /
     const info = db.prepare(`INSERT INTO agents (name,description,type,space_id,category,prompt,user_prompt,model,temperature,top_p,diversity_mode,icon,context_rounds,max_reply,opening,opening_questions,kb_id,status,source,tools,mcp_servers,long_memory,allow_user_model,suggest_enabled,variables,child_ids,routing_mode,owner,created_at,updated_at)
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))`)
-      .run(name, s.description || '', 'digital', null, '技能', s.prompt, '', '', 0.7, 0.7, 'balanced',
+      .run(name, s.description || '', 'digital', db.prepare('SELECT id FROM spaces WHERE type=? AND owner=? LIMIT 1').get('personal', req.user.username)?.id || 0, '技能', s.prompt, '', '', 0.7, 0.7, 'balanced',
         String(s.icon || '✨').slice(0, 8), 10, 1024, `您好，我是从技能市场克隆的「${s.name}」，请问有什么可以帮您？`, '[]',
         null, 'draft', 'self', JSON.stringify(toolIds), '[]', 0, 1, 1, '[]', '[]', 'function', req.user.username);
     db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
