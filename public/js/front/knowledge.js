@@ -2,6 +2,20 @@
 import { api } from '../api.js';
 import { esc, toast, modal, confirmBox, fmtBytes } from '../ui.js';
 
+// ---------- V2.3 #5 摄取管道（2026-10-31）：步骤定义（key 与后端白名单一致） ----------
+// 顺序即默认管道执行顺序；name 为中文步骤名、desc 为一句话说明（配置弹窗展示用）
+const PIPELINE_STEPS = [
+  { key: 'parse', name: '文件解析', desc: '提取 PDF/DOCX/TXT 等文档的原始文本' },
+  { key: 'ocr', name: 'OCR 增强', desc: '识别扫描版 PDF/图片中的文字（未配置 OCR 服务时自动跳过）' },
+  { key: 'clean', name: '文本清洗', desc: '去除页眉页脚、多余空白与乱码字符' },
+  { key: 'chunk', name: '智能切片', desc: '按切片配置分块，段落优先、超长按句边界切分' },
+  { key: 'toc', name: '目录提取', desc: '生成章节层级目录，检索命中自动带同章节上下文' },
+  { key: 'metadata', name: '元数据抽取', desc: '抽取部门/密级/文档类型元数据（用于检索权限过滤）' },
+  { key: 'keywords', name: '关键词生成', desc: '为分块生成检索关键词与问法（需已配置模型）' },
+  { key: 'regression', name: '召回回归', desc: '库变更后自动重跑评测集（有评测集时生效）' },
+];
+const PIPELINE_DEFAULT = PIPELINE_STEPS.map(s => s.key); // 默认管道（与后端默认一致）
+
 export async function render(el) {
   let kbs = [];
   let current = null;   // 当前打开的库
@@ -30,14 +44,43 @@ export async function render(el) {
   const paneEvals = el.querySelector('#paneEvals'); // V1.3 #6 2026-10-30：第四个主 tab「评测集」
 
   // V1.1 #1 2026-10-30：文件状态四态徽章（success/failed/pending/processing）
-  // pending/processing 为 #5 摄取管道异步化后的预留态，当前同步架构下不产生（非缺陷）；失败落库后文件列表会出现 failed 行
+  // V2.3 #5 2026-10-31：摄取管道化落地——pending/processing 成为异步管道真实中间态（黄色系 ⏳ 徽章），由文件列表 5s 轮询驱动收敛
   function kbFileStatusTag(s) {
     return {
       success: '<span class="tag green">解析完成</span>',
       failed: '<span class="tag red">解析失败</span>',
-      processing: '<span class="tag blue">处理中</span>',
-      pending: '<span class="tag orange">排队中</span>',
+      processing: '<span class="tag orange">⏳ 处理中</span>',
+      pending: '<span class="tag orange">⏳ 排队中</span>',
     }[s] || `<span class="tag gray">${esc(s || '未知')}</span>`;
+  }
+
+  // ---------- V2.3 #5 2026-10-31：文件列表异步管道轮询 ----------
+  // 触发：文件列表存在非终态（pending/processing）行 → 5s 间隔 loadFiles+重渲染；全部终态后自动停止
+  // 防泄漏三保险：①路由切页 destroy 钩子（render 返回值） ②interval 回调自检 el.isConnected（页面被替换） ③连续失败 ≥3 次熔断（防会话失效后空转）
+  let filePollTimer = null;
+  let filePollFails = 0;
+
+  function stopFilePolling() {
+    if (filePollTimer) { clearInterval(filePollTimer); filePollTimer = null; }
+    filePollFails = 0;
+  }
+
+  /** 轮询调度（幂等）：每次文件列表重渲染后调用，按当前 files 状态启停 */
+  function syncFilePolling() {
+    const hasRunning = !!current && files.some(f => f.status === 'pending' || f.status === 'processing');
+    if (hasRunning && !filePollTimer) {
+      filePollTimer = setInterval(async () => {
+        if (!el.isConnected || !current) return stopFilePolling(); // 页面已切走 / 已返回库列表
+        if (filePollFails >= 3) return stopFilePolling();          // 连续失败熔断
+        try {
+          await loadFiles();
+          filePollFails = 0;
+          renderKbList(); // 重渲染；末尾再次 syncFilePolling——全部终态后收敛停止
+        } catch { filePollFails++; }
+      }, 5000);
+    } else if (!hasRunning && filePollTimer) {
+      stopFilePolling();
+    }
   }
 
   // ---------- 知识库列表 ----------
@@ -70,6 +113,7 @@ export async function render(el) {
         catch (e) { toast(e.code === 403 ? '无权查看该知识库的文件（仅创建者或管理员）' : (e.message || '文件加载失败'), 'err'); }
         renderKbList();
       });
+      syncFilePolling(); // V2.3 #5：返回库列表视图（current=null）时停止轮询
       return;
     }
     // 文件管理视图
@@ -118,6 +162,7 @@ export async function render(el) {
       toast('已删除'); loadFiles().then(renderKbList);
     });
     paneKb.querySelectorAll('[data-chunks]').forEach(b => b.onclick = () => openChunks(+b.dataset.chunks));
+    syncFilePolling(); // V2.3 #5：文件视图重渲染后按四态启停轮询（存在 pending/processing 行即启动）
   }
 
   // ---------- 分块元数据工具（V1.2 #2 2026-10-30）----------
@@ -344,6 +389,16 @@ export async function render(el) {
             <div class="hint">开启后上传文件由 AI 自动抽取部门/密级/文档类型元数据，用于检索权限过滤（需已配置模型）</div>
           </div>
         </div>
+      </div>
+      <hr>
+      <div style="font-size:13px;font-weight:600;color:var(--text);margin:10px 0 6px">摄取管道<span style="font-weight:400;font-size:11px;color:var(--text-3)">（上传文件按以下步骤依序处理，可停用/调序）</span></div>
+      <div class="form-item">
+        <div id="kb_pipe_list" style="border:1px solid var(--border);border-radius:8px"></div>
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-top:8px;flex-wrap:wrap;gap:8px">
+          <span class="hint" id="kb_pipe_state"></span>
+          <button class="btn sm" id="kb_pipe_reset" title="恢复为默认管道（全部步骤、默认顺序）">↺ 恢复默认管道</button>
+        </div>
+        <div class="hint">全部步骤启用且为默认顺序时保存即恢复后端默认管道；OCR 步骤在未配置 OCR 服务时自动跳过，不阻塞上传</div>
       </div>`;
     modal({
       title: '编辑知识库', body,
@@ -364,19 +419,82 @@ export async function render(el) {
         // V1.2 #2：自动元数据开关（点按切换，不随其它字段联动）
         const autoMetaSw = mask.querySelector('#kb_auto_meta');
         autoMetaSw.onclick = () => autoMetaSw.classList.toggle('on');
+        // ---------- V2.3 #5 2026-10-31：摄取管道编排（列表式：每行启停开关 + 上移/下移；保存并入现有 PUT payload） ----------
+        let pipeRows = []; // [{key,on}] 列表顺序即执行顺序
+        const isDefaultPipe = () => pipeRows.length === PIPELINE_DEFAULT.length
+          && pipeRows.every((r, i) => r.on && r.key === PIPELINE_DEFAULT[i]); // 全启用 + 默认序 = 默认管道（保存传 null）
+        // 库上已保存管道 → 初始编排态：null/[] 视为默认（全步骤默认序启用）；自定义则按其顺序，未含步骤追加尾部且停用
+        const savedPipe = Array.isArray(kb.pipeline) ? kb.pipeline.filter(k => PIPELINE_DEFAULT.includes(k)) : null;
+        const buildDefaultRows = () => PIPELINE_DEFAULT.map(key => ({ key, on: true }));
+        const renderPipeRows = () => {
+          const listEl = mask.querySelector('#kb_pipe_list');
+          listEl.innerHTML = pipeRows.map((r, i) => {
+            // 步骤定义查表；兜底名 esc 转义（深度防御：key 来源已过白名单过滤，此分支理论不可达，仍防注入）
+            const st = PIPELINE_STEPS.find(s => s.key === r.key) || { name: esc(r.key), desc: '' };
+            return `
+            <div style="display:flex;align-items:center;gap:10px;padding:7px 10px;${i < pipeRows.length - 1 ? 'border-bottom:1px solid var(--border);' : ''}${r.on ? '' : 'opacity:.5;'}">
+              <span class="switch ${r.on ? 'on' : ''}" data-pipe-sw="${i}" title="启用/停用该步骤"></span>
+              <div style="flex:1;min-width:0">
+                <b style="font-size:13px">${st.name}</b>${r.on ? '' : ' <span class="tag gray" style="font-size:10px">已停用</span>'}
+                <div style="font-size:11px;color:var(--text-3)">${st.desc}</div>
+              </div>
+              <button class="btn sm" data-pipe-up="${i}" ${i === 0 ? 'disabled' : ''} title="上移">↑</button>
+              <button class="btn sm" data-pipe-down="${i}" ${i === pipeRows.length - 1 ? 'disabled' : ''} title="下移">↓</button>
+            </div>`;
+          }).join('');
+          mask.querySelector('#kb_pipe_state').innerHTML = isDefaultPipe()
+            ? '当前：<span class="tag blue">默认</span>管道（全部步骤按默认顺序执行）'
+            : `当前：<span class="tag orange">自定义</span>管道（${pipeRows.filter(r => r.on).length}/${pipeRows.length} 个步骤启用，保存后生效）`;
+          // 行内事件（整区重渲染后需重挂）
+          mask.querySelectorAll('[data-pipe-sw]').forEach(sw => sw.onclick = () => {
+            const i = +sw.dataset.pipeSw; pipeRows[i].on = !pipeRows[i].on; renderPipeRows();
+          });
+          mask.querySelectorAll('[data-pipe-up]').forEach(b => b.onclick = () => {
+            const i = +b.dataset.pipeUp; if (i <= 0) return;
+            [pipeRows[i - 1], pipeRows[i]] = [pipeRows[i], pipeRows[i - 1]]; renderPipeRows();
+          });
+          mask.querySelectorAll('[data-pipe-down]').forEach(b => b.onclick = () => {
+            const i = +b.dataset.pipeDown; if (i >= pipeRows.length - 1) return;
+            [pipeRows[i], pipeRows[i + 1]] = [pipeRows[i + 1], pipeRows[i]]; renderPipeRows();
+          });
+        };
+        // 初始态：按库上已保存的管道展开（后端默认管道返回 null → 全默认展示 + 「默认」标记，见 renderPipeRows 状态行）
+        // 注意 concat 补齐仅对自定义管道生效：默认（null/[]）直接取全量默认行——
+        // 此前三元分支两路都拼接补齐，null 时 PIPELINE_DEFAULT 与补齐集重复展开为 16 行（必现 UI 缺陷，已修）
+        const hasCustomPipe = !!(savedPipe && savedPipe.length);
+        pipeRows = (hasCustomPipe
+          ? savedPipe.concat(PIPELINE_DEFAULT.filter(k => !savedPipe.includes(k))) // 自定义序在前，未含步骤追加尾部
+          : PIPELINE_DEFAULT                                                        // 默认：全步骤默认序
+        ).map(key => ({ key, on: hasCustomPipe ? savedPipe.includes(key) : true }));
+        renderPipeRows();
+        mask.querySelector('#kb_pipe_reset').onclick = () => {
+          pipeRows = buildDefaultRows(); renderPipeRows();
+          toast('已恢复默认管道，保存后生效');
+        };
+        // 序列化：全默认 → null（恢复后端默认管道）；否则传启用步骤 key 数组（按列表顺序）
+        const serializePipe = () => (isDefaultPipe() ? null : pipeRows.filter(r => r.on).map(r => r.key));
+        // 全停用拦截提示：契约规定 [] = 恢复默认管道（存 NULL），与用户「什么都不执行」的直觉相悖，保存前明示
+        const assertPipeSerializable = () => {
+          if (!pipeRows.some(r => r.on)) { toast('已停用全部步骤——按后端契约，保存后等同于恢复默认管道（如需仅保留基础解析，请至少启用「文件解析」）', 'err'); return false; }
+          return true;
+        };
         mask.querySelector('[data-save]').onclick = async () => {
+          if (!assertPipeSerializable()) return; // 全停用步骤：拦截并明示语义（[] 在后端=恢复默认）
           const chunkSize = Math.min(2000, Math.max(100, +sizeInput.value)) || 500;
           const chunkOverlap = Math.min(chunkSize - 1, Math.max(0, +mask.querySelector('#kb_chunk_overlap').value)) || 0;
-          await api('/knowledge/' + kb.id, { method: 'PUT', body: {
-            name: mask.querySelector('#kb_name').value,
-            description: mask.querySelector('#kb_desc').value,
-            enabled: +mask.querySelector('#kb_enabled').value,
-            chunk_size: chunkSize,
-            chunk_overlap: chunkOverlap,
-            chunk_separator: mask.querySelector('#kb_chunk_sep').value || '\\n\\s*\\n',
-            auto_metadata: autoMetaSw.classList.contains('on') ? 1 : 0, // V1.2 #2：自动元数据开关
-          } });
-          toast('已保存'); close(); loadKbs().then(() => { current = kbs.find(x => x.id === kb.id); renderKbList(); });
+          try {
+            await api('/knowledge/' + kb.id, { method: 'PUT', body: {
+              name: mask.querySelector('#kb_name').value,
+              description: mask.querySelector('#kb_desc').value,
+              enabled: +mask.querySelector('#kb_enabled').value,
+              chunk_size: chunkSize,
+              chunk_overlap: chunkOverlap,
+              chunk_separator: mask.querySelector('#kb_chunk_sep').value || '\\n\\s*\\n',
+              auto_metadata: autoMetaSw.classList.contains('on') ? 1 : 0, // V1.2 #2：自动元数据开关
+              pipeline: serializePipe(), // V2.3 #5：摄取管道（非法步骤名等 400 错误在下方 catch 透传 toast）
+            } });
+            toast('已保存'); close(); loadKbs().then(() => { current = kbs.find(x => x.id === kb.id); renderKbList(); });
+          } catch (e) { toast(e.message, 'err'); } // V2.3 #5：保存失败（含 pipeline 400 校验）不再静默，弹窗保留供修正
         };
       },
     });
@@ -460,7 +578,7 @@ export async function render(el) {
   async function loadFiles() { const j = await api(`/knowledge/${current.id}/files`); files = j.data; }
 
   // ---------- 解析日志（V1.1 #1 2026-10-30：三张统计卡 + 日志表格 + 分页 + 失败行重传/删除） ----------
-  // 四态预设计：pending/processing 为 #5 摄取管道异步化后的预留演进位，当前同步解析架构下「处理中」恒为 0（非缺陷）
+  // V2.3 #5 2026-10-31：摄取管道化落地——pending/processing 由恒 0 变为真实中间态（stats 若带 pending 字段则与 processing 合计展示）
   let logsPage = 1;
 
   async function renderLogs(page) {
@@ -508,8 +626,8 @@ export async function render(el) {
         </div>
         <div class="stat-card">
           <div class="label">⏳ 处理中</div>
-          <div class="num" style="color:var(--brand)">${stats.processing}</div>
-          <div class="sub">异步管道化（#5）后生效，当前同步解析恒为 0</div>
+          <div class="num" style="color:var(--brand)">${(stats.processing || 0) + (stats.pending || 0)}</div>
+          <div class="sub">V2.3 #5 管道化后为真实中间态（排队 + 处理中）</div>
         </div>
       </div>
       <div class="card">
@@ -900,6 +1018,8 @@ export async function render(el) {
     paneRecall.style.display = t === 'recall' ? '' : 'none';
     paneLogs.style.display = t === 'logs' ? '' : 'none';
     paneEvals.style.display = t === 'evals' ? '' : 'none'; // V1.3 #6：评测集页
+    // V2.3 #5：离开文件列表视图（kb tab）即停轮询防空转；切回时按当前 files 状态重新评估（幂等）
+    if (t === 'kb') syncFilePolling(); else stopFilePolling();
   }
 
   el.querySelectorAll('#mainTabs .tab').forEach(t => t.onclick = () => {
@@ -910,4 +1030,6 @@ export async function render(el) {
 
   await loadKbs();
   await renderRecall();
+  // V2.3 #5 2026-10-31：路由 destroy 生命周期（app.js 切页统一调用）——离开知识库页时停止文件列表轮询，防内存泄漏
+  return { destroy() { stopFilePolling(); } };
 }

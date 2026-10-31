@@ -1,4 +1,18 @@
-/** 知识库：库 CRUD / 文件上传解析 / 召回测试 */
+/**
+ * 知识库：库 CRUD（含 V2.3 #5 摄取管道配置 pipeline 字段）/ 文件上传解析（管道化）/ 召回测试
+ *
+ * V2.3 #5 摄取管道化 + PaddleOCR 接入（2026-10-31）：
+ * - 上传解析链路自本文件内联实现（原 L135-274 约 140 行）移入 lib/ingestion-pipeline.js
+ *   （步骤注册表 + 执行器：parse→ocr→clean→chunk→toc→落库→metadata/keywords/regression 后处理），
+ *   默认管道 + 同步模式下行为与改造前逐字节等价（错误文案 / SQL 写入 / op_logs / fire-and-forget 条件）；
+ * - 同步模式（默认）：await 全管道，成功 { code:0, data:{ id, chunks } }、失败 400 同改造前文案；
+ * - 异步模式 ?async=1：先落 pending 行立即返回 { code:0, data:{ id, status:'pending', async:true } }，
+ *   管道后台 fire-and-forget 执行（异常兜底落 failed + err_logs），前端轮询 GET /:id/files 或 /:id/logs 观测终态；
+ * - 库级管道配置：PUT /:id 接受 pipeline 字段（步骤名数组，白名单校验；null/[]=恢复默认），
+ *   仅影响后续上传，不自动重切存量分块；
+ * - ocr 步骤依赖外部 PaddleOCR 服务（env PADDLEOCR_URL，未配置=整体跳过，部署见
+ *   docker-compose.paddleocr.yml + docs/PaddleOCR部署说明.md）。
+ */
 const express = require('express');
 const { db, now } = require('../db');
 const { auth } = require('../lib/auth');
@@ -7,6 +21,13 @@ const { generateForFile } = require('../lib/keywordgen');
 const { extractMetadataForFile, sanitizeMetadata } = require('../lib/kb-metadata'); // V1.2 #2 2026-10-30：自动元数据抽取 + 入参清洗
 const { retrieveGraph } = require('../lib/graphrag');
 const { rerunEvalSet, runKbRegression } = require('../lib/kb-eval-regression'); // V1.3 #6 2026-10-30：知识库级召回评测集重跑核心 + 库变更自动回归
+const {
+  runIngestionPipeline, // 同步执行入口（默认上传路径：await 全管道）
+  startPipeline,        // 底座入口（异步模式：先拿 pending fileId 再 fire-and-forget）
+  DEFAULT_PIPELINE,     // 默认管道步骤名数组（白名单提示用）
+  VALID_STEP,           // 步骤名白名单校验（PUT pipeline 字段用）
+  parsePipelineConfig,  // kbs.pipeline 读取侧归一（NULL/空/损坏 → null=默认管道）
+} = require('../lib/ingestion-pipeline'); // V2.3 #5 2026-10-31：摄取管道（上传链路自此管道化）
 
 const router = express.Router();
 router.use(auth);
@@ -20,20 +41,9 @@ function denyIfNotAllowed(kb, user) {
   return { code: 403, msg: '无权管理该知识库（仅创建者或管理员）' };
 }
 
-// V1.1 #1 2026-10-30：解析失败落库——此前三个失败出口（解析异常/文本过短/切片为空）直接 return 400 不留痕，
-// error_msg 恒空无从排查。失败记录 status='failed' + error_msg（截断 500 字符防超长）+ chunk_count=0，
-// 供「解析日志」页展示失败原因、支持重传/删除。三处失败点 kb 校验已过、kb.id 可用
-function insertFailedFile(kb, name, byteSize, source, errMsg, req) {
-  const msg = String(errMsg || '未知原因').slice(0, 500);
-  // V1.1 审查加固 2026-10-30：name 截 200（对齐 files.js 先例）/ source 白名单，防存储滥用
-  const safeName = String(name || '未命名').slice(0, 200);
-  const safeSource = ['upload', 'api', 'pipeline'].includes(source) ? source : 'upload';
-  db.prepare(`INSERT INTO kb_files (kb_id,name,size,status,chunk_count,source,error_msg,parsed_at,created_at)
-    VALUES (?,?,?,'failed',0,?,?,NULL,datetime('now','localtime'))`)
-    .run(kb.id, safeName, byteSize || 0, safeSource, msg);
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(req.user.username, '知识库文件解析失败', `${kb.name} / ${safeName}：${msg.slice(0, 200)}`, req.ip, now());
-}
+// V2.3 #5 2026-10-31：原 insertFailedFile（解析失败落库 + 审计）已随上传链路整体移入
+// lib/ingestion-pipeline.js 的 failPipeline（kb_files 置 failed + error_msg 截 500 + name 截 200 +
+// source 白名单 + op_logs「知识库文件解析失败」），行为逐字等价；本文件不再保留副本，避免两处漂移
 
 router.get('/', (req, res) => {
   // V1.2 审查加固 2026-10-30：库列表加 owner 过滤——此前任意登录用户可看全平台库名/描述/配置（含
@@ -41,7 +51,9 @@ router.get('/', (req, res) => {
   const rows = db.prepare(`
     SELECT k.*, (SELECT COUNT(*) FROM kb_files f WHERE f.kb_id=k.id) AS file_count
     FROM kbs k WHERE (?='admin' OR k.owner=?) ORDER BY k.id DESC`).all(req.user.role, req.user.username);
-  res.json({ code: 0, data: rows });
+  // V2.3 #5 2026-10-31：带出管道配置（JSON 解析为步骤名数组；NULL/空/损坏 → null=默认管道，前端据此回显编辑）
+  const data = rows.map(r => ({ ...r, pipeline: parsePipelineConfig(r.pipeline) }));
+  res.json({ code: 0, data });
 });
 
 router.post('/', (req, res) => {
@@ -54,7 +66,7 @@ router.post('/', (req, res) => {
 });
 
 router.put('/:id', (req, res) => {
-  const { name, description, enabled, chunk_size, chunk_overlap, chunk_separator, auto_metadata } = req.body || {};
+  const { name, description, enabled, chunk_size, chunk_overlap, chunk_separator, auto_metadata, pipeline } = req.body || {};
   const old = db.prepare('SELECT * FROM kbs WHERE id=?').get(req.params.id);
   const deny = denyIfNotAllowed(old, req.user);
   if (deny) return res.json(deny);
@@ -64,15 +76,39 @@ router.put('/:id', (req, res) => {
   const nextSize = chunk_size ?? old.chunk_size;
   const nextOverlap = chunk_overlap ?? old.chunk_overlap;
   const nextSep = chunk_separator ?? old.chunk_separator;
-  db.prepare('UPDATE kbs SET name=?,description=?,enabled=?,chunk_size=?,chunk_overlap=?,chunk_separator=?,auto_metadata=? WHERE id=?')
+  // V2.3 #5 2026-10-31：pipeline 字段归一——三态语义：
+  //   undefined → 保留原值（未传不动）；null 或 [] → 恢复默认管道（存 NULL）；
+  //   数组 → 元素须全部命中 VALID_STEP 白名单（非法 400 列出非法名与白名单），存 JSON.stringify
+  let nextPipeline;
+  if (pipeline === undefined) {
+    nextPipeline = old.pipeline ?? null;
+  } else if (pipeline === null || (Array.isArray(pipeline) && pipeline.length === 0)) {
+    nextPipeline = null; // 恢复默认管道
+  } else if (Array.isArray(pipeline)) {
+    const bad = pipeline.filter(s => !VALID_STEP(s));
+    if (bad.length) {
+      return res.json({ code: 400, msg: `非法管道步骤：${bad.join('、')}（可用步骤：${DEFAULT_PIPELINE.join(' / ')}）` });
+    }
+    // V2.3 审查加固（P1-1）：必含核心步骤 parse+chunk——摘除 parse 则无文本产出、摘除 chunk 则无分块
+    // 产出，两者均导致上传无法入库（执行层另有 chunks 空兜底落 failed，此处早拒绝误配置）
+    const missing = ['parse', 'chunk'].filter(s => !pipeline.includes(s));
+    if (missing.length) {
+      return res.json({ code: 400, msg: `管道必须包含核心步骤：${missing.join('、')}（parse 产出文本、chunk 产出分块，缺一不可）` });
+    }
+    nextPipeline = JSON.stringify(pipeline);
+  } else {
+    return res.json({ code: 400, msg: 'pipeline 须为步骤名字符串数组（null/空数组=恢复默认管道）' });
+  }
+  db.prepare('UPDATE kbs SET name=?,description=?,enabled=?,chunk_size=?,chunk_overlap=?,chunk_separator=?,auto_metadata=?,pipeline=? WHERE id=?')
     .run(name || old.name, description ?? old.description, enabled ?? old.enabled,
-      nextSize, nextOverlap, nextSep, autoMeta, old.id);
+      nextSize, nextOverlap, nextSep, autoMeta, nextPipeline, old.id);
   // V1.3 #6 2026-10-30：切片参数任一实际变化（与 old 逐项比对；数值归一比较防字符串/数字形态误判）
   // → fire-and-forget 召回评测回归：重跑该库全部评测集 + 通知 owner，异步执行不阻塞保存响应
   const chunkChanged = Number(nextSize) !== Number(old.chunk_size)
     || Number(nextOverlap) !== Number(old.chunk_overlap)
     || String(nextSep ?? '') !== String(old.chunk_separator ?? '');
-  // V1.3 审查加固：回归失败落 err_logs（原全静默——owner 永远不知道回归没跑成）
+  // V2.3 #5 2026-10-31：pipeline 变更与 chunk 参数变更同语义——仅影响【后续上传】的执行步骤/切片方式，
+  // 不自动重切存量分块（存量需重切按既有流程重传文件）；故 pipeline 变更不并入下方回归触发条件
   if (chunkChanged) runKbRegression(old.id, { username: req.user.username, ip: req.ip }).catch(e => {
     try { db.prepare('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)').run('kb-regression', `库#${old.id} 变更触发回归失败：${e.message}`, now()); } catch { }
   });
@@ -128,149 +164,74 @@ router.get('/:id/logs', (req, res) => {
   });
 });
 
-// 上传并解析。两种方式：
+// 上传并解析（V2.3 #5 2026-10-31 管道化）。两种方式：
 // ① { name, content }            —— 直接粘贴文本（txt/md）
-// ② { name, file_b64 }           —— 二进制文件（PDF/DOCX/TXT/MD），自动解析提取文本
-// 切片：按空行分段；超长段落按 ~500 字在句边界二次切分
+// ② { name, file_b64 }           —— 二进制文件（PDF/DOCX/XLSX/PPTX/TXT/MD），自动解析提取文本
+// 摄取逻辑全部移入 lib/ingestion-pipeline.js（步骤注册表 + 执行器）：
+//   默认管道 parse→ocr→clean→chunk→toc→（落库）→metadata/keywords/regression（后三者 fire-and-forget），
+//   默认管道 + 同步模式下与改造前行为逐字节等价（详见该文件头注释的等价性清单）
+// - 同步模式（默认）：await 全管道，成功 { code:0, data:{ id, chunks } }（与改造前逐字段兼容），
+//   失败 400 + 改造前同款 msg（存量用例兼容）
+// - 异步模式 ?async=1：INSERT pending 后 fire-and-forget 执行，立即返回
+//   { code:0, data:{ id, status:'pending', async:true } }；终态轮询 GET /:id/files（单文件 status）或
+//   GET /:id/logs（四态汇总；pending/processing 态自此不再是恒 0 预留位）
 router.post('/:id/files', async (req, res) => {
   const kb = db.prepare('SELECT * FROM kbs WHERE id=?').get(req.params.id);
   if (!kb) return res.json({ code: 404, msg: '知识库不存在' });
-  const deny = denyIfNotAllowed(kb, req.user); // P5.30：防向他人知识库注入内容
+  const deny = denyIfNotAllowed(kb, req.user); // P5.30：防向他人知识库注入内容（归属校验留在路由层，不进管道）
   if (deny) return res.json(deny);
   const { name, content, file_b64, source } = req.body || {};
   if (!name) return res.json({ code: 400, msg: '请提供文件名' });
+  // 参数校验（留在路由层，与改造前一致：file_b64 与 content 两者皆缺 → 400 且不落库留痕）。
+  // Buffer.from(str,'base64') 对非法 base64 字符串是宽松解码不抛错；但对非字符串入参（数字/对象）
+  // 会抛 TypeError——改造前该转换在 try 内（抛错走 catch → failed「文件解析失败：…」+ 400），
+  // 此处必须同样兜住：Express 4 的全局错误中间件不捕获 async handler 的 rejected promise，
+  // 裸抛会导致请求永久挂起。捕获后经 parseError 钩子交给管道 parse 步骤，复刻改造前 catch 行为
+  let buf = null;
+  let parseError = null;
+  if (file_b64) {
+    try { buf = Buffer.from(file_b64, 'base64'); }
+    catch (e) { parseError = e; }
+  }
+  if (!parseError && !buf && typeof content !== 'string') return res.json({ code: 400, msg: '请提供文件内容（粘贴文本或上传文件）' });
 
-  let text = '';
-  let byteSize = 0;
-  try {
-    if (file_b64) {
-      const buf = Buffer.from(file_b64, 'base64');
-      byteSize = buf.length;
-      // P5.14 提取公共解析（fileparse.js）：PDF/DOCX/TXT/MD → 文本（与工作流文件上传同一实现）
-      text = (await require('../lib/fileparse').parseFileBuffer(name, buf)).text;
-    } else if (typeof content === 'string') {
-      text = content;
-      byteSize = Buffer.byteLength(content);
-    } else {
-      return res.json({ code: 400, msg: '请提供文件内容（粘贴文本或上传文件）' });
-    }
-  } catch (e) {
-    insertFailedFile(kb, name, byteSize, source, '文件解析失败：' + e.message, req); // V1.1 #1：解析异常也落库留痕
-    return res.json({ code: 400, msg: '文件解析失败：' + e.message });
-  }
-  text = (text || '').replace(/\r\n/g, '\n').replace(/\u0000/g, '').trim();
-  if (text.length < 8) {
-    insertFailedFile(kb, name, byteSize, source, '解析后无有效文本内容（扫描版 PDF 需先 OCR）', req); // V1.1 #1：失败落库
-    return res.json({ code: 400, msg: '解析后无有效文本内容（扫描版 PDF 需先 OCR）' });
-  }
+  // 库级管道配置（kbs.pipeline：NULL/空/损坏 → null = 默认管道）
+  const steps = parsePipelineConfig(kb.pipeline);
+  const opts = { kb, name, buf, content, source, user: req.user, ip: req.ip, steps, parseError };
 
-  // 智能切片（使用知识库配置参数）
-  const chunkSize = kb.chunk_size || 500;
-  const chunkOverlap = kb.chunk_overlap || 0;
-  const sep = kb.chunk_separator || '\n\s*\n';
-  const sepRe = new RegExp(sep);
-  const chunks = [];
-  for (const para of text.split(sepRe)) {
-    const p = para.trim();
-    if (p.length < 8) continue;
-    if (p.length <= chunkSize) { chunks.push(p); continue; }
-    // 超长段落：按句边界切 ~chunkSize 字
-    let cur = '';
-    for (const sent of p.split(/(?<=[。！？；.!?;])/)) {
-      if ((cur + sent).length > chunkSize && cur) { chunks.push(cur.trim()); cur = sent; }
-      else cur += sent;
+  // 异步模式：INSERT pending 拿 fileId 后 fire-and-forget，立即返回
+  if (req.query.async === '1') {
+    // V2.3 审查加固（S2-1）：每库在途上限——认证用户高频 async 上传可堆积海量后台管道（TOC LLM 调用等
+    // 无队列背压），堆积至 ≥5 拒绝新的 async 上传（同步模式不受限——请求并发天然限流）防 DoS 自伤
+    const inflight = db.prepare("SELECT COUNT(*) c FROM kb_files WHERE kb_id=? AND status IN ('pending','processing')").get(kb.id).c;
+    if (inflight >= 5) {
+      return res.json({ code: 429, msg: `该库摄取队列繁忙（在途 ${inflight} 个，上限 5），请稍后重试或改用同步上传`, data: { retry_after: 5 } });
     }
-    if (cur.trim().length >= 8) chunks.push(cur.trim());
-  }
-  // 重叠切片：对相邻两块各取末尾 overlap 字符追加到前一块
-  if (chunkOverlap > 0 && chunks.length > 1) {
-    for (let i = chunks.length - 1; i > 0; i--) {
-      const prev = chunks[i - 1];
-      const next = chunks[i];
-      if (prev.length > chunkOverlap) {
-        chunks[i - 1] = prev + '\n' + next.slice(0, chunkOverlap);
-      }
+    const started = startPipeline(opts);
+    if (started.fileId == null) {
+      // 前置校验失败（步骤名非法等）：pending 行未落，同步报错（消息与同步模式一致）
+      const r = await started.promise;
+      return res.json({ code: 400, msg: r.msg });
     }
-  }
-  if (!chunks.length) {
-    insertFailedFile(kb, name, byteSize, source, '切片后无有效片段', req); // V1.1 #1：失败落库
-    return res.json({ code: 400, msg: '切片后无有效片段' });
+    started.promise.catch(e => {
+      // 兜底：管道内部已对步骤失败落 failed 且永不 reject，此处仅兜执行器自身意外
+      //（如 failPipeline 落库抛错）——置 failed + err_logs 留痕，保证 pending 行不会悬挂
+      try {
+        db.prepare(`UPDATE kb_files SET status='failed', error_msg=?, parsed_at=NULL WHERE id=?`)
+          .run(String(e?.message || e || '未知原因').slice(0, 500), started.fileId);
+      } catch { }
+      try {
+        db.prepare('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)')
+          .run('kb-ingestion', `库#${kb.id} 异步摄取失败：${e?.message || e}`, now());
+      } catch { }
+    });
+    return res.json({ code: 0, data: { id: started.fileId, status: 'pending', async: true } });
   }
 
-  // TOC目录增强（2026-10-30）：用LLM提取目录结构，按章节标记分块（失败不阻塞上传）
-  // 注意：chunks 统一保持字符串数组，章节归属单独存 chapterIds —— 避免对象混入导致 join 产生 [object Object]
-  let toc = null;
-  let chapterIds = chunks.map(() => null);
-  try {
-    const { extractToc, assignChapterIds } = require('../lib/tocService');
-    toc = await extractToc(text, chunkSize);
-    if (toc && toc.length) {
-      const withChapters = chunks.map(c => ({ content: c }));
-      assignChapterIds(withChapters, toc);
-      chapterIds = withChapters.map(c => c.chapterId || null);
-      // TOC 每章节定位：首个包含该标题的分块索引；未命中继承上一章节位置
-      let lastIdx = 0;
-      for (const t of toc) {
-        let found = -1;
-        for (let i = 0; i < chunks.length; i++) {
-          if (chunks[i].includes(t.title)) { found = i; break; }
-        }
-        t.startChunkIdx = found >= 0 ? found : lastIdx;
-        lastIdx = t.startChunkIdx;
-      }
-    }
-  } catch { /* TOC提取失败不阻塞上传 */ }
-
-  // 父子切片（2026-10-28 P2 父子切片）：子分片 ~200 字精准召回，父分片 ~1000 字保持上下文完整
-  // 按顺序每 4-6 个字分片合并为一个父分片（尽可能接近 1000 字）
-  const hasParentSlice = chunkSize > 200; // 只有 chunkSize > 200 时才需要分割父子切片
-  let parentChunks = [];
-  let childToParent = []; // 每个子分片对应的父分片索引（-1 = 独立，不关联）
-  if (hasParentSlice && chunks.length >= 2) {
-    // 计算每个父分片应该包含的子分片数
-    const pSize = 1000; // 目标父分片大小
-    const childCount = Math.max(2, Math.round(pSize / chunkSize));
-    parentChunks = [];
-    childToParent = [];
-    for (let i = 0; i < chunks.length; i += childCount) {
-      const group = chunks.slice(i, i + childCount);
-      parentChunks.push(group.join('\n'));
-      for (let j = 0; j < group.length; j++) childToParent.push(parentChunks.length - 1);
-    }
-  } else {
-    childToParent = chunks.map(() => -1);
-  }
-
-  const info = db.prepare(`INSERT INTO kb_files (kb_id,name,size,status,chunk_count,source,parsed_at,created_at) VALUES (?,?,?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))`)
-    .run(kb.id, name, byteSize, 'success', chunks.length, source || 'upload');
-  // 先插父分片，再插子分片
-  if (hasParentSlice && parentChunks.length) {
-    const insParent = db.prepare('INSERT INTO kb_chunks (file_id,kb_id,content,parent_id) VALUES (?,?,?,?)');
-    parentChunks.forEach(pc => insParent.run(info.lastInsertRowid, kb.id, pc, null));
-  }
-  const ins = db.prepare('INSERT INTO kb_chunks (file_id,kb_id,content,parent_id,chapter_id) VALUES (?,?,?,?,?)');
-  const parentStartIdx = hasParentSlice ? parentChunks.length : 0;
-  chunks.forEach((c, i) => {
-    const parentId = hasParentSlice && childToParent[i] >= 0 ? (parentStartIdx + childToParent[i] + 1) : null;
-    ins.run(info.lastInsertRowid, kb.id, c, parentId, chapterIds[i]); // chapter_id = TOC 章节归属
-  });
-  // 如果有 TOC，回写入 kbs 表
-  if (toc && toc.length) {
-    db.prepare('UPDATE kbs SET toc=? WHERE id=?').run(JSON.stringify(toc), kb.id);
-  }
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(req.user.username, '上传知识库文件', `${kb.name} / ${name}（${chunks.length} 片段）`, req.ip, now());
-  // 自动关键词/问法生成（2026-10-29）：上传响应后后台 best-effort 生成，不阻塞上传；无模型/失败静默跳过
-  generateForFile(info.lastInsertRowid).catch(() => { });
-  // V1.2 #2 2026-10-30：自动元数据抽取——库开启 auto_metadata 时上传后 fire-and-forget 后台抽取
-  // （与 generateForFile 并列）；未开启/无供应商/失败均静默跳过，不阻塞上传
-  if (kb.auto_metadata) extractMetadataForFile(info.lastInsertRowid).catch(() => { });
-  // V1.3 #6 2026-10-30：上传成功（新内容入库）→ fire-and-forget 召回评测回归——验证召回未劣化
-  // 并通知 owner；异步执行不阻塞上传响应，无评测集时静默跳过
-  runKbRegression(kb.id, { username: req.user.username, ip: req.ip }).catch(e => {
-    try { db.prepare('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)').run('kb-regression', `库#${kb.id} 上传后回归失败：${e.message}`, now()); } catch { }
-  });
-  res.json({ code: 0, data: { id: info.lastInsertRowid, chunks: chunks.length } });
+  // 同步模式（默认）：await 全管道（内部完成 pending→processing→success/failed 状态流转与落库）
+  const r = await runIngestionPipeline(opts);
+  if (!r.ok) return res.json({ code: 400, msg: r.msg }); // 失败文案逐字沿用改造前（存量用例兼容）
+  res.json({ code: 0, data: { id: r.fileId, chunks: r.chunks } });
 });
 
 router.delete('/files/:fileId', (req, res) => {

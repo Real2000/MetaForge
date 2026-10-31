@@ -745,6 +745,15 @@ if (!kbCols4.includes('auto_metadata')) {
   db.exec(`ALTER TABLE kbs ADD COLUMN auto_metadata INTEGER DEFAULT 0`);
   console.log('[db] kbs 表已迁移：新增 auto_metadata 字段（自动元数据开关）');
 }
+// ---------------- V2.3 #5 摄取管道化 + PaddleOCR 接入（2026-10-31） ----------------
+// kbs.pipeline：摄取管道配置（JSON 字符串数组，元素为 lib/ingestion-pipeline.js 注册的步骤名，
+// 如 '["parse","ocr","clean","chunk","toc"]'；NULL/空 = 默认管道）。变更仅影响【后续上传】的执行步骤，
+// 不自动重切存量分块（需重切按既有流程重传文件，与 chunk 参数变更语义对齐）。
+// 写入侧白名单校验见 routes/knowledge.js PUT /:id；读取侧归一（NULL/空/损坏 → 默认）见 parsePipelineConfig
+if (!kbCols4.includes('pipeline')) {
+  db.exec(`ALTER TABLE kbs ADD COLUMN pipeline TEXT DEFAULT NULL`);
+  console.log('[db] kbs 表已迁移：新增 pipeline 字段（摄取管道配置）');
+}
 // agents.kb_metadata_filter：挂知识库时声明的检索过滤（JSON 对象，AND 语义；值支持 "$user.dept" 占位符，
 // chat 时解析为请求用户部门文本名；NULL=不过滤）。例：{"level":"公开","dept":"$user.dept"}
 const agentCols2 = db.prepare('PRAGMA table_info(agents)').all().map(c => c.name);

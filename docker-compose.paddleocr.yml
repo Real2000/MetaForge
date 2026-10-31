@@ -1,0 +1,94 @@
+# PaddleOCR 识别服务（V2.3 #5 摄取管道化 + PaddleOCR 接入 2026-10-31）
+#
+# 用途：知识库摄取管道 ocr 步骤的识别后端——扫描版 PDF / 图片型文件解析文本过短（<8 字符）时，
+#       平台把原始文件 buffer 送本服务识别为文本（lib/paddleocr.js HTTP 封装）。
+#
+# 启动：docker compose -f docker-compose.paddleocr.yml up -d
+# 停止：docker compose -f docker-compose.paddleocr.yml down
+# 详见：docs/PaddleOCR部署说明.md（env 配置 / 健康探测降级机制 / 无 docker 时行为 / 常见问题）
+#
+# 注意：
+# - 首次启动需 pip 安装依赖（约数百 MB）并自动下载 PP-OCR 中英文检测/识别/方向分类模型，
+#   start_period 放宽到 10 分钟属正常等待，之后秒级启动；
+# - 模型缓存挂载到 ./data/paddleocr-models（复用已下载模型，避免容器重建重复下载）；
+# - 平台侧须配置 env PADDLEOCR_URL=http://127.0.0.1:9300 才会启用 OCR（未配置=整体跳过，无任何影响）。
+
+services:
+  paddleocr:
+    image: python:3.10-slim
+    container_name: paddleocr
+    restart: unless-stopped
+    ports:
+      # V2.3 审查加固（S2-2）：绑定 127.0.0.1 防容器服务暴露到宿主全部网卡（默认 0.0.0.0 局域网可达；
+      # 平台与 OCR 容器同机部署时本机回环足够，跨机部署请改为绑定内网网卡 IP 并自行加访问控制）
+      - "127.0.0.1:9300:9300" # 平台默认对接端口（PADDLEOCR_URL=http://127.0.0.1:9300）
+    environment:
+      - PADDLEOCR_PORT=9300
+    volumes:
+      - ./data/paddleocr-models:/root/.paddleocr   # 模型缓存（宿主机持久化）
+    # 首次启动：安装 paddlepaddle(CPU 版) + paddleocr + flask，随后落一个极简 HTTP 服务并运行。
+    # 服务契约：GET /health → {"ok":true}；POST /ocr {"image":"<base64>"} → {"code":0,"text":"全文","lines":[{text,score}]}
+    command:
+      - bash
+      - -lc
+      - |
+        pip install --no-cache-dir "paddlepaddle==2.6.1" "paddleocr==2.7.3" "flask==3.0.3"
+        cat > /app/server.py <<'PY'
+        # PP-OCR 极简 HTTP 封装（与平台 lib/paddleocr.js 契约对齐）
+        import base64
+        import io
+        import os
+
+        from flask import Flask, jsonify, request
+
+        app = Flask(__name__)
+        _engine = None  # OCR 引擎懒加载（首请求才初始化，健康探测不触发模型加载）
+
+
+        def get_engine():
+            global _engine
+            if _engine is None:
+                from paddleocr import PaddleOCR
+                _engine = PaddleOCR(lang="ch", use_angle_cls=True)
+            return _engine
+
+
+        @app.route("/health")
+        def health():
+            # 存活即健康（模型是否已加载不阻断探测——首次识别会稍慢属预期）
+            return jsonify({"ok": True, "model_loaded": _engine is not None})
+
+
+        @app.route("/ocr", methods=["POST"])
+        def ocr():
+            payload = request.get_json(silent=True) or {}
+            image_b64 = payload.get("image") or ""
+            if not image_b64:
+                return jsonify({"code": 1, "msg": "missing image"}), 400
+            try:
+                buf = base64.b64decode(image_b64)
+                result = get_engine().ocr(io.BytesIO(buf), cls=True)
+            except Exception as e:  # 识别失败按 500 返回（平台侧捕获后静默降级）
+                return jsonify({"code": 1, "msg": str(e)}), 500
+            lines = []
+            for page in result or []:
+                for item in page or []:
+                    try:
+                        text, score = item[1]
+                        lines.append({"text": text, "score": float(score)})
+                    except Exception:
+                        pass
+            text = "\n".join(line["text"] for line in lines)
+            return jsonify({"code": 0, "text": text, "lines": lines, "count": len(lines)})
+
+
+        if __name__ == "__main__":
+            app.run(host="0.0.0.0", port=int(os.environ.get("PADDLEOCR_PORT", "9300")), threaded=True)
+        PY
+        python /app/server.py
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9300/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10m   # 首次启动含 pip 安装 + 模型下载，放宽等待窗口

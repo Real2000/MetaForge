@@ -2570,6 +2570,205 @@ function t(name, fn) {
       db.prepare(`DELETE FROM kb_files WHERE id=?`).run(fid);
       db.prepare(`DELETE FROM kbs WHERE id=?`).run(kbid);
     });
+    // ===== V2.3 #5 摄取管道（2026-10-31）：默认管道等价 / 自定义管道持久化与执行 / 白名单校验 / 四态流转 / 失败终态 / OCR 降级 =====
+    await t('HTTP：默认管道等价——上传成功、chunks 与落库一致、TOC 后处理不报错（V2.3 #5）', async () => {
+      db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('管道默认测试库','',1,'httpu1',datetime('now','localtime'))`).run();
+      const kbid = db.prepare(`SELECT id FROM kbs WHERE name='管道默认测试库'`).get().id;
+      // 未配置 pipeline（NULL）→ 走后端默认管道；数据照抄「解析日志——上传成功落日志」用例（现状等价基准）
+      const up = await jfetch(`/api/knowledge/${kbid}/files`, { method: 'POST', body: JSON.stringify({ name: '管道默认文档.txt', content: '第一章 总则\n\n本制度适用于全体正式员工。\n\n第二章 考勤\n\n员工须按时上下班并打卡。' }) }, tok1);
+      assert.ok(up.j && up.j.code === 0, '默认管道粘贴文本上传应成功：' + JSON.stringify(up.j).slice(0, 120));
+      assert.ok(up.j.data.chunks > 0, '响应 chunks 应 > 0：' + JSON.stringify(up.j.data));
+      const row = db.prepare(`SELECT * FROM kb_files WHERE kb_id=? AND name='管道默认文档.txt'`).get(kbid);
+      assert.ok(row, 'kb_files 应出现该文件行');
+      assert.strictEqual(row.status, 'success', 'kb_files.status 应为 success：' + row.status);
+      // 等价核心断言：响应 chunks（=子分片数）与 kb_files.chunk_count 一致；kb_chunks 落库数 ≥ chunks
+      //（父子切片既有语义：chunk_size>200 时父分片额外落库，管道化不得引入分块漂移）
+      assert.strictEqual(row.chunk_count, up.j.data.chunks, 'kb_files.chunk_count 应等于响应 chunks：' + row.chunk_count + ' vs ' + up.j.data.chunks);
+      const chunkCnt = db.prepare('SELECT COUNT(*) c FROM kb_chunks WHERE file_id=?').get(row.id).c;
+      assert.ok(chunkCnt >= up.j.data.chunks, 'kb_chunks 落库数应 ≥ 响应 chunks（父分片额外落库）：' + chunkCnt + ' vs ' + up.j.data.chunks);
+      // TOC 后处理不报错：kbs.toc 可读且为合法 JSON 或 NULL（无 LLM 供应商环境下降级不炸、不写坏值）
+      const tocAfter = db.prepare('SELECT toc FROM kbs WHERE id=?').get(kbid).toc;
+      if (tocAfter != null) {
+        let okJson = true; try { JSON.parse(tocAfter); } catch { okJson = false; }
+        assert.ok(okJson, 'TOC 产物应为合法 JSON 或 NULL：' + String(tocAfter).slice(0, 80));
+      }
+      // 服务存活（TOC 后处理不炸进程——此前 graph-search 曾整进程崩溃，此断言保留防回归意义）
+      assert.ok((await fetch(base + '/api/health')).ok, '上传后服务应存活');
+      db.prepare(`DELETE FROM kb_chunks WHERE kb_id=?`).run(kbid);
+      db.prepare(`DELETE FROM kb_files WHERE kb_id=?`).run(kbid);
+      db.prepare(`DELETE FROM evaluations WHERE kb_id=?`).run(kbid);
+      db.prepare(`DELETE FROM kbs WHERE id=?`).run(kbid);
+    });
+    await t('HTTP：自定义管道持久化与执行——回读一致、toc 摘除后 kbs.toc 不更新、null 恢复默认（V2.3 #5）', async () => {
+      db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('管道自定义测试库','',1,'httpu1',datetime('now','localtime'))`).run();
+      const kbid = db.prepare(`SELECT id FROM kbs WHERE name='管道自定义测试库'`).get().id;
+      // ① PUT 自定义管道（去掉 toc/metadata/keywords/regression，仅保留 解析→清洗→切片）
+      const put = await jfetch(`/api/knowledge/${kbid}`, { method: 'PUT', body: JSON.stringify({ name: '管道自定义测试库', pipeline: ['parse', 'clean', 'chunk'] }) }, tok1);
+      assert.ok(put.j && put.j.code === 0, 'PUT 自定义管道应成功：' + JSON.stringify(put.j));
+      // ② GET 库列表回读：pipeline 已解析为数组且顺序一致
+      const lst = await jfetch('/api/knowledge', {}, tok1);
+      const mine = (lst.j.data || []).find(k => k.id === kbid);
+      assert.ok(mine, '库列表应含该库');
+      assert.deepStrictEqual(mine.pipeline, ['parse', 'clean', 'chunk'], '回读 pipeline 应为数组且顺序一致：' + JSON.stringify(mine.pipeline));
+      assert.ok(db.prepare('SELECT pipeline FROM kbs WHERE id=?').get(kbid).pipeline != null, 'kbs.pipeline 应已落库（非 NULL）');
+      // ③ 上传文本：自定义管道执行成功，且 toc 步骤被摘除 → kbs.toc 保持初始空目录未被写入
+      //（列 DEFAULT '[]'；仅 toc 步骤成功提取到目录时才回写，故摘除后应保持空态）
+      const up = await jfetch(`/api/knowledge/${kbid}/files`, { method: 'POST', body: JSON.stringify({ name: '管道自定义文档.txt', content: '第一章 总则\n\n本制度适用于全体正式员工。\n\n第二章 考勤\n\n员工须按时上下班并打卡。' }) }, tok1);
+      assert.ok(up.j && up.j.code === 0 && up.j.data.chunks > 0, '自定义管道（无 toc/metadata/keywords/regression）上传应成功：' + JSON.stringify(up.j).slice(0, 120));
+      const tocVal = db.prepare('SELECT toc FROM kbs WHERE id=?').get(kbid).toc;
+      let tocParsed = null; try { tocParsed = JSON.parse(tocVal); } catch { }
+      assert.ok(tocVal == null || (Array.isArray(tocParsed) && tocParsed.length === 0), 'toc 步骤被摘除，kbs.toc 应保持空目录未被更新：' + JSON.stringify(tocVal));
+      // ④ PUT null 恢复默认管道 → 回读 null（存 NULL）
+      const reset = await jfetch(`/api/knowledge/${kbid}`, { method: 'PUT', body: JSON.stringify({ name: '管道自定义测试库', pipeline: null }) }, tok1);
+      assert.ok(reset.j && reset.j.code === 0, 'PUT pipeline=null 恢复默认应成功：' + JSON.stringify(reset.j));
+      const lst2 = await jfetch('/api/knowledge', {}, tok1);
+      const mine2 = (lst2.j.data || []).find(k => k.id === kbid);
+      assert.strictEqual(mine2.pipeline, null, '恢复默认后回读 pipeline 应为 null：' + JSON.stringify(mine2.pipeline));
+      assert.strictEqual(db.prepare('SELECT pipeline FROM kbs WHERE id=?').get(kbid).pipeline, null, '恢复默认后落库应为 NULL');
+      db.prepare(`DELETE FROM kb_chunks WHERE kb_id=?`).run(kbid);
+      db.prepare(`DELETE FROM kb_files WHERE kb_id=?`).run(kbid);
+      db.prepare(`DELETE FROM evaluations WHERE kb_id=?`).run(kbid);
+      db.prepare(`DELETE FROM kbs WHERE id=?`).run(kbid);
+    });
+    await t('HTTP：步骤白名单校验——非法步骤名/非数组入参 400 且不污染已存值（V2.3 #5）', async () => {
+      db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('管道白名单测试库','',1,'httpu1',datetime('now','localtime'))`).run();
+      const kbid = db.prepare(`SELECT id FROM kbs WHERE name='管道白名单测试库'`).get().id;
+      // 先保存一份合法管道（供「400 拒绝不污染」对照）
+      const ok = await jfetch(`/api/knowledge/${kbid}`, { method: 'PUT', body: JSON.stringify({ name: '管道白名单测试库', pipeline: ['parse', 'chunk'] }) }, tok1);
+      assert.ok(ok.j && ok.j.code === 0, '合法管道 PUT 应成功：' + JSON.stringify(ok.j));
+      // ① 非法步骤名：400 且 msg 透传非法名
+      const bad1 = await jfetch(`/api/knowledge/${kbid}`, { method: 'PUT', body: JSON.stringify({ name: '管道白名单测试库', pipeline: ['parse', 'hack_step'] }) }, tok1);
+      assert.strictEqual(bad1.j && bad1.j.code, 400, '含非法步骤名应 400：' + JSON.stringify(bad1.j));
+      assert.ok((bad1.j.msg || '').includes('hack_step'), 'msg 应含非法步骤名：' + JSON.stringify(bad1.j.msg));
+      // ② 非数组（字符串）：400
+      const bad2 = await jfetch(`/api/knowledge/${kbid}`, { method: 'PUT', body: JSON.stringify({ name: '管道白名单测试库', pipeline: 'parse' }) }, tok1);
+      assert.strictEqual(bad2.j && bad2.j.code, 400, '非数组（字符串）入参应 400：' + JSON.stringify(bad2.j));
+      // ③ 400 拒绝后已保存值不被污染（回读仍为先前合法管道）
+      const lst = await jfetch('/api/knowledge', {}, tok1);
+      const mine = (lst.j.data || []).find(k => k.id === kbid);
+      assert.deepStrictEqual(mine.pipeline, ['parse', 'chunk'], '校验失败不应污染已保存管道：' + JSON.stringify(mine.pipeline));
+      db.prepare(`DELETE FROM kb_files WHERE kb_id=?`).run(kbid);
+      db.prepare(`DELETE FROM kbs WHERE id=?`).run(kbid);
+    });
+    await t('HTTP：状态流转四态——async=1 立返 pending 且后台收敛 success（V2.3 #5）', async () => {
+      db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('管道异步测试库','',1,'httpu1',datetime('now','localtime'))`).run();
+      const kbid = db.prepare(`SELECT id FROM kbs WHERE name='管道异步测试库'`).get().id;
+      // async=1：立即返回（不等待管道跑完）
+      const up = await jfetch(`/api/knowledge/${kbid}/files?async=1`, { method: 'POST', body: JSON.stringify({ name: '异步文档.txt', content: '第一章 总则\n\n本制度适用于全体正式员工。\n\n第二章 考勤\n\n员工须按时上下班并打卡。' }) }, tok1);
+      assert.ok(up.j && up.j.code === 0, 'async=1 上传应立即返回成功：' + JSON.stringify(up.j).slice(0, 120));
+      assert.strictEqual(up.j.data.status, 'pending', '响应 status 应为 pending：' + JSON.stringify(up.j.data));
+      assert.strictEqual(up.j.data.async, true, '响应应标记 async===true：' + JSON.stringify(up.j.data));
+      assert.ok(up.j.data.id, '响应应含文件 id（用于后续轮询定位）：' + JSON.stringify(up.j.data));
+      // 轮询等待异步管道收敛：500ms × 20 次 = 最多 ~10s，终态 success 且 chunk_count>0
+      let row = null;
+      for (let i = 0; i < 20 && !row; i++) {
+        await new Promise(r => setTimeout(r, 500));
+        const files = await jfetch(`/api/knowledge/${kbid}/files`, {}, tok1);
+        const f = (files.j.data || []).find(x => x.id === up.j.data.id);
+        if (f && (f.status === 'success' || f.status === 'failed')) row = f;
+      }
+      assert.ok(row, '10s 内应轮询到该文件的终态行（异步管道收敛）');
+      assert.strictEqual(row.status, 'success', '终态应为 success：' + JSON.stringify(row));
+      assert.ok(row.chunk_count > 0, '终态行 chunk_count 应 > 0：' + row.chunk_count);
+      assert.ok('error_msg' in row, 'files 行应带 error_msg 字段（四态契约）');
+      db.prepare(`DELETE FROM kb_chunks WHERE kb_id=?`).run(kbid);
+      db.prepare(`DELETE FROM kb_files WHERE kb_id=?`).run(kbid);
+      db.prepare(`DELETE FROM evaluations WHERE kb_id=?`).run(kbid);
+      db.prepare(`DELETE FROM kbs WHERE id=?`).run(kbid);
+    });
+    await t('HTTP：失败终态——极短文本 400 且 failed 行落库、error_msg 含解析原因（V2.3 #5）', async () => {
+      db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('管道失败测试库','',1,'httpu1',datetime('now','localtime'))`).run();
+      const kbid = db.prepare(`SELECT id FROM kbs WHERE name='管道失败测试库'`).get().id;
+      // 同步失败路径：极短文本 → 业务码 400（与现状兼容，前端上传入口无需感知管道化）
+      const fail = await jfetch(`/api/knowledge/${kbid}/files`, { method: 'POST', body: JSON.stringify({ name: '管道短文本.txt', content: '只有五个字' }) }, tok1);
+      assert.strictEqual(fail.j && fail.j.code, 400, '极短文本应业务码 400：' + JSON.stringify(fail.j));
+      // 失败终态落库：files 列表出现 failed 行且 error_msg 含「解析后无有效文本」
+      const files = await jfetch(`/api/knowledge/${kbid}/files`, {}, tok1);
+      const row = (files.j.data || []).find(x => x.name === '管道短文本.txt');
+      assert.ok(row, 'files 列表应出现失败行：' + JSON.stringify(files.j.data));
+      assert.strictEqual(row.status, 'failed', '失败行 status 应为 failed：' + row.status);
+      assert.ok((row.error_msg || '').includes('解析后无有效文本'), 'error_msg 应含「解析后无有效文本」：' + JSON.stringify(row.error_msg));
+      db.prepare(`DELETE FROM kb_files WHERE kb_id=?`).run(kbid);
+      db.prepare(`DELETE FROM kbs WHERE id=?`).run(kbid);
+    });
+    await t('HTTP：OCR 降级端到端——未配置 PADDLEOCR_URL 时扫描版样本不阻塞不挂死（V2.3 #5）', async () => {
+      db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('管道OCR测试库','',1,'httpu1',datetime('now','localtime'))`).run();
+      const kbid = db.prepare(`SELECT id FROM kbs WHERE name='管道OCR测试库'`).get().id;
+      // fixtures 扫描版样本：最小合法 PDF（731 字节，三行 ASCII 文本）；缺失时现跑生成脚本自愈
+      const fx = path.join(__dirname, 'fixtures', 'scan-sample.pdf');
+      if (!fs.existsSync(fx)) require('child_process').execSync(`"${process.execPath}" "${path.join(__dirname, 'fixtures', 'gen-scan-pdf.js')}"`);
+      const b64 = fs.readFileSync(fx).toString('base64');
+      // 默认管道（含 ocr 步骤）上传；测试环境 PADDLEOCR_URL 必未配置 → OCR 静默降级，不得阻塞挂死（超时兜底 <10s）
+      const t0 = Date.now();
+      const up = await jfetch(`/api/knowledge/${kbid}/files`, { method: 'POST', body: JSON.stringify({ name: 'scan.pdf', file_b64: b64 }) }, tok1);
+      const cost = Date.now() - t0;
+      assert.ok(cost < 10000, `OCR 降级路径整请求应 <10s（实际 ${cost}ms，不被 OCR 阻塞挂死）`);
+      // 二选一断言（契约 6，均可接受）：
+      //   A. 样本可提取 ≥8 字文本 → OCR 降级跳过后正常解析 success（本 fixtures 走此路径——pdf-parse 实测可提取 132 字符）
+      //   B. 无法提取文本 → failed 且 error_msg 含「扫描版 PDF 需先 OCR」
+      if (up.j && up.j.code === 0) {
+        assert.ok(up.j.data.chunks > 0, '路径 A：降级跳过 OCR 后应正常解析 success 且 chunks>0：' + JSON.stringify(up.j.data));
+        const row = db.prepare(`SELECT status, chunk_count FROM kb_files WHERE kb_id=? AND name='scan.pdf'`).get(kbid);
+        assert.ok(row && row.status === 'success', 'kb_files 状态应为 success：' + JSON.stringify(row));
+      } else {
+        assert.strictEqual(up.j && up.j.code, 400, '路径 B：OCR 不可用且无有效文本应 400（同步失败兼容）：' + JSON.stringify(up.j));
+        const files = await jfetch(`/api/knowledge/${kbid}/files`, {}, tok1);
+        const row = (files.j.data || []).find(x => x.name === 'scan.pdf');
+        assert.ok(row && row.status === 'failed', '应出现 failed 行：' + JSON.stringify(files.j.data));
+        assert.ok((row.error_msg || '').includes('扫描版 PDF 需先 OCR'), 'error_msg 应含「扫描版 PDF 需先 OCR」：' + JSON.stringify(row.error_msg));
+      }
+      db.prepare(`DELETE FROM kb_chunks WHERE kb_id=?`).run(kbid);
+      db.prepare(`DELETE FROM kb_files WHERE kb_id=?`).run(kbid);
+      db.prepare(`DELETE FROM evaluations WHERE kb_id=?`).run(kbid);
+      db.prepare(`DELETE FROM kbs WHERE id=?`).run(kbid);
+    });
+    // ===== V2.3 审查加固（2026-10-31，Tech Lead 代行双专家审查发现）：假成功拦截 / 必含校验 / 在途上限 =====
+    await t('HTTP：管道必含校验——摘除 parse/chunk 核心步骤 PUT 400（V2.3 审查加固 P1-1）', async () => {
+      db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('管道必含测试库','',1,'httpu1',datetime('now','localtime'))`).run();
+      const kbid = db.prepare(`SELECT id FROM kbs WHERE name='管道必含测试库'`).get().id;
+      // 摘除 parse（无文本产出）→ 400 提示必含
+      const m1 = await jfetch(`/api/knowledge/${kbid}`, { method: 'PUT', body: JSON.stringify({ name: '管道必含测试库', pipeline: ['clean', 'chunk'] }) }, tok1);
+      assert.ok(m1.j && m1.j.code === 400 && /parse/.test(m1.j.msg || ''), '摘除 parse 应 400 且提示：' + JSON.stringify(m1.j));
+      // 摘除 chunk（无分块产出）→ 400
+      const m2 = await jfetch(`/api/knowledge/${kbid}`, { method: 'PUT', body: JSON.stringify({ name: '管道必含测试库', pipeline: ['parse', 'clean'] }) }, tok1);
+      assert.ok(m2.j && m2.j.code === 400 && /chunk/.test(m2.j.msg || ''), '摘除 chunk 应 400 且提示：' + JSON.stringify(m2.j));
+      // 含全部核心步骤的子集合法（回归：不误伤既有用例形态）
+      const ok = await jfetch(`/api/knowledge/${kbid}`, { method: 'PUT', body: JSON.stringify({ name: '管道必含测试库', pipeline: ['parse', 'clean', 'chunk'] }) }, tok1);
+      assert.ok(ok.j && ok.j.code === 0, '含 parse+chunk 的合法子集应通过：' + JSON.stringify(ok.j));
+      db.prepare(`DELETE FROM kb_files WHERE kb_id=?`).run(kbid);
+      db.prepare(`DELETE FROM kbs WHERE id=?`).run(kbid);
+    });
+    await t('HTTP：管道执行层假成功拦截——直插摘除 chunk 的配置，上传必须 failed 不得 0 分块 success（V2.3 审查加固 P1-1）', async () => {
+      // 直插绕过 PUT 校验（模拟存量脏数据/直接改库）→ 执行层兜底仍必须拦住（防御纵深：两层独立生效）
+      db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at,pipeline) VALUES ('管道假成功测试库','',1,'httpu1',datetime('now','localtime'),'["parse","clean"]')`).run();
+      const kbid = db.prepare(`SELECT id FROM kbs WHERE name='管道假成功测试库'`).get().id;
+      const up = await jfetch(`/api/knowledge/${kbid}/files`, { method: 'POST', body: JSON.stringify({ name: '无分块文档.txt', content: '这是一段足够长的测试文本，验证摘除 chunk 步骤后不会静默假成功，必须落 failed 终态并给出原因。' }) }, tok1);
+      assert.strictEqual(up.j && up.j.code, 400, '分块产出为空应 400（同步失败路径）：' + JSON.stringify(up.j));
+      const row = db.prepare(`SELECT status,chunk_count,error_msg FROM kb_files WHERE kb_id=? AND name='无分块文档.txt'`).get(kbid);
+      assert.ok(row && row.status === 'failed', '必须落 failed 终态（修复前假 success+0 分块，文件看起来成功但检索永不可命中）：' + JSON.stringify(row));
+      assert.ok((row.error_msg || '').includes('切片后无有效片段'), 'error_msg 应沿用现状文案：' + JSON.stringify(row.error_msg));
+      assert.strictEqual(db.prepare('SELECT COUNT(*) c FROM kb_chunks WHERE kb_id=?').get(kbid).c, 0, '不得落任何分块');
+      db.prepare(`DELETE FROM kb_chunks WHERE kb_id=?`).run(kbid);
+      db.prepare(`DELETE FROM kb_files WHERE kb_id=?`).run(kbid);
+      db.prepare(`DELETE FROM kbs WHERE id=?`).run(kbid);
+    });
+    await t('HTTP：async 在途上限——堆积至 5 个 pending 拒绝新的异步上传（V2.3 审查加固 S2-1）', async () => {
+      db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('管道在途测试库','',1,'httpu1',datetime('now','localtime'))`).run();
+      const kbid = db.prepare(`SELECT id FROM kbs WHERE name='管道在途测试库'`).get().id;
+      // 直插 5 个 pending 行模拟堆积（管道 fire-and-forget 在测试环境瞬间跑完，无法自然堆积，直插是最小复现手法）
+      const ins = db.prepare(`INSERT INTO kb_files (kb_id,name,size,status,chunk_count,source,created_at) VALUES (?,?,0,'pending',0,'upload',datetime('now','localtime'))`);
+      for (let i = 0; i < 5; i++) ins.run(kbid, `堆积行${i}.txt`);
+      const up = await jfetch(`/api/knowledge/${kbid}/files?async=1`, { method: 'POST', body: JSON.stringify({ name: '超额.txt', content: '这是一段足够长的测试文本内容，用于验证在途上限拒绝逻辑本身工作正常。' }) }, tok1);
+      assert.ok(up.j && up.j.code === 429, '在途 ≥5 时 async 上传应 429：' + JSON.stringify(up.j));
+      assert.ok(/繁忙/.test(up.j.msg || ''), 'msg 应提示队列繁忙：' + JSON.stringify(up.j.msg));
+      // 同步模式不受限（请求并发天然限流）——堆积行清理后同步上传应正常
+      db.prepare(`DELETE FROM kb_files WHERE kb_id=? AND status='pending'`).run(kbid);
+      const sync = await jfetch(`/api/knowledge/${kbid}/files`, { method: 'POST', body: JSON.stringify({ name: '同步清理后.txt', content: '这是一段足够长的测试文本内容，验证同步模式不受在途上限影响。' }) }, tok1);
+      assert.ok(sync.j && sync.j.code === 0, '清理在途后同步上传应正常：' + JSON.stringify(sync.j).slice(0, 120));
+      db.prepare(`DELETE FROM kb_chunks WHERE kb_id=?`).run(kbid);
+      db.prepare(`DELETE FROM kb_files WHERE kb_id=?`).run(kbid);
+      db.prepare(`DELETE FROM kbs WHERE id=?`).run(kbid);
+    });
     // 【V1.2 前置】黄金召回基线（2026-10-30）：#2 元数据改造动 retriever.js 检索链路前固化行为基线——
     // 6 条黄金问答 × Top-1 命中断言 + 复跑稳定性；后续任何检索改动（元数据过滤/管道化）跑此用例防召回隐性劣化
     await t('黄金召回基线：6 条黄金问答 Top-1 全命中 + 复跑稳定（V1.2 #2 改造护栏）', async () => {
