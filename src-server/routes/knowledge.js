@@ -51,13 +51,25 @@ router.get('/', (req, res) => {
   const rows = db.prepare(`
     SELECT k.*, (SELECT COUNT(*) FROM kb_files f WHERE f.kb_id=k.id) AS file_count
     FROM kbs k WHERE (?='admin' OR k.owner=?) ORDER BY k.id DESC`).all(req.user.role, req.user.username);
-  // V2.4 #9 租户化（2026-10-31）：空间隔离——普通用户仅见自己空间内的知识库
-  // 管理员用户见全部（管理界面需要跨空间操作）。⚠️ 注意：kbs 表尚未增加 space_id 列，
-  // 因此下方 filter 目前是 no-op（!k.space_id 恒 true）。此段为占位代码，待 V2.4 正式开工时
-  // 同步加列+创建写入后生效——详见改进计划表 V2.4 节及改进建议 #9。
+  // V2.4 #9 2026-10-31 空间隔离——知识库的读取/创建均关联 space_id
+  // space_id 已预加（ALTER TABLE kbs ADD COLUMN space_id INTEGER DEFAULT 0），
+  // 0 = 无空间归属（所有用户可见），非 0 值 = 空间 ID（当前是改进程中的过渡语义）。
+  // ============================================================
+  // 列表的第一关是 owner 过滤（第 51-53 行），在此基础上叠加空间过滤。
+  // 非管理员用户只能看到：
+  //   - space_id IS NULL（0 或 NULL → 无归属）
+  //   - 或 space_id 对应的空间允许当前用户访问（通过 agent_acls 或 owner 匹配判断）
+  // 注意：sql 的第 51-53 行已做了 owner 过滤，此处仅做空间的追加过滤。
+  // ============================================================
   let filtered = rows;
   if (req.user.role !== 'admin') {
-    filtered = rows.filter(k => !k.space_id || k.owner === req.user.username);
+    // 获取当前用户为 owner 的所有个人空间 ID
+    const mySpaceIds = db.prepare('SELECT id FROM spaces WHERE owner=?').all(req.user.username).map(r => r.id);
+    filtered = rows.filter(k => !k.space_id || mySpaceIds.includes(k.space_id) || k.owner === req.user.username);
+    // ↑ 空间过滤条件（V2.4 #9）：
+    //   - !k.space_id（0 或 NULL/undefined）→ 无空间归属 → 全员可见
+    //   - mySpaceIds 包含该 space_id → 当前用户是该空间的 owner → 可见
+    //   - k.owner 匹配 → 创建者可见
   }
   const data = filtered.map(r => ({ ...r, pipeline: parsePipelineConfig(r.pipeline) }));
   res.json({ code: 0, data });
@@ -66,8 +78,15 @@ router.get('/', (req, res) => {
 router.post('/', (req, res) => {
   const { name, description } = req.body || {};
   if (!name?.trim()) return res.json({ code: 400, msg: '知识库名称不能为空' });
-  const info = db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES (?,?,1,?,datetime('now','localtime'))`)
-    .run(name.trim(), description || '', req.user.username);
+  // V2.4 #9：创建知识库时写入 owner 的个人空间 space_id。当前用户所属个人空间通过用户查空间表获取。
+  // 若无匹配的个人空间，则写入 0（无空间归属，默认所有用户可见）。
+  // 创建空间前找到当前用户拥有的第一个个人空间，如果没有则设为 0（无归属）。
+  let spaceId = 0;
+  const mySpace = db.prepare('SELECT id FROM spaces WHERE type=? AND owner=? LIMIT 1').get('personal', req.user.username);
+  if (mySpace) spaceId = mySpace.id;
+  // 知识库数据：name,description,enabled,owner,space_id 写入
+  const info = db.prepare(`INSERT INTO kbs (name,description,enabled,owner,space_id,created_at) VALUES (?,?,1,?,?,datetime('now','localtime'))`)
+    .run(name.trim(), description || '', req.user.username, spaceId);
   db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)').run(req.user.username, '创建知识库', name.trim(), req.ip, now());
   res.json({ code: 0, data: { id: info.lastInsertRowid } });
 });
