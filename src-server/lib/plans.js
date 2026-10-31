@@ -70,7 +70,23 @@ function buildUpgradeReasons(plan, u) {
   return out;
 }
 
-/** 智能体创建配额软约束统一判定（V2.3 Y3 2026-10-31）：统一 POST /api/agents 与技能市场克隆
+/** 根据 License 版本获取特性的软上限（0 = 不限，由 plans.js 等决定）
+ *  V2.4 #8 收尾：社区版用户（License edition=community）受 3 智能体/1 知识库限制
+ *  专业版/企业版用户不限制。管理员豁免（role=admin）不受此限制。 */
+function getSoftLimit(feature, username) {
+  const { db } = require('../db');
+  const u = db.prepare('SELECT role, plan FROM users WHERE username=?').get(username);
+  if (!u || u.role === 'admin') return 0;
+  const { currentEdition } = require('./edition');
+  const edition = currentEdition();
+  if (edition.edition === 'community') {
+    if (feature === 'agents') return 3;
+    if (feature === 'kb') return 1;
+  }
+  return 0;
+}
+
+统一 POST /api/agents 与技能市场克隆
  *  （routes/skills-market.js clone）两通道口径——此前两处各自内联同款判断，规则/文案漂移风险高。
  *  返回值约定（调用方直接按字段组装 res.json）：
  *  - 拦截：{ blocked: true, code: 402, msg: '免费版最多创建 X 个智能体（当前 Y 个）', data: { upgrade_hint: true } }
@@ -85,4 +101,4 @@ function agentQuotaBlock(username) {
   return { blocked: false };
 }
 
-module.exports = { PLANS, planOf, planUsage, agentQuotaBlock };
+module.exports = { PLANS, planOf, planUsage, agentQuotaBlock, getSoftLimit };

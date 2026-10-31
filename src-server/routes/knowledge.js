@@ -78,6 +78,15 @@ router.get('/', (req, res) => {
 router.post('/', (req, res) => {
   const { name, description } = req.body || {};
   if (!name?.trim()) return res.json({ code: 400, msg: '知识库名称不能为空' });
+  // V2.4 #8 收尾：社区版用户最多创建 1 个知识库（edition 限制，与 plan 的软约束叠加）
+  const { getSoftLimit } = require('../lib/plans');
+  const softLimit = getSoftLimit('kb', req.user.username);
+  if (softLimit > 0 && !req.user.plan) {
+    const count = db.prepare('SELECT COUNT(*) c FROM kbs WHERE owner=?').get(req.user.username).c;
+    if (count >= softLimit) {
+      return res.json({ code: 402, msg: `社区版最多创建 ${softLimit} 个知识库（当前 ${count} 个），请升级专业版或企业版`, data: { upgrade_hint: true } });
+    }
+  }
   // V2.4 #9：创建知识库时写入 owner 的个人空间 space_id。当前用户所属个人空间通过用户查空间表获取。
   // 若无匹配的个人空间，则写入 0（无空间归属，默认所有用户可见）。
   // 创建空间前找到当前用户拥有的第一个个人空间，如果没有则设为 0（无归属）。

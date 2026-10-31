@@ -134,10 +134,20 @@ function parseBody(b) {
   };
 }
 
-// V2.2 #8 2026-10-31 License 功能闸门（接线示范）：community 即含 agents 特性，当前实际不拦——
-// 机制先行、付费墙后置（避免误伤存量用户）；后续钉钉/租户/审核流上线时在对应路由挂
-// requireFeature('dingtalk') / requireFeature('tenant') / requireFeature('audit_flow') 即生效
-router.post('/', requireFeature('agents'), (req, res) => {
+  // V2.2 #8 2026-10-31 License 功能闸门（接线示范）：community 即含 agents 特性，当前实际不拦——
+  // 机制先行、付费墙后置（避免误伤存量用户）；后续钉钉/租户/审核流上线时在对应路由挂
+  // requireFeature('dingtalk') / requireFeature('tenant') / requireFeature('audit_flow') 即生效
+  // V2.4 #8 收尾：叠加 edition 限制——社区版用户最多创建 3 个智能体（getSoftLimit 结合 planUsage 判断）
+  const { agentQuotaBlock } = require('../lib/plans');
+  const { getSoftLimit } = require('../lib/plans');
+  const softLimit = getSoftLimit('agents', req.user.username);
+  if (softLimit > 0 && !req.user.plan) {
+    const count = db.prepare("SELECT COUNT(*) c FROM agents WHERE owner=? AND source='self'").get(req.user.username).c;
+    if (count >= softLimit) {
+      return res.json({ code: 402, msg: `社区版最多创建 ${softLimit} 个智能体（当前 ${count} 个），请升级专业版或企业版`, data: { upgrade_hint: true } });
+    }
+  }
+  router.post('/', requireFeature('agents'), (req, res) => {
   const a = parseBody(req.body || {});
   if (!a.name) return res.json({ code: 400, msg: '智能体名称不能为空' });
   if (a.tool_error) return res.json({ code: 400, msg: a.tool_error }); // P5.34：工具白名单
