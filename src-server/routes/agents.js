@@ -10,6 +10,7 @@ const { chatOnce } = require('../lib/llm');
 const { canView, canEdit, isOwnerLevel, parseJsonArr } = require('../lib/agent-access');
 const { sanitizeMetadata } = require('../lib/kb-metadata'); // V1.2 #2 2026-10-30：kb_metadata_filter 入参清洗
 const { requireFeature } = require('../lib/edition'); // V2.2 #8 2026-10-31：License 特性闸门（中间件工厂）
+const { spaceFilterSql } = require('../lib/space-utils'); // V2.4 #9 2026-10-31：统一空间过滤
 const { runTool, validateAgentTools, TOOL_DEFS, AGENT_TOOL_DENY } = require('../lib/tools'); // P5.34b copy 过滤依赖 AGENT_TOOL_DENY（此前漏导入被 catch 吞错致副本工具恒空——测试轮实锤修复）
 
 const router = express.Router();
@@ -44,8 +45,10 @@ router.get('/', (req, res) => {
   if (req.user.role !== 'admin') { sql += ' AND a.status=?'; args.push('published'); }
   if (keyword) { sql += ' AND (a.name LIKE ? OR a.description LIKE ?)'; args.push(`%${keyword}%`, `%${keyword}%`); }
   // V2.4 #9 租户化（2026-10-31）：空间隔离——普通用户仅见自己空间内的智能体
-  // 管理员用户见全部（管理界面需要跨空间操作）；依赖 space_id 在创建时已正确落库
-  if (req.user.role !== 'admin') { sql += ' AND (a.space_id IS NULL OR a.owner=?)'; args.push(req.user.username); }
+  // 管理员用户见全部（管理界面需要跨空间操作）。使用 space-utils 统一过滤，避免各处手写 SQL 语义分叉。
+  const { sqlStr: spaceFilter, args: spaceArgs } = spaceFilterSql('a', req.user);
+  sql += spaceFilter;
+  args.push(...spaceArgs);
   sql += ' ORDER BY a.updated_at DESC';
   let rows = db.prepare(sql).all(...args);
   if (req.user.role !== 'admin') rows = rows.filter(a => canView(a, req.user)); // P3 可见性过滤
