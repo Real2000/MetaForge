@@ -579,6 +579,37 @@ db.exec(`CREATE TABLE IF NOT EXISTS agent_publish_history (
   created_at TEXT
 );`);
 db.exec(`CREATE INDEX IF NOT EXISTS idx_pub_history_agent ON agent_publish_history(agent_id, version DESC);`);
+// LLMOps 提示词版本管理（2026-10-31 计划 #10）：每次 prompt/user_prompt 实际变更自动记快照
+// （快照存变更后的值），支持版本对比与一键回滚。version 在同一 agent 内从 1 递增；
+// note 记录来源（'提示词修改' / '回滚到 vN'）。回滚本身也产生新版本（完整审计链）。
+db.exec(`CREATE TABLE IF NOT EXISTS agent_prompt_versions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  agent_id INTEGER NOT NULL,
+  version INTEGER NOT NULL,        -- agent_id 内从 1 递增
+  prompt TEXT DEFAULT '',          -- 系统提示词快照（变更后值）
+  user_prompt TEXT DEFAULT '',     -- 用户提示词快照
+  edited_by TEXT,                  -- 操作者 username
+  note TEXT DEFAULT '',            -- 备注（自动记 '提示词修改' / '回滚到 vN'）
+  created_at TEXT
+);`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_prompt_versions_agent ON agent_prompt_versions(agent_id, version DESC);`);
+// V2.4 #9 租户化 + agent_acls 权限表（2026-10-31）：三元组 ACL（用户/部门/角色）做权限的三道防线
+// grant_to: 'user'|'dept'|'role'，grant_to_value 为对应的用户名/部门名/角色名
+// agent_id 对应的 agent 的 filter：allow 1 允许 / 0 拒绝；未配置任何 ACL = 全允许
+// 仅配合空间过滤使用：ACL 在空间过滤通过后检查（空间过滤拒绝的用户无需进一步 ACL 检查）
+db.exec(`CREATE TABLE IF NOT EXISTS agent_acls (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  space_id INTEGER,
+  grant_to TEXT NOT NULL,
+  grant_to_value TEXT NOT NULL,
+  agent_id INTEGER NOT NULL,
+  allow INTEGER DEFAULT 1,
+  created_at TEXT
+);`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_agent_acls_agent ON agent_acls(agent_id);`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_agent_acls_space ON agent_acls(space_id);`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_agent_acls_grant ON agent_acls(grant_to, grant_to_value);`);
+console.log('[db] 创建 agent_acls 表（租户化 ACL 权限表）');
 // agents 表补充协作与可见性字段（2026-10-22 P3 协作与团队功能）
 // visibility: public 全员可见（默认，存量不受影响）/ restricted 受限可见
 // visible_depts / visible_members: restricted 时的可见部门/成员名单（JSON 数组）

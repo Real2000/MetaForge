@@ -266,10 +266,13 @@ export async function render(el, params) {
     const box = $('#stEdit');
     if (view === 'prompt') {
       box.innerHTML = `
-        <div class="seg" style="margin-bottom:12px">
-          <button data-pt="system" class="${promptTab === 'system' ? 'on' : ''}">系统提示词</button>
-          <button data-pt="user" class="${promptTab === 'user' ? 'on' : ''}">用户提示词</button>
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">
+          <div class="seg">
+            <button data-pt="system" class="${promptTab === 'system' ? 'on' : ''}">系统提示词</button>
+            <button data-pt="user" class="${promptTab === 'user' ? 'on' : ''}">用户提示词</button>
+          </div>
           <div style="flex:1"></div>
+          <button class="btn sm" id="stPromptHist" title="查看历史版本并对比 / 回滚">🕘 历史版本</button>
         </div>
         ${promptTab === 'system' ? `
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
@@ -282,6 +285,7 @@ export async function render(el, params) {
           <textarea class="st-ta" id="edUserPrompt" rows="14" placeholder="如：请帮我总结这篇研报的核心观点">${esc(S.user_prompt)}</textarea>
         `}`;
       box.querySelectorAll('[data-pt]').forEach(b => b.onclick = () => { promptTab = b.dataset.pt; renderEdit(); });
+      box.querySelector('#stPromptHist').onclick = () => openPromptVersions();
       const p = box.querySelector('#edPrompt');
       if (p) {
         p.oninput = () => { S.prompt = p.value; scheduleSave(); };
@@ -776,6 +780,114 @@ export async function render(el, params) {
           await save(true);
           close();
         };
+      },
+    });
+  }
+
+  // ---------- #10 LLMOps：提示词历史版本面板（查看 / 双栏对比 / 回滚） ----------
+  // 版本由后端在 PUT /api/agents/:id 保存时对 prompt/user_prompt 实际变更自动记录（前端无需额外调用）；
+  // 权限：能编辑该智能体的人才能看/回滚（后端校验，403 时经 api() throw → toast 错误消息）
+
+  /** 拉取最新配置回填本地可编辑状态（回滚后复用；更新失败回退整页重载） */
+  async function reloadConfig() {
+    try {
+      const ja = await api(`/agents/${id}/detail`);
+      const c = ja.data || {};
+      S.prompt = c.prompt || '';
+      S.user_prompt = c.user_prompt || '';
+      if (c.updated_at) baseUpdated = c.updated_at; // 跟进乐观锁基准，防止下一次保存误报 409
+      renderEdit();
+      renderLeft();
+    } catch { location.reload(); }
+  }
+
+  /** 简易逐行 diff（不引第三方库）：两边按 \n split 按行号对齐；行内容不同标黄、相同置灰。
+   *  行数不齐时短侧补空行（缺失行在对面标黄高亮）；空行渲染为 &nbsp; 保持行高 */
+  function lineDiffRows(oldText, newText) {
+    const a = String(oldText ?? '').split('\n');
+    const b = String(newText ?? '').split('\n');
+    const n = Math.max(a.length, b.length);
+    const rows = [];
+    for (let i = 0; i < n; i++) {
+      const l = i < a.length ? a[i] : null;
+      const r = i < b.length ? b[i] : null;
+      rows.push({ l, r, diff: l !== r }); // null !== '' → 行数不齐侧高亮（一侧缺失）
+    }
+    return rows;
+  }
+
+  /** 双栏对比弹窗：左 = 历史版本快照，右 = 当前编辑框实时值（S 即 textarea oninput 后的最新值） */
+  function showPromptDiff(v) {
+    if (!v) return;
+    const cell = (text, diff) => `<div style="flex:1;min-width:0;padding:0 8px;white-space:pre-wrap;word-break:break-all;${diff ? 'background:#fef9c3;color:#1f2937' : 'color:var(--text-3,#9ca3af)'}">${text == null || text === '' ? '&nbsp;' : esc(text)}</div>`;
+    const sect = (title, oldVal, newVal) => {
+      const rows = lineDiffRows(oldVal, newVal);
+      const changed = rows.filter(r => r.diff).length;
+      return `<div style="margin-bottom:16px">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+          <b style="font-size:13px">${esc(title)}</b>
+          <span class="tag ${changed ? 'orange' : 'gray'}">${changed ? `${changed} 行不同（黄色高亮）` : '完全一致'}</span>
+        </div>
+        <div style="border:1px solid var(--border,#e5e7eb);border-radius:8px;overflow:hidden">
+          <div style="display:flex;font-size:11px;color:var(--text-3,#9ca3af);border-bottom:1px solid var(--border,#e5e7eb);background:var(--surface-3,#f9fafb)">
+            <div style="flex:1;padding:5px 8px">📼 v${esc(String(v.version))}（历史版本）</div>
+            <div style="width:1px;background:var(--border,#e5e7eb)"></div>
+            <div style="flex:1;padding:5px 8px">✏️ 当前编辑中（未保存）</div>
+          </div>
+          <div style="max-height:240px;overflow:auto;display:flex;flex-direction:column;font:12px/1.9 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">
+            ${rows.map(r => `<div style="display:flex;border-bottom:1px solid rgba(0,0,0,.03)">${cell(r.l, r.diff)}<div style="width:1px;background:var(--border,#e5e7eb)"></div>${cell(r.r, r.diff)}</div>`).join('')}
+          </div>
+        </div>
+      </div>`;
+    };
+    modal({
+      title: `🔍 版本对比：v${v.version} ↔ 当前编辑内容`,
+      wide: true,
+      body: sect('系统提示词', v.prompt, S.prompt) + sect('用户提示词', v.user_prompt, S.user_prompt),
+      foot: `<button class="btn" data-close>${t('关闭')}</button>`,
+      onMount(mask, close) { mask.querySelector('[data-close]').onclick = close; },
+    });
+  }
+
+  /** 版本列表面板：vN / 时间 / 操作者 / note + 查看对比 / 回滚 */
+  async function openPromptVersions() {
+    let list = [];
+    try {
+      const j = await api(`/agents/${id}/prompt-versions`);
+      list = (j.data || []).slice().sort((a, b) => (b.version || 0) - (a.version || 0)); // 最新在前
+    } catch (e) { toast(e.message || '加载历史版本失败', 'err'); return; }
+    modal({
+      title: `🕘 提示词历史版本${list.length ? `（共 ${list.length} 个）` : ''}`,
+      wide: true,
+      body: `<div id="pvList">${list.length ? `
+        <div class="table-wrap"><table class="tbl">
+          <thead><tr><th style="width:64px">版本</th><th style="width:140px">时间</th><th style="width:110px">操作者</th><th>说明</th><th style="width:172px">操作</th></tr></thead>
+          <tbody>${list.map(v => `
+            <tr>
+              <td><b>v${esc(String(v.version))}</b></td>
+              <td style="font-size:12px;color:var(--text-3)">${esc((v.created_at || '').slice(0, 16))}</td>
+              <td style="font-size:12px">${esc(v.edited_by || '—')}</td>
+              <td style="font-size:12px">${esc(v.note || '')}</td>
+              <td><button class="btn sm" data-diff="${esc(String(v.id))}">查看对比</button> <button class="btn sm" data-rb="${esc(String(v.id))}" data-vn="${esc(String(v.version))}">回滚</button></td>
+            </tr>`).join('')}</tbody>
+        </table></div>` : `
+        <div style="padding:32px;text-align:center;color:var(--text-3,#9ca3af);font-size:13px">暂无历史版本（修改提示词后自动记录）</div>`}
+      </div>`,
+      foot: `<button class="btn" data-close>${t('关闭')}</button>`,
+      onMount(mask, close) {
+        mask.querySelector('[data-close]').onclick = close;
+        mask.querySelectorAll('[data-diff]').forEach(b => b.onclick = () =>
+          showPromptDiff(list.find(x => String(x.id) === b.dataset.diff)));
+        mask.querySelectorAll('[data-rb]').forEach(b => b.onclick = async () => {
+          const vn = b.dataset.vn;
+          if (!await confirmBox(`将把提示词恢复到 v${vn} 保存时的内容，当前未保存的修改将丢失，继续？`, '回滚确认')) return;
+          try {
+            const r = await api(`/agents/${id}/prompt-versions/${b.dataset.rb}/rollback`, { method: 'POST' });
+            toast(r.msg || `已回滚到 v${vn}`);
+            close();
+            await reloadConfig(); // 重新加载 agent 配置（含乐观锁基准），覆盖本地编辑态
+          } catch (e) { toast(e.message || '回滚失败', 'err'); }
+        });
       },
     });
   }

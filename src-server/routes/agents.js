@@ -1,4 +1,8 @@
-/** 智能体 + 空间 + 测评（2026-10-22 P3：协作与可见性权限层全链路接入） */
+/** 智能体 + 空间 + 测评（2026-10-22 P3：协作与可见性权限层全链路接入）
+ *  LLMOps 提示词版本管理（2026-10-31 计划 #10）：
+ *  - PUT /api/agents/:id 保存时 prompt/user_prompt 有实际差异 → 自动记快照到 agent_prompt_versions
+ *  - GET  /api/agents/:id/prompt-versions 版本列表（最多 50 条，权限=可编辑者：版本含提示词全文，泄露面等同编辑权限）
+ *  - POST /api/agents/:id/prompt-versions/:vid/rollback 回滚写回 + 再记一条新版本（note='回滚到 vN'，完整审计链） */
 const express = require('express');
 const { db, now } = require('../db');
 const { auth } = require('../lib/auth');
@@ -10,6 +14,22 @@ const { runTool, validateAgentTools, TOOL_DEFS, AGENT_TOOL_DENY } = require('../
 
 const router = express.Router();
 router.use(auth);
+
+/** LLMOps：写一条提示词版本快照（version 在 agent 内自增；同步 INSERT 微秒级，不阻塞保存响应）。
+ *  prompt/userPrompt 存变更后的值；note 记录来源（'提示词修改' / '回滚到 vN'）。返回新版本号。 */
+function insertPromptVersion(agentId, prompt, userPrompt, editedBy, note) {
+  const version = (db.prepare('SELECT COALESCE(MAX(version),0) v FROM agent_prompt_versions WHERE agent_id=?').get(agentId).v || 0) + 1;
+  db.prepare(`INSERT INTO agent_prompt_versions (agent_id, version, prompt, user_prompt, edited_by, note, created_at) VALUES (?,?,?,?,?,?,datetime('now','localtime'))`)
+    .run(agentId, version, prompt || '', userPrompt || '', editedBy || '', note || '');
+  return version;
+}
+
+/** LLMOps：提示词变更判定——NULL/'' 归一为 '' 后逐字比对（PUT 为全量覆盖语义，parseBody 未传
+ *  prompt 时取 ''，故"未传导致的清空"同样是真实变更需要记快照；值无差异则不产生版本记录） */
+function promptChanged(oldAgent, newPrompt, newUserPrompt) {
+  const norm = v => (v == null ? '' : String(v));
+  return norm(oldAgent.prompt) !== norm(newPrompt) || norm(oldAgent.user_prompt) !== norm(newUserPrompt);
+}
 
 const TYPE_MAP = { enterprise: '企业智能体', digital: '数字员工', dept: '部门AI助理', other: '其他' };
 const TYPE_NAME = Object.fromEntries(Object.entries(TYPE_MAP).map(([k, v]) => [v, k]));
@@ -23,6 +43,9 @@ router.get('/', (req, res) => {
   if (type && TYPE_MAP[type]) { sql += ' AND a.type=?'; args.push(type); }
   if (req.user.role !== 'admin') { sql += ' AND a.status=?'; args.push('published'); }
   if (keyword) { sql += ' AND (a.name LIKE ? OR a.description LIKE ?)'; args.push(`%${keyword}%`, `%${keyword}%`); }
+  // V2.4 #9 租户化（2026-10-31）：空间隔离——普通用户仅见自己空间内的智能体
+  // 管理员用户见全部（管理界面需要跨空间操作）；依赖 space_id 在创建时已正确落库
+  if (req.user.role !== 'admin') { sql += ' AND (a.space_id IS NULL OR a.owner=?)'; args.push(req.user.username); }
   sql += ' ORDER BY a.updated_at DESC';
   let rows = db.prepare(sql).all(...args);
   if (req.user.role !== 'admin') rows = rows.filter(a => canView(a, req.user)); // P3 可见性过滤
@@ -240,6 +263,10 @@ router.put('/:id', (req, res) => {
   }
   db.prepare(`UPDATE agents SET name=?,description=?,type=?,space_id=?,category=?,prompt=?,user_prompt=?,model=?,temperature=?,top_p=?,diversity_mode=?,icon=?,context_rounds=?,max_reply=?,opening=?,opening_questions=?,kb_id=?,tools=?,mcp_servers=?,long_memory=?,allow_user_model=?,suggest_enabled=?,variables=?,child_ids=?,routing_mode=?,workflow=?,edit_mode=?,visibility=?,visible_depts=?,visible_members=?,collaborators=?,kb_metadata_filter=?,updated_at=datetime('now','localtime') WHERE id=?`)
     .run(a.name, a.description, a.type, a.space_id, a.category, a.prompt, a.user_prompt, a.model || old.model, a.temperature, a.top_p, a.diversity_mode, a.icon, a.context_rounds, a.max_reply, a.opening, a.opening_questions, a.kb_id, a.tools, a.mcp_servers, a.long_memory, a.allow_user_model, a.suggest_enabled, a.variables, a.child_ids, a.routing_mode, a.workflow, a.edit_mode, visibility, vDepts, vMembers, collabs, kbMetaFilter, old.id);
+  // LLMOps：prompt/user_prompt 有实际差异才自动记版本快照（变更后值），无差异（仅改名称/描述等）不记
+  if (promptChanged(old, a.prompt, a.user_prompt)) {
+    insertPromptVersion(old.id, a.prompt, a.user_prompt, req.user.username, '提示词修改');
+  }
   db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)').run(req.user.username, '编辑智能体', a.name, req.ip, now());
   const nu = db.prepare('SELECT updated_at FROM agents WHERE id=?').get(old.id);
   // P5.12 服务端二次校验（不拦截）：悬空引用清单随保存返回（前端已先校验，双保险/覆盖 API 直改场景）
@@ -480,6 +507,34 @@ router.post('/:id/publish-history/:version/rollback', (req, res) => {
   db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
     .run(req.user.username, '回滚智能体版本', `${old.name} → v${hist.version}`, req.ip, now());
   res.json({ code: 0, msg: `已回滚到 v${hist.version}（草稿与线上快照均已恢复该版本）` });
+});
+
+// ---------- LLMOps 提示词版本管理（2026-10-31 计划 #10） ----------
+
+// 版本列表：version DESC 上限 50。权限=可编辑者（与 PUT 同款 canEdit 校验）——
+// 版本含提示词全文，泄露面等同编辑权限，故不放宽到仅可见者
+router.get('/:id/prompt-versions', (req, res) => {
+  const old = db.prepare('SELECT * FROM agents WHERE id=?').get(req.params.id);
+  if (!old) return res.json({ code: 404, msg: '智能体不存在' });
+  if (!canEdit(old, req.user)) return res.json({ code: 403, msg: '无查看权限（提示词版本仅创建者、协作者与管理员可见）' });
+  const rows = db.prepare(`SELECT id, version, prompt, user_prompt, edited_by, note, created_at FROM agent_prompt_versions WHERE agent_id=? ORDER BY version DESC LIMIT 50`).all(old.id);
+  res.json({ code: 0, data: rows });
+});
+
+// 一键回滚：把该版本的 prompt/user_prompt 写回 agents 表 + 自动记一条新版本
+// （note='回滚到 vN'——回滚是显式操作，即使值与当前相同也留痕"谁在何时回滚"，完整审计链）
+router.post('/:id/prompt-versions/:vid/rollback', (req, res) => {
+  const old = db.prepare('SELECT * FROM agents WHERE id=?').get(req.params.id);
+  if (!old) return res.json({ code: 404, msg: '智能体不存在' });
+  if (!canEdit(old, req.user)) return res.json({ code: 403, msg: '无回滚权限（仅创建者、协作者与管理员）' });
+  const ver = db.prepare('SELECT * FROM agent_prompt_versions WHERE agent_id=? AND version=?').get(old.id, +req.params.vid);
+  if (!ver) return res.json({ code: 404, msg: '该版本不存在' });
+  db.prepare(`UPDATE agents SET prompt=?, user_prompt=?, updated_at=datetime('now','localtime') WHERE id=?`)
+    .run(ver.prompt || '', ver.user_prompt || '', old.id);
+  const nv = insertPromptVersion(old.id, ver.prompt, ver.user_prompt, req.user.username, `回滚到 v${ver.version}`);
+  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
+    .run(req.user.username, '回滚提示词版本', `${old.name} → 恢复 v${ver.version}（记为 v${nv}）`, req.ip, now());
+  res.json({ code: 0, msg: `已回滚到 v${ver.version}`, data: { version: nv } });
 });
 
 // ---------- 智能体广场（SinguX 式：已发布智能体集中展示，分类/搜索/官方/收藏/统计；P3：仅公开展示 public 智能体） ----------

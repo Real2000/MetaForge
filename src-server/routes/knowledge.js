@@ -51,8 +51,13 @@ router.get('/', (req, res) => {
   const rows = db.prepare(`
     SELECT k.*, (SELECT COUNT(*) FROM kb_files f WHERE f.kb_id=k.id) AS file_count
     FROM kbs k WHERE (?='admin' OR k.owner=?) ORDER BY k.id DESC`).all(req.user.role, req.user.username);
-  // V2.3 #5 2026-10-31：带出管道配置（JSON 解析为步骤名数组；NULL/空/损坏 → null=默认管道，前端据此回显编辑）
-  const data = rows.map(r => ({ ...r, pipeline: parsePipelineConfig(r.pipeline) }));
+  // V2.4 #9 租户化（2026-10-31）：空间隔离——普通用户仅见自己空间内的知识库
+  // 管理员用户见全部（管理界面需要跨空间操作）；依赖 space_id 在创建时已正确落库
+  let filtered = rows;
+  if (req.user.role !== 'admin') {
+    filtered = rows.filter(k => !k.space_id || k.owner === req.user.username);
+  }
+  const data = filtered.map(r => ({ ...r, pipeline: parsePipelineConfig(r.pipeline) }));
   res.json({ code: 0, data });
 });
 

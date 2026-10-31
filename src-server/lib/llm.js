@@ -3,6 +3,14 @@
  * 1. 若默认供应商已配置且填了 api_key → 真实调用 OpenAI 兼容 /chat/completions（SSE 流式）
  * 2. 否则 → 内置模拟流式回复（基于提示词/知识库上下文的确定性生成）
  * 统一以 async generator 形式输出 { delta } 事件，结束时返回 { usage }
+ *
+ * LLMOps 硬超时（2026-10-31 计划 #10）：非流式链路（chatOnce：TOC 提取/GraphRAG 抽取/关键词生成/评测/
+ * 任务执行等）支持整体硬超时——供应商网关故障时上游 connect timeout 无限挂起，生产实测把上传请求
+ * 拖死 90s+。机制：chatOnce 注入 opts.hardTimeoutMs（默认 120s，环境变量 LLM_TIMEOUT_MS 可覆盖），
+ * postModel 内与调用方 signal 合并（AbortSignal.any）后作用于 fetch（含响应体读取阶段）。
+ * 【严禁】给流式对话（chat.js → chat()）整体加超时——长回答会被中途截断；hardTimeoutMs 仅由
+ * chatOnce 注入，流式路径不传该值则 postModel 行为与旧版完全一致。超时抛 TimeoutError，
+ * 现有 isFailoverWorthy 已判定 Timeout 类错误走故障转移（failover 下一候选重新计时）。
  */
 const { db } = require('../db');
 const circuit = require('./circuit');
@@ -40,6 +48,25 @@ function isRetryableNetErr(e) {
     || /fetch failed/i.test(e?.message || '');
 }
 
+/** 合并多个 AbortSignal（任一触发即触发）。仅 postModel 硬超时使用：
+ *  Node ≥20 走 AbortSignal.any；老 Node 降级手动桥接（本项目现跑 Node 24，防御性保留）。 */
+function mergeAbortSignals(signals) {
+  const live = signals.filter(Boolean);
+  if (!live.length) return null;
+  if (live.length === 1) return live[0];
+  if (typeof AbortSignal.any === 'function') return AbortSignal.any(live);
+  const ctrl = new AbortController();
+  const onAbort = () => {
+    for (const s of live) s.removeEventListener('abort', onAbort);
+    ctrl.abort(live.find(s => s.aborted)?.reason);
+  };
+  for (const s of live) {
+    if (s.aborted) { ctrl.abort(s.reason); return ctrl.signal; }
+    s.addEventListener('abort', onAbort, { once: true });
+  }
+  return ctrl.signal;
+}
+
 /** P5.19 节点级故障转移条件：超时/网络抖动/429 限流/5xx（可降级到备用模型的失败类型）。
  *  4xx 确定性错误（鉴权失败/模型不存在/参数错）不在内——换模型也不解决（备用模型同样鉴权体系），
  *  报错让用户改配置才是正解。 */
@@ -58,12 +85,20 @@ function isFailoverWorthy(e) {
 
 /** 带自动重试的 POST（默认 3 次尝试，退避 700ms/1400ms）。
  *  重试范围：① fetch 抛连接类错误；② 网关返回 502/503/504（上游瞬时故障）。
- *  4xx 等确定性错误不重试，直接返回由调用方按原有逻辑抛详细错误。 */
-async function postModel(url, headers, body, { tries = 3, signal } = {}) {
+ *  4xx 等确定性错误不重试，直接返回由调用方按原有逻辑抛详细错误。
+ *  LLMOps 硬超时（2026-10-31）：opts.hardTimeoutMs（默认 undefined 行为不变）为整次调用的
+ *  总预算（含自动重试）——signal 在循环外创建，超时后重试因 signal 已 aborted 立即失败，
+ *  不会空耗预算。动机：供应商网关 connect timeout 挂起生产上传 90s+（2026-10-31 实测）。
+ *  与调用方 signal（如停止生成）合并而非覆盖；仅非流式链路（chatOnce）注入该值，
+ *  流式对话不传则与旧版行为完全一致（长回答不会被截断）。 */
+async function postModel(url, headers, body, { tries = 3, signal, hardTimeoutMs } = {}) {
+  const hardMs = Number.isFinite(+hardTimeoutMs) && +hardTimeoutMs > 0 ? +hardTimeoutMs : 0;
+  const timeoutSignal = hardMs ? AbortSignal.timeout(hardMs) : null;
+  const fetchSignal = mergeAbortSignals([signal, timeoutSignal]);
   let lastErr = null;
   for (let i = 1; i <= tries; i++) {
     try {
-      const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body), ...(signal ? { signal } : {}) });
+      const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body), ...(fetchSignal ? { signal: fetchSignal } : {}) });
       if ([502, 503, 504].includes(res.status) && i < tries) {
         await res.text().catch(() => ''); // 排空响应体，保持连接可复用
         lastErr = new Error(`模型供应商返回 ${res.status}`);
@@ -73,6 +108,14 @@ async function postModel(url, headers, body, { tries = 3, signal } = {}) {
       return res;
     } catch (e) {
       lastErr = e;
+      if (timeoutSignal?.aborted) {
+        // LLMOps 硬超时触发：不重试直接抛（保留 TimeoutError name——isFailoverWorthy 已判定
+        // Timeout 走故障转移，failover 到下一候选时重新计时）。注明 env 覆盖方式便于运维调整。
+        const err = new Error(`模型请求整体超时（${(hardMs / 1000).toFixed(1)}s，可用环境变量 LLM_TIMEOUT_MS 调整）`);
+        err.name = 'TimeoutError';
+        err.cause = e;
+        throw err;
+      }
       if (e?.name === 'AbortError' || e?.aborted) throw e; // P5.29 停止生成：调用方主动中止直接透传原错误（不重试、不包装，保住 name 标记供上层识别）
       if (i < tries && isRetryableNetErr(e)) {
         await sleep(700 * i);
@@ -134,9 +177,10 @@ async function* callReal(provider, messages, opts = {}) {
       body.tool_choice = 'auto';
     }
     // 自动重试容错：连接超时/重置/网关 5xx 自动重试（实测瞬时故障重试即恢复）
+    // LLMOps：透传 hardTimeoutMs（仅 chatOnce 注入，流式为 undefined 行为不变）+ 调用方 signal（合并而非覆盖）
     let res;
     try {
-      res = await postModel(url, { 'Content-Type': 'application/json', Authorization: 'Bearer ' + provider.api_key }, body, opts.signal ? { signal: opts.signal } : undefined);
+      res = await postModel(url, { 'Content-Type': 'application/json', Authorization: 'Bearer ' + provider.api_key }, body, { signal: opts.signal, hardTimeoutMs: opts.hardTimeoutMs });
     } catch (e) {
       e.partial = emitted; // 响应头阶段失败：未输出过内容则上层可换模型降级
       throw e;
@@ -383,9 +427,14 @@ function chat(messages, opts = {}) {
   return withFallback();
 }
 
-/** 非流式一次性获取（任务执行/测评用） */
+/** 非流式一次性获取（TOC 提取/GraphRAG 抽取/关键词生成/评测/任务执行等）。
+ *  LLMOps 硬超时（2026-10-31 计划 #10）：注入 opts.hardTimeoutMs，默认 120s、环境变量
+ *  LLM_TIMEOUT_MS 可覆盖——供应商网关 connect timeout 挂起时（2026-10-31 生产实测把上传
+ *  请求拖死 90s+）限时抛 TimeoutError 走故障转移，不再无限等待。
+ *  仅此非流式入口注入；流式对话（chat.js）不经 chatOnce，长回答不受影响。 */
 async function chatOnce(messages, opts = {}) {
-  const gen = chat(messages, opts);
+  const hardTimeoutMs = Number(process.env.LLM_TIMEOUT_MS) || 120000;
+  const gen = chat(messages, { ...opts, hardTimeoutMs });
   let out = null;
   while (true) {
     const r = await gen.next();

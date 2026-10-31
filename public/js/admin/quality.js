@@ -1,13 +1,14 @@
-/** 后台-对话质量（体验优化）：用户 👍/👎 与「解决了吗」反馈聚合
- *  统计卡片（满意度/解决率/好评差评数）+ 差评&未解决列表（用户/智能体/问题/回答摘录）
- *  用途：定位低评分对话 → 针对性优化智能体提示词与知识库
+/** 后台-对话质量（#10 LLMOps 质量看板四视图）：反馈质量 | Token 成本 | 检索命中率 | 评测得分
+ *  视图一「反馈质量」= 原功能：用户 👍/👎 与「解决了吗」调研聚合 + 差评/未解决列表（定位低分对话）
+ *  新增三视图消费 GET /api/chat/quality 扩展的 llm/kb/eval 数据块（四视图一次拉取，切换纯前端渲染不再发请求）
  */
 import { api } from '../api.js';
-import { esc, toast, modal } from '../ui.js';
+import { esc, modal, fmtNum } from '../ui.js';
 
 export async function render(el) {
   let data = null;
-  let type = 'all'; // all | down | unsolved
+  let type = 'all'; // 反馈视图内过滤：all | down | unsolved
+  let view = 'fb';  // 四视图：fb | llm | kb | eval
 
   el.innerHTML = `
   <style>
@@ -16,24 +17,36 @@ export async function render(el) {
   </style>
   <div class="page-head">
     <h2>对话质量</h2>
-    <div class="desc">用户在对话中的 👍/👎 评价与「这个回答解决你的问题了吗」调研聚合——定位低分对话，针对性优化提示词与知识库。</div>
+    <div class="desc">LLMOps 质量看板四视图——反馈质量 / Token 成本 / 检索命中率 / 评测得分，定位低分对话，针对性优化提示词与知识库。</div>
   </div>
-  <div class="grid-4" id="statCards" style="margin-bottom:14px"></div>
-  <div class="card" style="padding:12px 18px;margin-bottom:14px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-    <span class="fb-chip" data-t="all">待改进（差评+未解决）</span>
-    <span class="fb-chip" data-t="down">仅差评</span>
-    <span class="fb-chip" data-t="unsolved">仅未解决</span>
-    <span style="font-size:12px;color:var(--text-3);margin-left:auto">💡 点击行查看完整问答上下文</span>
+  <div class="card" style="padding:10px 18px;margin-bottom:14px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+    <span class="fb-chip" data-v="fb">👍 反馈质量</span>
+    <span class="fb-chip" data-v="llm">💰 Token 成本</span>
+    <span class="fb-chip" data-v="kb">📚 检索命中率</span>
+    <span class="fb-chip" data-v="eval">🧪 评测得分</span>
+    <span style="font-size:12px;color:var(--text-3);margin-left:auto" id="qzHint">💡 点击行查看完整问答上下文</span>
   </div>
-  <div class="card">
-    <div class="table-wrap"><table class="tbl">
-      <thead><tr><th style="width:120px">用户</th><th style="width:110px">智能体</th><th>问题 → 回答（摘录）</th><th style="width:86px">类型</th><th style="width:135px">时间</th></tr></thead>
-      <tbody id="tbody"></tbody>
-    </table></div>
-  </div>`;
+  <div id="vFb">
+    <div class="grid-4" id="statCards" style="margin-bottom:14px"></div>
+    <div class="card" style="padding:12px 18px;margin-bottom:14px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      <span class="fb-chip" data-t="all">待改进（差评+未解决）</span>
+      <span class="fb-chip" data-t="down">仅差评</span>
+      <span class="fb-chip" data-t="unsolved">仅未解决</span>
+    </div>
+    <div class="card">
+      <div class="table-wrap"><table class="tbl">
+        <thead><tr><th style="width:120px">用户</th><th style="width:110px">智能体</th><th>问题 → 回答（摘录）</th><th style="width:86px">类型</th><th style="width:135px">时间</th></tr></thead>
+        <tbody id="tbody"></tbody>
+      </table></div>
+    </div>
+  </div>
+  <div id="vLlm" style="display:none"></div>
+  <div id="vKb" style="display:none"></div>
+  <div id="vEval" style="display:none"></div>`;
 
   const tbody = el.querySelector('#tbody');
 
+  // ---------- 视图一：反馈质量（原有功能原样保留） ----------
   function renderFilters() {
     el.querySelectorAll('[data-t]').forEach(c => {
       c.classList.toggle('on', c.dataset.t === type);
@@ -86,6 +99,131 @@ export async function render(el) {
     });
   }
 
+  // ---------- 视图二：Token 成本（llm 块） ----------
+  // 纯 CSS 柱状图（项目内零依赖先例：ui.js Canvas 图表用于折线/柱状；此处轻量 14 天柱用 div 高度条即可，与全局风格一致）
+  const fmtTok = (n) => n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'K' : String(n || 0);
+
+  function renderLlm() {
+    const box = el.querySelector('#vLlm');
+    const L = data.llm || {};
+    const days = Array.isArray(L.tokens_by_day) ? L.tokens_by_day : [];
+    const max = Math.max(...days.map(d => +d.tokens || 0), 0);
+    const total = days.reduce((s, d) => s + (+d.tokens || 0), 0);
+    const calls = days.reduce((s, d) => s + (+d.calls || 0), 0);
+    const topTable = (title, rows, key) => `
+      <div class="card" style="flex:1;min-width:320px;padding:14px 18px">
+        <b style="font-size:13px">${esc(title)}</b>
+        <div class="table-wrap" style="margin-top:8px"><table class="tbl">
+          <thead><tr><th>${key === 'model' ? '模型' : '智能体'}</th><th style="width:100px">tokens</th><th style="width:80px">调用次数</th></tr></thead>
+          <tbody>${(rows || []).length ? (rows || []).map(r => `
+            <tr><td style="font-size:12px"><b>${esc(key === 'model' ? r.model : r.agent_name)}</b></td>
+            <td style="font-size:12px">${fmtNum(r.tokens)}</td>
+            <td style="font-size:12px">${fmtNum(r.calls)}</td></tr>`).join('') :
+            `<tr><td colspan="3" class="empty">暂无数据</td></tr>`}
+          </tbody></table></div>
+      </div>`;
+    box.innerHTML = `
+      <div class="card" style="padding:14px 18px;margin-bottom:14px">
+        <div style="display:flex;align-items:baseline;gap:10px;margin-bottom:2px">
+          <b style="font-size:14px">📈 近 14 天 Token 消耗</b>
+          <span style="font-size:12px;color:var(--text-3)">合计 <b>${fmtNum(total)}</b> tokens · ${fmtNum(calls)} 次调用（chat_traces 全链路口径，含技能/外部转发链路）</span>
+        </div>
+        ${max > 0 ? `
+        <div style="display:flex;align-items:flex-end;gap:5px;height:150px;margin-top:14px">
+          ${days.map(d => `
+          <div style="flex:1;height:100%;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;gap:4px" title="${esc(d.day)}：${fmtNum(d.tokens)} tokens / ${fmtNum(d.calls)} 次">
+            <span style="font-size:10px;color:var(--text-3)">${d.tokens ? fmtTok(d.tokens) : ''}</span>
+            <div style="width:66%;max-width:36px;height:${Math.max(d.tokens / max * 100, 2).toFixed(1)}%;background:linear-gradient(180deg,#3b82f6,#93c5fd);border-radius:4px 4px 0 0"></div>
+          </div>`).join('')}
+        </div>
+        <div style="display:flex;gap:5px;margin-top:6px">
+          ${days.map((d, i) => `<span style="flex:1;text-align:center;font-size:10px;color:var(--text-3)">${i % 2 === 0 ? esc(String(d.day).slice(5)) : ''}</span>`).join('')}
+        </div>` : `<div class="empty" style="padding:26px">近 14 天暂无 token 消耗记录</div>`}
+      </div>
+      <div style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:14px">
+        ${topTable('按模型 TOP10', L.tokens_by_model, 'model')}
+        ${topTable('按智能体 TOP10', L.tokens_by_agent, 'agent')}
+      </div>`;
+  }
+
+  // ---------- 视图三：检索命中率（kb 块） ----------
+  function renderKb() {
+    const box = el.querySelector('#vKb');
+    const K = data.kb || {};
+    const hr = K.hit_rate;
+    const miss = Math.max((+K.total_with_kb || 0) - (+K.hit_count || 0), 0);
+    box.innerHTML = `
+      <div class="grid-4" style="margin-bottom:14px">
+        <div class="stat"><div class="s-label">知识库检索命中率</div>
+          <div class="s-num" style="color:${hr == null ? 'var(--text-3)' : hr >= 70 ? '#059669' : hr >= 40 ? '#d97706' : '#dc2626'}">${hr == null ? '—' : hr + '%'}</div></div>
+        <div class="stat"><div class="s-label">命中对话数</div><div class="s-num" style="color:#059669">${fmtNum(K.hit_count || 0)}</div></div>
+        <div class="stat"><div class="s-label">挂库对话总数</div><div class="s-num">${fmtNum(K.total_with_kb || 0)}</div></div>
+        <div class="stat"><div class="s-label">未命中数</div><div class="s-num" style="color:${miss ? '#dc2626' : 'var(--text)'}">${fmtNum(miss)}</div></div>
+      </div>
+      <div class="card" style="padding:14px 18px">
+        <b style="font-size:13px">📖 口径说明</b>
+        <div style="font-size:12px;line-height:2;color:var(--text-2);margin-top:6px">
+          · 分母（挂库对话总数）＝当前仍关联知识库的智能体的全部对话记录；智能体后来解绑知识库或已删除的历史对话不计入（chat_traces 未记录检索时刻的挂库状态，按 agents 当前配置关联，属近似口径）<br>
+          · 命中 ＝ 该轮对话知识库检索返回了至少一条内容（kb_hits 非空）；挂库但未检索到内容计为未命中<br>
+          · 命中率低时优先检查：知识库分块质量、检索阈值、智能体与知识库的内容匹配度
+        </div>
+      </div>`;
+  }
+
+  // ---------- 视图四：评测得分（eval 块，V1.3 #6 评测集） ----------
+  function renderEval() {
+    const box = el.querySelector('#vEval');
+    const E = Array.isArray(data.eval) ? data.eval : [];
+    if (!E.length) {
+      box.innerHTML = `<div class="card" style="padding:40px;text-align:center">
+        <div style="font-size:28px;margin-bottom:8px">🧪</div>
+        <div style="color:var(--text-3);font-size:13px">暂无评测数据（V1.3 #6 评测集）——到智能体详情或知识库详情创建评测集并运行后，此处将展示近 14 天得分趋势</div>
+      </div>`;
+      return;
+    }
+    const max = Math.max(...E.map(e => +e.avg_score || 0), 0);
+    const avg = E.length ? (E.reduce((s, e) => s + (+e.avg_score || 0), 0) / E.length).toFixed(2) : '0';
+    box.innerHTML = `
+      <div class="card" style="padding:14px 18px;margin-bottom:14px">
+        <div style="display:flex;align-items:baseline;gap:10px;margin-bottom:2px">
+          <b style="font-size:14px">🧪 近 14 天评测得分趋势</b>
+          <span style="font-size:12px;color:var(--text-3)">日均分 <b>${esc(String(avg))}</b> · ${fmtNum(E.reduce((s, e) => s + (+e.runs || 0), 0))} 次评测运行（仅统计已完成的评测）</span>
+        </div>
+        <div style="display:flex;align-items:flex-end;gap:5px;height:150px;margin-top:14px">
+          ${E.map(e => `
+          <div style="flex:1;height:100%;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;gap:4px" title="${esc(e.day)}：平均 ${e.avg_score} 分 / ${fmtNum(e.runs)} 次运行">
+            <span style="font-size:10px;color:var(--text-3)">${esc(String(e.avg_score ?? ''))}</span>
+            <div style="width:66%;max-width:36px;height:${Math.max((+e.avg_score || 0) / (max || 1) * 100, 2).toFixed(1)}%;background:linear-gradient(180deg,#059669,#6ee7b7);border-radius:4px 4px 0 0"></div>
+          </div>`).join('')}
+        </div>
+        <div style="display:flex;gap:5px;margin-top:6px">
+          ${E.map((e, i) => `<span style="flex:1;text-align:center;font-size:10px;color:var(--text-3)">${i % 2 === 0 ? esc(String(e.day).slice(5)) : ''}</span>`).join('')}
+        </div>
+      </div>`;
+  }
+
+  // ---------- 视图切换（四视图数据一次拉取，切换纯前端渲染不再发请求） ----------
+  const HINTS = {
+    fb: '💡 点击行查看完整问答上下文',
+    llm: '💡 悬停柱体查看当日明细；TOP10 按累计 tokens 排序',
+    kb: '💡 分母为当前仍挂知识库的智能体对话（近似口径，详见卡片说明）',
+    eval: '💡 数据来自 V1.3 #6 评测集（仅统计已完成的评测运行）',
+  };
+  function renderView() {
+    el.querySelectorAll('[data-v]').forEach(c => {
+      c.classList.toggle('on', c.dataset.v === view);
+      c.onclick = () => { view = c.dataset.v; renderView(); };
+    });
+    el.querySelector('#qzHint').textContent = HINTS[view] || '';
+    el.querySelector('#vFb').style.display = view === 'fb' ? '' : 'none';
+    el.querySelector('#vLlm').style.display = view === 'llm' ? '' : 'none';
+    el.querySelector('#vKb').style.display = view === 'kb' ? '' : 'none';
+    el.querySelector('#vEval').style.display = view === 'eval' ? '' : 'none';
+    if (view === 'llm') renderLlm();
+    if (view === 'kb') renderKb();
+    if (view === 'eval') renderEval();
+  }
+
   async function load() {
     data = (await api('/chat/quality')).data;
     const s = data.stat;
@@ -96,9 +234,10 @@ export async function render(el) {
       <div class="stat"><div class="s-label">差评数</div><div class="s-num" style="color:${s.rated_down ? '#dc2626' : 'var(--text)'}">${s.rated_down}</div></div>`;
     renderFilters();
     renderTable();
+    renderView();
   }
 
-  // 复用反馈页的 chip 样式（fb-chip 类在 feedback 页 scoped style，这里补一份）
+  // 复用反馈页的 chip 样式（fb-chip 类在 feedback 页 scoped style，这里补一份；四视图切换与反馈过滤共用）
   const st = document.createElement('style');
   st.textContent = '.fb-chip{padding:5px 14px;border-radius:999px;border:1px solid #e5e7eb;background:#fff;font-size:12px;cursor:pointer;color:#4b5563}.fb-chip:hover{border-color:#93c5fd;color:#2563eb}.fb-chip.on{background:#2563eb;border-color:#2563eb;color:#fff}';
   el.prepend(st);

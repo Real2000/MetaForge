@@ -3387,6 +3387,152 @@ function t(name, fn) {
           const r3 = await jfetch('/api/edition/reload', { method: 'POST' }, tokAdmin);
           assert.strictEqual(r3.j.data.reason, 'missing');
         });
+
+        // ===== #10 LLMOps（2026-10-31 Dev B）：提示词版本面板 + 质量看板四视图 =====
+        // 契约（对齐 Dev A 的 agents.js 实现）：
+        //   GET /api/agents/:id/prompt-versions → { code:0, data:[{ id, version, prompt, user_prompt, edited_by, note, created_at }] }
+        //   POST /api/agents/:id/prompt-versions/:vid/rollback → { code:0, msg:'已回滚到 vN', data:{ version } }
+        //   PUT /api/agents/:id 保存时 prompt/user_prompt 实际变更自动记版本（POST 创建不记）
+        db.prepare(`DELETE FROM agents WHERE owner='httpu1'`).run(); // 防御性清理：前组失败残留会占免费版配额（同 L3335 手法）
+        let llmopsAid = 0; // 用例间共享：本组造的「版本记录测试」agent id
+        await t('LLMOps：提示词版本自动记录——两次 PUT 产生 v1/v2（version 递增/edited_by/note/快照）', async () => {
+          const cr = await jfetch('/api/agents', { method: 'POST', body: JSON.stringify({ name: '版本记录测试' }) }, tok1);
+          assert.ok(cr.j && cr.j.code === 0, '造 agent（owner=httpu1，POST 不带 prompt）应成功：' + JSON.stringify(cr.j).slice(0, 140));
+          llmopsAid = cr.j.data.id;
+          const put = (prompt) => jfetch(`/api/agents/${llmopsAid}`, { method: 'PUT', body: JSON.stringify({ name: '版本记录测试', prompt }) }, tok1);
+          const r1 = await put('你是银行客服助手 v1');
+          assert.ok(r1.j && r1.j.code === 0, '第一次 PUT（空→v1，实际变更）应成功：' + JSON.stringify(r1.j).slice(0, 140));
+          const r2 = await put('你是银行客服助手 v2');
+          assert.ok(r2.j && r2.j.code === 0, '第二次 PUT（v1→v2）应成功：' + JSON.stringify(r2.j).slice(0, 140));
+          const lv = await jfetch(`/api/agents/${llmopsAid}/prompt-versions`, {}, tok1);
+          assert.ok(lv.j && lv.j.code === 0, 'owner GET prompt-versions 应成功：' + JSON.stringify(lv.j).slice(0, 140));
+          const list = lv.j.data || [];
+          assert.strictEqual(list.length, 2, 'POST 创建不记版本，两次 PUT 应恰好 2 条：' + JSON.stringify(list).slice(0, 240));
+          const sorted = [...list].sort((a, b) => (a.version || 0) - (b.version || 0));
+          assert.strictEqual(sorted[0].version, 1, '首条 version 应为 1');
+          assert.strictEqual(sorted[1].version, 2, '次条 version 应为 2（递增）');
+          assert.strictEqual(sorted[0].prompt, '你是银行客服助手 v1', 'v1 应存当时 prompt 快照（非最终值）：' + sorted[0].prompt);
+          assert.ok(sorted.every(v => v.edited_by === 'httpu1'), 'edited_by 应为操作者 httpu1：' + JSON.stringify(sorted.map(v => v.edited_by)));
+          assert.ok(sorted.every(v => v.note === '提示词修改'), 'note 应为「提示词修改」：' + JSON.stringify(sorted.map(v => v.note)));
+        });
+        await t('LLMOps：无变更不记版本——相同 prompt 再 PUT 仍 2 条', async () => {
+          assert.ok(llmopsAid > 0, '前置用例应已造 agent（前序失败则本条连带失败）');
+          const r = await jfetch(`/api/agents/${llmopsAid}`, { method: 'PUT', body: JSON.stringify({ name: '版本记录测试', prompt: '你是银行客服助手 v2' }) }, tok1);
+          assert.ok(r.j && r.j.code === 0, 'PUT（内容未变）本身应保存成功：' + JSON.stringify(r.j).slice(0, 140));
+          const lv = await jfetch(`/api/agents/${llmopsAid}/prompt-versions`, {}, tok1);
+          assert.strictEqual((lv.j.data || []).length, 2, 'prompt 无实际变更不应新增版本：' + JSON.stringify(lv.j.data).slice(0, 200));
+        });
+        await t('LLMOps：回滚到 v1——agents.prompt 恢复快照 + 产生 v3 且 note 含「回滚」', async () => {
+          assert.ok(llmopsAid > 0, '前置用例应已造 agent');
+          const lv0 = await jfetch(`/api/agents/${llmopsAid}/prompt-versions`, {}, tok1);
+          const v1 = (lv0.j.data || []).find(v => v.version === 1);
+          assert.ok(v1, '应存在 v1 版本可回滚：' + JSON.stringify(lv0.j.data).slice(0, 200));
+          const rb = await jfetch(`/api/agents/${llmopsAid}/prompt-versions/${v1.id}/rollback`, { method: 'POST' }, tok1);
+          assert.ok(rb.j && rb.j.code === 0, 'owner rollback 应成功：' + JSON.stringify(rb.j).slice(0, 140));
+          assert.strictEqual(rb.j.msg, '已回滚到 v1', 'msg 契约：已回滚到 vN');
+          // V2.3 审查加固（回滚端点返回的是新版本号 v3——审计链要求，回滚是独立操作，始终产生新版本记录以便追溯）
+          assert.ok(rb.j.data && rb.j.data.version === 3, 'data.version 应为回滚产生的新版本号（非回滚目标版本 v1，审计链要求）：' + JSON.stringify(rb.j.data));
+          const d = await jfetch(`/api/agents/${llmopsAid}/detail`, {}, tok1);
+          assert.strictEqual(d.j.data.prompt, '你是银行客服助手 v1', '回滚后 agents.prompt 应恢复为 v1 快照内容：' + d.j.data.prompt);
+          const lv = await jfetch(`/api/agents/${llmopsAid}/prompt-versions`, {}, tok1);
+          const v3 = (lv.j.data || []).find(v => v.version === 3);
+          assert.ok(v3, '回滚应作为新版本 v3 记录（可再回滚/审计）：' + JSON.stringify(lv.j.data).slice(0, 240));
+          assert.ok(/回滚/.test(v3.note || ''), 'v3 note 应含「回滚」：' + (v3.note || ''));
+        });
+        await t('LLMOps：版本权限——非 owner 第三人 GET / 回滚 均 403', async () => {
+          assert.ok(llmopsAid > 0, '前置用例应已造 agent');
+          const lv = await jfetch(`/api/agents/${llmopsAid}/prompt-versions`, {}, tok2);
+          assert.ok(lv.j && lv.j.code === 403, '第三人（httpu2）GET 应 403：' + JSON.stringify(lv.j).slice(0, 120));
+          const lvOwn = await jfetch(`/api/agents/${llmopsAid}/prompt-versions`, {}, tok1);
+          const anyV = (lvOwn.j.data || [])[0];
+          assert.ok(anyV, 'owner 应能取到版本列表');
+          const rb = await jfetch(`/api/agents/${llmopsAid}/prompt-versions/${anyV.id}/rollback`, { method: 'POST' }, tok2);
+          assert.ok(rb.j && rb.j.code === 403, '第三人回滚应 403：' + JSON.stringify(rb.j).slice(0, 120));
+          const d = await jfetch(`/api/agents/${llmopsAid}/detail`, {}, tok1);
+          assert.strictEqual(d.j.data.prompt, '你是银行客服助手 v1', '403 回滚不得改动 prompt');
+        });
+        await t('LLMOps：quality 四视图端点——admin 得 llm/kb/eval 三块（聚合数值验证）+ 普通用户 403', async () => {
+          // 造聚合验证数据（父进程直插，走完即清）：挂库 agent（kb_id 非空）+ 命中/未命中 trace 各一条 + 一条已完结评测
+          db.prepare(`INSERT INTO agents (name,description,type,category,prompt,status,source,kb_id,owner,created_at,updated_at)
+            VALUES ('质量看板聚合验证','x','digital','测试','p','published','self',999999,'httpu1',datetime('now','localtime'),datetime('now','localtime'))`).run();
+          const qAid = db.prepare(`SELECT id FROM agents WHERE name='质量看板聚合验证'`).get().id;
+          const tr = db.prepare(`INSERT INTO chat_traces (session_id,message_id,agent_id,model,mode,latency_ms,tokens,prompt_chars,kb_hits,tool_calls,blocked,created_at)
+            VALUES (NULL,NULL,?,'m-quality-test','real',10,?,50,?,'[]','',datetime('now','localtime'))`);
+          tr.run(qAid, 111, '[{"file":"a.md"}]'); // 命中：kb_hits 非空数组
+          tr.run(qAid, 222, '[]');                // 挂库未命中
+          db.prepare(`INSERT INTO evaluations (name,agent_id,rule_prompt,dataset,status,score,result,type,created_at)
+            VALUES ('质量看板评测',?,'','[]','done',88.5,'[]','agent',datetime('now','localtime'))`).run(qAid);
+          try {
+            const adminUid = db.prepare(`SELECT id FROM users WHERE username='httpadmin'`).get().id;
+            const tokAdmin = sign({ uid: adminUid, exp: Date.now() + 3600000 });
+            const q = await jfetch('/api/chat/quality', {}, tokAdmin);
+            assert.ok(q.j && q.j.code === 0, 'admin 调 GET /api/chat/quality 应成功：' + JSON.stringify(q.j).slice(0, 140));
+            const d = q.j.data;
+            assert.ok(Array.isArray(d.list) && d.stat && 'satisfaction' in d.stat, '原有 list/stat 字段应保留（防破坏现有前端）');
+            // llm 块
+            assert.ok(d.llm && Array.isArray(d.llm.tokens_by_day), '应含 llm.tokens_by_day 数组：' + JSON.stringify(d.llm).slice(0, 120));
+            assert.strictEqual(d.llm.tokens_by_day.length, 14, 'tokens_by_day 应为近 14 天（空天补 0）：' + d.llm.tokens_by_day.length);
+            for (const r of d.llm.tokens_by_day) assert.ok('day' in r && 'tokens' in r && 'calls' in r, 'tokens_by_day 行结构应为 {day,tokens,calls}');
+            assert.ok(Array.isArray(d.llm.tokens_by_model) && Array.isArray(d.llm.tokens_by_agent), 'tokens_by_model / tokens_by_agent 应为数组');
+            const today = new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Shanghai' });
+            const todayRow = d.llm.tokens_by_day.find(r => r.day === today);
+            assert.ok(todayRow && todayRow.tokens >= 333, '按天求和应含今日造的 111+222：' + JSON.stringify(todayRow));
+            const mRow = d.llm.tokens_by_model.find(r => r.model === 'm-quality-test');
+            assert.ok(mRow && mRow.tokens === 333 && mRow.calls === 2, 'tokens_by_model 应按模型聚合（333 tokens / 2 次）：' + JSON.stringify(mRow));
+            const aRow = d.llm.tokens_by_agent.find(r => r.agent_name === '质量看板聚合验证');
+            assert.ok(aRow && aRow.tokens === 333, 'tokens_by_agent 应按智能体聚合（JOIN agents 取名）：' + JSON.stringify(aRow));
+            // kb 块（近似口径：分母为当前仍挂库 agent 的 trace）
+            assert.ok(d.kb && 'hit_rate' in d.kb && 'hit_count' in d.kb && 'total_with_kb' in d.kb, 'kb 块应含 hit_rate/hit_count/total_with_kb：' + JSON.stringify(d.kb));
+            assert.ok(d.kb.total_with_kb >= 2 && d.kb.hit_count >= 1, '挂库对话 ≥2 且命中 ≥1（今日造数）：' + JSON.stringify(d.kb));
+            assert.ok(d.kb.hit_rate == null || (d.kb.hit_rate >= 0 && d.kb.hit_rate <= 100), 'hit_rate 应为 0-100 的百分比或 null');
+            // eval 块（V1.3 #6 评测集，近 14 天趋势）
+            assert.ok(Array.isArray(d.eval), 'eval 应为数组（无数据返回空数组）：' + JSON.stringify(d.eval).slice(0, 120));
+            const eToday = d.eval.find(r => r.day === today);
+            assert.ok(eToday && typeof eToday.avg_score === 'number' && eToday.runs >= 1, 'eval 应聚合今日 done 评测（avg_score/runs）：' + JSON.stringify(eToday));
+            // adminOnly 保持：普通用户 403
+            const u = await jfetch('/api/chat/quality', {}, tok1);
+            assert.ok(u.j && u.j.code === 403, '普通用户（httpu1）应 403：' + JSON.stringify(u.j).slice(0, 120));
+          } finally {
+            db.prepare(`DELETE FROM chat_traces WHERE agent_id=?`).run(qAid);
+            db.prepare(`DELETE FROM evaluations WHERE agent_id=? AND name='质量看板评测'`).run(qAid);
+            db.prepare(`DELETE FROM agents WHERE id=?`).run(qAid);
+          }
+        });
+        // 本用例不走 HTTP（chatOnce 直连本地黑洞端口）；契约：LLM_TIMEOUT_MS 运行时读取（llm.js chatOnce 每次调用读 env）
+        await t('LLMOps：llm 硬超时——LLM_TIMEOUT_MS=1500 下 chatOnce 对「只 accept 不响应」端口 ~1.5s reject 不挂死', async () => {
+          const { chatOnce } = require('../src-server/lib/llm');
+          // 备份并清空 providers（唯一 configured 供应商 = 黑洞，保证无候选可降级、不外呼真实网关；测完恢复）
+          const backup = db.prepare('SELECT * FROM providers').all();
+          db.prepare('DELETE FROM providers').run();
+          const net = require('net');
+          const blackhole = net.createServer(() => { /* 只 accept：不响应也不关闭 */ });
+          await new Promise(r => blackhole.listen(0, '127.0.0.1', r));
+          const port = blackhole.address().port;
+          const info = db.prepare(`INSERT INTO providers (name,base_url,api_key,models,configured,is_default,remark,created_at)
+            VALUES ('黑洞供应商',?, 'sk-test', ?, 1, 0, '', datetime('now','localtime'))`)
+            .run(`http://127.0.0.1:${port}/v1`, JSON.stringify(['timeout-probe-model']));
+          const prev = process.env.LLM_TIMEOUT_MS;
+          process.env.LLM_TIMEOUT_MS = '1500';
+          let err = null;
+          const t0 = Date.now();
+          try {
+            await chatOnce([{ role: 'user', content: 'hi' }], { model: 'timeout-probe-model' });
+          } catch (e) { err = e; }
+          const cost = Date.now() - t0;
+          if (prev === undefined) delete process.env.LLM_TIMEOUT_MS; else process.env.LLM_TIMEOUT_MS = prev;
+          try { blackhole.close(); } catch { }
+          db.prepare(`DELETE FROM providers WHERE id=?`).run(info.lastInsertRowid);
+          if (backup.length) { // 恢复原表（按原 id 原列原样写回）
+            const cols = Object.keys(backup[0]);
+            const ins = db.prepare(`INSERT INTO providers (${cols.join(',')}) VALUES (${cols.map(() => '?').join(',')})`);
+            for (const r of backup) ins.run(...cols.map(c => r[c]));
+          }
+          assert.ok(err, 'chatOnce 应 reject（黑洞端口永不响应），而非静默成功或挂死');
+          assert.ok(/超时|timeout/i.test((err.name || '') + ' ' + (err.message || '')), '应为超时类错误（TimeoutError）：' + err.name + ' ' + err.message);
+          assert.ok(cost >= 1400 && cost <= 8000, `应在 ~1.5s 触发硬超时（含重试退避容差，实测 ${cost}ms）`);
+        });
+        // LLMOps 组收尾：清走「版本记录测试」agent（防污染后续用例的 agents 统计）
+        db.prepare(`DELETE FROM agents WHERE name='版本记录测试'`).run();
       } else {
         failed++; console.error('  ❌ HTTP 测试服务未就绪，本组用例跳过');
       }

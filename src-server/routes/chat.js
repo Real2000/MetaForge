@@ -143,6 +143,9 @@ router.post('/messages/:id/solved', (req, res) => {
 });
 
 // 管理端对话质量报表（admin）：差评/未解决消息 + 上下文问题 + 统计
+// #10 LLMOps（2026-10-31）四视图扩展：data 追加 llm（token 成本）/ kb（检索命中率）/ eval（评测得分趋势）
+// 三新块；原有 list/stat 字段与结构保持不变（防破坏现有前端），由 public/js/admin/quality.js 四视图消费。
+// 聚合全部 SQL 下推（stats.js L17 教训：禁止全表读进内存 JS 聚合——SUM/GROUP BY + LIMIT），仅对聚合结果做 ≤14 行空天补齐
 router.get('/quality', adminOnly, (req, res) => {
   const rows = db.prepare(`
     SELECT m.id, m.session_id, m.content, m.rating, m.solved, m.created_at,
@@ -163,7 +166,54 @@ router.get('/quality', adminOnly, (req, res) => {
   };
   stat.satisfaction = (stat.rated_up + stat.rated_down) ? Math.round(stat.rated_up / (stat.rated_up + stat.rated_down) * 100) : null;
   stat.resolve_rate = (stat.solved_yes + stat.solved_no) ? Math.round(stat.solved_yes / (stat.solved_yes + stat.solved_no) * 100) : null;
-  res.json({ code: 0, data: { list: rows, stat } });
+
+  // ---------- #10 LLMOps：llm 块（token 成本） ----------
+  // 近 14 天窗口（Asia/Shanghai，与 now() 落库时区一致）；days 仅用于补齐空天（14 行结果，非全表操作）
+  const days14 = Array.from({ length: 14 }, (_, i) =>
+    new Date(Date.now() - (13 - i) * 86400000).toLocaleDateString('sv-SE', { timeZone: 'Asia/Shanghai' }));
+  const since14 = days14[0] + ' 00:00:00';
+  const dayRows = db.prepare(`SELECT substr(created_at,1,10) AS d, COALESCE(SUM(tokens),0) AS tokens, COUNT(*) AS calls
+    FROM chat_traces WHERE created_at >= ? GROUP BY substr(created_at,1,10)`).all(since14);
+  const dayMap = new Map(dayRows.map(r => [r.d, r]));
+  const llm = {
+    // 按天（空天补 0，保证前端 14 天柱状连续）
+    tokens_by_day: days14.map(d => ({ day: d, tokens: dayMap.get(d)?.tokens || 0, calls: dayMap.get(d)?.calls || 0 })),
+    // 按模型 TOP10（空 model 归「未知」）
+    tokens_by_model: db.prepare(`SELECT CASE WHEN model IS NULL OR model='' THEN '未知' ELSE model END AS model,
+      COALESCE(SUM(tokens),0) AS tokens, COUNT(*) AS calls
+      FROM chat_traces GROUP BY model ORDER BY tokens DESC LIMIT 10`).all(),
+    // 按智能体 TOP10（agent 已删显示「已删除」；agent_id 为 NULL = 首页助手直连对话）
+    tokens_by_agent: db.prepare(`SELECT CASE WHEN t.agent_id IS NULL THEN '首页助手' ELSE COALESCE(a.name,'已删除') END AS agent_name,
+      COALESCE(SUM(t.tokens),0) AS tokens, COUNT(*) AS calls
+      FROM chat_traces t LEFT JOIN agents a ON a.id=t.agent_id
+      GROUP BY t.agent_id ORDER BY tokens DESC LIMIT 10`).all(),
+  };
+
+  // ---------- #10 LLMOps：kb 块（检索命中率） ----------
+  // 口径说明：chat_traces 未记录检索时刻 agent 是否挂库（kb_id 不落 trace，历史对话无法精确回放当时配置），
+  // 采用「JOIN agents 当前配置」近似——分母 = agent 当前仍挂知识库（agents.kb_id 非空）的全部对话 trace；
+  // agent 已删除或已解绑知识库的历史对话不计入分母（挂库总量低估，命中率在口径内精确）。
+  // 命中定义 = kb_hits 为非空 JSON 数组（写入端 JSON.stringify(kbHits)：未命中/外部链路固定写 '[]'，
+  // 正常不会产生 NULL/''，SQL 仍防御性排除）。「挂库未命中」在分母内、「历史未挂库」已排除——
+  // 本表内可区分的边界即止于此，无法区分的部分不计入（宁少勿错）。
+  const kbRow = db.prepare(`SELECT COUNT(*) AS total,
+    COALESCE(SUM(CASE WHEN t.kb_hits IS NOT NULL AND t.kb_hits != '' AND t.kb_hits != '[]' THEN 1 ELSE 0 END),0) AS hit
+    FROM chat_traces t JOIN agents a ON a.id=t.agent_id
+    WHERE a.kb_id IS NOT NULL AND a.kb_id != ''`).get();
+  const kb = {
+    hit_rate: kbRow.total ? Math.round(kbRow.hit / kbRow.total * 100) : null, // 无挂库对话时 null（前端显示「—」）
+    hit_count: kbRow.hit,
+    total_with_kb: kbRow.total,
+  };
+
+  // ---------- #10 LLMOps：eval 块（评测得分趋势，V1.3 #6 evaluations 表） ----------
+  // 近 14 天每次重跑的按天平均得分趋势；仅计入 status='done' 的已完结评测（running 时 score 无意义）；
+  // agent 级与知识库级（type='agent'/'kb'）合并统计口径（LLMOps 质量大盘不区分用途）；无数据返回空数组
+  const evalTrend = db.prepare(`SELECT substr(created_at,1,10) AS day, ROUND(AVG(score),2) AS avg_score, COUNT(*) AS runs
+    FROM evaluations WHERE created_at >= ? AND status='done'
+    GROUP BY substr(created_at,1,10) ORDER BY day`).all(since14);
+
+  res.json({ code: 0, data: { list: rows, stat, llm, kb, eval: evalTrend } });
 });
 
 /** 子智能体编排（SinguX 式：主智能体作为编排器，把子智能体注册为 function calling 工具路由执行）
