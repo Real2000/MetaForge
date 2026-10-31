@@ -724,6 +724,13 @@ if (!kbCols.includes('chunk_separator')) {
   db.exec(`ALTER TABLE kbs ADD COLUMN chunk_separator TEXT DEFAULT '\\n\\s*\\n'`);
   console.log('[db] kbs 表已迁移：新增 chunk_separator 字段');
 }
+// V2.4 #9 租户化（2026-10-31）：kbs 表增加 space_id 列——空间归属，0=无空间（默认），写入时关联对应的 space 表记录。
+// 本列是占位迁移，V2.4 正式开工时做存量回填+创建写入口。幂等（列已存在则跳过）。
+const kbColsV24 = db.prepare('PRAGMA table_info(kbs)').all().map(c => c.name);
+if (!kbColsV24.includes('space_id')) {
+  db.exec(`ALTER TABLE kbs ADD COLUMN space_id INTEGER DEFAULT 0`);
+  console.log('[db] kbs 表已迁移：新增 space_id 字段（V2.4 #9 租户化占位）');
+}
 // kb_chunks 表增加 parent_id（父子切片：父 = ~1000 字上下文，子 = ~200 字精准召回）
 const chunkCols2 = db.prepare('PRAGMA table_info(kb_chunks)').all().map(c => c.name);
 if (!chunkCols2.includes('parent_id')) {

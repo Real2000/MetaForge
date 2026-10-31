@@ -52,7 +52,9 @@ router.get('/', (req, res) => {
     SELECT k.*, (SELECT COUNT(*) FROM kb_files f WHERE f.kb_id=k.id) AS file_count
     FROM kbs k WHERE (?='admin' OR k.owner=?) ORDER BY k.id DESC`).all(req.user.role, req.user.username);
   // V2.4 #9 租户化（2026-10-31）：空间隔离——普通用户仅见自己空间内的知识库
-  // 管理员用户见全部（管理界面需要跨空间操作）；依赖 space_id 在创建时已正确落库
+  // 管理员用户见全部（管理界面需要跨空间操作）。⚠️ 注意：kbs 表尚未增加 space_id 列，
+  // 因此下方 filter 目前是 no-op（!k.space_id 恒 true）。此段为占位代码，待 V2.4 正式开工时
+  // 同步加列+创建写入后生效——详见改进计划表 V2.4 节及改进建议 #9。
   let filtered = rows;
   if (req.user.role !== 'admin') {
     filtered = rows.filter(k => !k.space_id || k.owner === req.user.username);
