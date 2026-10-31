@@ -118,11 +118,11 @@ router.post('/', requireFeature('agents'), (req, res) => {
   const kbDeny = denyKbNotOwned(a.kb_id, req.user); // V1.2 审查加固：挂库归属校验
   if (kbDeny) return res.json(kbDeny);
   // 商业化软约束：免费版智能体数达上限不硬拦，返回升级提示（upgrade_hint 前端弹引导）
-  const { planUsage } = require('../lib/plans');
-  const pu = planUsage(req.user.username);
-  if (pu && !pu.exempt && pu.plan === 'free' && pu.agents >= pu.agentsLimit) {
-    return res.json({ code: 402, msg: `免费版最多创建 ${pu.agentsLimit} 个智能体（当前 ${pu.agents} 个）`, data: { upgrade_hint: true } });
-  }
+  // V2.3 Y3：改用 lib/plans.js agentQuotaBlock 统一封装——与技能市场克隆通道（routes/skills-market.js）
+  // 同口径，配额规则/文案变更只改一处；消息与 code/data 逐字对齐原内联实现（防测试断言漂移）
+  const { agentQuotaBlock } = require('../lib/plans');
+  const quota = agentQuotaBlock(req.user.username);
+  if (quota.blocked) return res.json({ code: quota.code, msg: quota.msg, data: quota.data });
   // SinguX 式轻量创建：只需名称（提示词可后置到编排页填写），创建后前端直接跳转编排页
   const info = db.prepare(`INSERT INTO agents (name,description,type,space_id,category,prompt,user_prompt,model,temperature,top_p,diversity_mode,icon,context_rounds,max_reply,opening,opening_questions,kb_id,status,source,tools,mcp_servers,long_memory,allow_user_model,suggest_enabled,variables,child_ids,routing_mode,owner,created_at,updated_at)
     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))`)

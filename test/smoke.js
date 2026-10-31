@@ -2153,6 +2153,11 @@ function t(name, fn) {
     require('../src-server/lib/secrets').upsert('DINGTALK_TOKEN', DT_TOKEN, 'smoke V1.3#4');
     require('../src-server/lib/secrets').upsert('DINGTALK_APP_KEY', 'smoke-dt-app-key', 'smoke V1.3#4');       // 扫码登录骨架前置（本组暂不直接用，为后续用例铺路）
     require('../src-server/lib/secrets').upsert('DINGTALK_APP_SECRET', 'smoke-dt-app-secret', 'smoke V1.3#4'); // 同上
+    // ===== V2.3 Y7 前置（2026-10-31）：子进程预置 License 测试公钥 =====
+    // ⚠️ 必须在 spawn 子进程【之前】设置 env（与上方钉钉 secrets 同理）：运行中改父进程 env 不会传播到已启动子进程；
+    //    热重载用例在子进程内验签 License，公钥须随 spawn 传入；父进程保留私钥供用例签发（见下方「License 热重载」用例）
+    const licKeypair = require('crypto').generateKeyPairSync('ed25519');
+    process.env.LICENSE_PUBKEY_HEX = licKeypair.publicKey.export({ type: 'spki', format: 'der' }).subarray(-32).toString('hex');
     const child = spawn(process.execPath, ['server.js'], {
       cwd: path.join(__dirname, '..'),
       env: { ...process.env, PORT: String(port), AGENT_DATA_DIR: process.env.AGENT_DATA_DIR },
@@ -3026,13 +3031,15 @@ function t(name, fn) {
           const r = await jfetch('/api/skills-market', {}, tok1);
           assert.ok(r.j && r.j.code === 0, '聚合端点应 code=0：' + JSON.stringify(r.j).slice(0, 120));
           const d = r.j.data;
-          assert.ok(Array.isArray(d.wf_templates) && Array.isArray(d.skill_assets) && Array.isArray(d.mcp_tools) && Array.isArray(d.platforms), '四区数组齐备');
+          assert.ok(Array.isArray(d.wf_templates) && Array.isArray(d.skill_assets) && Array.isArray(d.mcp_tools), '三区数组齐备');
+          // V2.3 F5 防聚合回退：主端点不应再返回 platforms / platform_errors / platforms_cached（异构清单独立端点承担）
+          assert.ok(!('platforms' in d) && !('platform_errors' in d) && !('platforms_cached' in d), '主端点不应含 platforms 三字段（F5 分离防聚合回退）');
           const a = d.wf_templates.find(x => x.slug === 'mk-smoke-a'), b = d.wf_templates.find(x => x.slug === 'mk-smoke-b');
           assert.ok(a && b && d.wf_templates.indexOf(a) < d.wf_templates.indexOf(b), 'wf_templates 按 use_count DESC（模版A=50 在模版B=5 前）');
           assert.ok(d.wf_templates.every((x, i, arr) => i === 0 || arr[i - 1].use_count >= x.use_count), 'use_count 全表单调不增');
           const mySkill = d.skill_assets.find(x => x.name === '市场克隆技能');
           assert.ok(!!mySkill && mySkill.owned_by_me, 'skill_assets 含本人资产且 owned_by_me=true');
-          assert.ok(d.stats.total === d.wf_templates.length + d.skill_assets.length + d.mcp_tools.length + d.platforms.length && d.stats.my_favorites === 0, 'stats.total=四区条数和、my_favorites=0');
+          assert.ok(d.stats.total === d.wf_templates.length + d.skill_assets.length + d.mcp_tools.length && d.stats.my_favorites === 0, 'stats.total=三区条数之和（F5 后不含 platforms）、my_favorites=0');
         });
         await t('HTTP：技能市场——收藏 / 幂等 / 列表 / 取消（V2.2 #7）', async () => {
           const tplId = db.prepare(`SELECT id FROM workflow_templates WHERE slug='mk-smoke-a'`).get().id;
@@ -3081,6 +3088,105 @@ function t(name, fn) {
           assert.ok(n.length <= 50, `入库名应 ≤50 字符（实际 ${n.length}）`);
           assert.ok(n.endsWith('（副本）'), `截断后应仍带完整后缀（修复前先查重后截断，后缀会被切掉）：…${n.slice(-8)}`);
           assert.ok(!db.prepare('SELECT 1 FROM agents WHERE name=?').get(longName), '原始 60 字全名不应直接入库（查重名必须=入库名，防重名自相矛盾）');
+        });
+        // ===== V2.3 技能市场（2026-10-31）：F5 platforms 独立端点 / Y3 克隆配额统一口径 =====
+        await t('HTTP：技能市场——platforms 独立端点 + 缓存命中单飞语义（F5 分离 / V2.3 审查加固 S1-1/S2-1）', async () => {
+          const errBefore = db.prepare(`SELECT COUNT(*) c FROM err_logs WHERE source='skills-market'`).get().c;
+          const r = await jfetch('/api/skills-market/platforms', {}, tok1);
+          assert.ok(r.j && r.j.code === 0, 'platforms 独立端点应 code=0（外部平台故障也 best-effort 不 5xx）：' + JSON.stringify(r.j).slice(0, 120));
+          const d = r.j.data;
+          assert.ok(Array.isArray(d.platforms), 'data.platforms 应为数组');
+          assert.strictEqual(typeof d.platforms_cached, 'boolean', 'platforms_cached 应为布尔');
+          assert.ok(Array.isArray(d.platform_errors), 'platform_errors 应为数组（best-effort 观测标记）');
+          // 种子库 2 个平台均未配置真实凭据（coze token 非 pat_ 前缀 / dify 无控制台账号密码），
+          // 应全部走静默 error 分支：清单为空数组、失败入 platform_errors、HTTP 仍 code=0 不 5xx
+          assert.strictEqual(d.platforms.length, 0, '未配置凭据的平台拉不到应用（空数组不 5xx）');
+          assert.ok(d.platform_errors.length > 0, '拉取失败应记入 platform_errors 供前端观测');
+          assert.strictEqual(d.platforms_cached, false, '首次调用应真实拉取（cached=false）');
+          const errAfterFirst = db.prepare(`SELECT COUNT(*) c FROM err_logs WHERE source='skills-market'`).get().c;
+          assert.ok(errAfterFirst > errBefore, '首次真实拉取失败应写 err_logs（S2-1 守卫只拦缓存命中，不拦真实失败）');
+          // V2.3 审查加固（S1-1/S2-1/P2-2）：TTL 内第二次调用应命中缓存（single-flight 单飞）——
+          // 不再触发外部调用（cached=true）、失败观测标记照常返回（响应字段保留）、err_logs 不再新增（防日志洪泛）
+          const r2 = await jfetch('/api/skills-market/platforms', {}, tok1);
+          const d2 = r2.j.data;
+          assert.strictEqual(d2.platforms_cached, true, 'TTL 内第二次调用应命中缓存（未触发外部调用，单飞/缓存语义）');
+          assert.strictEqual(d2.platform_errors.length, d.platform_errors.length, '缓存命中时失败观测标记应照常返回（前端需知清单为空的原因）');
+          assert.strictEqual(db.prepare(`SELECT COUNT(*) c FROM err_logs WHERE source='skills-market'`).get().c, errAfterFirst, '缓存命中不应再写 err_logs（S2-1：防高频刷端点刷出日志洪泛）');
+        });
+        await t('HTTP：技能市场——克隆与创建双通道配额统一口径（Y3 / V2.3 审查加固 P1-2）', async () => {
+          db.prepare(`DELETE FROM agents WHERE owner='httpu1'`).run(); // 清空前序用例克隆产物，腾出配额（同 Y2 用例清理手法）
+          // httpu1 为 user 角色免费版（users.plan 默认 'free'，上限 3 个智能体）——直插 3 个 source='self' 草稿打满配额
+          const ins = db.prepare(`INSERT INTO agents (name,description,type,category,prompt,status,source,owner,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))`);
+          ins.run('配额打满A', 'Y3 配额测试', 'digital', '测试', 'p', 'draft', 'self', 'httpu1');
+          ins.run('配额打满B', 'Y3 配额测试', 'digital', '测试', 'p', 'draft', 'self', 'httpu1');
+          ins.run('配额打满C', 'Y3 配额测试', 'digital', '测试', 'p', 'draft', 'self', 'httpu1');
+          const sid = db.prepare(`SELECT id FROM skill_assets WHERE name='市场克隆技能' AND owner='httpu1'`).get().id;
+          const k = await jfetch('/api/skills-market/clone', { method: 'POST', body: JSON.stringify({ item_type: 'skill_asset', item_id: String(sid) }) }, tok1);
+          assert.ok(k.j && k.j.code === 402, '配额打满后克隆应 402（lib/plans agentQuotaBlock 统一口径）：' + JSON.stringify(k.j).slice(0, 160));
+          assert.ok(/免费版最多创建 3 个智能体（当前 3 个）/.test(k.j.msg || ''), 'msg 应锁全文案（V2.3 审查加固 P2-3：防统一函数文案漂移）：' + (k.j.msg || ''));
+          assert.ok(k.j.data && k.j.data.upgrade_hint === true, 'data.upgrade_hint 应为 true（前端升级引导）');
+          assert.strictEqual(db.prepare(`SELECT COUNT(*) c FROM agents WHERE owner='httpu1'`).get().c, 3, '402 拒绝时不应落库新智能体（仍为打满的 3 个）');
+          // V2.3 审查加固（P1-2）：POST /api/agents 通道同断言——Y3 同步改了两处调用点，
+          // 只测 clone 通道则 agents 通道误删/漂移不会被捕获（「两通道自动同步」卖点缺一半闭环）
+          const g = await jfetch('/api/agents', { method: 'POST', body: JSON.stringify({ name: '配额402测试' }) }, tok1);
+          assert.ok(g.j && g.j.code === 402, '配额打满后 POST /api/agents 也应 402（同一 agentQuotaBlock）：' + JSON.stringify(g.j).slice(0, 160));
+          assert.strictEqual(g.j.msg, k.j.msg, '两通道 msg 应完全一致（统一口径零漂移）');
+          assert.ok(g.j.data && g.j.data.upgrade_hint === true, 'agents 通道 upgrade_hint 同为 true');
+          assert.strictEqual(db.prepare(`SELECT COUNT(*) c FROM agents WHERE owner='httpu1'`).get().c, 3, 'agents 通道 402 拒绝时同样不落库');
+          db.prepare(`DELETE FROM agents WHERE owner='httpu1'`).run(); // 清理：还原免费版配额空间，避免影响后续用例
+        });
+        // ===== V2.3 Y7 版本/License 管理端点（2026-10-31）：GET 脱敏快照 + POST 热重载 =====
+        await t('HTTP：版本端点 GET——未登录 401 / 普通用户脱敏快照 / 管理员完整快照（V2.3 Y7）', async () => {
+          const anon = await jfetch('/api/edition', {});
+          assert.strictEqual(anon.j && anon.j.code, 401, '未登录应 401：' + JSON.stringify(anon.j));
+          const u = await jfetch('/api/edition', {}, tok1);
+          assert.ok(u.j && u.j.code === 0, '登录用户 GET 应 code=0：' + JSON.stringify(u.j).slice(0, 120));
+          const ud = u.j.data;
+          // 脱敏快照：四字段齐备，授权商业信息四字段不得出现（V2.3 审查加固 P1-3/S2-2：days_left 可反推到期日，移出白名单）
+          for (const k of ['edition', 'name', 'licensed', 'reason']) assert.ok(k in ud, `普通用户快照应含 ${k}`);
+          for (const k of ['customer', 'expires_at', 'license_key', 'days_left']) assert.ok(!(k in ud), `普通用户快照不得含 ${k}（脱敏：客户名/到期日/编号/可反推到期日的剩余天数）`);
+          assert.strictEqual(ud.edition, 'community', '子进程无 License 应为 community（重载前置态）');
+          const adminUid = db.prepare(`SELECT id FROM users WHERE username='httpadmin'`).get().id;
+          const tokAdmin = sign({ uid: adminUid, exp: Date.now() + 3600000 });
+          const a = await jfetch('/api/edition', {}, tokAdmin);
+          assert.ok(a.j && a.j.code === 0 && 'customer' in a.j.data && 'expires_at' in a.j.data && 'license_key' in a.j.data, '管理员应得完整快照（含 customer/expires_at/license_key 前缀）：' + JSON.stringify(a.j).slice(0, 160));
+        });
+        await t('HTTP：License 热重载——仅管理员 + 审计落库 + 文件替换免重启热切换/篡改即时降级（V2.3 Y7）', async () => {
+          const crypto = require('crypto'), fs = require('fs'), path = require('path');
+          const licFile = path.join(process.env.AGENT_DATA_DIR, 'license.json');
+          const p = (n) => String(n).padStart(2, '0');
+          const dstr = (d) => `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+          const signLic = (fields) => ({ ...fields, signature: crypto.sign(null, Buffer.from(JSON.stringify(fields), 'utf8'), licKeypair.privateKey).toString('hex') });
+          const adminUid = db.prepare(`SELECT id FROM users WHERE username='httpadmin'`).get().id;
+          const tokAdmin = sign({ uid: adminUid, exp: Date.now() + 3600000 });
+
+          // 普通用户 reload → 403（管理操作权限闸门）
+          const denied = await jfetch('/api/edition/reload', { method: 'POST' }, tok1);
+          assert.ok(denied.j && denied.j.code === 403 && /仅管理员/.test(denied.j.msg || ''), '普通用户 reload 应 403：' + JSON.stringify(denied.j));
+
+          // 写入合法专业版 License（子进程 env 公钥即 licKeypair 公钥）→ admin reload 热切换（免重启，Y7 核心价值）
+          const exp = new Date(); exp.setDate(exp.getDate() + 365);
+          fs.writeFileSync(licFile, JSON.stringify(signLic({ customer: '热重载验证公司', edition: 'professional', expires_at: dstr(exp), issued_at: dstr(new Date()), license_key: '33'.repeat(16) })));
+          const r1 = await jfetch('/api/edition/reload', { method: 'POST' }, tokAdmin);
+          assert.ok(r1.j && r1.j.code === 0 && r1.j.data.edition === 'professional' && r1.j.data.licensed === true, 'reload 后应热切换为 professional（免重启）：' + JSON.stringify(r1.j).slice(0, 160));
+          assert.strictEqual(r1.j.data.customer, '热重载验证公司');
+          // 切换后普通用户 GET：看到 professional 但仍无授权商业字段（脱敏跨重载持续生效）
+          const u = await jfetch('/api/edition', {}, tok1);
+          assert.strictEqual(u.j.data.edition, 'professional', '普通用户应看到热切换后的版本');
+          assert.ok(!('customer' in u.j.data), '脱敏在重载后仍生效');
+          // 审计：op_logs 应记 License热重载（操作者 httpadmin）
+          assert.ok(!!db.prepare(`SELECT 1 FROM op_logs WHERE action='License热重载' AND username='httpadmin'`).get(), 'op_logs 应记「License热重载」审计');
+
+          // 文件被篡改（改客户名）→ admin reload → 运行态即时降级 badsig（R1 同款运行期感知语义）
+          const bad = JSON.parse(fs.readFileSync(licFile, 'utf8')); bad.customer = '改票公司';
+          fs.writeFileSync(licFile, JSON.stringify(bad));
+          const r2 = await jfetch('/api/edition/reload', { method: 'POST' }, tokAdmin);
+          assert.strictEqual(r2.j.data.edition, 'community', '篡改后 reload 应即时降级 community');
+          assert.strictEqual(r2.j.data.reason, 'badsig');
+          // 清理：删除文件 + reload 还原 community/missing（还原子进程与磁盘一致态，不污染后续）
+          fs.rmSync(licFile, { force: true });
+          const r3 = await jfetch('/api/edition/reload', { method: 'POST' }, tokAdmin);
+          assert.strictEqual(r3.j.data.reason, 'missing');
         });
       } else {
         failed++; console.error('  ❌ HTTP 测试服务未就绪，本组用例跳过');

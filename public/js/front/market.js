@@ -1,6 +1,7 @@
 /** 前台-技能市场（V2.2 #7 2026-10-31）：工作流模版 / 技能资产 / MCP 工具 / 异构应用 四区聚合运营位
  *  对标 Dify 插件市场 / Coze Skills 商店——统一入口：浏览 / 搜索 / 收藏（market_favorites）/ 一键克隆。
  *  卡片视觉沿用 front/agents.js 的 agent-grid/agent-card 体系；全部用户可控字段经 esc() 转义。
+ *  V2.3 F5：主端点只拉本地三区保首屏速度，「异构应用」tab 由 /skills-market/platforms 独立端点异步填充（加载中展示空态卡片）。
  */
 import { api } from '../api.js';
 import { esc, toast } from '../ui.js';
@@ -21,7 +22,9 @@ const PLAT_META = {
 };
 
 export async function render(el) {
-  let data = null;          // 聚合响应（四区 + stats）
+  let data = null;          // 主端点聚合响应（三区 + stats；platforms 由独立端点异步填充，初始 []）
+  let platLoaded = false;   // F5：异构清单是否已到达（false=加载中；到达后用 platErr 区分成功/失败）
+  let platErr = '';         // 异构清单加载失败信息（空串=成功）
   let tab = 'wf';           // 当前 tab：wf / skill / mcp / plat
   let kw = '';
   let favOnly = false;
@@ -79,7 +82,17 @@ export async function render(el) {
     if (tab === 'wf') items = data.wf_templates.map(x => ({ ...x, _t: 'wf_template' }));
     else if (tab === 'skill') items = data.skill_assets.map(x => ({ ...x, _t: 'skill_asset' }));
     else if (tab === 'mcp') items = data.mcp_tools.map(x => ({ ...x, _t: 'mcp_tool' }));
-    else items = (data.platforms || []).map(x => ({ ...x, _t: 'platform' }));
+    // F5：异构清单独立端点尚未返回——展示加载态空卡片（到达后 loadPlatforms 会按当前 tab 触发一次重绘）
+    else if (!platLoaded) {
+      grid.innerHTML = `<div class="empty-box" style="grid-column:1/-1"><div class="big">🔌</div>${t('外部平台清单加载中…')}<br><span style="font-size:12px">${t('Dify / 扣子应用经独立接口异步拉取，到达后自动展示')}</span></div>`;
+      return;
+    } else if (platErr) {
+      // V2.3 审查加固（P2-5）：失败卡片加「点此重试」——重置状态后重调 loadPlatforms（免整页刷新）
+      grid.innerHTML = `<div class="empty-box" style="grid-column:1/-1"><div class="big">⚠️</div>${t('外部平台清单加载失败')}：${esc(platErr)}<br><span style="font-size:12px">${t('外部平台故障不影响本地三区浏览')}</span><br><button class="btn sm" id="mkPlatRetry" style="margin-top:8px">↻ ${t('点此重试')}</button></div>`;
+      const rb = grid.querySelector('#mkPlatRetry');
+      if (rb) rb.onclick = () => { platLoaded = false; platErr = ''; renderGrid(); loadPlatforms(); };
+      return;
+    } else items = (data.platforms || []).map(x => ({ ...x, _t: 'platform' }));
 
     const shown = items.filter(x => (!favOnly || inFav(x._t, x.id)) && hit(kw, x.name, x.tool_name, x.app_name, x.description, x.app_desc, x.server_name, x.category));
 
@@ -185,13 +198,17 @@ export async function render(el) {
 
   function updateStats() {
     if (!data) return;
-    statsEl.textContent = t('共 N 项资产 · 我收藏 M').replace('N', data.stats.total).replace('M', favSet.size);
+    // 口径说明（F5）：stats.total 来自主端点=本地三区条数之和；异构清单到达后可选追加「+N 异构」展示，
+    // 不并入 total——避免主/异构两套口径互相漂移，也避免平台未到达时徽章数字回跳
+    let s = t('共 N 项资产 · 我收藏 M').replace('N', data.stats.total).replace('M', favSet.size);
+    if (platLoaded && !platErr && (data.platforms || []).length) s += ` · +${data.platforms.length} ${t('异构')}`;
+    statsEl.textContent = s;
   }
 
   async function load() {
     try {
       const j = await api('/skills-market');
-      data = j.data;
+      data = { ...j.data, platforms: [] }; // F5：主端点不再返回 platforms，本地初始化为空数组待异步填充
       favSet.clear();
       for (const x of data.wf_templates || []) if (x.favorited) favSet.add(`wf_template:${x.id}`);
       for (const x of data.skill_assets || []) if (x.favorited) favSet.add(`skill_asset:${x.id}`);
@@ -203,9 +220,29 @@ export async function render(el) {
     }
   }
 
+  /** F5：异步加载异构应用清单（独立端点）——不 await、不阻塞首屏；到达后仅当用户正处于 plat tab
+   *  才触发一次 renderGrid 刷新，否则等用户切到该 tab 时由点击回调自然读到已填充的 data.platforms。
+   *  防循环设计：renderGrid 是同步重绘且不调用本函数，本函数仅在 fetch 恢复时被调用一次（不注册
+   *  任何会再次触发自身的事件），到达→重绘→结束为单向链路，不会形成循环。 */
+  async function loadPlatforms() {
+    if (!data) return; // 主端点失败（如 403）时页面已呈错误态，不再拉异构清单
+    try {
+      const j = await api('/skills-market/platforms');
+      data.platforms = (j.data && j.data.platforms) || [];
+      platErr = '';
+    } catch (e) {
+      data.platforms = [];
+      platErr = e.message || String(e); // 失败也置到达态：plat tab 显示失败空卡片而非永久「加载中」
+    }
+    platLoaded = true;
+    updateStats(); // 徽章可选追加「+N 异构」
+    if (tab === 'plat') renderGrid(); // 仅当前正处于异构 tab 才重绘一次（避免覆盖用户正在浏览的其他 tab）
+  }
+
   tabs.querySelectorAll('button').forEach(b => b.onclick = () => { tab = b.dataset.t; renderGrid(); });
   favChip.onclick = () => { favOnly = !favOnly; renderGrid(); };
   kwInput.oninput = () => { kw = kwInput.value.trim(); renderGrid(); };
 
-  await load();
+  await load();          // 主端点：本地三区（首屏快，F5）
+  loadPlatforms();       // 异构清单异步加载（不 await，不阻塞首屏；结果按当前 tab 决定是否重绘）
 }

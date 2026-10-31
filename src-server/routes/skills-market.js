@@ -1,6 +1,8 @@
 /** 技能/模版市场（V2.2 #7 2026-10-31）：分散资产的统一聚合运营位
  *  对标 Dify 插件市场 / Coze Skills 商店——工作流模版 / 技能资产 / MCP 工具 / 异构纳管应用四区一页：
- *  - GET    /api/skills-market               三区聚合 + 异构应用 + 统计（单请求返回，降低前端复杂度；登录即可浏览）
+ *  - GET    /api/skills-market               本地三区聚合 + 统计（V2.3 F5：不再拉外部平台，立即返回保市场首屏速度；登录即可浏览）
+ *  - GET    /api/skills-market/platforms     异构应用清单独立端点（V2.3 F5+Y4：多平台并行拉取 + 10 分钟缓存 best-effort；
+ *                                          F5 动机：外部平台故障/超时不拖慢市场首屏，前端异步加载填充「异构应用」tab）
  *  - GET    /api/skills-market/favorites     我的收藏列表（join 回资产详情，已下架资产标 available:false）
  *  - POST   /api/skills-market/favorites     收藏（UNIQUE 幂等：重复收藏返回成功）
  *  - DELETE /api/skills-market/favorites     取消收藏
@@ -27,9 +29,12 @@ const FAV_TYPES = ['wf_template', 'skill_asset', 'mcp_tool'];
 
 /* ---------------- 异构应用清单缓存（模块级 Map + 时间戳，TTL 10 分钟） ----------------
  * 外部平台 API 慢且可能故障，市场页每次刷新都直调不可接受；
- * 成功与失败结果都缓存（失败缓存防反复打故障平台拖慢市场页），TTL 过后自动重试。 */
+ * 成功与失败结果都缓存（失败缓存防反复打故障平台拖慢市场页），TTL 过后自动重试。
+ * V2.3 审查加固（S1-1）：缓存 Promise 而非结果（single-flight 单飞）——缓存过期后的首个慢请求在途期间，
+ * 后续并发请求共享同一个在途 Promise 而非各自再起一整批外呼；否则认证用户高频刷 /platforms 可在
+ * 外呼窗口（dify 10-15s / coze 分钟级翻页）内按 RPS×窗口×N平台 放大外呼，击穿「失败缓存防打故障平台」的设计意图。 */
 const PLATFORM_TTL_MS = 10 * 60 * 1000;
-const platformCache = new Map(); // platform_id → { ts, apps: [...], error: '' }
+const platformCache = new Map(); // platform_id → { ts, promise }（缓存拉取 Promise，单飞共享）
 
 /** 单个接入平台 best-effort 拉取应用清单（try-catch 静默，异常返回 error 标记不抛出） */
 async function fetchPlatformApps(p) {
@@ -49,14 +54,20 @@ async function fetchPlatformApps(p) {
   return apps;
 }
 
-/** 带缓存读取（命中未过期直接返回，cached=true 供前端/测试验证未触发外部调用） */
-async function loadPlatformApps(p) {
+/** 带缓存读取（single-flight：命中未过期/TTL 内在途均共享同一 Promise，cached=true 供前端/测试验证未触发外部调用） */
+function loadPlatformApps(p) {
   const hit = platformCache.get(p.id);
-  if (hit && Date.now() - hit.ts < PLATFORM_TTL_MS) return { apps: hit.apps, error: hit.error, cached: true };
-  let apps = [], error = '';
-  try { apps = await fetchPlatformApps(p); } catch (e) { error = e.message; }
-  platformCache.set(p.id, { ts: Date.now(), apps, error });
-  return { apps, error, cached: false };
+  if (hit && Date.now() - hit.ts < PLATFORM_TTL_MS) {
+    // 返回新对象不污染缓存内共享结果；TTL 内（含在途未完成）一律 cached=true——本次未触发新的外部调用
+    return hit.promise.then(r => ({ ...r, cached: true }));
+  }
+  const promise = (async () => {
+    let apps = [], error = '';
+    try { apps = await fetchPlatformApps(p); } catch (e) { error = e.message; }
+    return { apps, error, cached: false };
+  })();
+  platformCache.set(p.id, { ts: Date.now(), promise }); // 在途即入缓存：并发请求按位命中同一 Promise（单飞）
+  return promise;
 }
 
 /** 解析 MCP 工具级生效风险（P5.34 口径：人工标注 risk_overrides 优先 → 工具启发式 risk → 'auto' 回落） */
@@ -103,33 +114,54 @@ router.get('/', async (req, res) => {
     }
   }
 
-  // 四区：异构纳管应用（best-effort + 10 分钟缓存；外部平台故障不 5xx，记 platform_errors 标记）
-  const platforms = [];
-  const platformErrors = [];
-  let allCached = true;
-  for (const p of db.prepare('SELECT * FROM platforms').all()) {
-    const r = await loadPlatformApps(p);
-    if (!r.cached) allCached = false;
-    platforms.push(...r.apps);
-    if (r.error) {
-      platformErrors.push({ platform_id: p.id, platform_name: p.name, platform_type: p.type, message: r.error });
-      try { db.prepare('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)').run('skills-market', `异构应用拉取失败（${p.name}）：${r.error}`, now()); } catch { }
-    }
-  }
-
+  // V2.3 F5：异构应用拉取已移出本端点（原四区同请求聚合时，外部平台慢/故障会拖住整个市场页首屏）——
+  // 主端点只聚合本地三区立即返回，异构清单改由 GET /platforms 独立端点承担、前端异步加载
   res.json({
     code: 0,
     data: {
       wf_templates: wfTemplates,
       skill_assets: skillAssets,
       mcp_tools: mcpTools,
+      stats: {
+        total: wfTemplates.length + skillAssets.length + mcpTools.length, // 三区条数之和（异构清单独立端点另行返回，不并入 total）
+        my_favorites: favSet.size,
+      },
+    },
+  });
+});
+
+/* ---------------- 异构应用独立端点（V2.3 F5 / Y4 2026-10-31） ---------------- */
+// F5 动机：外部平台慢/故障时不拖慢市场首屏——主端点立即返回本地三区，本端点由前端异步请求填充「异构应用」tab；
+// Y4 动机：原串行 for-await 下 N 个平台 × 各自网络超时会线性叠加拖慢市场页，改 Promise.all 并行后总耗时 ≈ 最慢单个平台；
+// 并行安全依据：loadPlatformApps 内部 try-catch 静默吞错、永不 reject（见上），故 Promise.all 不会因单平台失败短路抛错，无需 allSettled；
+// 语义与原聚合段完全一致：10 分钟缓存（成功与失败都缓存）/ allCached 统计 / platform_errors 收集 / err_logs 记录；
+// platforms 表通常个位数，直接全量并行，无需并发上限。
+router.get('/platforms', async (req, res) => {
+  const platforms = [];
+  const platformErrors = [];
+  let allCached = true;
+  const rows = db.prepare('SELECT * FROM platforms').all();
+  // Promise.all 结果顺序与 rows 一一对应（按位映射回原平台行），platforms 拼接顺序与原串行版一致，输出确定性不变
+  const results = await Promise.all(rows.map(p => loadPlatformApps(p)));
+  results.forEach((r, i) => {
+    const p = rows[i];
+    if (!r.cached) allCached = false;
+    platforms.push(...r.apps);
+    if (r.error) {
+      platformErrors.push({ platform_id: p.id, platform_name: p.name, platform_type: p.type, message: r.error }); // 响应观测标记：缓存命中也返回（前端需知道清单为空的原因）
+      // V2.3 审查加固（S2-1）：仅真实发生外呼且失败才记 err_logs（原实现缓存命中也写库，
+      // 认证用户高频刷本端点可按 R×N 行/秒持续 10 分钟刷出日志洪泛，90 天保留期内磁盘膨胀）
+      if (!r.cached) {
+        try { db.prepare('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)').run('skills-market', `异构应用拉取失败（${p.name}）：${r.error}`, now()); } catch { }
+      }
+    }
+  });
+  res.json({
+    code: 0,
+    data: {
       platforms,
       platform_errors: platformErrors,   // best-effort 观测标记（前端不阻塞渲染）
       platforms_cached: allCached,       // 调试字段：true=本次未触发任何外部调用（缓存命中）
-      stats: {
-        total: wfTemplates.length + skillAssets.length + mcpTools.length + platforms.length,
-        my_favorites: favSet.size,
-      },
     },
   });
 });
@@ -214,12 +246,11 @@ router.post('/clone', requireFeature('agents'), (req, res) => {
     return res.json({ code: 400, msg: '该类型暂不支持克隆，请在 MCP 管理/接入管理中配置' });
   }
 
-  // 免费版智能体数软约束（与 POST /api/agents 同款商业化口径，防市场克隆绕过配额引导）
-  const { planUsage } = require('../lib/plans');
-  const pu = planUsage(req.user.username);
-  if (pu && !pu.exempt && pu.plan === 'free' && pu.agents >= pu.agentsLimit) {
-    return res.json({ code: 402, msg: `免费版最多创建 ${pu.agentsLimit} 个智能体（当前 ${pu.agents} 个）`, data: { upgrade_hint: true } });
-  }
+  // V2.3 Y3：与 POST /api/agents 共用 lib/plans.js agentQuotaBlock 统一口径
+  // （免费版智能体数软约束，防市场克隆绕过配额引导；行为不变：402 + 同款 msg + upgrade_hint）
+  const { agentQuotaBlock } = require('../lib/plans');
+  const qb = agentQuotaBlock(req.user.username);
+  if (qb.blocked) return res.json({ code: qb.code, msg: qb.msg, data: qb.data });
 
   if (item_type === 'skill_asset') {
     // 可见性口径同市场列表（他人私有资产不可克隆）

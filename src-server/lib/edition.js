@@ -210,4 +210,6 @@ function checkExpiryNotice() {
   }
 }
 
-module.exports = { EDITIONS, currentEdition, hasFeature, requireFeature, refreshLicense, checkExpiryNotice, getPublicKeyHex, editionBanner, canonicalOf };
+// V2.3 审查加固（P2-4/S2-4）：publicKeyFromHex / localDateStr 一并导出——scripts/verify-license.js 复用而非照抄，
+// 消灭 SPKI 封装与日期算式的双实现漂移（轮换自检工具与服务端验签必须同源）
+module.exports = { EDITIONS, currentEdition, hasFeature, requireFeature, refreshLicense, checkExpiryNotice, getPublicKeyHex, editionBanner, canonicalOf, reasonDescription, publicKeyFromHex, localDateStr };

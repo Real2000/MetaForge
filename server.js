@@ -66,6 +66,8 @@ app.use('/api/usermodels', require('./src-server/routes/usermodels'));
 app.use('/api/skillassets', require('./src-server/routes/skillassets'));
 // V2.2 #7 技能/模版市场：工作流模版/技能资产/MCP 工具/异构应用四区聚合 + 收藏 + 一键克隆
 app.use('/api/skills-market', require('./src-server/routes/skills-market'));
+// V2.3 Y7 版本/License 管理端点：GET 版本快照（登录可看，普通用户脱敏）+ POST 热重载（仅管理员，写 op_logs 审计）
+app.use('/api/edition', require('./src-server/routes/edition'));
 // 用户管理：管理员对用户的增删改查/角色管理/重置密码/启停
 app.use('/api/users', require('./src-server/routes/users'));
 // 意见反馈（帮助体系）：全站反馈通道 + 管理员闭环处理（站内信回告提交者）
