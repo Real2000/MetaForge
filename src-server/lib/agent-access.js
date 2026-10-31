@@ -5,9 +5,11 @@
  *
  * 权限模型：
  *  - 可见 canView：管理员 ∪ 创建者 ∪ 协作者（含草稿）∪ 已发布且（public 或 命中部门/成员名单）
+ *                    ∪ 命中 agent_acls 授权（V2.4 #9 租户化）
  *  - 可编辑 canEdit：管理员 ∪ 创建者 ∪ 协作者（协作者不可改可见性与协作者名单，见 agents.js）
  *  - 删除/密钥等高危操作仅 管理员 ∪ 创建者（agents.js 内单独校验）
  */
+const { db } = require('../db'); // V2.4 #9：引入 db 用于 agent_acls 表查询
 
 function parseJsonArr(s) {
   if (Array.isArray(s)) return s; // 前端 fetch body 直接传数组（E2E 实测发现：JSON.parse(数组) 会静默失败成 []）
@@ -15,6 +17,20 @@ function parseJsonArr(s) {
     try { const v = JSON.parse(s); return Array.isArray(v) ? v : []; } catch { return []; }
   }
   return [];
+}
+
+/** 检查 agent_acls 表是否有匹配的 allow=1 授权 */
+function hasAclAccess(a, user) {
+  if (!a || !user) return false;
+  // 查用户、部门、角色三路ACL，任一匹配即放行
+  const rows = db.prepare(`SELECT allow FROM agent_acls WHERE agent_id=? AND (grant_to='user' AND grant_to_value=? OR grant_to='dept' AND grant_to_value=? OR grant_to='role' AND grant_to_value=?) LIMIT 1`)
+    .all(a.id, user.username, user.dept, user.role);
+  if (rows.length && rows[0].allow === 1) return true;
+  // 拒绝规则：有明确 deny（allow=0）则拒绝访问
+  const denies = db.prepare(`SELECT allow FROM agent_acls WHERE agent_id=? AND allow=0 AND (grant_to='user' AND grant_to_value=? OR grant_to='dept' AND grant_to_value=? OR grant_to='role' AND grant_to_value=?) LIMIT 1`)
+    .all(a.id, user.username, user.dept, user.role);
+  if (denies.length) return false;
+  return null; // 未配置任何 ACL → 不置可否，由下游规则决定
 }
 
 /** 智能体对 user 是否可见 */
@@ -40,6 +56,9 @@ function canView(a, user) {
     const textHit = hasText && !!user.dept && depts.includes(user.dept);
     if (idHit || textHit) return true;
   }
+  // V2.4 #9 租户化：检查 agent_acls 表（用户/部门/角色精确授权）
+  const aclResult = hasAclAccess(a, user);
+  if (aclResult !== null) return aclResult;
   return false;
 }
 
@@ -48,7 +67,11 @@ function canEdit(a, user) {
   if (!a || !user) return false;
   if (user.role === 'admin') return true;
   if (a.owner && a.owner === user.username) return true;
-  return parseJsonArr(a.collaborators).includes(user.username);
+  // V2.4 #9：可编辑也查一下 agent_acls（允许编辑的 ACL）
+  if (parseJsonArr(a.collaborators).includes(user.username)) return true;
+  const aclResult = hasAclAccess(a, user);
+  if (aclResult === true) return true;
+  return false;
 }
 
 /** 是否为归属级权限（可删/可改可见性/可管密钥）：管理员 ∪ 创建者 */
