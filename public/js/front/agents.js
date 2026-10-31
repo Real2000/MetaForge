@@ -182,6 +182,7 @@ export async function render(el) {
             max_reply: +mask.querySelector('#f_max').value,
             opening: mask.querySelector('#f_open').value.trim(),
             opening_questions: [...qList.querySelectorAll('input')].map(i => i.value.trim()).filter(Boolean),
+            space_id: window.__currentSpace || 0,
           };
           if (!payload.name) return toast('请填写智能体名称', 'err');
           if (!payload.prompt) return toast('请填写提示词设定', 'err');
@@ -196,9 +197,13 @@ export async function render(el) {
   }
 
   async function load() {
-    const [ja, jm, jk] = await Promise.all([api('/agents'), api('/chat/models'), api('/knowledge')]);
-    list = ja.data; models = jm.data; kbs = jk.data;
-    renderGrid();
+    const sp = window.__currentSpace || '';
+    const sq = sp ? `?space_id=${sp}` : '';
+    const [ja, js, je, jm, jk, jp, jmcp] = await Promise.all([
+      api('/agents' + sq), api('/agents/spaces/list'), api('/agents/evaluations'), api('/chat/models'), api('/knowledge' + sq), api('/platforms'), api('/mcp'),
+    ]);
+    agents = ja.data; spaces = js.data; evals = je.data; models = jm.data; kbs = jk.data; platforms = jp.data; mcpServers = jmcp.data;
+    renderCurrent();
   }
 
   seg.querySelectorAll('button').forEach(b => b.onclick = () => { tab = b.dataset.t; renderGrid(); });

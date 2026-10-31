@@ -151,6 +151,11 @@ function layoutShell(kind, currentPath, title, contentHTML) {
         <div class="crumb"><button class="mobile-menu-btn" id="menuBtn" title="菜单" aria-label="打开导航菜单">☰</button> ${t('智能体平台')} <span>/</span> <b>${esc(t(title))}</b></div>
         <div class="right">
           ${prefToggleHTML()}
+          <div class="space-selector" id="spaceSelector">
+            <select class="input" id="spaceSelect" style="width:160px;font-size:12px">
+              <option value="">全部空间</option>
+            </select>
+          </div>
           <span class="user-chip" id="userChip">
             <span class="avatar">${esc((user.nickname || user.username || 'U')[0])}</span>
             <span>${esc(user.nickname || user.username || '')}</span>
@@ -255,7 +260,36 @@ async function route() {  const hash = location.hash || '#/home';
     }
     // 移动端汉堡菜单：页面渲染后挂载（chat 布局的 .chat-side 此时才存在）
     mountMobileMenu();
+    if (!location.hash.startsWith('#/login') && !location.hash.startsWith('#/chat')) {
+      mountSpaceSelector();
+    }
   }
+}
+
+  // 空间选择器（V2.4 #9 2026-10-31）：加载空间列表 + 设置全局 currentSpace + 绑定刷新
+let spaceSelectorMounted = false;
+window.__currentSpace = window.__currentSpace || ''; // 初始化全局变量
+async function mountSpaceSelector() {
+  if (spaceSelectorMounted) return;
+  const sel = document.getElementById('spaceSelect');
+  if (!sel) return;
+  spaceSelectorMounted = true;
+  try {
+    const j = await api('/agents/spaces/list');
+    const spaces = j.data || [];
+    spaces.forEach(s => {
+      const opt = document.createElement('option');
+      opt.value = s.id;
+      opt.textContent = s.name;
+      sel.appendChild(opt);
+    });
+  } catch { /* 静默 */ }
+  // 恢复上次选择的空间
+  if (window.__currentSpace) sel.value = window.__currentSpace;
+  sel.onchange = () => {
+    window.__currentSpace = parseInt(sel.value) || '';
+    route(); // 重新加载当前页面
+  };
 }
 
 /** 骨架屏（体验优化）：路由切换 shimmer 占位，替代白屏/⏳ 文案 */

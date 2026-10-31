@@ -743,8 +743,10 @@ export async function render(el) {
   }
 
   async function load() {
+    const sp = window.__currentSpace || '';
+    const sq = sp ? `?space_id=${sp}` : '';
     const [ja, js, je, jm, jk, jp, jmcp] = await Promise.all([
-      api('/agents'), api('/agents/spaces/list'), api('/agents/evaluations'), api('/chat/models'), api('/knowledge'), api('/platforms'), api('/mcp'),
+      api('/agents' + sq), api('/agents/spaces/list'), api('/agents/evaluations'), api('/chat/models'), api('/knowledge' + sq), api('/platforms'), api('/mcp'),
     ]);
     agents = ja.data; spaces = js.data; evals = je.data; models = jm.data; kbs = jk.data; platforms = jp.data; mcpServers = jmcp.data;
     renderCurrent();
