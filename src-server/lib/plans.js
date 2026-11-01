@@ -86,7 +86,7 @@ function getSoftLimit(feature, username) {
   return 0;
 }
 
-统一 POST /api/agents 与技能市场克隆
+/** 智能体创建配额软约束统一判定（V2.3 Y3 2026-10-31）：统一 POST /api/agents 与技能市场克隆
  *  （routes/skills-market.js clone）两通道口径——此前两处各自内联同款判断，规则/文案漂移风险高。
  *  返回值约定（调用方直接按字段组装 res.json）：
  *  - 拦截：{ blocked: true, code: 402, msg: '免费版最多创建 X 个智能体（当前 Y 个）', data: { upgrade_hint: true } }
