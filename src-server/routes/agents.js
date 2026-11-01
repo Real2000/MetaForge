@@ -11,6 +11,7 @@ const { canView, canEdit, isOwnerLevel, parseJsonArr } = require('../lib/agent-a
 const { sanitizeMetadata } = require('../lib/kb-metadata'); // V1.2 #2 2026-10-30：kb_metadata_filter 入参清洗
 const { requireFeature } = require('../lib/edition'); // V2.2 #8 2026-10-31：License 特性闸门（中间件工厂）
 const { spaceFilterSql } = require('../lib/space-utils'); // V2.4 #9 2026-10-31：统一空间过滤
+const { getSoftLimit, agentQuotaBlock } = require('../lib/plans'); // V2.4 #8 2026-10-31：edition+plan配额限制
 const { runTool, validateAgentTools, TOOL_DEFS, AGENT_TOOL_DENY } = require('../lib/tools'); // P5.34b copy 过滤依赖 AGENT_TOOL_DENY（此前漏导入被 catch 吞错致副本工具恒空——测试轮实锤修复）
 
 const router = express.Router();
@@ -137,9 +138,8 @@ function parseBody(b) {
   // V2.2 #8 2026-10-31 License 功能闸门（接线示范）：community 即含 agents 特性，当前实际不拦——
   // 机制先行、付费墙后置（避免误伤存量用户）；后续钉钉/租户/审核流上线时在对应路由挂
   // requireFeature('dingtalk') / requireFeature('tenant') / requireFeature('audit_flow') 即生效
-  // V2.4 #8 收尾：叠加 edition 限制——社区版用户最多创建 3 个智能体（getSoftLimit 结合 planUsage 判断）
-  const { agentQuotaBlock } = require('../lib/plans');
-  const { getSoftLimit } = require('../lib/plans');
+  router.post('/', requireFeature('agents'), (req, res) => {
+  // V2.4 #8 收尾：叠加 edition 限制——社区版用户最多创建 3 个智能体
   const softLimit = getSoftLimit('agents', req.user.username);
   if (softLimit > 0 && !req.user.plan) {
     const count = db.prepare("SELECT COUNT(*) c FROM agents WHERE owner=? AND source='self'").get(req.user.username).c;
@@ -147,7 +147,6 @@ function parseBody(b) {
       return res.json({ code: 402, msg: `社区版最多创建 ${softLimit} 个智能体（当前 ${count} 个），请升级专业版或企业版`, data: { upgrade_hint: true } });
     }
   }
-  router.post('/', requireFeature('agents'), (req, res) => {
   const a = parseBody(req.body || {});
   if (!a.name) return res.json({ code: 400, msg: '智能体名称不能为空' });
   if (a.tool_error) return res.json({ code: 400, msg: a.tool_error }); // P5.34：工具白名单
@@ -156,7 +155,6 @@ function parseBody(b) {
   // 商业化软约束：免费版智能体数达上限不硬拦，返回升级提示（upgrade_hint 前端弹引导）
   // V2.3 Y3：改用 lib/plans.js agentQuotaBlock 统一封装——与技能市场克隆通道（routes/skills-market.js）
   // 同口径，配额规则/文案变更只改一处；消息与 code/data 逐字对齐原内联实现（防测试断言漂移）
-  const { agentQuotaBlock } = require('../lib/plans');
   const quota = agentQuotaBlock(req.user.username);
   if (quota.blocked) return res.json({ code: quota.code, msg: quota.msg, data: quota.data });
   // SinguX 式轻量创建：只需名称（提示词可后置到编排页填写），创建后前端直接跳转编排页
