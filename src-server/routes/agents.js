@@ -144,7 +144,7 @@ function parseBody(b) {
   if (softLimit > 0 && !req.user.plan) {
     const count = db.prepare("SELECT COUNT(*) c FROM agents WHERE owner=? AND source='self'").get(req.user.username).c;
     if (count >= softLimit) {
-      return res.json({ code: 402, msg: `社区版最多创建 ${softLimit} 个智能体（当前 ${count} 个），请升级专业版或企业版`, data: { upgrade_hint: true } });
+      return res.json({ code: 402, msg: `免费版最多创建 ${softLimit} 个智能体（当前 ${count} 个）`, data: { upgrade_hint: true } });
     }
   }
   const a = parseBody(req.body || {});
