@@ -4103,11 +4103,11 @@ function t(name, fn) {
       assert.strictEqual(r.tables.length, 0);
     });
     // 【P3】P3 工程化：建表数 tripwire
-    await t('P3 工程化：新库建表数 = 40（防 schema 误删/迁移遗漏）', () => {
+    await t('P3 工程化：新库建表数 = 49（防 schema 误删/迁移遗漏）', () => {
       const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all();
-      // token_blacklist 是临时表才存在，种子数据不存在时不计数
+      // 临时表影响计算（微信/飞书等动态创建的除外）
       const tableNames = tables.map(r => r.name);
-      const expected = 42; // 对照：db.js 中 CREATE TABLE 语句数，P0-5 新增 entities + entity_relations
+      const expected = 48; // 对照：db.js 中 CREATE TABLE 语句数，8月以上版本可能因迁移增加
       const hasTokenBlacklist = tableNames.includes('token_blacklist');
       // token_blacklist 是动态决定是否存在的，不算标准建表数
       assert.ok(tables.length >= expected, `建表数 ${tables.length} 应 ≥ ${expected}（当前可能缺表：${tableNames.filter(n => !tables.some(t => t.name === n)).join(',')}）`);

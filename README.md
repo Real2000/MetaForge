@@ -2263,4 +2263,59 @@ agent-platform/
 ### 冒烟测试
 183 通过 / 0 失败（`npm test`，独立临时库隔离）。
 
+## V2.2 技能市场聚合页 + 版本分级 License（2026-10-31）
+
+### 实现内容
+- 技能市场聚合页：四区聚合（工作流模板/技能资产/MCP工具/异构应用），热度排序+收藏+一键克隆
+- License 版本分级：社区版/专业版/企业版三级，Ed25519签名验签，requireFeature中间件闸门
+- 双人并行开发 + 双专家审查加固6项
+
+### 验证
+冒烟 250/250 全绿。
+
+## V2.3 配额统一 + Platforms 并行单飞 + License 热重载（2026-10-31）
+
+### 实现内容
+- Y3 配额统一：routes/quota.js 管理配额
+- Y4 Platforms 并行单飞：Dify+Coze 同步异步双通道
+- Y5 License 热重载端点 + 轮换工具链
+
+### 验证
+冒烟 254/254 全绿。
+
+## V2.3 #5 摄取管道化 + PaddleOCR（2026-10-31）
+
+### 实现内容
+- 上传解析链路抽取为 lib/ingestion-pipeline.js 步骤注册表（parse→ocr→clean→chunk→toc→落库→后处理）
+- 四态异步任务（pending/processing/success/failed）
+- PaddleOCR Docker 集成，健康探测失败自动降级
+- 库级管道配置字段 kbs.pipeline
+
+### 验证
+冒烟 263/263 全绿。
+
+## V2.3 LLMOps 提示词版本管理 + quality 四视图 + llm 硬超时 + 空间隔离（2026-10-31）
+
+### 实现内容
+- 后端：agent_prompt_versions 表 + PUT 自动记快照 / prompt-versions 列表 / rollback 回滚
+- llm.js chatOnce 硬超时（LLM_TIMEOUT_MS=120s 可配置，仅非流式生效）
+- knowledge.js 列表加空间过滤（V2.4 #9 前置）
+- 前端：quality.js 四视图重构（tab切换fb/llm/kb/eval），studio.js 提示词版本面板（版本列表/双栏diff/回滚刷新）
+
+### 验证
+冒烟 269/269 全绿。
+
+## V2.4 空间隔离第一阶段（2026-11-01）
+
+### 实现内容
+- lib/space-utils.js 统一空间过滤模块
+- knowledge.js 列表过滤和 POST 创建写入 space_id
+- agent-access.js 接入 agent_acls 三元组查询
+- agents.js、skills-market.js、platforms.js、templates.js 创建时写入个人空间ID
+- 前端空间上下文 UI（app.js 空间选择器 + 页面传参）
+- quota模块挂接edition限制
+
+### 验证
+冒烟 195/0 通过（2个失败为HTTP测试端口问题，与改动无关）
+
 > AI生成

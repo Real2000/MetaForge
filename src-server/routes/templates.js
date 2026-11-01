@@ -98,7 +98,7 @@ router.post('/:id/create', (req, res) => {
   const kbId = (req.body || {}).kb_id || null;
   const info = db.prepare(`INSERT INTO agents (name,description,type,space_id,category,prompt,model,temperature,context_rounds,max_reply,opening,opening_questions,kb_id,status,source,tools,created_at,updated_at)
     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))`)
-    .run(name, t.description, t.type, 1, t.industry, t.prompt, 'qwen-plus', 0.3, 10, 2048,
+    .run(name, t.description, t.type, db.prepare('SELECT id FROM spaces WHERE type=? AND owner=? LIMIT 1').get('personal', req.user.username)?.id || 0, t.industry, t.prompt, 'qwen-plus', 0.3, 10, 2048,
       t.opening, JSON.stringify(t.opening_questions || []), kbId, 'published', 'self', JSON.stringify(t.tools || []));
   db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
     .run(req.user.username, '从模板创建智能体', `${name}（模板：${t.name}）`, req.ip, now());

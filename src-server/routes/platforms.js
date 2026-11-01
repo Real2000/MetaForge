@@ -162,7 +162,7 @@ router.post('/:id/sync', async (req, res) => {
         } else {
           db.prepare(`INSERT INTO agents (name,description,type,space_id,category,prompt,model,temperature,context_rounds,max_reply,opening,opening_questions,kb_id,status,source,source_name,external_app_id,external_api_key,external_mode,created_at,updated_at)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-            .run(app.name, desc, 'enterprise', 1, '工作', `【外部 Dify 应用】${app.name}`, 'dify-app', 0.7, 10, 2048,
+            .run(app.name, desc, 'enterprise', db.prepare('SELECT id FROM spaces WHERE type=? AND owner=? LIMIT 1').get('personal', req.user.username)?.id || 0, '工作', `【外部 Dify 应用】${app.name}`, 'dify-app', 0.7, 10, 2048,
               `您好，我是「${app.name}」（Dify 搭建），请问有什么可以帮您？`, '[]', null, 'published', 'dify', old.name, app.id, serviceKey, mode, t, t);
           added++;
         }
@@ -198,7 +198,7 @@ router.post('/:id/sync', async (req, res) => {
         } else {
           db.prepare(`INSERT INTO agents (name,description,type,space_id,category,prompt,model,temperature,context_rounds,max_reply,opening,opening_questions,kb_id,status,source,source_name,external_app_id,external_api_key,external_mode,created_at,updated_at)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-            .run(name, desc, 'enterprise', 1, '工作', `【外部扣子智能体】${name}`, 'coze-bot', 0.7, 10, 2048,
+            .run(name, desc, 'enterprise', db.prepare('SELECT id FROM spaces WHERE type=? AND owner=? LIMIT 1').get('personal', req.user.username)?.id || 0, '工作', `【外部扣子智能体】${name}`, 'coze-bot', 0.7, 10, 2048,
               `您好，我是「${name}」（扣子搭建），请问有什么可以帮您？`, '[]', null, 'published', 'coze', old.name, String(botId), old.token, 'chat', t, t);
           added++;
         }
