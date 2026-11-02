@@ -16,6 +16,7 @@ export async function render(el) {
   let models = [];
   let kbs = [];
   let spaces = [];
+  let agents = []; // V2.4 #9 空间过滤：智能体列表数据
 
   el.innerHTML = `
     <div class="page-head">
@@ -202,7 +203,7 @@ export async function render(el) {
     const [ja, js, je, jm, jk, jp, jmcp] = await Promise.all([
       api('/agents' + sq), api('/agents/spaces/list'), api('/agents/evaluations'), api('/chat/models'), api('/knowledge' + sq), api('/platforms'), api('/mcp'),
     ]);
-    agents = ja.data; spaces = js.data; evals = je.data; models = jm.data; kbs = jk.data; platforms = jp.data; mcpServers = jmcp.data;
+    list = ja.data; spaces = js.data; evals = je.data; models = jm.data; kbs = jk.data; platforms = jp.data; mcpServers = jmcp.data;
     renderCurrent();
   }
 
