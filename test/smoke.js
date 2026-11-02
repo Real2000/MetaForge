@@ -486,6 +486,73 @@ function t(name, fn) {
     assert.strictEqual(canView(byMixed, { username: 'eve', role: 'user', dept_id: 99, dept: '研发部' }), false, '混合名单两者皆未命中不可见（fail-closed）');
   });
 
+  // ================ V2.4 #9 租户化：agent_acls 行为快照 + 7 条 ACL 用例 ================
+  console.log('【V2.4#9】租户化：agent_acls 7 条冒烟');
+  // 【用例 1】admin 放行——即使有 deny ACL 也不拦截
+  await t('P3 工程化：agent_acls——admin 不受 ACL 约束', () => {
+    const { canView, canEdit, isOwnerLevel } = require('../src-server/lib/agent-access');
+    const a = { id: 9991, owner: 'alice', status: 'published', visibility: 'public', collaborators: '[]', visible_depts: '[]', visible_members: '[]' };
+    db.prepare("INSERT INTO agent_acls (agent_id, grant_to, grant_to_value, allow) VALUES (9991, 'user', 'bob', 0)").run();
+    assert.strictEqual(canView(a, { username: 'root', role: 'admin' }), true, 'admin 即使有 deny ACL 也可见');
+    assert.strictEqual(canEdit(a, { username: 'root', role: 'admin' }), true, 'admin 可编辑');
+    assert.strictEqual(isOwnerLevel(a, { username: 'root', role: 'admin' }), true, 'admin 为归属级');
+    db.prepare("DELETE FROM agent_acls WHERE agent_id=9991").run();
+  });
+  // 【用例 2】owner 始终可见/可编辑
+  await t('P3 工程化：agent_acls——owner 始终可见可编辑', () => {
+    const { canView, canEdit, isOwnerLevel } = require('../src-server/lib/agent-access');
+    const a = { id: 9992, owner: 'alice', status: 'published', visibility: 'restricted', collaborators: '[]', visible_depts: '[]', visible_members: '[]' };
+    assert.strictEqual(canView(a, { username: 'alice', role: 'user' }), true, 'owner 可见');
+    assert.strictEqual(canEdit(a, { username: 'alice', role: 'user' }), true, 'owner 可编辑');
+    assert.strictEqual(isOwnerLevel(a, { username: 'alice', role: 'user' }), true, 'owner 归属级');
+  });
+  // 【用例 3】ACL user 精确授权——不符合的用户不可见
+  await t('P3 工程化：agent_acls——用户精确授权（user 类型）', () => {
+    const { canView, canEdit } = require('../src-server/lib/agent-access');
+    const a = { id: 9993, owner: 'alice', status: 'published', visibility: 'restricted', collaborators: '[]', visible_depts: '[]', visible_members: '[]' };
+    db.prepare("INSERT INTO agent_acls (agent_id, grant_to, grant_to_value, allow) VALUES (9993, 'user', 'bob', 1)").run();
+    assert.strictEqual(canView(a, { username: 'bob', role: 'user' }), true, 'ACL user 精确授权→可见');
+    assert.strictEqual(canView(a, { username: 'eve', role: 'user' }), false, '未授权→不可见');
+    assert.strictEqual(canEdit(a, { username: 'bob', role: 'user' }), true, 'ACL user 精确授权→可编辑');
+    assert.strictEqual(canEdit(a, { username: 'eve', role: 'user' }), false, '未授权→不可编辑');
+    db.prepare("DELETE FROM agent_acls WHERE agent_id=9993").run();
+  });
+  // 【用例 4】ACL dept 授权——同部门用户可见
+  await t('P3 工程化：agent_acls——部门授权（dept 类型）', () => {
+    const { canView } = require('../src-server/lib/agent-access');
+    const a = { id: 9994, owner: 'alice', status: 'published', visibility: 'restricted', collaborators: '[]', visible_depts: '[]', visible_members: '[]' };
+    db.prepare("INSERT INTO agent_acls (agent_id, grant_to, grant_to_value, allow) VALUES (9994, 'dept', '市场部', 1)").run();
+    assert.strictEqual(canView(a, { username: 'bob', role: 'user', dept: '市场部' }), true, '同部门→可见');
+    assert.strictEqual(canView(a, { username: 'eve', role: 'user', dept: '研发部' }), false, '不同部门→不可见');
+    db.prepare("DELETE FROM agent_acls WHERE agent_id=9994").run();
+  });
+  // 【用例 5】ACL role 授权
+  await t('P3 工程化：agent_acls——角色授权（role 类型）', () => {
+    const { canView } = require('../src-server/lib/agent-access');
+    const a = { id: 9995, owner: 'alice', status: 'published', visibility: 'restricted', collaborators: '[]', visible_depts: '[]', visible_members: '[]' };
+    db.prepare("INSERT INTO agent_acls (agent_id, grant_to, grant_to_value, allow) VALUES (9995, 'role', 'user', 1)").run();
+    assert.strictEqual(canView(a, { username: 'bob', role: 'user' }), true, 'role=user→可见');
+    assert.strictEqual(canView(a, { username: 'admin', role: 'admin' }), true, 'admin 不受ACL限制');
+    db.prepare("DELETE FROM agent_acls WHERE agent_id=9995").run();
+  });
+  // 【用例 6】ACL deny 优先级高于 allow
+  await t('P3 工程化：agent_acls——deny 优先于 allow（黑名单优先）', () => {
+    const { canView } = require('../src-server/lib/agent-access');
+    const a = { id: 9996, owner: 'alice', status: 'published', visibility: 'public', collaborators: '[]', visible_depts: '[]', visible_members: '[]' };
+    db.prepare("INSERT INTO agent_acls (agent_id, grant_to, grant_to_value, allow) VALUES (9996, 'user', 'bob', 1)").run();
+    db.prepare("INSERT INTO agent_acls (agent_id, grant_to, grant_to_value, allow) VALUES (9996, 'user', 'bob', 0)").run();
+    assert.strictEqual(canView(a, { username: 'bob', role: 'user' }), false, 'deny 优先于 allow→不可见');
+    db.prepare("DELETE FROM agent_acls WHERE agent_id=9996").run();
+  });
+  // 【用例 7】无 ACL 配置时回退到旧字段（visible_depts/visible_members）——兼容性
+  await t('P3 工程化：agent_acls——无 ACL 行回退到旧可见性字段', () => {
+    const { canView } = require('../src-server/lib/agent-access');
+    const a = { id: 9997, owner: 'alice', status: 'published', visibility: 'restricted', collaborators: '[]', visible_depts: '["市场部"]', visible_members: '["dave"]' };
+    assert.strictEqual(canView(a, { username: 'dave', role: 'user' }), true, '成员名单→可见（旧字段生效）');
+    assert.strictEqual(canView(a, { username: 'bob', role: 'user', dept: '市场部' }), true, '部门名单→可见（旧字段生效）');
+    assert.strictEqual(canView(a, { username: 'eve', role: 'user', dept: '研发部' }), false, '名单外→不可见（旧字段也拒绝）');
+  });
+
   // ================ P3 扩展工具（2026-10-22）：Text2SQL / 图表 / Word / MCP Server / 分类器路由 ================
   console.log('【N】P3 扩展工具（Text2SQL / 图表 / Word / MCP Server / 分类器路由）');
   const extra = require('../src-server/lib/tools-extra');
