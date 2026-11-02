@@ -2,17 +2,25 @@
  * 通用密钥管理（P5.5：画布 {{env.XXX}} 占位符运行时注入）
  * - secrets 表存密钥（仅管理员可写）；内存缓存 60s
  * - 任何接口不回读明文；日志/inputs 落库前用 maskSecrets 脱敏
+ * 
+ * V2.4 #4 收尾：敏感密钥加密存储。存储时对值进行 AES-256-GCM 加密，
+ * 读取时自动解密。ENCRYPTION_KEY 自身不加密（它是加密密钥自身）。
  */
 const { db } = require('../db');
+const { encrypt, decrypt } = require('./crypto-util'); // V2.4 #4 加密工具
 
 const CACHE_TTL = 60 * 1000;
 let cache = null, cacheAt = 0;
 
-/** 全量密钥名→值（缓存） */
+/** 全量密钥名→值（缓存，值已解密） */
 function loadSecrets() {
   if (cache && Date.now() - cacheAt < CACHE_TTL) return cache;
   const rows = db.prepare('SELECT name, value FROM secrets').all();
-  cache = Object.fromEntries(rows.map(r => [r.name, r.value]));
+  // V2.4 #4：对加密的值进行解密；ENCRYPTION_KEY 自身不解密（保持明文）
+  cache = Object.fromEntries(rows.map(r => [
+    r.name,
+    r.name === 'ENCRYPTION_KEY' ? r.value : decrypt(r.value)
+  ]));
   cacheAt = Date.now();
   return cache;
 }
@@ -41,8 +49,10 @@ function upsert(name, value, remark) {
     invalidate();
     return old ? 'deleted' : 'noop';
   }
-  if (old) db.prepare("UPDATE secrets SET value=?, remark=?, updated_at=datetime('now','localtime') WHERE id=?").run(value, remark || old.remark || '', old.id);
-  else db.prepare("INSERT INTO secrets (name, value, remark, created_at, updated_at) VALUES (?,?,?,datetime('now','localtime'),datetime('now','localtime'))").run(name, value, remark || '');
+  // V2.4 #4：对值加密后存储；ENCRYPTION_KEY 自身不加密（保持明文）
+  const storedValue = name === 'ENCRYPTION_KEY' ? value : encrypt(value);
+  if (old) db.prepare("UPDATE secrets SET value=?, remark=?, updated_at=datetime('now','localtime') WHERE id=?").run(storedValue, remark || old.remark || '', old.id);
+  else db.prepare("INSERT INTO secrets (name, value, remark, created_at, updated_at) VALUES (?,?,?,datetime('now','localtime'),datetime('now','localtime'))").run(name, storedValue, remark || '');
   invalidate();
   return old ? 'updated' : 'created';
 }
