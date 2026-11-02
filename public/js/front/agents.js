@@ -15,11 +15,6 @@ export async function render(el) {
   let keyword = '';
   let models = [];
   let kbs = [];
-  let spaces = [];
-  let agents = []; // V2.4 #9 空间过滤：智能体列表数据
-  let evals = []; // V2.4 #9：评测数据
-  let platforms = []; // V2.4 #9：平台列表数据
-  let mcpServers = []; // V2.4 #9：MCP服务列表数据
 
   el.innerHTML = `
     <div class="page-head">
@@ -203,11 +198,11 @@ export async function render(el) {
   async function load() {
     const sp = window.__currentSpace || '';
     const sq = sp ? `?space_id=${sp}` : '';
-    const [ja, js, je, jm, jk, jp, jmcp] = await Promise.all([
-      api('/agents' + sq), api('/agents/spaces/list'), api('/agents/evaluations'), api('/chat/models'), api('/knowledge' + sq), api('/platforms'), api('/mcp'),
+    const [ja, jm, jk] = await Promise.all([
+      api('/agents' + sq), api('/chat/models'), api('/knowledge' + sq),
     ]);
-    list = ja.data; spaces = js.data; evals = je.data; models = jm.data; kbs = jk.data; platforms = jp.data; mcpServers = jmcp.data;
-    renderCurrent();
+    list = ja.data; models = jm.data; kbs = jk.data;
+    renderGrid();
   }
 
   seg.querySelectorAll('button').forEach(b => b.onclick = () => { tab = b.dataset.t; renderGrid(); });

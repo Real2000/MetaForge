@@ -2318,4 +2318,17 @@ agent-platform/
 ### 验证
 冒烟 195/0 通过（2个失败为HTTP测试端口问题，与改动无关）
 
+## V2.4 #9/#4 收尾与前端回归修复（2026-11-02）
+
+### 实现内容
+- #4 secrets 加密存储：upsert 时 encrypt、loadSecrets 时 decrypt，环境变量密钥优先，ENCRYPTION_KEY 自身不加密（避免循环依赖）（04ebf00）
+- #9 agent-access.js 调整判定顺序：agent_acls 查询优先于 visibility='public' 短路，修复 deny ACL 不生效（b10705b）
+- #9 新增 7 条 agent_acls 冒烟用例（user/dept/role 三路授权 + deny 优先于 allow）（d0eb441）
+- #9 knowledge.js 列表过滤回退至正确语义（!k.space_id 过渡期全员可见 + URL space_id 参数精确过滤）（4331d89）
+- #9 前端空间选择器接线：app.js mountSpaceSelector + window.__currentSpace，智能体/知识库列表携带 space_id（56dc94f）
+- 前端回归修复：front/agents.js 补全临时变量声明（a2800d2）；load() 恢复前台结构——只拉 /agents、/chat/models、/knowledge 三个前台 API（保留 space_id 参数），渲染调用 renderGrid()，删除 5 个死变量与 4 个 admin 专用 API 调用，修复「renderCurrent is not defined」页面白屏
+
+### 验证
+冒烟 276/0 全绿；浏览器实测 http://localhost:3210/#/agents：登录后页面完整渲染（三级矩阵 tab / 约 40 个智能体卡片 / 新增按钮），控制台无新增错误。
+
 > AI生成
