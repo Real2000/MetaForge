@@ -22,14 +22,14 @@ function parseJsonArr(s) {
 /** 检查 agent_acls 表是否有匹配的 allow=1 授权 */
 function hasAclAccess(a, user) {
   if (!a || !user) return false;
-  // 查用户、部门、角色三路ACL，任一匹配即放行
-  const rows = db.prepare(`SELECT allow FROM agent_acls WHERE agent_id=? AND (grant_to='user' AND grant_to_value=? OR grant_to='dept' AND grant_to_value=? OR grant_to='role' AND grant_to_value=?) LIMIT 1`)
-    .all(a.id, user.username, user.dept, user.role);
-  if (rows.length && rows[0].allow === 1) return true;
-  // 拒绝规则：有明确 deny（allow=0）则拒绝访问
-  const denies = db.prepare(`SELECT allow FROM agent_acls WHERE agent_id=? AND allow=0 AND (grant_to='user' AND grant_to_value=? OR grant_to='dept' AND grant_to_value=? OR grant_to='role' AND grant_to_value=?) LIMIT 1`)
+  // 拒绝规则优先：有明确 deny（allow=0）则拒绝访问
+  const denies = db.prepare(`SELECT 1 FROM agent_acls WHERE agent_id=? AND allow=0 AND (grant_to='user' AND grant_to_value=? OR grant_to='dept' AND grant_to_value=? OR grant_to='role' AND grant_to_value=?) LIMIT 1`)
     .all(a.id, user.username, user.dept, user.role);
   if (denies.length) return false;
+  // 查用户、部门、角色三路ACL，任一匹配即放行
+  const rows = db.prepare(`SELECT allow FROM agent_acls WHERE agent_id=? AND allow=1 AND (grant_to='user' AND grant_to_value=? OR grant_to='dept' AND grant_to_value=? OR grant_to='role' AND grant_to_value=?) LIMIT 1`)
+    .all(a.id, user.username, user.dept, user.role);
+  if (rows.length && rows[0].allow === 1) return true;
   return null; // 未配置任何 ACL → 不置可否，由下游规则决定
 }
 
@@ -40,6 +40,9 @@ function canView(a, user) {
   if (a.owner && a.owner === user.username) return true;
   if (parseJsonArr(a.collaborators).includes(user.username)) return true;
   if (a.status !== 'published') return false; // 草稿仅 owner/协作者/管理员可见
+  // V2.4 #9 租户化：agent_acls 查询优先（deny 覆盖 public 等旧字段）
+  const aclResult = hasAclAccess(a, user);
+  if (aclResult !== null) return aclResult;
   if ((a.visibility || 'public') === 'public') return true;
   const members = parseJsonArr(a.visible_members);
   if (members.includes(user.username)) return true;
@@ -56,9 +59,6 @@ function canView(a, user) {
     const textHit = hasText && !!user.dept && depts.includes(user.dept);
     if (idHit || textHit) return true;
   }
-  // V2.4 #9 租户化：检查 agent_acls 表（用户/部门/角色精确授权）
-  const aclResult = hasAclAccess(a, user);
-  if (aclResult !== null) return aclResult;
   return false;
 }
 
