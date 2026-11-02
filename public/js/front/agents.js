@@ -17,6 +17,9 @@ export async function render(el) {
   let kbs = [];
   let spaces = [];
   let agents = []; // V2.4 #9 空间过滤：智能体列表数据
+  let evals = []; // V2.4 #9：评测数据
+  let platforms = []; // V2.4 #9：平台列表数据
+  let mcpServers = []; // V2.4 #9：MCP服务列表数据
 
   el.innerHTML = `
     <div class="page-head">
