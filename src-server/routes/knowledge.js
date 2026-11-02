@@ -65,7 +65,7 @@ router.get('/', (req, res) => {
   if (req.user.role !== 'admin') {
     // 获取当前用户为 owner 的所有个人空间 ID
     const mySpaceIds = db.prepare('SELECT id FROM spaces WHERE owner=?').all(req.user.username).map(r => r.id);
-    filtered = rows.filter(k => ![0, null].includes(k.space_id) || mySpaceIds.includes(k.space_id) || k.owner === req.user.username);
+    filtered = rows.filter(k => !k.space_id || mySpaceIds.includes(k.space_id) || k.owner === req.user.username);
     // ↑ 空间过滤条件（V2.4 #9）：
     //   - !k.space_id（0 或 NULL/undefined）→ 无空间归属 → 全员可见
     //   - mySpaceIds 包含该 space_id → 当前用户是该空间的 owner → 可见
