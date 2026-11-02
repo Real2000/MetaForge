@@ -1309,6 +1309,29 @@ db.exec(`CREATE TABLE IF NOT EXISTS workflow_templates (
   }
 }
 
+// ---------------- V2.4 #9 收尾（2026-11-02）：存量资源空间归属回填（幂等） ----------------
+// 规则（只处理 space_id 为 NULL/0 的存量行，已有归属的行不动；位置在 seed 之后，新库种子一并归类）：
+//   - 无 owner 或 owner=admin → 第一个企业空间（企业共享语义：配合 space-utils 的 enterprise 全员可见过滤，
+//     回填前后普通用户可见性不收缩——admin/演示资源在企业空间仍全员可见）
+//   - 其他 owner → 该用户的个人空间（个人空间=私有的目标租户语义）；无个人空间则保持无归属不强行归类
+// 注：运行时创建的资源都带明确 space_id（个人空间 id 或 0=无归属），本块不会误改——仅当
+//     「无个人空间用户故意写 0」且之后该用户获得个人空间的边缘场景会被归类为个人空间（符合租户化方向）。
+{
+  const ent = db.prepare("SELECT id FROM spaces WHERE type='enterprise' ORDER BY id LIMIT 1").get();
+  if (ent) {
+    const ra1 = db.prepare(`UPDATE agents SET space_id=? WHERE (space_id IS NULL OR space_id=0) AND (owner IS NULL OR owner='' OR owner='admin')`).run(ent.id);
+    const ra2 = db.prepare(`UPDATE agents SET space_id=(SELECT s.id FROM spaces s WHERE s.type='personal' AND s.owner=agents.owner LIMIT 1)
+      WHERE (space_id IS NULL OR space_id=0) AND owner IS NOT NULL AND owner!='admin'
+        AND EXISTS (SELECT 1 FROM spaces s2 WHERE s2.type='personal' AND s2.owner=agents.owner)`).run();
+    const rk1 = db.prepare(`UPDATE kbs SET space_id=? WHERE (space_id IS NULL OR space_id=0) AND (owner IS NULL OR owner='' OR owner='admin')`).run(ent.id);
+    const rk2 = db.prepare(`UPDATE kbs SET space_id=(SELECT s.id FROM spaces s WHERE s.type='personal' AND s.owner=kbs.owner LIMIT 1)
+      WHERE (space_id IS NULL OR space_id=0) AND owner IS NOT NULL AND owner!='admin'
+        AND EXISTS (SELECT 1 FROM spaces s2 WHERE s2.type='personal' AND s2.owner=kbs.owner)`).run();
+    const na = ra1.changes + ra2.changes, nk = rk1.changes + rk2.changes;
+    if (na + nk > 0) console.log(`[db] V2.4 #9 存量空间归属回填：agents ${na} 行、kbs ${nk} 行（无主/admin→企业空间#${ent.id}，其余→个人空间）`);
+  }
+}
+
 // ---------------- 热表索引（2026-10-28 DB 优化：补齐 6 张高频表二级索引 + agents 高频查询）----------------
 // 幂等：IF NOT EXISTS 已存在则跳过；首次对存量数据建索引可能耗时数秒（WAL 下读不阻塞，但 better-sqlite3 同步会短暂冻结事件循环）
 // 索引与 stats.js 聚合下推必须同批上线（WHERE created_at>=? 依赖 idx_messages_created 才能走范围扫，否则仍全表扫）

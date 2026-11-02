@@ -553,6 +553,64 @@ function t(name, fn) {
     assert.strictEqual(canView(a, { username: 'eve', role: 'user', dept: '研发部' }), false, '名单外→不可见（旧字段也拒绝）');
   });
 
+  // ================ V2.4 #9 收尾（2026-11-02）：企业空间全员可见 + 存量回填 ================
+  console.log('【V2.4#9】空间租户化收尾：企业空间语义 + 存量回填');
+  // 【用例 1】spaceFilterSql 三态语义——企业空间/无归属回填行对普通用户可见，部门空间不可见
+  await t('V2.4#9 收尾：企业空间智能体对普通用户可见，部门空间不可见', () => {
+    const { spaceFilterSql } = require('../src-server/lib/space-utils');
+    const { sqlStr, args } = spaceFilterSql('a', { username: 'zhangsan', role: 'user' });
+    const rows = db.prepare(`SELECT a.name, a.space_id FROM agents a WHERE 1=1 AND a.status='published' ${sqlStr}`).all(...args);
+    const names = rows.map(r => r.name);
+    assert.ok(names.includes('公司制度问答助手'), '企业空间智能体（space_id=1）应可见');
+    assert.ok(names.includes('会议纪要整理员'), '原无归属行（seed space_id=NULL）经回填进企业空间后应可见');
+    assert.ok(!names.includes('公文写作专家'), '部门空间智能体（space_id=2，非空间 owner）应不可见');
+  });
+  // 【用例 2】个人空间资源仅空间/资源 owner 可见
+  await t('V2.4#9 收尾：个人空间智能体仅空间 owner 可见，他人不可见', () => {
+    const { spaceFilterSql } = require('../src-server/lib/space-utils');
+    const sp = db.prepare("SELECT id FROM spaces WHERE type='personal' AND owner='admin' LIMIT 1").get();
+    db.prepare("INSERT INTO agents (name,type,space_id,owner,status,visibility) VALUES ('回填测试-个人空间agent','other',?,'admin','published','public')").run(sp.id);
+    try {
+      const mk = u => { const { sqlStr, args } = spaceFilterSql('a', u); return db.prepare(`SELECT a.name FROM agents a WHERE 1=1 ${sqlStr}`).all(...args).map(r => r.name); };
+      assert.ok(!mk({ username: 'zhangsan', role: 'user' }).includes('回填测试-个人空间agent'), '非空间 owner 不可见');
+      assert.ok(mk({ username: 'admin', role: 'user' }).includes('回填测试-个人空间agent'), '空间 owner 可见（role=user 视角）');
+    } finally {
+      db.prepare("DELETE FROM agents WHERE name='回填测试-个人空间agent'").run();
+    }
+  });
+  // 【用例 3】存量回填后 agents/kbs 无 NULL/0 归属残留（新库 seed 场景，迁移块位于 db.js seed 之后）
+  await t('V2.4#9 收尾：存量回填后 agents/kbs 无未归属行残留', () => {
+    const a = db.prepare('SELECT COUNT(*) c FROM agents WHERE space_id IS NULL OR space_id=0').get();
+    assert.strictEqual(a.c, 0, `agents 应无 space_id 为 0/NULL 的行（实际 ${a.c}）`);
+    const k = db.prepare('SELECT COUNT(*) c FROM kbs WHERE space_id IS NULL OR space_id=0').get();
+    assert.strictEqual(k.c, 0, `kbs 应无 space_id 为 0/NULL 的行（实际 ${k.c}）`);
+  });
+  // 【用例 4】spaceVisibleTo 单行判定与 SQL 语义一致（无归属/企业/个人/部门/脏数据五态）
+  await t('V2.4#9 收尾：spaceVisibleTo 五态语义', () => {
+    const { spaceVisibleTo } = require('../src-server/lib/space-utils');
+    assert.strictEqual(spaceVisibleTo(db, 0, 'zhangsan'), true, '0→全员可见');
+    assert.strictEqual(spaceVisibleTo(db, null, 'zhangsan'), true, 'NULL→全员可见');
+    const ent = db.prepare("SELECT id FROM spaces WHERE type='enterprise' LIMIT 1").get();
+    assert.strictEqual(spaceVisibleTo(db, ent.id, 'zhangsan'), true, '企业空间→全员可见');
+    assert.strictEqual(spaceVisibleTo(db, 99999, 'zhangsan'), true, '空间不存在→宽容放行（脏数据等效无归属）');
+    const per = db.prepare("SELECT id FROM spaces WHERE type='personal' AND owner='admin' LIMIT 1").get();
+    assert.strictEqual(spaceVisibleTo(db, per.id, 'admin'), true, '个人空间 owner→可见');
+    assert.strictEqual(spaceVisibleTo(db, per.id, 'zhangsan'), false, '个人空间非 owner→不可见');
+    const dept = db.prepare("SELECT id FROM spaces WHERE type='dept' LIMIT 1").get();
+    assert.strictEqual(spaceVisibleTo(db, dept.id, 'zhangsan'), false, '部门空间非 owner→不可见（过渡语义）');
+  });
+  // 【用例 5】knowledge 列表统一语义——企业空间知识库 JS 过滤放行（owner 第一关之外的空间维度）
+  await t('V2.4#9 收尾：knowledge 列表空间过滤复用统一语义', () => {
+    const { spaceVisibleTo } = require('../src-server/lib/space-utils');
+    // seed 的 2 个 kbs（owner=admin）经回填归企业空间——企业空间维度对任意用户放行
+    const kbs = db.prepare('SELECT name, space_id FROM kbs').all();
+    assert.ok(kbs.length >= 2, 'seed 应有知识库');
+    for (const k of kbs) {
+      assert.ok(k.space_id, `知识库「${k.name}」应已完成空间回填`);
+      assert.strictEqual(spaceVisibleTo(db, k.space_id, 'zhangsan'), true, `企业空间知识库「${k.name}」空间维度应放行`);
+    }
+  });
+
   // ================ P3 扩展工具（2026-10-22）：Text2SQL / 图表 / Word / MCP Server / 分类器路由 ================
   console.log('【N】P3 扩展工具（Text2SQL / 图表 / Word / MCP Server / 分类器路由）');
   const extra = require('../src-server/lib/tools-extra');

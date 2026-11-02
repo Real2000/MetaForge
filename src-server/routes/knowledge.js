@@ -28,6 +28,7 @@ const {
   VALID_STEP,           // 步骤名白名单校验（PUT pipeline 字段用）
   parsePipelineConfig,  // kbs.pipeline 读取侧归一（NULL/空/损坏 → null=默认管道）
 } = require('../lib/ingestion-pipeline'); // V2.3 #5 2026-10-31：摄取管道（上传链路自此管道化）
+const { spaceVisibleTo } = require('../lib/space-utils'); // V2.4 #9 收尾 2026-11-02：列表空间过滤统一语义
 
 const router = express.Router();
 router.use(auth);
@@ -63,13 +64,10 @@ router.get('/', (req, res) => {
   // ============================================================
   let filtered = rows;
   if (req.user.role !== 'admin') {
-    // 获取当前用户为 owner 的所有个人空间 ID
-    const mySpaceIds = db.prepare('SELECT id FROM spaces WHERE owner=?').all(req.user.username).map(r => r.id);
-    filtered = rows.filter(k => !k.space_id || mySpaceIds.includes(k.space_id) || k.owner === req.user.username);
-    // ↑ 空间过滤条件（V2.4 #9）：
-    //   - !k.space_id（0 或 NULL/undefined）→ 无空间归属 → 全员可见
-    //   - mySpaceIds 包含该 space_id → 当前用户是该空间的 owner → 可见
-    //   - k.owner 匹配 → 创建者可见
+    // V2.4 #9 收尾（2026-11-02）：改用 space-utils 统一语义（与 agents 列表的 spaceFilterSql 严格一致）——
+    // 无归属(0/NULL)→全员可见；企业空间→全员可见；个人/部门空间→空间/资源 owner 可见。
+    // 消除此前与 agents 路由各自手写导致的空间语义分叉（企业空间资源曾被双方判为仅 owner 可见）。
+    filtered = rows.filter(k => !k.space_id || k.owner === req.user.username || spaceVisibleTo(db, k.space_id, req.user.username));
   }
   const data = filtered.map(r => ({ ...r, pipeline: parsePipelineConfig(r.pipeline) }));
   res.json({ code: 0, data });

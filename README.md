@@ -2327,8 +2327,11 @@ agent-platform/
 - #9 knowledge.js 列表过滤回退至正确语义（!k.space_id 过渡期全员可见 + URL space_id 参数精确过滤）（4331d89）
 - #9 前端空间选择器接线：app.js mountSpaceSelector + window.__currentSpace，智能体/知识库列表携带 space_id（56dc94f）
 - 前端回归修复：front/agents.js 补全临时变量声明（a2800d2）；load() 恢复前台结构——只拉 /agents、/chat/models、/knowledge 三个前台 API（保留 space_id 参数），渲染调用 renderGrid()，删除 5 个死变量与 4 个 admin 专用 API 调用，修复「renderCurrent is not defined」页面白屏
+- #9 存量空间归属回填（收尾）：db.js seed 后新增幂等迁移块——无主/admin 存量行→第一个企业空间，其他 owner→其个人空间；生产库重启时 agents 32 行、kbs 4 行自动归类
+- #9 企业空间全员可见语义：space-utils spaceFilterSql 补 EXISTS 子句（企业空间 OR 空间 owner 放行），新增 spaceVisibleTo 单行判定器；knowledge.js 列表改用统一语义消除与 agents 路由的语义分叉。修复旧过渡语义「有归属即仅 owner 可见」导致的企业空间资源对普通用户不可见问题（金融资讯助手等 3 个被过滤）
+- 新增 5 条收尾冒烟用例（企业空间可见/个人空间 owner-only/回填无残留/spaceVisibleTo 五态/knowledge 统一语义）
 
 ### 验证
-冒烟 276/0 全绿；浏览器实测 http://localhost:3210/#/agents：登录后页面完整渲染（三级矩阵 tab / 约 40 个智能体卡片 / 新增按钮），控制台无新增错误。
+冒烟 281/0 全绿；生产库副本实测：回填后 agents 32 行/kbs 4 行全部归企业空间，普通用户（zhangsan）可见智能体 27→30（仅增不减，被旧过渡语义误过滤的 3 个企业智能体恢复可见）；浏览器实测 http://localhost:3210/#/agents：登录后页面完整渲染，控制台无新增错误。回填需重启服务生效（db.js 启动时幂等执行）。
 
 > AI生成
