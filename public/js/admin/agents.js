@@ -25,7 +25,7 @@ export async function render(el) {
       <div class="card">
         <div class="toolbar">
           <div class="filters">
-            <select class="input" id="f_status"><option value="">全部状态</option><option value="published">已发布</option><option value="draft">草稿/下架</option></select>
+            <select class="input" id="f_status"><option value="">全部状态</option><option value="published">已发布</option><option value="review">审核中</option><option value="rejected">已驳回</option><option value="draft">草稿/下架</option></select>
             <select class="input" id="f_type"><option value="">全部类型</option><option value="enterprise">企业智能体</option><option value="digital">数字员工</option><option value="dept">部门AI助理</option><option value="other">其他</option></select>
             <input class="input" id="f_kw" placeholder="🔍 搜索名称">
           </div>
@@ -52,10 +52,12 @@ export async function render(el) {
           <td class="mono">${esc(a.model || '-')}</td>
           <td>${a.kb_id ? '📚 ' + esc(kbs.find(k => k.id === a.kb_id)?.name || '已关联') : '<span style="color:var(--text-3)">-</span>'}</td>
           <td>${a.source === 'self' ? '<span class="tag gray">自建</span>' : `<span class="tag orange">${esc(a.source_name || a.source)}</span>`}</td>
-          <td>${a.status === 'published' ? '<span class="tag green">已发布</span>' : '<span class="tag gray">草稿</span>'}</td>
+          <td>${a.status === 'published' ? '<span class="tag green">已发布</span>' : a.status === 'review' ? '<span class="tag orange">审核中</span>' : a.status === 'rejected' ? `<span class="tag red" title="${esc(a.review_comment || '')}">已驳回</span>` : '<span class="tag gray">草稿</span>'}${a.status === 'rejected' && a.review_comment ? `<div style="font-size:11px;color:var(--danger);margin-top:3px">${esc(a.review_comment.slice(0, 60))}${a.review_comment.length > 60 ? '…' : ''}</div>` : ''}</td>
           <td style="color:var(--text-3);font-size:12px">${esc((a.updated_at || '').slice(0, 16))}</td>
           <td>
-            <button class="btn link" data-pb="${a.id}">${a.status === 'published' ? '下架' : '发布'}</button>
+            ${a.status === 'review' ? `
+            <button class="btn link" style="color:var(--success,#059669)" data-rv-approve="${a.id}">通过</button>
+            <button class="btn link" style="color:var(--danger)" data-rv-reject="${a.id}">驳回</button>` : `<button class="btn link" data-pb="${a.id}">${a.status === 'published' ? '下架' : a.status === 'rejected' ? '重新发布' : '发布'}</button>`}
             <button class="btn link" data-ed="${a.id}">编排</button>
             <button class="btn link" data-analytics="${a.id}">分析</button>
             <button class="btn link" data-apidoc="${a.id}" title="接口文档：参数/输出/调用示例由画布 Start/End 节点自动生成">文档</button>
@@ -70,6 +72,13 @@ export async function render(el) {
         const j = await api(`/agents/${b.dataset.pb}/publish`, { method: 'POST' });
         toast(j.msg); load();
       });
+      // V3.1 #12 审核操作：通过（复用发布逻辑）/ 驳回（必填意见）
+      pane.querySelectorAll('[data-rv-approve]').forEach(b => b.onclick = async () => {
+        if (!await confirmBox('确认审核通过并发布该智能体？')) return;
+        const j = await api(`/agents/${b.dataset.rvApprove}/review`, { method: 'POST', body: { action: 'approve' } });
+        toast(j.msg); load();
+      });
+      pane.querySelectorAll('[data-rv-reject]').forEach(b => b.onclick = () => openReject(+b.dataset.rvReject));
       pane.querySelectorAll('[data-ed]').forEach(b => b.onclick = () => { location.hash = '#/admin/studio/' + b.dataset.ed; });
       pane.querySelectorAll('[data-apidoc]').forEach(b => b.onclick = () => openApiDoc(+b.dataset.apidoc));
       pane.querySelectorAll('[data-api]').forEach(b => b.onclick = () => openApiKeys(+b.dataset.api));
@@ -88,6 +97,31 @@ export async function render(el) {
     pane.querySelector('#fromTpl').onclick = openTemplates;
     pane.querySelector('#importCfg').onclick = importAgentCfg;
     rows();
+  }
+
+  // ---------- V3.1 #12 审核流（2026-11-03）：驳回弹窗（必填意见，提审人可据此整改重提） ----------
+  function openReject(id) {
+    const a = agents.find(x => x.id === id);
+    const m = modal({
+      title: `驳回审核：${a ? a.name : id}`,
+      body: `
+        <div style="font-size:12.5px;line-height:1.7;color:var(--text-2);margin-bottom:12px">
+          驳回后智能体转为「已驳回」状态（提审人可见驳回意见，修改后可重新提审）。
+        </div>
+        <div class="form-item"><label>审核意见（必填，将通知提审人）</label>
+          <textarea class="input" id="rvComment" rows="3" placeholder="例如：开场白包含未授权承诺，请调整后再提交"></textarea></div>`,
+      foot: `<button class="btn" data-close>取消</button><button class="btn primary" id="rvSubmit">确认驳回</button>`,
+      onMount(mask) {
+        mask.querySelector('#rvSubmit').onclick = async () => {
+          const comment = mask.querySelector('#rvComment').value.trim();
+          if (!comment) return toast('驳回必须填写审核意见', 'err');
+          try {
+            const j = await api(`/agents/${id}/review`, { method: 'POST', body: { action: 'reject', comment } });
+            toast(j.msg || '已驳回'); m.close(); load();
+          } catch (e) { toast(e.message, 'err'); }
+        };
+      },
+    });
   }
 
   // ---------- P5.16 API 文档自动生成（Swagger 风格，Start/End 节点 → 参数/输出/调用示例，发布即有零手写） ----------

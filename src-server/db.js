@@ -610,6 +610,27 @@ db.exec(`CREATE INDEX IF NOT EXISTS idx_agent_acls_agent ON agent_acls(agent_id)
 db.exec(`CREATE INDEX IF NOT EXISTS idx_agent_acls_space ON agent_acls(space_id);`);
 db.exec(`CREATE INDEX IF NOT EXISTS idx_agent_acls_grant ON agent_acls(grant_to, grant_to_value);`);
 console.log('[db] 创建 agent_acls 表（租户化 ACL 权限表）');
+
+// V3.1 #12 审核流（2026-11-03）：agent_reviews 审核流水表 + agents.review_comment 列
+// 流转：draft/rejected →（提审 submit）review →（approve）published /（reject）rejected
+// 企业版（audit_flow 特性）非 admin 提审走人工审核；社区/专业版与管理员发布直接生效（auto_approve 流水）
+db.exec(`CREATE TABLE IF NOT EXISTS agent_reviews (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  agent_id INTEGER NOT NULL,
+  action TEXT NOT NULL,           -- submit / approve / reject / auto_approve / withdraw
+  operator TEXT,                  -- submit=提审人；approve/reject=审核人（admin）；auto_approve=系统判定（edition）
+  comment TEXT DEFAULT '',
+  created_at TEXT
+);`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_agent_reviews_agent ON agent_reviews(agent_id, id DESC);`);
+{
+  const aCols = db.prepare('PRAGMA table_info(agents)').all().map(c => c.name);
+  if (!aCols.includes('review_comment')) {
+    db.exec(`ALTER TABLE agents ADD COLUMN review_comment TEXT DEFAULT ''`);
+    console.log('[db] agents 表已迁移：新增 review_comment 字段（V3.1 #12 审核流——最新驳回意见，前台展示用）');
+  }
+}
+
 // agents 表补充协作与可见性字段（2026-10-22 P3 协作与团队功能）
 // visibility: public 全员可见（默认，存量不受影响）/ restricted 受限可见
 // visible_depts / visible_members: restricted 时的可见部门/成员名单（JSON 数组）

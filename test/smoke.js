@@ -2347,6 +2347,47 @@ function t(name, fn) {
           assert.strictEqual(r2.status, 401, '缺 code 字段应 401，实际 ' + r2.status);
           assert.ok(!JSON.stringify(r2.j || {}).includes('token'), '负例响应不得泄露 token 字样：' + JSON.stringify(r2.j));
         });
+        // ===== V3.1 #12 审核流（2026-11-03）：社区版自动通过 + 审核路由权限 + 非法状态拦截 =====
+        await t('HTTP：审核流——社区版发布自动通过 + auto_approve 审核流水（V3.1 #12）', async () => {
+          // 建一个 httpu1 拥有的 draft 智能体（父进程句柄写入，WAL 共享临时库）
+          db.prepare(`INSERT INTO agents (name,description,type,category,owner,status,visibility,created_at,updated_at) VALUES ('审核流测试agent','#12','','未分类','httpu1','draft','public',datetime('now','localtime'),datetime('now','localtime'))`).run();
+          const ag = db.prepare(`SELECT id FROM agents WHERE name='审核流测试agent'`).get();
+          // 社区版（smoke 无 License → community，无 audit_flow 特性）：httpu1（非 admin）发布 → 直接 published
+          const j = await jfetch(`/api/agents/${ag.id}/publish`, { method: 'POST', body: JSON.stringify({ record: '#12 审核流冒烟' }) }, tok1);
+          assert.ok(j.j && j.j.code === 0, '社区版发布应直接成功：' + JSON.stringify(j.j).slice(0, 120));
+          assert.ok((j.j.msg || '').includes('已发布'), '社区版 msg 应为已发布（自动通过语义），实际：' + j.j.msg);
+          const st = db.prepare('SELECT status FROM agents WHERE id=?').get(ag.id).status;
+          assert.strictEqual(st, 'published', '发布后状态应为 published，实际 ' + st);
+          // 审核流水：auto_approve 一条（用户决策：社区版提审自动通过）
+          const flow = db.prepare(`SELECT action, operator FROM agent_reviews WHERE agent_id=? ORDER BY id DESC LIMIT 1`).get(ag.id);
+          assert.ok(flow && flow.action === 'auto_approve' && flow.operator === 'httpu1', '应有 auto_approve 流水（operator=httpu1），实际：' + JSON.stringify(flow));
+          // 自清理：删测试 agent + 流水 + 广场广播（不污染后续用例）
+          db.prepare('DELETE FROM agents WHERE id=?').run(ag.id);
+          db.prepare('DELETE FROM agent_reviews WHERE agent_id=?').run(ag.id);
+          db.prepare(`DELETE FROM notifications WHERE type='agent_publish' AND title LIKE '%审核流测试agent%'`).run();
+        });
+        await t('HTTP：审核流——review/review-queue 路由权限与状态门禁（V3.1 #12）', async () => {
+          // 自建数据：httpu1 拥有的 draft 智能体（不依赖前组用例的清理时序）
+          db.prepare(`INSERT INTO agents (name,description,type,category,owner,status,visibility,created_at,updated_at) VALUES ('审核门禁测试agent','#12','','未分类','httpu1','draft','public',datetime('now','localtime'),datetime('now','localtime'))`).run();
+          const ag = db.prepare(`SELECT id FROM agents WHERE name='审核门禁测试agent'`).get();
+          // 非 admin 访问审核队列 → 403
+          const q1 = await jfetch('/api/agents/review-queue', {}, tok1);
+          assert.strictEqual(q1.j && q1.j.code, 403, '非 admin 拉取审核队列应 403，实际：' + JSON.stringify(q1.j));
+          // 非 admin 调审核 → 403
+          const r1 = await jfetch(`/api/agents/${ag.id}/review`, { method: 'POST', body: JSON.stringify({ action: 'approve' }) }, tok1);
+          assert.strictEqual(r1.j && r1.j.code, 403, '非 admin 审核应 403，实际：' + JSON.stringify(r1.j));
+          // admin 对非 review 状态智能体审核 → 400（状态门禁）
+          db.prepare(`INSERT INTO users (username,password,nickname,role,status,must_change_pwd,created_at) VALUES ('rvadmin',?,'审核测试管理员','admin',1,0,datetime('now','localtime'))`).run(hashPwd('rv-pass-123'));
+          const rvAid = db.prepare(`SELECT id FROM users WHERE username='rvadmin'`).get().id;
+          const tokA = sign({ uid: rvAid, exp: Date.now() + 3600000 });
+          const r2 = await jfetch(`/api/agents/${ag.id}/review`, { method: 'POST', body: JSON.stringify({ action: 'approve' }) }, tokA);
+          assert.strictEqual(r2.j && r2.j.code, 400, '非 review 状态（draft）审核应 400，实际：' + JSON.stringify(r2.j));
+          // admin 拉取审核队列 → code 0（此时无 review 状态行，data 为空数组）
+          const q2 = await jfetch('/api/agents/review-queue', {}, tokA);
+          assert.ok(q2.j && q2.j.code === 0 && Array.isArray(q2.j.data), 'admin 审核队列应 code 0：' + JSON.stringify(q2.j).slice(0, 120));
+          // 自清理
+          db.prepare('DELETE FROM agents WHERE id=?').run(ag.id);
+        });
         await t('HTTP：providers 列表 API Key 脱敏回显（P5.30）', async () => {
           db.prepare(`INSERT INTO users (username,password,nickname,role,status,must_change_pwd,created_at) VALUES ('httpadmin',?,'测试管理员','admin',1,0,datetime('now','localtime'))`).run(hashPwd('http-pass-123'));
           const aid = db.prepare(`SELECT id FROM users WHERE username='httpadmin'`).get().id;
@@ -3560,6 +3601,62 @@ function t(name, fn) {
           assert.strictEqual(r3.j.data.reason, 'missing');
         });
 
+        // ===== V3.1 #12 审核流（2026-11-03）：企业版完整流转——提审→驳回→整改重提→通过 =====
+        await t('HTTP：审核流——企业版提审进 review + 驳回带意见 + 重提 + 审批通过（V3.1 #12）', async () => {
+          const crypto = require('crypto'), fs = require('fs'), path = require('path');
+          const licFile = path.join(process.env.AGENT_DATA_DIR, 'license.json');
+          const p = (n) => String(n).padStart(2, '0');
+          const dstr = (d) => `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+          const signLic = (fields) => ({ ...fields, signature: crypto.sign(null, Buffer.from(JSON.stringify(fields), 'utf8'), licKeypair.privateKey).toString('hex') });
+          const adminUid = db.prepare(`SELECT id FROM users WHERE username='httpadmin'`).get().id;
+          const tokAdmin = sign({ uid: adminUid, exp: Date.now() + 3600000 });
+          // ① 热切换企业版（audit_flow 特性生效）
+          const exp = new Date(); exp.setDate(exp.getDate() + 365);
+          fs.writeFileSync(licFile, JSON.stringify(signLic({ customer: '审核流验证公司', edition: 'enterprise', expires_at: dstr(exp), issued_at: dstr(new Date()), license_key: '44'.repeat(16) })));
+          const rl = await jfetch('/api/edition/reload', { method: 'POST' }, tokAdmin);
+          assert.strictEqual(rl.j.data.edition, 'enterprise', '前置：热切换企业版失败 ' + JSON.stringify(rl.j).slice(0, 120));
+          // ② httpu1（非 admin）发布 → 进 review（提审），不直接 published
+          const cr = await jfetch('/api/agents', { method: 'POST', body: JSON.stringify({ name: '企业版审核流agent' }) }, tok1);
+          assert.ok(cr.j && cr.j.code === 0, '造 agent 应成功：' + JSON.stringify(cr.j).slice(0, 120));
+          const aid = cr.j.data.id;
+          const sub = await jfetch(`/api/agents/${aid}/publish`, { method: 'POST', body: JSON.stringify({ record: '首次提审' }) }, tok1);
+          assert.ok(sub.j && sub.j.code === 0 && /提交审核/.test(sub.j.msg || ''), '企业版非 admin 发布应转提审：' + JSON.stringify(sub.j).slice(0, 140));
+          assert.strictEqual(db.prepare('SELECT status FROM agents WHERE id=?').get(aid).status, 'review', '提审后状态应为 review');
+          // ③ 审核中重复提审 → 400
+          const dup = await jfetch(`/api/agents/${aid}/publish`, { method: 'POST', body: JSON.stringify({}) }, tok1);
+          assert.strictEqual(dup.j && dup.j.code, 400, '审核中重复提审应 400：' + JSON.stringify(dup.j));
+          // ④ 审核队列可见（含提审人/说明）
+          const q = await jfetch('/api/agents/review-queue', {}, tokAdmin);
+          const row = (q.j.data || []).find(x => x.id === aid);
+          assert.ok(row && row.submit_by === 'httpu1' && row.submit_comment === '首次提审', '审核队列应含提审人/说明：' + JSON.stringify(row));
+          // ⑤ 驳回（无意见 → 400；带意见 → rejected + review_comment + 通知提审人）
+          const noComment = await jfetch(`/api/agents/${aid}/review`, { method: 'POST', body: JSON.stringify({ action: 'reject' }) }, tokAdmin);
+          assert.strictEqual(noComment.j && noComment.j.code, 400, '驳回缺意见应 400');
+          const rej = await jfetch(`/api/agents/${aid}/review`, { method: 'POST', body: JSON.stringify({ action: 'reject', comment: '开场白含未授权承诺，请调整' }) }, tokAdmin);
+          assert.ok(rej.j && rej.j.code === 0, '驳回应成功：' + JSON.stringify(rej.j));
+          const after = db.prepare('SELECT status, review_comment FROM agents WHERE id=?').get(aid);
+          assert.strictEqual(after.status, 'rejected', '驳回后状态应为 rejected');
+          assert.strictEqual(after.review_comment, '开场白含未授权承诺，请调整', '驳回意见应落 review_comment');
+          assert.ok(!!db.prepare(`SELECT 1 FROM notifications WHERE username='httpu1' AND type='agent_review'`).get(), '驳回应通知提审人 httpu1');
+          // ⑥ 整改后重提（rejected → review，走同一提审路径）
+          const resub = await jfetch(`/api/agents/${aid}/publish`, { method: 'POST', body: JSON.stringify({ record: '整改后重提' }) }, tok1);
+          assert.ok(resub.j && resub.j.code === 0 && /提交审核/.test(resub.j.msg || ''), '驳回后应可重新提审：' + JSON.stringify(resub.j).slice(0, 140));
+          // ⑦ 审批通过 → published + agent_reviews 流水齐全 + 广场上架通知
+          const ok = await jfetch(`/api/agents/${aid}/review`, { method: 'POST', body: JSON.stringify({ action: 'approve' }) }, tokAdmin);
+          assert.ok(ok.j && ok.j.code === 0 && /审核通过/.test(ok.j.msg || ''), '审批应通过：' + JSON.stringify(ok.j).slice(0, 140));
+          assert.strictEqual(db.prepare('SELECT status FROM agents WHERE id=?').get(aid).status, 'published', '通过后状态应为 published');
+          const flows = db.prepare(`SELECT action FROM agent_reviews WHERE agent_id=? ORDER BY id`).all(aid).map(r => r.action);
+          assert.deepStrictEqual(flows, ['submit', 'reject', 'submit', 'approve'], '审核流水应为 submit→reject→submit→approve：' + JSON.stringify(flows));
+          // ⑧ 清理：删测试 agent + 流水 + 广场广播 + 还原 community（磁盘与子进程一致，不污染后续用例）
+          db.prepare('DELETE FROM agents WHERE id=?').run(aid);
+          db.prepare('DELETE FROM agent_reviews WHERE agent_id=?').run(aid);
+          db.prepare(`DELETE FROM notifications WHERE type='agent_review'`).run();
+          db.prepare(`DELETE FROM notifications WHERE type='agent_publish' AND title LIKE '%企业版审核流agent%'`).run();
+          fs.rmSync(licFile, { force: true });
+          const rl2 = await jfetch('/api/edition/reload', { method: 'POST' }, tokAdmin);
+          assert.strictEqual(rl2.j.data.reason, 'missing', '清理后应还原 community');
+        });
+
         // ===== #10 LLMOps（2026-10-31 Dev B）：提示词版本面板 + 质量看板四视图 =====
         // 契约（对齐 Dev A 的 agents.js 实现）：
         //   GET /api/agents/:id/prompt-versions → { code:0, data:[{ id, version, prompt, user_prompt, edited_by, note, created_at }] }
@@ -4275,11 +4372,11 @@ function t(name, fn) {
       assert.strictEqual(r.tables.length, 0);
     });
     // 【P3】P3 工程化：建表数 tripwire
-    await t('P3 工程化：新库建表数 = 49（防 schema 误删/迁移遗漏）', () => {
+    await t('P3 工程化：新库建表数 = 50（防 schema 误删/迁移遗漏）', () => {
       const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all();
       // 临时表影响计算（微信/飞书等动态创建的除外）
       const tableNames = tables.map(r => r.name);
-      const expected = 48; // 对照：db.js 中 CREATE TABLE 语句数，8月以上版本可能因迁移增加
+      const expected = 49; // 对照：db.js 中 CREATE TABLE 语句数，8月以上版本可能因迁移增加（V3.1 #12 +1：agent_reviews）
       const hasTokenBlacklist = tableNames.includes('token_blacklist');
       // token_blacklist 是动态决定是否存在的，不算标准建表数
       assert.ok(tables.length >= expected, `建表数 ${tables.length} 应 ≥ ${expected}（当前可能缺表：${tableNames.filter(n => !tables.some(t => t.name === n)).join(',')}）`);

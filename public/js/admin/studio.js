@@ -193,7 +193,7 @@ export async function render(el, params) {
       <span id="stIcon" style="font-size:22px">${esc(S.icon)}</span>
       <div>
         <div class="t-name" id="stName">${esc(S.name)}</div>
-        <div style="font-size:11px;color:var(--text-3,#9ca3af)" id="stMeta">${esc(TYPE_NAME[S.type] || S.type)} · <span id="stStatus">${S.status === 'published' ? '已发布' : '草稿'}</span><span id="stPubVer"></span></div>
+        <div style="font-size:11px;color:var(--text-3,#9ca3af)" id="stMeta">${esc(TYPE_NAME[S.type] || S.type)} · <span id="stStatus">${S.status === 'published' ? '已发布' : S.status === 'review' ? '审核中' : S.status === 'rejected' ? '已驳回' : '草稿'}</span>${S.status === 'rejected' && S.review_comment ? `<span style="color:var(--danger)">（${esc(S.review_comment.slice(0, 40))}${S.review_comment.length > 40 ? '…' : ''}）</span>` : ''}<span id="stPubVer"></span></div>
       </div>
       <div style="flex:1"></div>
       <span style="font-size:12px;color:var(--text-3,#9ca3af)" id="stSaved"></span>
@@ -203,7 +203,7 @@ export async function render(el, params) {
       </div>
       <button class="btn" id="stSave">${t('保存')}</button>
       <button class="btn" id="stVersionBtn" title="${t('发布版本历史（快照/说明/一键回滚）')}">🕘 ${t('版本')}</button>
-      <button class="btn primary" id="stPublish">${S.status === 'published' ? '下架' : '发布'}</button>
+      <button class="btn primary" id="stPublish">${S.status === 'published' ? '下架' : S.status === 'review' ? '审核中…' : S.status === 'rejected' ? '重新提审' : '发布'}</button>
     </div>
     <div class="studio-body" id="stBody">
       <div id="stFormArea" style="display:flex;flex:1;min-height:0">
@@ -1242,10 +1242,10 @@ export async function render(el, params) {
               allow_copy: mask.querySelector('#pbCopy').checked,
               is_official: mask.querySelector('#pbOfficial').checked,
             } });
-            S.status = 'published';
+            S.status = j.code === 0 && /提交审核/.test(j.msg || '') ? 'review' : 'published'; // V3.1 #12：企业版非 admin 提审返回「已提交审核」
             S.category = mask.querySelector('#pbCat').value.trim() || '未分类';
-            $('#stStatus').textContent = '已发布';
-            $('#stPublish').textContent = '下架';
+            $('#stStatus').textContent = S.status === 'review' ? '审核中（等待管理员审批）' : '已发布';
+            $('#stPublish').textContent = S.status === 'review' ? '审核中…' : '下架';
             if (j.data?.version) { pubInfo.has = true; pubInfo.version = j.data.version; pubInfo.draftDirty = false; renderPubVerBadge(); }
             toast(j.msg || '已发布');
             close();

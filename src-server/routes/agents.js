@@ -9,7 +9,7 @@ const { auth } = require('../lib/auth');
 const { chatOnce } = require('../lib/llm');
 const { canView, canEdit, isOwnerLevel, parseJsonArr } = require('../lib/agent-access');
 const { sanitizeMetadata } = require('../lib/kb-metadata'); // V1.2 #2 2026-10-30：kb_metadata_filter 入参清洗
-const { requireFeature } = require('../lib/edition'); // V2.2 #8 2026-10-31：License 特性闸门（中间件工厂）
+const { requireFeature, hasFeature } = require('../lib/edition'); // V2.2 #8 2026-10-31：License 特性闸门（中间件工厂）；V3.1 #12：audit_flow 审核流判定
 const { spaceFilterSql } = require('../lib/space-utils'); // V2.4 #9 2026-10-31：统一空间过滤
 const { getSoftLimit, agentQuotaBlock } = require('../lib/plans'); // V2.4 #8 2026-10-31：edition+plan配额限制
 const { runTool, validateAgentTools, TOOL_DEFS, AGENT_TOOL_DENY } = require('../lib/tools'); // P5.34b copy 过滤依赖 AGENT_TOOL_DENY（此前漏导入被 catch 吞错致副本工具恒空——测试轮实锤修复）
@@ -62,10 +62,34 @@ router.get('/categories', (req, res) => {
   res.json({ code: 0, data: rows });
 });
 
+/** V3.1 #12 审核流（2026-11-03）：写一条审核流水（幂等辅助，不抛错） */
+function insertReview(agentId, action, operator, comment) {
+  db.prepare(`INSERT INTO agent_reviews (agent_id, action, operator, comment, created_at) VALUES (?,?,?,?,datetime('now','localtime'))`)
+    .run(agentId, action, operator || '', String(comment || '').slice(0, 500));
+}
+
+/** V3.1 #12：当前请求是否需走人工审核——企业版（audit_flow 特性）且非 admin 发布者。
+ *  社区/专业版与管理员直接发布（用户决策：社区版提审自动通过）；管理员是审核主体，自发布不自审 */
+function needsReview(req) {
+  return hasFeature('audit_flow') && req.user.role !== 'admin';
+}
+
 // 协作成员选择器数据源（P3）：全平台启用用户的基础信息（用户名/昵称/部门/角色，无敏感字段），
 // 供编排页「协作与可见性」区块选择可见部门/成员与协作者
 router.get('/members', (req, res) => {
   const rows = db.prepare("SELECT username, nickname, dept, role FROM users WHERE status=1 ORDER BY role='admin' DESC, username").all();
+  res.json({ code: 0, data: rows });
+});
+
+// V3.1 #12 审核流（2026-11-03）：待审核队列（仅管理员）——status='review' 的智能体 + 提审人/提审说明/提交时间
+router.get('/review-queue', (req, res) => {
+  if (req.user.role !== 'admin') return res.json({ code: 403, msg: '需要管理员权限' });
+  const rows = db.prepare(`
+    SELECT a.id, a.name, a.description, a.type, a.category, a.visibility, a.owner, a.updated_at,
+           (SELECT r.operator FROM agent_reviews r WHERE r.agent_id=a.id AND r.action='submit' ORDER BY r.id DESC LIMIT 1) AS submit_by,
+           (SELECT r.comment  FROM agent_reviews r WHERE r.agent_id=a.id AND r.action='submit' ORDER BY r.id DESC LIMIT 1) AS submit_comment,
+           (SELECT r.created_at FROM agent_reviews r WHERE r.agent_id=a.id AND r.action='submit' ORDER BY r.id DESC LIMIT 1) AS submitted_at
+    FROM agents a WHERE a.status='review' ORDER BY a.updated_at DESC`).all();
   res.json({ code: 0, data: rows });
 });
 
@@ -444,12 +468,26 @@ router.get('/:id/runs/:runId', (req, res) => {
   res.json({ code: 0, data: { ...row, node_logs: undefined, nodeLogs, childRuns } });
 });
 
-// 发布 / 下架（SinguX 式发布体系：发布记录 + 分类 + 发布范围 + 允许复制为模板；P3：协作者可发布，受限智能体不上广场）
+// 发布 / 下架 / 提审（SinguX 式发布体系：发布记录 + 分类 + 发布范围 + 允许复制为模板；P3：协作者可发布，受限智能体不上广场）
+// V3.1 #12 审核流（2026-11-03）：企业版（audit_flow）非 admin 发布 → 提审进 review 状态待管理员审批；
+// 社区/专业版与管理员发布直接生效（用户决策：社区版提审自动通过，管理员是审核主体不自审）
 router.post('/:id/publish', (req, res) => {
   const old = db.prepare('SELECT * FROM agents WHERE id=?').get(req.params.id);
   if (!old) return res.json({ code: 404, msg: '智能体不存在' });
   if (!canEdit(old, req.user)) return res.json({ code: 403, msg: '无发布权限（仅创建者、协作者与管理员）' });
+  // 审核中不可重复提审（重复点击/前端状态不同步防护）
+  if (old.status === 'review') return res.json({ code: 400, msg: '该智能体正在审核中，请等待管理员审批（或先联系管理员处理）' });
   const to = old.status === 'published' ? 'draft' : 'published';
+  // V3.1 #12：企业版且非 admin 的发布意图 → 转提审（draft/rejected → review），不入发布分支
+  if (to === 'published' && needsReview(req)) {
+    const b = req.body || {};
+    const record = (b.record || '').trim().slice(0, 200);
+    db.prepare(`UPDATE agents SET status='review', publish_record=?, review_comment='', updated_at=datetime('now','localtime') WHERE id=?`).run(record, old.id);
+    insertReview(old.id, 'submit', req.user.username, record);
+    db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
+      .run(req.user.username, '提交审核', old.name, req.ip, now());
+    return res.json({ code: 0, msg: '已提交审核，等待管理员审批（企业版发布需审核）' });
+  }
   let publishedVersion = null;
   if (to === 'published') {
     const b = req.body || {};
@@ -475,6 +513,8 @@ router.post('/:id/publish', (req, res) => {
       db.prepare(`INSERT INTO agent_publish_history (agent_id, version, workflow, note, nodes, published_by, created_at) VALUES (?,?,?,?,?,?,datetime('now','localtime'))`)
         .run(old.id, version, snapSql, record, nodeCount, req.user.username);
     }
+    // V3.1 #12：免审直发也记一条流水（auto_approve：社区/专业版或管理员直发），审核链完整可审计
+    insertReview(old.id, 'auto_approve', req.user.username, '免审直发（' + (req.user.role === 'admin' ? '管理员' : '社区/专业版自动通过') + '）');
     // 发布到广场 → 全员广播通知（避免重复发布刷新；仅首次上架或记录变化时发送）
     // P3：受限可见（visibility=restricted）的智能体不上广场、不全员广播（仅指定范围可见）
     const restricted = (old.visibility === 'restricted' && b.visibility !== 'public');
@@ -491,6 +531,56 @@ router.post('/:id/publish', (req, res) => {
   db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
     .run(req.user.username, to === 'published' ? '发布智能体' : '下架智能体', old.name, req.ip, now());
   res.json({ code: 0, msg: to === 'published' ? (publishedVersion ? `已发布（画布快照 v${publishedVersion}，线上即刻生效）` : '已发布') : '已下架', data: publishedVersion ? { version: publishedVersion } : undefined });
+});
+
+// V3.1 #12 审核流（2026-11-03）：管理员审批——approve（复用发布逻辑：快照/历史/广场广播）/ reject（驳回带意见）
+router.post('/:id/review', (req, res) => {
+  if (req.user.role !== 'admin') return res.json({ code: 403, msg: '审核需要管理员权限' });
+  const old = db.prepare('SELECT * FROM agents WHERE id=?').get(req.params.id);
+  if (!old) return res.json({ code: 404, msg: '智能体不存在' });
+  if (old.status !== 'review') return res.json({ code: 400, msg: '该智能体不在审核中（当前状态：' + old.status + '）' });
+  const { action } = req.body || {};
+  const comment = String((req.body || {}).comment || '').trim().slice(0, 500);
+  if (action === 'approve') {
+    // 复用发布分支逻辑（快照/版本历史/广场广播）——提审人写入 publish 相关字段（record 用提审说明，管理员审批不改发布说明）
+    const record = old.publish_record || '';
+    let snapSql = null, nodeCount = 0;
+    if (old.edit_mode === 'canvas' || old.routing_mode === 'workflow') {
+      const { validateWorkflowV2 } = require('../lib/workflow-schema');
+      let wf = null;
+      try { wf = JSON.parse(old.workflow || 'null'); } catch { wf = null; }
+      const v = wf && validateWorkflowV2(wf);
+      if (v && !v.error) { snapSql = JSON.stringify(v); nodeCount = v.nodes.length; }
+    }
+    const version = (db.prepare('SELECT COALESCE(MAX(version),0) v FROM agent_publish_history WHERE agent_id=?').get(old.id).v || 0) + 1;
+    db.prepare(`UPDATE agents SET status='published', publish_record=?, published_workflow=COALESCE(?, published_workflow), review_comment='', updated_at=datetime('now','localtime') WHERE id=?`)
+      .run(record, snapSql, old.id);
+    if (snapSql) {
+      db.prepare(`INSERT INTO agent_publish_history (agent_id, version, workflow, note, nodes, published_by, created_at) VALUES (?,?,?,?,?,?,datetime('now','localtime'))`)
+        .run(old.id, version, snapSql, record, nodeCount, old.owner || req.user.username);
+    }
+    insertReview(old.id, 'approve', req.user.username, comment);
+    // 广场广播（同发布分支语义：受限智能体不上广场）
+    if ((old.visibility || 'public') !== 'restricted') {
+      db.prepare(`INSERT INTO notifications (username,title,content,type,link,is_read,created_at) VALUES ('*',?,?,?,?,0,?)`)
+        .run(`新智能体上架：${old.name}`, `「${old.name}」审核通过已发布到广场${record ? '——' + record : ''}，点击前往使用。`, 'agent_publish', `#/square`, now());
+    }
+    db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
+      .run(req.user.username, '审核通过', old.name + (comment ? '（' + comment + '）' : ''), req.ip, now());
+    return res.json({ code: 0, msg: '已审核通过并发布' + (snapSql ? `（画布快照 v${version}）` : '') });
+  }
+  if (action === 'reject') {
+    if (!comment) return res.json({ code: 400, msg: '驳回必须填写审核意见（提审人需知道整改方向）' });
+    db.prepare(`UPDATE agents SET status='rejected', review_comment=?, updated_at=datetime('now','localtime') WHERE id=?`).run(comment, old.id);
+    insertReview(old.id, 'reject', req.user.username, comment);
+    // 通知提审人（不在场的管理员操作后，提审人下次登录可见）
+    db.prepare(`INSERT INTO notifications (username,title,content,type,link,is_read,created_at) VALUES (?,?,?,?,?,0,?)`)
+      .run(old.owner || '', `审核驳回：${old.name}`, `「${old.name}」未通过审核——${comment}。请修改后重新提审。`, 'agent_review', `#/admin/studio/${old.id}`, now());
+    db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
+      .run(req.user.username, '审核驳回', old.name + '（' + comment + '）', req.ip, now());
+    return res.json({ code: 0, msg: '已驳回，意见已通知提审人' });
+  }
+  return res.json({ code: 400, msg: 'action 仅支持 approve / reject' });
 });
 
 // P5.9 版本历史：列表（版本号/说明/发布人/节点数；不含大 JSON）
