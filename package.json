@@ -2,6 +2,7 @@
   "name": "agent-platform",
   "version": "1.0.0",
   "description": "企业级智能体平台：前台（首页对话/智能体/知识库/任务管理）+ 管理后台（数据看板/智能体管理/知识库管理/接入管理/模型接入/安全合规/系统监控/运营监控）",
+  "license": "Apache-2.0",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

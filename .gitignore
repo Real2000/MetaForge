@@ -2,9 +2,20 @@
 node_modules/
 .temp/
 server.log
+*.log
 
 # 业务数据与密钥（严禁入库）
 data/
+
+# 数据库与密钥文件通用模式（#13 开源加固 2026-11-03：防 data/ 之外的散落库文件/密钥误提交）
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+.env
+.env.*
+!.env.example
 
 # 用户生成产物与客户端安装包（体积大且非源码）
 public/uploads/

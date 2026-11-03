@@ -1,0 +1,25 @@
+agent-platform
+Copyright 2026 agent-platform contributors
+
+本产品依据 Apache License 2.0 开源（见 LICENSE）。
+
+第三方依赖（运行时，均以各自许可证分发）：
+===============================================================================
+- express          MIT
+- better-sqlite3   MIT
+- docx             MIT
+- mammoth          BSD-2-Clause
+- msedge-tts       MIT
+- pdf-parse        Apache-2.0
+- pptxgenjs        MIT
+- echarts          Apache-2.0
+- vectordb         Apache-2.0
+- xlsx             Apache-2.0
+===============================================================================
+
+说明：
+- 本清单覆盖 package.json 中全部 runtime dependencies（无 devDependencies）。
+- 上游更新或新增依赖时请同步维护本清单（可用 `npm ls --license` 辅助核对）。
+- 平台自身的「社区版/专业版/企业版」运行时功能分级（License 体系）是产品特性，
+  与本仓库源码的 Apache-2.0 开源许可相互独立：源码可自由使用与修改，
+  官方构建物中的高级特性开关不受本许可约束。
