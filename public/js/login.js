@@ -43,6 +43,24 @@ function forceChangePwd(user, token) {
 }
 
 export function render(root) {
+  // #14（2026-11-03）钉钉扫码回跳：URL hash 中的 60s 一次性 dingtalk_code POST 换 JWT（JSON body 交付，
+  // token 不落 URL/历史）。码一次性消费：先清 URL 再请求（刷新不重放报错），失败落回正常登录表单。
+  const mCode = /dingtalk_code=([0-9a-f]{64})/.exec(location.hash);
+  if (mCode) {
+    const code = mCode[1];
+    history.replaceState(null, '', '#/login'); // 立即清 URL（码一次性，留在地址栏刷新必 401）
+    (async () => {
+      try {
+        const j = await api('/auth/dingtalk/exchange', { method: 'POST', body: { code } });
+        setLogin(j.data.token, j.data.user);
+        toast(`${t('欢迎回来')}，${j.data.user.nickname || j.data.user.username}`);
+        location.hash = '#/home';
+      } catch (e) {
+        toast(e.message, 'err'); // 交换码过期/已用 → 落回正常登录表单（下方表单已渲染）
+      }
+    })();
+  }
+
   root.innerHTML = `
   <div class="login-wrap">
     <div class="pref-float"><span class="pref-theme">${getTheme() === 'dark' ? '☀️' : '🌙'}</span><span style="width:6px"></span><span class="pref-lang">${getLang() === 'en' ? 'EN' : '中'}</span></div>

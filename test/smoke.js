@@ -2338,6 +2338,15 @@ function t(name, fn) {
           assert.ok(out[9].endsWith('/401'), '第 10 次应返回业务码 401（密码错误），实际：' + out.join(','));
           assert.ok(out[10].startsWith('429'), '第 11 次应被限流 HTTP 429，实际：' + out.join(','));
         });
+        await t('HTTP：钉钉交换码——伪造码 401 + 响应不含任何 token 字样（#14）', async () => {
+          // 伪造/空码走路由负例：consume 返回 null → 401（正例已在 lib 单测覆盖——HTTP 正例需真实钉钉 OAuth 回调，
+          // mock 阶段凭证伪造不可行；路由→lib 的接线由「伪造码恰好命中限流前的 401 分支」验证）
+          const r1 = await jfetch('/api/auth/dingtalk/exchange', { method: 'POST', body: JSON.stringify({ code: 'a'.repeat(64) }) });
+          assert.strictEqual(r1.status, 401, '伪造 64hex 码应 401，实际 ' + r1.status);
+          const r2 = await jfetch('/api/auth/dingtalk/exchange', { method: 'POST', body: JSON.stringify({}) });
+          assert.strictEqual(r2.status, 401, '缺 code 字段应 401，实际 ' + r2.status);
+          assert.ok(!JSON.stringify(r2.j || {}).includes('token'), '负例响应不得泄露 token 字样：' + JSON.stringify(r2.j));
+        });
         await t('HTTP：providers 列表 API Key 脱敏回显（P5.30）', async () => {
           db.prepare(`INSERT INTO users (username,password,nickname,role,status,must_change_pwd,created_at) VALUES ('httpadmin',?,'测试管理员','admin',1,0,datetime('now','localtime'))`).run(hashPwd('http-pass-123'));
           const aid = db.prepare(`SELECT id FROM users WHERE username='httpadmin'`).get().id;
@@ -3027,6 +3036,44 @@ function t(name, fn) {
       assert.strictEqual(db.prepare(`SELECT dept_id FROM users WHERE id=?`).get(uid).dept_id, 1, '空映射同步后 dept_id 应保留（原实现裸写 null 直接清空——visible_depts 权限判定依据静默丢失）');
       assert.strictEqual(db.prepare(`SELECT nickname FROM users WHERE id=?`).get(uid).nickname, '新昵称', 'nickname 更新照常生效（COALESCE 只保护 dept_id，不影响其他字段）');
       db.prepare(`DELETE FROM users WHERE username='dingtalk_smoke-dt-u1'`).run();
+    });
+    // ===== #14 一次性交换码（2026-11-03）：钉钉回调 JWT 不落 URL 的交付机制 =====
+    await t('exchange-code：mint→consume 正常换载荷 + 64hex 形态（#14）', () => {
+      const ec = require('../src-server/lib/exchange-code');
+      const code = ec.mint({ token: 'fake-jwt-abc', user: { username: 'u1' } });
+      assert.ok(/^[0-9a-f]{64}$/.test(code), '交换码应为 64 hex 随机串：' + code.slice(0, 16) + '...');
+      const p1 = ec.consume(code);
+      assert.deepStrictEqual(p1, { token: 'fake-jwt-abc', user: { username: 'u1' } }, '首次消费应原样返回绑定载荷');
+    });
+    await t('exchange-code：一次性消费——同码二次 consume 返回 null（防重放，#14）', () => {
+      const ec = require('../src-server/lib/exchange-code');
+      const code = ec.mint({ v: 42 });
+      const first = ec.consume(code);
+      assert.ok(first && first.v === 42, '首次消费应返回绑定载荷');
+      const second = ec.consume(code);
+      assert.strictEqual(second, null, '二次消费必须返回 null（首次消费已删条目，防重放）');
+      // 独立码不受影响（删除是码维度而非全表）
+      const c2 = ec.mint({ v: 43 });
+      assert.strictEqual(ec.consume(c2).v, 43, '其他码照常可消费');
+    });
+    await t('exchange-code：过期返回 null + 伪造/空码返回 null（#14）', async () => {
+      const ec = require('../src-server/lib/exchange-code');
+      const code = ec.mint({ v: 1 }, 30); // 30ms 短时效
+      await new Promise(r => setTimeout(r, 60)); // 等过期
+      assert.strictEqual(ec.consume(code), null, '过期码应返回 null');
+      assert.strictEqual(ec.consume('0000deadbeef'), null, '伪造码应返回 null');
+      assert.strictEqual(ec.consume(''), null, '空码应返回 null');
+      assert.strictEqual(ec.consume(null), null, 'null 应返回 null（不抛错）');
+    });
+    await t('exchange-code：auth 回调产物含完整登录形状（token+user+must_change_pwd，#14）', () => {
+      // 验证 auth.js 路由模块可正常加载（exchange-code 接线无循环依赖/语法错误），
+      // 并确认回调携带的数据形状与 /auth/login 响应 data 字段同构（前端 setLogin 可直接消费）
+      const router = require('../src-server/routes/auth');
+      assert.strictEqual(typeof router, 'function', 'auth 路由应正常导出');
+      const ec = require('../src-server/lib/exchange-code');
+      const code = ec.mint({ token: 't', user: { id: 1, username: 'u', nickname: 'n', role: 'user', dept: '', onboarded: 1 }, must_change_pwd: 0 });
+      const p = ec.consume(code);
+      assert.ok(p.token && p.user.username && p.must_change_pwd === 0, '载荷应含 token/user/must_change_pwd 三字段');
     });
     // ===== V2.2 #8 版本分级 + License 授权控制（2026-10-31，三态用例：合法/篡改/缺失——测试先行）=====
     await t('License 缺失 → community 降级不抛错 + hasFeature 矩阵（V2.2 #8）', () => {

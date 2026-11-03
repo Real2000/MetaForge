@@ -5,6 +5,7 @@ const { db, hashPwd, verifyPwd, hashPwdAsync, now } = require('../db');
 const { sign, auth, revokeToken, TOKEN_TTL_MS } = require('../lib/auth');
 const { createLimiter, clientIp } = require('../lib/rate-limit');
 const { loadSecrets } = require('../lib/secrets'); // 钉钉 OAuth 凭证（DINGTALK_APP_KEY/APP_SECRET）
+const { mint: mintExchange, consume: consumeExchange } = require('../lib/exchange-code'); // #14：一次性交换码换 JWT
 const { upsertDingtalkUser } = require('./dingtalk'); // 扫码登录用户映射复用 user_add_org 同款规则
 
 const router = express.Router();
@@ -71,6 +72,12 @@ setInterval(() => {
   for (const [k, v] of oauthStates) if (v.expire < t) oauthStates.delete(k);
 }, 60 * 1000).unref(); // unref：不阻塞进程退出
 
+// ---------- #14（2026-11-03）一次性交换码：钉钉回调不再把 JWT 放进 302 URL ----------
+// 原实现 res.redirect(302, front + '/#/login?dingtalk_token=' + token)：JWT 整串暴露在浏览器历史/
+// Referer/代理日志，且前端从未实现 dingtalk_token 接收（token 白发）。
+// 改为：回调用 lib/exchange-code 签发 60s 一次性随机码走 URL（泄露面为短时效一次性码，用过/过期即废），
+// 前端 POST /api/auth/dingtalk/exchange 换 JWT（JSON body 交付，token 不落 URL）。
+
 // ---------- GET /dingtalk/url：签发扫码登录跳转地址（登录页发起，未登录可访问） ----------
 // V1.3 审查加固 2026-10-30：挂限流（与 loginLimiter 同款——否则高频刷可堆积百万级 state Map 条目，内存膨胀）
 const dingUrlLimiter = createLimiter({
@@ -114,7 +121,8 @@ router.get('/dingtalk/url', dingUrlLimiter, (req, res) => {
 
 // ---------- GET /dingtalk/callback：钉钉扫码回跳（浏览器 302 流程，非 XHR） ----------
 // 流程：state 校验（一次性消费防重放）→ code 换用户信息 → user_add_org 同款映射找/建用户
-//       → sign 签发与密码登录完全同构的 token（sign 内部自动加 jti）→ 302 回前端哈希路由带 token
+//       → sign 签发与密码登录完全同构的 token（sign 内部自动加 jti）→ 签发 60s 一次性交换码
+//       → 302 回前端 #/login?dingtalk_code=xxx，前端 POST /dingtalk/exchange 换 JWT（#14：token 不落 URL）
 router.get('/dingtalk/callback', async (req, res) => {
   const ip = clientIp(req);
   const { code, state } = req.query || {};
@@ -175,7 +183,30 @@ router.get('/dingtalk/callback', async (req, res) => {
   if (!originOk) {
     return fail('重定向目标与当前站点不同源（疑似伪造 origin）', 403, '扫码登录回调源校验失败');
   }
-  res.redirect(302, front + '/#/login?dingtalk_token=' + encodeURIComponent(token));
+  // ⑥ #14（2026-11-03）安全收口：JWT 不再走 302 URL。签发 60s 一次性交换码走 URL（泄露后 60s 内
+  // 一次性消费即作废），前端 POST /api/auth/dingtalk/exchange 换 JWT（JSON body 交付）
+  const exchangeCode = mintExchange({
+    token,
+    user: { id: user.id, username: user.username, nickname: user.nickname, role: user.role, dept: user.dept, onboarded: user.onboarded ? 1 : 0 },
+    must_change_pwd: user.must_change_pwd ? 1 : 0, // API 形状与 /auth/login 一致（钉钉用户实际恒 0）
+  });
+  res.redirect(302, front + '/#/login?dingtalk_code=' + exchangeCode);
+});
+
+// ---------- POST /dingtalk/exchange：一次性交换码换 JWT（#14 2026-11-03） ----------
+// 前端登录页检测 URL hash 的 dingtalk_code 后 POST 本接口；lib/exchange-code consume 命中即删（防重放）。
+// 防暴力猜码：与 loginLimiter 同款限流（32 字节随机码本身不可猜，限流做防御纵深）
+const dingExchangeLimiter = createLimiter({
+  name: 'dingtalk-exchange',
+  windowMs: 60000,
+  max: 10,
+  keyFn: req => req.ip || clientIp(req),
+  msg: '交换码验证过于频繁，请稍后再试',
+});
+router.post('/dingtalk/exchange', dingExchangeLimiter, (req, res) => {
+  const payload = consumeExchange(String((req.body || {}).code || ''));
+  if (!payload) return res.status(401).json({ code: 401, msg: '交换码无效或已使用（60 秒有效），请重新扫码登录' });
+  res.json({ code: 0, data: payload });
 });
 
 module.exports = router;
