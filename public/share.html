@@ -70,6 +70,17 @@
       const $ = s => document.querySelector(s);
       let info = null, sid = null, streaming = false;
 
+      // V3.1 #12 嵌入（2026-11-03）：iframe 嵌入场景高度上报——浮窗组件（/embed/widget.js）监听
+      // ap-share-height 消息自适应面板高度。仅在被嵌入（window.parent !== window）时发送，普通浏览器访问零开销。
+      const reportHeight = () => {
+        try {
+          if (window.parent === window) return;
+          window.parent.postMessage({ type: 'ap-share-height', height: Math.max(document.body.scrollHeight, document.documentElement.scrollHeight) }, '*');
+        } catch (e) { /* 跨域受限时静默（高度上报是尽力而为的增强） */ }
+      };
+      window.addEventListener('load', reportHeight);
+      setInterval(reportHeight, 1500); // 流式回复/图片加载引起的高度变化周期上报
+
       try {
         const r = await fetch(`/api/share/${token}/info`);
         const j = await r.json();

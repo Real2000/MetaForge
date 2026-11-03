@@ -784,6 +784,45 @@ router.post('/:id/share', (req, res) => {
   }
 });
 
+// ---------- V3.1 #12 嵌入代码（2026-11-03）：第三方站点嵌入（iframe / JS 浮窗两种） ----------
+// 安全设计（对齐安全报告 T2.1/T2.3）：
+//   ① 嵌入前提 = 已发布 + 已开启分享（复用 share_token 免登链路，不新开匿名面）
+//   ② 域名白名单 embed_domains 驱动 server.js 的 CSP frame-ancestors（未配置=仅 'self' 可嵌，防点击劫持）
+//   ③ 权限 = isOwnerLevel（嵌入暴露面管理属归属级决策，与分享开关同档）
+//   ④ 域名格式严格校验（防 CSP 头注入：逗号/引号/通配符一律拒绝）
+router.post('/:id/embed-config', (req, res) => {
+  const agent = db.prepare('SELECT * FROM agents WHERE id=?').get(req.params.id);
+  if (!agent) return res.json({ code: 404, msg: '智能体不存在' });
+  if (!isOwnerLevel(agent, req.user)) return res.json({ code: 403, msg: '无权限（嵌入配置仅创建者与管理员可管理）' });
+  const raw = String((req.body || {}).domains || '');
+  // 解析 + 格式校验：支持逗号/换行/中文分隔符；每项须为纯域名（含子域），拒绝 http 前缀（只按域匹配）
+  const items = raw.split(/[,\n;，；]/).map(s => s.trim().toLowerCase()).filter(Boolean);
+  const bad = items.filter(d => !/^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(d) || d.length > 253);
+  if (bad.length) return res.json({ code: 400, msg: `域名格式不合法：${bad.join('、')}（应为纯域名如 example.com，不带 http:// 前缀）` });
+  const uniq = [...new Set(items)].slice(0, 20); // 上限 20 个（防 CSP 头超长）
+  db.prepare('UPDATE agents SET embed_domains=? WHERE id=?').run(uniq.join(','), agent.id);
+  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
+    .run(req.user.username, '配置嵌入域名', `${agent.name}：${uniq.length ? uniq.join(',') : '（清空，仅本站可嵌）'}`, req.ip, now());
+  res.json({ code: 0, msg: uniq.length ? `已允许 ${uniq.length} 个域名嵌入（CSP 即刻生效）` : '已清空域名白名单（仅本站可嵌入）', data: { domains: uniq } });
+});
+
+// 嵌入代码生成：iframe 直嵌 + JS 浮窗两种 snippet（含域名白名单回显；未达前提时返回引导信息）
+router.get('/:id/embed-code', (req, res) => {
+  const agent = db.prepare('SELECT * FROM agents WHERE id=?').get(req.params.id);
+  if (!agent) return res.json({ code: 404, msg: '智能体不存在' });
+  if (!isOwnerLevel(agent, req.user)) return res.json({ code: 403, msg: '无权限（嵌入代码仅创建者与管理员可获取）' });
+  if (agent.status !== 'published') return res.json({ code: 400, msg: '请先发布该智能体（嵌入页面仅对已发布智能体可用）', data: { need: 'publish' } });
+  if (!agent.share_enabled || !agent.share_token) return res.json({ code: 400, msg: '请先开启分享链接（嵌入复用分享链路的免登会话）', data: { need: 'share' } });
+  const domains = String(agent.embed_domains || '').split(',').map(s => s.trim()).filter(Boolean);
+  if (!domains.length) return res.json({ code: 400, msg: '请先配置允许嵌入的域名白名单（防点击劫持：未配置时仅本站可嵌）', data: { need: 'domains' } });
+  // 站点根地址：协议 + Host（嵌入方按此拼 URL；反代/子路径部署天然兼容）
+  const origin = `${req.protocol}://${req.headers.host || 'localhost'}`;
+  const shareUrl = `${origin}/share/${agent.share_token}`;
+  const iframe = `<iframe src="${shareUrl}" title="${agent.name.replace(/"/g, '&quot;')}" style="width:100%;height:640px;border:0;border-radius:12px" loading="lazy" allow="clipboard-write"></iframe>`;
+  const script = `<!-- 智能体嵌入浮窗：${agent.name}（在页面右下角渲染对话球，点击展开） -->\n<script>\n(function(){var s=document.createElement('script');s.async=true;\ns.src="${origin}/embed/widget.js?token=${agent.share_token}";\ndocument.body.appendChild(s);})();\n</script>`;
+  res.json({ code: 0, data: { domains, share_url: shareUrl, iframe, script, note: `已允许嵌入的域名：${domains.join('、')}（配置变更在「嵌入」弹窗中保存，CSP 即刻生效）` } });
+});
+
 // ---------- 提示词 AI 优化（借鉴 SinguX「优化」按钮：AI 根据简单描述生成结构化提示词） ----------
 router.post('/optimize-prompt', async (req, res) => {
   const { name, description, prompt } = req.body || {};

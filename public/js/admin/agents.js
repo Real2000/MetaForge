@@ -63,6 +63,7 @@ export async function render(el) {
             <button class="btn link" data-apidoc="${a.id}" title="接口文档：参数/输出/调用示例由画布 Start/End 节点自动生成">文档</button>
             <button class="btn link" data-api="${a.id}">API</button>
             <button class="btn link" data-share="${a.id}">${a.share_enabled ? '分享中' : '分享'}</button>
+            <button class="btn link" data-embed="${a.id}" title="嵌入代码：iframe / JS 浮窗两种（需已发布+已分享+域名白名单）">嵌入</button>
             <button class="btn link" data-export="${a.id}">导出</button>
             <button class="btn link" style="color:var(--danger)" data-del="${a.id}">删除</button>
           </td>
@@ -85,6 +86,7 @@ export async function render(el) {
       pane.querySelectorAll('[data-analytics]').forEach(b => b.onclick = () => openAnalytics(+b.dataset.analytics));
       pane.querySelectorAll('[data-export]').forEach(b => b.onclick = () => exportAgent(+b.dataset.export));
       pane.querySelectorAll('[data-share]').forEach(b => b.onclick = () => openShare(+b.dataset.share));
+      pane.querySelectorAll('[data-embed]').forEach(b => b.onclick = () => openEmbed(+b.dataset.embed));
       pane.querySelectorAll('[data-del]').forEach(b => b.onclick = async () => {
         if (!await confirmBox('删除该智能体？关联会话将保留但无法继续对话。')) return;
         await api(`/agents/${b.dataset.del}`, { method: 'DELETE' });
@@ -97,6 +99,73 @@ export async function render(el) {
     pane.querySelector('#fromTpl').onclick = openTemplates;
     pane.querySelector('#importCfg').onclick = importAgentCfg;
     rows();
+  }
+
+  // ---------- V3.1 #12 嵌入代码（2026-11-03）：域名白名单管理 + iframe/JS 浮窗两种 snippet ----------
+  async function openEmbed(id) {
+    const a = agents.find(x => x.id === id);
+    if (!a) return;
+    let domains = String(a.embed_domains || '').split(',').map(s => s.trim()).filter(Boolean);
+    const m = modal({
+      title: `嵌入代码：${a.name}`,
+      body: `
+        <div style="font-size:12.5px;line-height:1.7;color:var(--text-2);margin-bottom:12px">
+          将该智能体嵌入第三方站点（对话能力直接在你的网站可用）。<b>安全前置</b>：已发布 + 已开启分享 + 配置域名白名单——
+          未列入白名单的域名会被 CSP 拒绝嵌入（防点击劫持/盗用）。
+        </div>
+        <div class="form-item"><label>允许嵌入的域名白名单（逗号或换行分隔，至多 20 个，纯域名不带 https://）</label>
+          <textarea class="input" id="embDomains" rows="2" placeholder="例如：www.example.com, portal.example.com">${esc(domains.join(', '))}</textarea>
+        </div>
+        <div style="display:flex;gap:8px;margin:10px 0 14px">
+          <button class="btn" id="embSave">保存域名白名单</button>
+          <button class="btn primary" id="embGen">生成嵌入代码</button>
+        </div>
+        <div id="embOut"></div>`,
+      foot: `<button class="btn" data-close>关闭</button>`,
+      onMount(mask) {
+        mask.querySelector('#embSave').onclick = async () => {
+          try {
+            const j = await api(`/agents/${id}/embed-config`, { method: 'POST', body: { domains: mask.querySelector('#embDomains').value } });
+            toast(j.msg || '已保存');
+            if (j.code === 0) { domains = j.data?.domains || []; a.embed_domains = domains.join(','); }
+          } catch (e) { toast(e.message, 'err'); }
+        };
+        const copy = (txt, btn) => {
+          navigator.clipboard?.writeText(txt).then(() => { btn.textContent = '已复制 ✓'; setTimeout(() => btn.textContent = '复制', 1500); });
+        };
+        const renderOut = (d) => {
+          const out = mask.querySelector('#embOut');
+          out.innerHTML = `
+            <div style="font-size:11.5px;color:var(--text-3);margin-bottom:6px">✅ 已允许域名：${d.domains.map(esc).join('、')}（CSP 即刻生效，域名变更后需重新保存）</div>
+            <label style="font-size:12px;font-weight:600">方式一：iframe 直嵌（推荐，简单可控）</label>
+            <div style="display:flex;gap:6px;align-items:flex-start;margin:4px 0 10px">
+              <pre class="mono" style="flex:1;font-size:11px;background:var(--surface-2,#f8fafc);border:1px solid var(--border,#eef0f4);border-radius:8px;padding:8px 10px;white-space:pre-wrap;word-break:break-all;max-height:110px;overflow:auto;margin:0">${esc(d.iframe)}</pre>
+              <button class="btn" id="cpIframe">复制</button>
+            </div>
+            <label style="font-size:12px;font-weight:600">方式二：JS 浮窗（右下角对话球，点击展开）</label>
+            <div style="display:flex;gap:6px;align-items:flex-start;margin:4px 0 2px">
+              <pre class="mono" style="flex:1;font-size:11px;background:var(--surface-2,#f8fafc);border:1px solid var(--border,#eef0f4);border-radius:8px;padding:8px 10px;white-space:pre-wrap;word-break:break-all;max-height:150px;overflow:auto;margin:0">${esc(d.script)}</pre>
+              <button class="btn" id="cpScript">复制</button>
+            </div>
+            <div style="font-size:11px;color:var(--text-3)">${esc(d.note || '')}</div>`;
+          out.querySelector('#cpIframe').onclick = e => copy(d.iframe, e.target);
+          out.querySelector('#cpScript').onclick = e => copy(d.script, e.target);
+        };
+        mask.querySelector('#embGen').onclick = async () => {
+          try {
+            // rawResponse：业务码 400（前置缺失引导）不抛错，由本处按 need 字段渲染引导而非 toast
+            const j = await api(`/agents/${id}/embed-code`, { rawResponse: true });
+            if (j.code === 0) return renderOut(j.data);
+            // 前置缺失引导（need 字段：publish / share / domains）
+            const need = j.data?.need;
+            const out = mask.querySelector('#embOut');
+            out.innerHTML = `<div style="font-size:12.5px;color:var(--warn,#b45309);background:var(--surface-3,#fffbeb);border:1px solid #fde68a;border-radius:8px;padding:8px 12px">⚠️ ${esc(j.msg || '无法生成')}${need === 'domains' ? '——上方填写域名并点「保存域名白名单」后再生成' : need === 'share' ? '——先在列表「分享」按钮开启分享链接' : need === 'publish' ? '——先发布该智能体' : ''}</div>`;
+          } catch (e) { toast(e.message, 'err'); }
+        };
+        // 已有白名单时自动生成一次（省一次点击）
+        if (domains.length) mask.querySelector('#embGen').click();
+      },
+    });
   }
 
   // ---------- V3.1 #12 审核流（2026-11-03）：驳回弹窗（必填意见，提审人可据此整改重提） ----------

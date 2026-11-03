@@ -2388,6 +2388,48 @@ function t(name, fn) {
           // 自清理
           db.prepare('DELETE FROM agents WHERE id=?').run(ag.id);
         });
+        // ===== V3.1 #12 嵌入代码（2026-11-03）：域名白名单 + snippet 生成 + CSP frame-ancestors =====
+        let embAid = 0, embToken = '';
+        await t('HTTP：嵌入代码——权限/格式校验/前置门禁/snippet 生成（V3.1 #12）', async () => {
+          // 造已发布+已分享的智能体（owner=httpu1；share_token 直插——开分享的正常入口走 POST /:id/share，此处直插等效）
+          embToken = 'emb' + require('crypto').randomBytes(8).toString('hex');
+          db.prepare(`INSERT INTO agents (name,type,category,owner,status,visibility,share_token,share_enabled,created_at,updated_at) VALUES ('嵌入测试agent','other','未分类','httpu1','published','public',?,1,datetime('now','localtime'),datetime('now','localtime'))`).run(embToken);
+          embAid = db.prepare(`SELECT id FROM agents WHERE share_token=?`).get(embToken).id;
+          // ① 他人（httpu2）配置嵌入域名 → 403（归属级权限）
+          const r403 = await jfetch(`/api/agents/${embAid}/embed-config`, { method: 'POST', body: JSON.stringify({ domains: 'evil.com' }) }, tok2);
+          assert.strictEqual(r403.j && r403.j.code, 403, '非 owner 配置嵌入域名应 403，实际：' + JSON.stringify(r403.j));
+          // ② 非法域名格式 → 400（防 CSP 头注入：带协议/引号/通配符全拒）
+          const bad = await jfetch(`/api/agents/${embAid}/embed-config`, { method: 'POST', body: JSON.stringify({ domains: 'https://x.com, "a", *.b.com' }) }, tok1);
+          assert.strictEqual(bad.j && bad.j.code, 400, '非法域名格式应 400：' + JSON.stringify(bad.j));
+          // ③ 未配白名单生成代码 → 400 + need=domains 引导
+          const noDom = await jfetch(`/api/agents/${embAid}/embed-code`, {}, tok1);
+          assert.strictEqual(noDom.j && noDom.j.code, 400, '无白名单生成应 400：' + JSON.stringify(noDom.j));
+          assert.strictEqual(noDom.j.data && noDom.j.data.need, 'domains', '引导字段应为 domains');
+          // ④ 合法域名 → 保存成功 + 生成 snippet（iframe 含 share URL、script 含 widget.js）
+          const ok = await jfetch(`/api/agents/${embAid}/embed-config`, { method: 'POST', body: JSON.stringify({ domains: 'www.example.com, portal.example.com, www.example.com' }) }, tok1);
+          assert.ok(ok.j && ok.j.code === 0, '合法域名应保存成功：' + JSON.stringify(ok.j));
+          assert.deepStrictEqual(ok.j.data.domains, ['www.example.com', 'portal.example.com'], '域名应去重且保序：' + JSON.stringify(ok.j.data.domains));
+          const gen = await jfetch(`/api/agents/${embAid}/embed-code`, {}, tok1);
+          assert.ok(gen.j && gen.j.code === 0, '生成嵌入代码应成功：' + JSON.stringify(gen.j).slice(0, 140));
+          assert.ok((gen.j.data.iframe || '').includes(`/share/${embToken}`), 'iframe snippet 应含 share URL');
+          assert.ok((gen.j.data.script || '').includes(`/embed/widget.js?token=${embToken}`), 'script snippet 应含 widget.js 入口');
+          assert.deepStrictEqual(gen.j.data.domains, ['www.example.com', 'portal.example.com'], '回显白名单');
+        });
+        await t('HTTP：嵌入防护——CSP frame-ancestors 白名单生效 + 无白名单仅 self（V3.1 #12）', async () => {
+          // 有白名单的 token：CSP 头含两个域名 + 'self'
+          const r1 = await fetch(base + `/share/${embToken}`);
+          const csp1 = r1.headers.get('content-security-policy') || '';
+          assert.ok(csp1.includes("frame-ancestors 'self' www.example.com portal.example.com"), 'CSP 应含白名单域名：' + csp1);
+          // 无白名单的 token（另造一个未配置 embed_domains 的分享 agent）：CSP 仅 'self'（点击劫持默认防护）
+          const tok2share = 'embx' + require('crypto').randomBytes(8).toString('hex');
+          db.prepare(`INSERT INTO agents (name,type,category,owner,status,visibility,share_token,share_enabled,created_at,updated_at) VALUES ('嵌入CSP对照agent','other','未分类','httpu1','published','public',?,1,datetime('now','localtime'),datetime('now','localtime'))`).run(tok2share);
+          const r2 = await fetch(base + `/share/${tok2share}`);
+          const csp2 = r2.headers.get('content-security-policy') || '';
+          assert.strictEqual(csp2, "frame-ancestors 'self'", '无白名单应仅 self：' + csp2);
+          // 清理
+          db.prepare(`DELETE FROM agents WHERE share_token IN (?,?)`).run(embToken, tok2share);
+          db.prepare(`DELETE FROM agents WHERE id=?`).run(embAid);
+        });
         await t('HTTP：providers 列表 API Key 脱敏回显（P5.30）', async () => {
           db.prepare(`INSERT INTO users (username,password,nickname,role,status,must_change_pwd,created_at) VALUES ('httpadmin',?,'测试管理员','admin',1,0,datetime('now','localtime'))`).run(hashPwd('http-pass-123'));
           const aid = db.prepare(`SELECT id FROM users WHERE username='httpadmin'`).get().id;

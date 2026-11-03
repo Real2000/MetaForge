@@ -86,7 +86,20 @@ app.use('/api/mcp-server', require('./src-server/routes/mcp-server'));
 app.get('/api/health', (req, res) => res.json({ code: 0, data: { ok: true, ts: Date.now() } }));
 
 // 分享页面（/share/:token → share.html，前端自解析 token）
-app.get('/share/*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'share.html')));
+// V3.1 #12 嵌入代码（2026-11-03）：按 token 对应智能体的 embed_domains 白名单动态下发 CSP
+// frame-ancestors（点击劫持防护核心——安全报告 T2.1）：白名单域名 + 'self' 可嵌；未配置白名单仅 'self'。
+// share API 响应头同源处理见 routes/share.js；此处覆盖页面级（iframe 嵌的是页面而非 API）。
+app.get('/share/*', (req, res) => {
+  try {
+    const { db } = require('./src-server/db');
+    const token = String(req.path.split('/')[2] || '').slice(0, 64);
+    const a = token ? db.prepare('SELECT embed_domains FROM agents WHERE share_token=? AND share_enabled=1').get(token) : null;
+    const domains = String(a && a.embed_domains || '')
+      .split(/[,\n;，；]/).map(s => s.trim().toLowerCase()).filter(d => /^[a-z0-9.-]+\.[a-z]{2,}$/.test(d)); // 域名格式白名单校验
+    res.setHeader('Content-Security-Policy', `frame-ancestors 'self'${domains.length ? ' ' + domains.join(' ') : ''}`);
+  } catch { res.setHeader('Content-Security-Policy', "frame-ancestors 'self'"); } // 兜底：查询失败也保底防嵌
+  res.sendFile(path.join(__dirname, 'public', 'share.html'));
+});
 
 // SPA 兑底
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));

@@ -629,6 +629,11 @@ db.exec(`CREATE INDEX IF NOT EXISTS idx_agent_reviews_agent ON agent_reviews(age
     db.exec(`ALTER TABLE agents ADD COLUMN review_comment TEXT DEFAULT ''`);
     console.log('[db] agents 表已迁移：新增 review_comment 字段（V3.1 #12 审核流——最新驳回意见，前台展示用）');
   }
+  // V3.1 #12 嵌入代码（2026-11-03）：第三方站点嵌入域名白名单（逗号/换行分隔；空=不允许嵌入——CSP frame-ancestors 仅 'self'）
+  if (!aCols.includes('embed_domains')) {
+    db.exec(`ALTER TABLE agents ADD COLUMN embed_domains TEXT DEFAULT ''`);
+    console.log('[db] agents 表已迁移：新增 embed_domains 字段（V3.1 #12 嵌入域名白名单）');
+  }
 }
 
 // agents 表补充协作与可见性字段（2026-10-22 P3 协作与团队功能）
