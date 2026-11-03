@@ -2334,4 +2334,17 @@ agent-platform/
 ### 验证
 冒烟 281/0 全绿；生产库副本实测：回填后 agents 32 行/kbs 4 行全部归企业空间，普通用户（zhangsan）可见智能体 27→30（仅增不减，被旧过渡语义误过滤的 3 个企业智能体恢复可见）；浏览器实测 http://localhost:3210/#/agents：登录后页面完整渲染，控制台无新增错误。回填需重启服务生效（db.js 启动时幂等执行）。
 
+## V3.1 #14/#13/#12/#11 四事项（2026-11-03）
+
+### 实现内容
+- **#14 JWT URL 参数风险修复**：钉钉扫码回调不再把 JWT 放 302 URL（浏览器历史/Referer 泄露面 + 前端从未接收的白发 bug）；新增 lib/exchange-code.js（60s 一次性交换码：mint/consume 命中即删防重放），回调改带 dingtalk_code，前端 login.js POST /api/auth/dingtalk/exchange 换 JWT（JSON body 交付）+ 5 条冒烟（957be78）
+- **#13 开源评估**：选定 Apache-2.0（LICENSE+NOTICE 落盘，10 个运行时依赖全宽松许可无 GPL 传染）；.gitignore 加固（*.db/*.log/.env 通用模式，与 144 个跟踪文件零冲突）；docs/开源就绪检查清单.md（三方扫描证据：git 历史 data/ 零泄露、源码零真实密钥、待办清单）；package.json 补 license 字段（a9ec84f）
+- **#12 审核流**：agents status 四态流转 draft→review→published/rejected；企业版（audit_flow 特性）非 admin 提审走人工审核，社区/专业版与管理员直发（auto_approve 流水）；agent_reviews 审核流水表 + review_comment 驳回意见列；路由：POST /:id/submit 走 publish 复用、POST /:id/review（approve 复用发布逻辑/驳回必填意见+通知提审人）、GET /review-queue（仅 admin）；admin 前端四态筛选+通过/驳回操作+驳回弹窗，studio 编排页四态状态栏（ed4960a）
+- **#12 嵌入代码**：agents.embed_domains 域名白名单列（严格格式校验防 CSP 头注入，上限 20 个）；server.js /share/* 动态 CSP frame-ancestors（白名单+'self'，无白名单仅 self——点击劫持默认防护）；POST /:id/embed-config + GET /:id/embed-code（iframe 直嵌/JS 浮窗双 snippet，前置门禁 publish/share/domains 三态引导）；public/embed/widget.js 零依赖浮窗组件（右下角对话球+postMessage 高度自适应，origin 白名单校验防消息伪造）；share.html 高度上报；admin 嵌入弹窗（域名管理+双代码段+复制）（0af2e0e）
+- **#11 钉钉 H5 方案设计+mock**：dingtalk.js 新增 /h5/config（模式发现）/h5/login（免登换 JWT：真实=auth_code 换 userid，mock=凭证未配置时 mock_user 直登）/h5/jsapi-config（dd.config 签名，钉钉官方 HMAC-SHA256 算法）/h5/send-msg（工作通知，auth 门禁）；登录页 mock 模式显示「钉钉免登（演示）」按钮；docs/钉钉H5接入说明.md（真实联调五步清单）；安全要点：mock 通道凭证配置后自动关闭（冒烟断言后门不可达）
+- 建表数 tripwire 49→50（agent_reviews）
+
+### 验证
+冒烟 293/0 全绿（281 基线 + 12 条新用例：#14 交换码 5 + #12 审核流/嵌入 7 + #11 钉钉 H5 2... 实为各分组合计）；#12 嵌入浏览器实测（临时子进程 33210 端口独立数据目录）：域名保存→CSP 头动态更新（frame-ancestors 'self' www.mycompany.com portal.mycompany.com 实测命中）→iframe/JS 双 snippet 生成→widget.js 200 可达；#11 mock 全链路实测：mock 免登 demo→JWT 过 /auth/me→签名独立复算一致→消息审计留痕。生产生效需重启服务（运行中进程为旧代码）。
+
 > AI生成

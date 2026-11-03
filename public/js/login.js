@@ -86,6 +86,7 @@ export function render(root) {
         </div>
         <button class="btn primary" type="submit" style="width:100%;justify-content:center;padding:11px;font-size:14px;margin-top:6px" id="loginBtn">${t('登 录')}</button>
       </form>
+      <button class="btn" id="dtH5Btn" style="width:100%;justify-content:center;padding:10px;font-size:13px;margin-top:10px;display:none">📱 ${t('钉钉免登（演示）')}</button>
       <div class="demo-tip">
         ${t('演示账号')}：<b>admin</b>（${t('管理员')}）/ <b>demo</b>（${t('普通用户')}）<br>
         ${t('初始密码由管理员在后台「用户管理」中设置与重置')}
@@ -141,4 +142,28 @@ export function render(root) {
       btn.disabled = false; btn.textContent = t('登 录');
     }
   });
+
+  // V3.1 #11 钉钉 H5 免登（2026-11-03）：mock 模式（凭证未配置）显示演示按钮——POST /dingtalk/h5/login
+  // 直登 demo 账号验证免登链路（JWT 走 JSON body，#14 同款安全交付）；真实模式按钮隐藏（待 JSAPI 联调阶段接线）
+  (async () => {
+    try {
+      const j = await api('/dingtalk/h5/config', { rawResponse: true });
+      if (j.code !== 0 || !j.data?.mock) return;
+      const btn = root.querySelector('#dtH5Btn');
+      btn.style.display = 'flex';
+      btn.onclick = async () => {
+        btn.disabled = true; btn.textContent = t('免登中…');
+        try {
+          const r = await api('/dingtalk/h5/login', { method: 'POST', body: { mock_user: 'demo' } });
+          setLogin(r.data.token, r.data.user);
+          toast(`${t('欢迎回来')}，${r.data.user.nickname || r.data.user.username}（${t('钉钉免登演示')}）`);
+          location.hash = '#/home';
+        } catch (e) {
+          toast(e.message, 'err');
+        } finally {
+          btn.disabled = false; btn.textContent = `📱 ${t('钉钉免登（演示）')}`;
+        }
+      };
+    } catch { /* config 不可达时静默（登录页核心是密码登录） */ }
+  })();
 }

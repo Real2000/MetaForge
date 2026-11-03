@@ -2430,6 +2430,76 @@ function t(name, fn) {
           db.prepare(`DELETE FROM agents WHERE share_token IN (?,?)`).run(embToken, tok2share);
           db.prepare(`DELETE FROM agents WHERE id=?`).run(embAid);
         });
+        // ===== V3.1 #11 钉钉 H5（2026-11-03）：真实模式安全断言（凭证已配置的子进程） =====
+        await t('HTTP：钉钉H5——凭证已配置时 mock 免登后门关闭（V3.1 #11）', async () => {
+          // 模式发现：enabled=true / mock=false（HTTP 组前置已写 DINGTALK_APP_KEY/SECRET）
+          const cfg = await jfetch('/api/dingtalk/h5/config');
+          assert.strictEqual(cfg.j.data.mock, false, '凭证已配置应为真实模式：' + JSON.stringify(cfg.j.data));
+          // 关键安全断言：真实模式下 mock_user 参数不可达（返回 missing auth_code 而非 mock 登录）
+          const r = await jfetch('/api/dingtalk/h5/login', { method: 'POST', body: JSON.stringify({ mock_user: 'admin' }) });
+          assert.strictEqual(r.j && r.j.code, 400, '真实模式 mock_user 登录应 400（mock 后门必须关闭）：' + JSON.stringify(r.j));
+          assert.ok(/auth_code/.test(r.j.msg || ''), '400 应指向缺 auth_code：' + r.j.msg);
+          // jsapi-config 非法 url → 400
+          const js = await jfetch('/api/dingtalk/h5/jsapi-config', { method: 'POST', body: JSON.stringify({ url: 'not-a-url' }) });
+          assert.strictEqual(js.j && js.j.code, 400, '非法 url 应 400：' + JSON.stringify(js.j));
+          // send-msg：无 token 401（auth 中间件门禁）
+          const noAuth = await jfetch('/api/dingtalk/h5/send-msg', { method: 'POST', body: JSON.stringify({ userid_list: 'u1', content: 'hi' }) });
+          assert.strictEqual(noAuth.status, 401, '无 token 应 HTTP 401，实际 ' + noAuth.status);
+          // 有 token 空 body → 400（参数校验先于外呼）
+          const empty = await jfetch('/api/dingtalk/h5/send-msg', { method: 'POST', body: JSON.stringify({}) }, tok1);
+          assert.strictEqual(empty.j && empty.j.code, 400, '空 body 应 400：' + JSON.stringify(empty.j));
+        });
+        // ===== V3.1 #11 钉钉 H5 mock 模式全链路（独立子进程 + 全新临时数据目录，无钉钉凭证） =====
+        {
+          const port2 = 35000 + Math.floor(Math.random() * 1000);
+          const base2 = `http://127.0.0.1:${port2}`;
+          const child2 = spawn(process.execPath, ['server.js'], {
+            cwd: path.join(__dirname, '..'),
+            env: { ...process.env, PORT: String(port2), AGENT_DATA_DIR: process.env.AGENT_DATA_DIR + '-h5mock' },
+            stdio: 'ignore',
+          });
+          try {
+            let up2 = false;
+            for (let i = 0; i < 50 && !up2; i++) {
+              await new Promise(r2 => setTimeout(r2, 200));
+              try { up2 = (await fetch(base2 + '/api/health')).ok; } catch { }
+            }
+            await t('HTTP：钉钉H5 mock——config 模式发现 + 免登换可用 JWT + 签名可复算 + 消息留痕（V3.1 #11）', async () => {
+              assert.ok(up2, 'mock 子进程应在 10s 内就绪');
+              const jf2 = async (p, opts = {}, tok) => {
+                const r = await fetch(base2 + p, { ...opts, headers: { 'Content-Type': 'application/json', ...(tok ? { Authorization: 'Bearer ' + tok } : {}) } });
+                let j = null; try { j = await r.json(); } catch { }
+                return { status: r.status, j };
+              };
+              // ① config：mock=true（全新数据目录无钉钉凭证）
+              const cfg = await jf2('/api/dingtalk/h5/config');
+              assert.strictEqual(cfg.j.data.mock, true, '无凭证应为 mock 模式：' + JSON.stringify(cfg.j.data));
+              // ② mock 免登：demo 账号换 JWT（与密码登录同构载荷）
+              const lg = await jf2('/api/dingtalk/h5/login', { method: 'POST', body: JSON.stringify({ mock_user: 'demo' }) });
+              assert.ok(lg.j && lg.j.code === 0 && lg.j.data.token, 'mock 免登应返回 token：' + JSON.stringify(lg.j).slice(0, 140));
+              assert.strictEqual(lg.j.data.user.username, 'demo', '应为 demo 用户');
+              assert.strictEqual(lg.j.mock, true, '响应应带 mock 标记');
+              // ③ 签发的 JWT 在主鉴权链路可用（/api/auth/me 校验通过）
+              const me = await jf2('/api/auth/me', {}, lg.j.data.token);
+              assert.strictEqual(me.j.data.username, 'demo', '免登 JWT 应通过 /auth/me：' + JSON.stringify(me.j).slice(0, 100));
+              // ④ jsapi-config：mock 票据 + 真实算法——独立复算签名验证（HMAC-SHA256(ticket, nonce+ts+url)）
+              const pageUrl = base2 + '/#/home';
+              const js = await jf2('/api/dingtalk/h5/jsapi-config', { method: 'POST', body: JSON.stringify({ url: pageUrl }) });
+              assert.ok(js.j && js.j.code === 0 && js.j.data.signature, 'jsapi-config 应返回签名：' + JSON.stringify(js.j).slice(0, 140));
+              const ticket = 'mock-jsapi-ticket-' + require('crypto').createHash('sha256').update('mock:h5').digest('hex').slice(0, 32);
+              const expect = require('crypto').createHmac('sha256', ticket).update(`${js.j.data.nonceStr}${js.j.data.timeStamp}${pageUrl}`).digest('hex');
+              assert.strictEqual(js.j.data.signature, expect, '签名应与钉钉官方算法独立复算一致');
+              // ⑤ send-msg：带 token 走 mock 分支（审计留痕 + mock 标记）
+              const sm = await jf2('/api/dingtalk/h5/send-msg', { method: 'POST', body: JSON.stringify({ userid_list: 'u1,u2', title: '冒烟', content: 'V3.1#11 mock 消息' }) }, lg.j.data.token);
+              assert.ok(sm.j && sm.j.code === 0 && sm.j.data && sm.j.data.mock === true, 'mock 消息应成功并带 mock 标记：' + JSON.stringify(sm.j).slice(0, 140));
+              assert.strictEqual(sm.j.data.receivers, 2, '收件人数应回显');
+            });
+          } finally {
+            try { child2.kill('SIGTERM'); } catch { }
+            await new Promise(r2 => setTimeout(r2, 400));
+            try { child2.kill('SIGKILL'); } catch { }
+          }
+        }
         await t('HTTP：providers 列表 API Key 脱敏回显（P5.30）', async () => {
           db.prepare(`INSERT INTO users (username,password,nickname,role,status,must_change_pwd,created_at) VALUES ('httpadmin',?,'测试管理员','admin',1,0,datetime('now','localtime'))`).run(hashPwd('http-pass-123'));
           const aid = db.prepare(`SELECT id FROM users WHERE username='httpadmin'`).get().id;

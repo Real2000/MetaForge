@@ -277,6 +277,150 @@ const USER_EVENTS = {
   user_leave_org: (p, ip) => logOp('钉钉用户离职（软处理）', `user_leave_org UserId=${p.UserId}——仅记录，未禁用账号`, ip),
 };
 
+// ==================== V3.1 #11 钉钉 H5 微应用（2026-11-03：方案设计 + mock 实现，真实联调待企业凭证） ====================
+// 设计要点（对齐安全报告 T1.3：H5 免登 JWT 不走 URL，全部 POST JSON body 交付——复用 #14 同款结论）：
+//   - GET  /h5/config       模式发现（mock/real + corpId/agentId 回显，前端据此选免登按钮形态）
+//   - POST /h5/login        免登换 JWT：real=auth_code 换 userid（gettoken→getuserinfo）；mock=mock_user 直登本地账号
+//   - POST /h5/jsapi-config dd.config 所需签名（real=jsapi_ticket HMAC；mock=本地票据同算法，链路可测）
+//   - POST /h5/send-msg     工作通知（auth 中间件；real=asyncCorpSend；mock=op_logs 留痕返回成功）
+// mock 通道仅在凭证未配置时可用——配置 DINGTALK_APP_KEY/SECRET 后自动关闭（生产环境不可能被 mock 登录绕过）
+const { auth, sign, TOKEN_TTL_MS } = require('../lib/auth');
+const h5Limiter = createLimiter({
+  name: 'dingtalk-h5',
+  windowMs: 60000,
+  max: 10,
+  keyFn: req => req.ip || clientIp(req),
+  msg: '钉钉免登请求过于频繁，请 1 分钟后再试',
+});
+
+/** H5 凭证就绪判定（APP_KEY/SECRET 齐备 = 真实模式） */
+function h5Configured() {
+  const s = loadSecrets();
+  return !!(s.DINGTALK_APP_KEY && s.DINGTALK_APP_SECRET);
+}
+
+/** 企业 access_token 获取（真实模式；内存缓存 7000s < 官方 7200s 有效期，避免每请求都打钉钉） */
+let cachedToken = { value: '', expire: 0 };
+async function getAccessToken() {
+  const s = loadSecrets();
+  if (Date.now() < cachedToken.expire) return cachedToken.value;
+  const r = await fetch('https://oapi.dingtalk.com/gettoken?' + new URLSearchParams({
+    appkey: s.DINGTALK_APP_KEY, appsecret: s.DINGTALK_APP_SECRET,
+  }), { signal: AbortSignal.timeout(8000) });
+  const j = await r.json();
+  if (!j || j.errcode !== 0 || !j.access_token) throw new Error('获取钉钉 access_token 失败：' + JSON.stringify(j || {}).slice(0, 120));
+  cachedToken = { value: j.access_token, expire: Date.now() + (j.expires_in || 7200) * 1000 - 200000 };
+  return cachedToken.value;
+}
+
+/** 签发与密码登录完全同构的登录响应（#14 之后统一走 JSON body，token 不落 URL） */
+function loginPayload(user) {
+  const token = sign({ uid: user.id, exp: Date.now() + TOKEN_TTL_MS });
+  const u = db.prepare('SELECT id, username, nickname, role, dept, onboarded, must_change_pwd FROM users WHERE id=? AND status=1').get(user.id);
+  return { token, user: { id: u.id, username: u.username, nickname: u.nickname, role: u.role, dept: u.dept, onboarded: u.onboarded ? 1 : 0 }, must_change_pwd: u.must_change_pwd ? 1 : 0 };
+}
+
+// ---------- GET /h5/config：模式发现（前端免登按钮形态判定；未挂 auth——登录前调用） ----------
+router.get('/h5/config', (req, res) => {
+  const s = loadSecrets();
+  res.json({ code: 0, data: {
+    enabled: h5Configured(),       // true=真实模式（凭证齐备）
+    mock: !h5Configured(),         // true=mock 模式（演示/开发用）
+    corp_id: s.DINGTALK_CORP_ID || '',
+    agent_id: s.DINGTALK_AGENT_ID || '',
+  } });
+});
+
+// ---------- POST /h5/login：免登换 JWT（真实=auth_code 换 userid；mock=mock_user 直登本地账号） ----------
+router.post('/h5/login', h5Limiter, async (req, res) => {
+  const ip = clientIp(req);
+  const b = req.body || {};
+  if (h5Configured()) {
+    // 真实模式：前端 dd.runtime.permission.requestAuthCode 拿 auth_code → gettoken → getuserinfo → upsert 用户 → 签发
+    if (!b.auth_code) return res.json({ code: 400, msg: '缺少 auth_code（前端需先经 dd.runtime.permission.requestAuthCode 获取）' });
+    try {
+      const accessToken = await getAccessToken();
+      const r = await fetch('https://oapi.dingtalk.com/topapi/v2/user/getuserinfo?' + new URLSearchParams({ access_token: accessToken }), {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code: b.auth_code }), signal: AbortSignal.timeout(8000),
+      });
+      const j = await r.json();
+      if (!j || j.errcode !== 0 || !j.result) return res.json({ code: 401, msg: '钉钉免登失败：' + (j && j.errmsg || '换取用户信息被拒') });
+      const user = upsertDingtalkUser({ userId: j.result.userid, nickname: j.result.name || '', deptIdList: (j.result.dept_id_list || []).map(String), phone: j.result.mobile || '' });
+      logOp('钉钉H5免登', `userid=${j.result.userid} → ${user.username}（真实模式）`, ip);
+      return res.json({ code: 0, data: loginPayload(user) });
+    } catch (e) {
+      logOp('钉钉H5免登失败', String(e.message).slice(0, 120), ip);
+      return res.json({ code: 502, msg: '钉钉服务暂不可达，请稍后重试' });
+    }
+  }
+  // mock 模式：mock_user 指定本地用户名直登（凭证配置后本分支自动不可达——mock 不可能进入生产）
+  if (!b.mock_user || !/^[a-zA-Z0-9_]{2,32}$/.test(b.mock_user)) return res.json({ code: 400, msg: 'mock 模式需指定本地用户名（mock_user）' });
+  const user = db.prepare('SELECT * FROM users WHERE username=? AND status=1').get(b.mock_user);
+  if (!user) return res.json({ code: 401, msg: '本地用户不存在或已禁用：' + b.mock_user });
+  logOp('钉钉H5免登', `${b.mock_user}（mock 模式——凭证未配置）`, ip);
+  res.json({ code: 0, data: loginPayload(user), mock: true });
+});
+
+// ---------- POST /h5/jsapi-config：dd.config 签名（真实=jsapi_ticket；mock=本地票据同算法） ----------
+// 签名算法（钉钉官方）：HMAC-SHA256(jsapi_ticket, `${nonceStr}${timestamp}${url}`) 十六进制。
+// 真实模式 ticket 经 access_token 换取并缓存；mock 用确定性本地票据（前端链路可完整调试 dd.config 前置流程）。
+let cachedTicket = { value: '', expire: 0 };
+router.post('/h5/jsapi-config', h5Limiter, async (req, res) => {
+  const s = loadSecrets();
+  const url = String((req.body || {}).url || '').slice(0, 500);
+  if (!/^https?:\/\//.test(url)) return res.json({ code: 400, msg: '缺少页面 url（dd.config 需按调用页 URL 签名）' });
+  let ticket = '';
+  if (h5Configured()) {
+    try {
+      if (Date.now() >= cachedTicket.expire) {
+        const accessToken = await getAccessToken();
+        const r = await fetch('https://oapi.dingtalk.com/get_jsapi_ticket?' + new URLSearchParams({ access_token: accessToken }), { signal: AbortSignal.timeout(8000) });
+        const j = await r.json();
+        if (!j || j.errcode !== 0 || !j.ticket) return res.json({ code: 502, msg: '获取 jsapi_ticket 失败：' + (j && j.errmsg || '') });
+        cachedTicket = { value: j.ticket, expire: Date.now() + (j.expires_in || 7200) * 1000 - 200000 };
+      }
+      ticket = cachedTicket.value;
+    } catch (e) { return res.json({ code: 502, msg: '钉钉服务暂不可达，请稍后重试' }); }
+  } else {
+    ticket = 'mock-jsapi-ticket-' + crypto.createHash('sha256').update(String(s.DINGTALK_APP_KEY || 'mock') + ':h5').digest('hex').slice(0, 32);
+  }
+  const nonceStr = crypto.randomBytes(8).toString('hex');
+  const timeStamp = String(Math.floor(Date.now() / 1000));
+  const signature = crypto.createHmac('sha256', ticket).update(`${nonceStr}${timeStamp}${url}`).digest('hex');
+  res.json({ code: 0, data: { agentId: s.DINGTALK_AGENT_ID || '', corpId: s.DINGTALK_CORP_ID || '', timeStamp, nonceStr, signature, mock: !h5Configured() } });
+});
+
+// ---------- POST /h5/send-msg：工作通知（挂 auth；真实=asyncCorpSend；mock=审计留痕返回成功） ----------
+router.post('/h5/send-msg', auth, async (req, res) => {
+  const ip = clientIp(req);
+  const b = req.body || {};
+  const s = loadSecrets();
+  const userList = String(b.userid_list || '').split(',').map(x => x.trim()).filter(Boolean).slice(0, 20); // 单次至多 20 人
+  const title = String(b.title || '').trim().slice(0, 60);
+  const content = String(b.content || '').trim().slice(0, 500);
+  if (!userList.length || !content) return res.json({ code: 400, msg: 'userid_list 与 content 必填（title 可选）' });
+  if (!h5Configured()) {
+    logOp('钉钉H5消息（mock）', `收件 ${userList.length} 人 [${title || content.slice(0, 20)}] ${content.slice(0, 80)}`, ip);
+    return res.json({ code: 0, msg: '已发送（mock 模式：未配置钉钉凭证，消息仅审计留痕）', data: { mock: true, receivers: userList.length } });
+  }
+  try {
+    const accessToken = await getAccessToken();
+    const r = await fetch('https://oapi.dingtalk.com/topapi/message/corpconversation/asyncsend_v2?' + new URLSearchParams({ access_token: accessToken }), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ agent_id: s.DINGTALK_AGENT_ID || '', userid_list: userList.join(','), msg: { msgtype: 'text', text: { content: (title ? `【${title}】` : '') + content } } }),
+      signal: AbortSignal.timeout(8000),
+    });
+    const j = await r.json();
+    if (!j || j.errcode !== 0) return res.json({ code: 502, msg: '钉钉消息发送失败：' + (j && j.errmsg || '未知错误') });
+    logOp('钉钉H5消息', `收件 ${userList.length} 人 [${title || content.slice(0, 20)}] taskId=${j.task_id}`, ip);
+    res.json({ code: 0, msg: '已发送', data: { task_id: j.task_id } });
+  } catch (e) {
+    logOp('钉钉H5消息失败', String(e.message).slice(0, 120), ip);
+    res.json({ code: 502, msg: '钉钉服务暂不可达，请稍后重试' });
+  }
+});
+
 module.exports = router;
 // 供 routes/auth.js 扫码登录复用同款用户映射规则（departments.js 的附加导出同款模式）
 module.exports.upsertDingtalkUser = upsertDingtalkUser;
