@@ -18,12 +18,12 @@
     "better-sqlite3": "^11.5.0",
     "docx": "^9.13.0",
     "echarts": "^6.1.0",
+    "exceljs": "^4.4.0",
     "express": "^4.21.1",
     "mammoth": "^1.13.0",
     "msedge-tts": "^2.1.0",
     "pdf-parse": "^2.4.5",
     "pptxgenjs": "^4.0.1",
-    "vectordb": "^0.21.2",
-    "xlsx": "^0.18.5"
+    "vectordb": "^0.21.2"
   }
 }
