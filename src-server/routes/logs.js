@@ -4,27 +4,28 @@ const os = require('os');
 const fs = require('fs');
 const { db, now } = require('../db');
 const { auth, adminOnly } = require('../lib/auth');
+const { parsePagination } = require('../lib/pagination'); // P1-3 2026-11-04：分页参数容错统一解析
 
 const router = express.Router();
 router.use(auth, adminOnly);
 
 router.get('/op-logs', (req, res) => {
   const { keyword } = req.query;
-  let page = Math.max(1, +req.query.page) || 1;
-  let size = Math.min(100, Math.max(1, +req.query.size)) || 20;
+  // P1-3 分页容错：page/size 非法值（abc/负数/超大）一律钳制到安全区间，不再依赖各处手写表达式
+  const { page, size, offset } = parsePagination(req);
   let sql = 'SELECT * FROM op_logs WHERE 1=1', args = [];
   if (keyword) { sql += ' AND (username LIKE ? OR action LIKE ? OR detail LIKE ?)'; args.push(`%${keyword}%`, `%${keyword}%`, `%${keyword}%`); }
   const total = db.prepare(sql.replace('SELECT *', 'SELECT COUNT(*) c')).get(...args).c;
   sql += ' ORDER BY id DESC LIMIT ? OFFSET ?';
-  args.push(+size, (+page - 1) * +size);
+  args.push(size, offset);
   res.json({ code: 0, data: { list: db.prepare(sql).all(...args), total } });
 });
 
 router.get('/err-logs', (req, res) => {
-  let page = Math.max(1, +req.query.page) || 1;
-  let size = Math.min(100, Math.max(1, +req.query.size)) || 20;
+  // P1-3 分页容错：同 op-logs 统一解析（原 +req.query.page 写法碰巧不 500，但与全项目语义不一）
+  const { size, offset } = parsePagination(req);
   const total = db.prepare('SELECT COUNT(*) c FROM err_logs').get().c;
-  const list = db.prepare('SELECT * FROM err_logs ORDER BY id DESC LIMIT ? OFFSET ?').all(+size, (+page - 1) * +size);
+  const list = db.prepare('SELECT * FROM err_logs ORDER BY id DESC LIMIT ? OFFSET ?').all(size, offset);
   res.json({ code: 0, data: { list, total } });
 });
 

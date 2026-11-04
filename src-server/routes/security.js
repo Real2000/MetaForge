@@ -2,6 +2,7 @@
 const express = require('express');
 const { db, now } = require('../db');
 const { auth, adminOnly } = require('../lib/auth');
+const { parseLimit } = require('../lib/pagination'); // P1-3 2026-11-04：limit 容错统一解析
 
 const router = express.Router();
 router.use(auth, adminOnly);
@@ -99,7 +100,8 @@ router.get('/stats', (req, res) => {
 
 // PII / 注入安全事件统计（P2 安全合规增强）
 router.get('/events', (req, res) => {
-  const limit = Math.min(+req.query.limit || 50, 200);
+  // P1-3 分页容错 2026-11-04：limit 负数（SQLite 负 LIMIT=无限制→全量返回）回落默认 50，上限 200 不变
+  const limit = parseLimit(req, { def: 50, max: 200 });
   const type = req.query.type;
   const rows = type
     ? db.prepare('SELECT * FROM security_events WHERE type=? ORDER BY id DESC LIMIT ?').all(type, limit)

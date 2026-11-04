@@ -29,6 +29,7 @@ const {
   parsePipelineConfig,  // kbs.pipeline 读取侧归一（NULL/空/损坏 → null=默认管道）
 } = require('../lib/ingestion-pipeline'); // V2.3 #5 2026-10-31：摄取管道（上传链路自此管道化）
 const { spaceVisibleTo } = require('../lib/space-utils'); // V2.4 #9 收尾 2026-11-02：列表空间过滤统一语义
+const { parsePagination } = require('../lib/pagination'); // P1-3 2026-11-04：分页参数容错统一解析
 
 const router = express.Router();
 router.use(auth);
@@ -176,11 +177,11 @@ router.get('/:id/logs', (req, res) => {
   const kb = db.prepare('SELECT * FROM kbs WHERE id=?').get(req.params.id);
   const deny = denyIfNotAllowed(kb, req.user);
   if (deny) return res.json(deny);
-  const page = Math.max(1, parseInt(req.query.page, 10) || 1);
-  const pageSize = Math.min(100, Math.max(1, parseInt(req.query.page_size, 10) || 20));
+  // P1-3 分页容错 2026-11-04：改用 lib/pagination 统一解析（原手写式碰巧已容错，收口为全项目同语义；page_size 字段名保持前端兼容）
+  const { page, size: pageSize, offset } = parsePagination(req, { sizeKey: 'page_size' });
   const total = db.prepare('SELECT COUNT(*) AS c FROM kb_files WHERE kb_id=?').get(kb.id).c;
   const list = db.prepare(`SELECT id,name,source,size,status,chunk_count,error_msg,parsed_at,created_at
-    FROM kb_files WHERE kb_id=? ORDER BY id DESC LIMIT ? OFFSET ?`).all(kb.id, pageSize, (page - 1) * pageSize);
+    FROM kb_files WHERE kb_id=? ORDER BY id DESC LIMIT ? OFFSET ?`).all(kb.id, pageSize, offset);
   // V1.1 审查加固 2026-10-30：stats 由 5 次独立 COUNT 合并为单条 GROUP BY（配合 idx_kb_files_kb 索引，防行数膨胀后同步驱动阻塞事件循环）
   const stats = { total, success: 0, failed: 0, processing: 0 };
   db.prepare('SELECT status, COUNT(*) AS c FROM kb_files WHERE kb_id=? GROUP BY status').all(kb.id).forEach(r => {

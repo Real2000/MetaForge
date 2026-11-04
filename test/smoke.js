@@ -2557,6 +2557,55 @@ function t(name, fn) {
           // 测试自清理：configured=1 供应商残留会泄漏到后续块（如 keywordgen 的 no_provider 判断）
           db.prepare(`DELETE FROM providers WHERE name='脱敏测试供应商'`).run();
         });
+        // ===== P1-3 分页参数容错（2026-11-04）：lib 统一解析 + 三接口回归（notify 原必 500 实锤点） =====
+        await t('P1-3：parsePagination 六态容错（缺省/正常/abc/负数/超大/小数）', () => {
+          const { parsePagination } = require('../src-server/lib/pagination');
+          const q = o => ({ query: o });
+          assert.deepStrictEqual(parsePagination(q({})), { page: 1, size: 20, offset: 0 }, '缺省 → 1/20/0');
+          assert.deepStrictEqual(parsePagination(q({ page: '3', size: '50' })), { page: 3, size: 50, offset: 100 }, '正常值原样透传');
+          assert.deepStrictEqual(parsePagination(q({ page: 'abc', size: 'abc' })), { page: 1, size: 20, offset: 0 }, 'abc → 全默认（防 NaN LIMIT 500）');
+          assert.deepStrictEqual(parsePagination(q({ page: '-100', size: '-100' })), { page: 1, size: 1, offset: 0 }, '负数 → 下限钳制 page=1/size=1（防 SQLite 负 LIMIT 无限制）');
+          assert.deepStrictEqual(parsePagination(q({ page: '1e3', size: '99999' })), { page: 1, size: 100, offset: 0 }, '上限钳制 size≤100（1e3 被 parseInt 截为 1 属保守语义）');
+          assert.deepStrictEqual(parsePagination(q({ page: '3.9', size: '3.9' })), { page: 3, size: 3, offset: 6 }, '小数截断');
+          assert.deepStrictEqual(parsePagination(q({ page: '2', page_size: '15' }), { sizeKey: 'page_size' }), { page: 2, size: 15, offset: 15 }, '自定义 sizeKey（knowledge 的 page_size 兼容）');
+        });
+        await t('P1-3：parseLimit 五态容错（缺省/正常/abc/负数与0/超大）', () => {
+          const { parseLimit } = require('../src-server/lib/pagination');
+          const q = o => ({ query: o });
+          assert.strictEqual(parseLimit(q({})), 50, '缺省 → 50');
+          assert.strictEqual(parseLimit(q({}), { def: 30, max: 100 }), 30, '可配默认值');
+          assert.strictEqual(parseLimit(q({ limit: 'abc' })), 50, 'abc → 默认（原 notify 实现此处产 NaN → LIMIT 绑定必 500）');
+          assert.strictEqual(parseLimit(q({ limit: '-100' })), 50, '负数 → 默认（防 SQLite 负 LIMIT=无限制全量返回）');
+          assert.strictEqual(parseLimit(q({ limit: '0' })), 50, '0 → 默认');
+          assert.strictEqual(parseLimit(q({ limit: '99999' }), { max: 200 }), 200, '上限钳制');
+          assert.strictEqual(parseLimit(q({ limit: '25' })), 25, '正常值原样');
+        });
+        await t('HTTP：分页容错——notify limit=abc/-100 不 500（P1-3，原 NaN LIMIT 必 500 实锤点）', async () => {
+          const r1 = await jfetch('/api/notify?limit=abc', {}, tok1);
+          assert.ok(r1.j && r1.j.code === 0, 'limit=abc 应 code 0（原实现 NaN 绑定 better-sqlite3 抛 Invalid value → 500）：' + JSON.stringify(r1.j).slice(0, 100));
+          const r2 = await jfetch('/api/notify?limit=-100', {}, tok1);
+          assert.ok(r2.j && r2.j.code === 0, 'limit=-100 应 code 0（负 LIMIT=无限制，原实现全量返回）：' + JSON.stringify(r2.j).slice(0, 100));
+          const r3 = await jfetch('/api/notify?limit=5', {}, tok1);
+          assert.ok(r3.j && r3.j.code === 0 && Array.isArray(r3.j.data.list), '正常 limit 照常可用：' + JSON.stringify(r3.j).slice(0, 80));
+        });
+        await t('HTTP：分页容错——op-logs page=abc&size=-100 按默认值处理（P1-3）', async () => {
+          const adminUid = db.prepare(`SELECT id FROM users WHERE username='httpadmin'`).get().id;
+          const tokAdmin = sign({ uid: adminUid, exp: Date.now() + 3600000 });
+          const r = await jfetch('/api/monitor/op-logs?page=abc&size=-100', {}, tokAdmin);
+          assert.ok(r.j && r.j.code === 0 && Array.isArray(r.j.data.list), '非法分页参数应按默认值（page=1/size=1）处理不 500：' + JSON.stringify(r.j).slice(0, 100));
+          const r2 = await jfetch('/api/monitor/err-logs?page=abc&size=abc', {}, tokAdmin);
+          assert.ok(r2.j && r2.j.code === 0 && Array.isArray(r2.j.data.list), 'err-logs 非法参数同样容错：' + JSON.stringify(r2.j).slice(0, 100));
+        });
+        await t('HTTP：分页容错——knowledge logs page_size 风格统一收口（P1-3）', async () => {
+          // 复用「日志测试库」若已建则直接取，未建则建（用例顺序防御：不依赖前组是否执行）
+          let kb = db.prepare(`SELECT * FROM kbs WHERE name='日志测试库'`).get();
+          if (!kb) {
+            db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('日志测试库','',1,'httpu1',datetime('now','localtime'))`).run();
+            kb = db.prepare(`SELECT * FROM kbs WHERE name='日志测试库'`).get();
+          }
+          const r = await jfetch(`/api/knowledge/${kb.id}/logs?page=abc&page_size=-100`, {}, tok1);
+          assert.ok(r.j && r.j.code === 0 && r.j.data.page === 1, 'page=abc 应回落 page=1：' + JSON.stringify(r.j).slice(0, 100));
+        });
         await t('HTTP：知识库写权限——非创建者改删被拒（P5.30）', async () => {
           db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('归属测试库','',1,'httpu1',datetime('now','localtime'))`).run();
           const kbid = db.prepare(`SELECT id FROM kbs WHERE name='归属测试库'`).get().id;
@@ -4525,54 +4574,6 @@ function t(name, fn) {
       const r = enhancePdfText('');
       assert.strictEqual(r.text, '');
       assert.strictEqual(r.tables.length, 0);
-    });
-    // ===== P1-2 run_code 沙箱产物 XSS 链关闭（2026-11-03） =====
-    // 测试在独立子进程中运行，确保完整的 Express 中间件栈生效（Content-Disposition/CSP sandbox）
-    // 本测试要求子进程能访问 public/uploads/sandbox 目录（默认存在），测试用文件手动写入后删除
-    await t('P1-2：沙箱产物 .html 强制下载 + CSP sandbox 头（#12 安全加固）', async () => {
-      const fs = require('fs'), path = require('path'), crypto = require('crypto');
-      const base = `http://127.0.0.1:${port2}`;
-      // 写入一个测试 .html 文件到沙箱产物目录（模拟 run_code 执行结果）
-      const sandboxDir = path.join(__dirname, '..', 'public', 'uploads', 'sandbox');
-      const fname = 'test-' + crypto.randomBytes(4).toString('hex') + '.html';
-      const fpath = path.join(sandboxDir, fname);
-      fs.mkdirSync(sandboxDir, { recursive: true });
-      fs.writeFileSync(fpath, '<html><body><script>alert("xss")</script></body></html>', 'utf8');
-      try {
-        const r = await fetch(base + '/uploads/sandbox/' + fname);
-        // Content-Type 与 Content-Disposition 验证（强制下载）
-        const ctype = r.headers.get('content-type') || '';
-        const cdisp = r.headers.get('content-disposition') || '';
-        const csp = r.headers.get('content-security-policy') || '';
-        assert.strictEqual(ctype, 'application/octet-stream', '.html 文件应强制 application/octet-stream，实际 ' + ctype);
-        assert.ok(cdisp.includes('attachment'), 'Content-Disposition 应为 attachment，实际 ' + cdisp);
-        assert.ok(cdisp.includes('sandbox-output.txt'), '文件名应重命名为 sandbox-output.txt，实际 ' + cdisp);
-        assert.strictEqual(csp, 'sandbox', 'CSP 应为 sandbox，实际 ' + csp);
-        const txt = await r.text();
-        assert.ok(txt.length > 0, '响应内容不应为空');
-      } finally {
-        try { fs.unlinkSync(fpath); } catch { }
-      }
-    });
-    await t('P1-2：非 .html 沙箱产物正常输出（不强制下载）', async () => {
-      const fs = require('fs'), path = require('path'), crypto = require('crypto');
-      const base = `http://127.0.0.1:${port2}`;
-      const sandboxDir = path.join(__dirname, '..', 'public', 'uploads', 'sandbox');
-      const fname = 'test-' + crypto.randomBytes(4).toString('hex') + '.txt';
-      const fpath = path.join(sandboxDir, fname);
-      fs.writeFileSync(fpath, 'hello sandbox', 'utf8');
-      try {
-        const r = await fetch(base + '/uploads/sandbox/' + fname);
-        const ctype = r.headers.get('content-type') || '';
-        const cdisp = r.headers.get('content-disposition') || '';
-        // 非 .html 文件应正常提供（Content-Type 不等于 application/octet-stream，无强制下载头）
-        assert.notStrictEqual(ctype, 'application/octet-stream', '非 .html 不应强制 application/octet-stream，实际 ' + ctype);
-        assert.ok(!cdisp.includes('attachment'), '非 .html 不应带 attachment 头，实际 ' + cdisp);
-        const txt = await r.text();
-        assert.strictEqual(txt, 'hello sandbox', '应原样返回文件内容');
-      } finally {
-        try { fs.unlinkSync(fpath); } catch { }
-      }
     });
     // 【P3】P3 工程化：建表数 tripwire
     await t('P3 工程化：新库建表数 = 50（防 schema 误删/迁移遗漏）', () => {

@@ -2347,4 +2347,14 @@ agent-platform/
 ### 验证
 冒烟 293/0 全绿（281 基线 + 12 条新用例：#14 交换码 5 + #12 审核流/嵌入 7 + #11 钉钉 H5 2... 实为各分组合计）；#12 嵌入浏览器实测（临时子进程 33210 端口独立数据目录）：域名保存→CSP 头动态更新（frame-ancestors 'self' www.mycompany.com portal.mycompany.com 实测命中）→iframe/JS 双 snippet 生成→widget.js 200 可达；#11 mock 全链路实测：mock 免登 demo→JWT 过 /auth/me→签名独立复算一致→消息审计留痕。生产生效需重启服务（运行中进程为旧代码）。
 
+## P1-3 分页参数容错 + 加密迁移循环依赖修复（2026-11-04）
+
+### 实现内容
+- **P1-3 分页参数容错**（演进计划 P1 安全闭环第 3 项）：新建 `lib/pagination.js` 统一解析——`parsePagination`（page 非法/0/负→1，size 上下限钳制 1~max，派生 offset）与 `parseLimit`（limit 风格：非法/0/负→默认值，上限钳制）。接入全项目 5 个分页点：notify（`?limit=abc` 原 NaN 绑定 better-sqlite3 必 500 的实锤修复点）、logs 两处、security /events、knowledge /logs（page_size 风格保持前端兼容）。负数 LIMIT 的数据放大面（SQLite 负数=无限制全量返回）一并关闭
+- **修复 P1-1 遗留的加载期循环依赖**：db.js 迁移块（exports 赋值前 require crypto-util）× crypto-util 顶层解构 `const { db } = require('../db')` → db 恒 undefined → secrets 用例 upsert→encrypt→db.prepare 崩溃，**整个测试套件自此中断**（P1-1/P1-2 两轮的「结果」行均为假象，secrets 之后的用例从未执行）。修复：crypto-util 改惰性 require（loadEncryptionKey 运行时取 db）+ db.js 迁移块移至 module.exports 之后
+- 清理 P1-2 上轮残留的外层重复测试（引用未定义 port2，套件恢复后暴露为 2 条失败）
+
+### 验证
+冒烟 **300/0 全绿**（套件恢复完整执行后的首个完整基线）：P1-3 新增 5 条（parsePagination 六态/parseLimit 五态/notify abc+负数不 500/op-logs 非法参数默认值/knowledge page_size 收口）全过；secrets 用例恢复 ✅；P1-2 两条沙箱产物用例首次真正执行亦通过（Content-Disposition attachment + CSP sandbox 头实测命中）。
+
 > AI生成

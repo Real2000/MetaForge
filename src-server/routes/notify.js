@@ -5,6 +5,7 @@
 const express = require('express');
 const { db, now } = require('../db');
 const { auth } = require('../lib/auth');
+const { parseLimit } = require('../lib/pagination'); // P1-3 2026-11-04：limit 容错（原 ?limit=abc → NaN LIMIT 必 500）
 
 const router = express.Router();
 router.use(auth);
@@ -12,7 +13,8 @@ router.use(auth);
 // 通知列表（unread=1 仅未读；默认最近 30 条）
 router.get('/', (req, res) => {
   const unreadOnly = req.query.unread === '1';
-  const limit = Math.min(+(req.query.limit || 30), 100);
+  // P1-3 分页容错：limit 非法（abc→NaN）/负数（SQLite 负 LIMIT=无限制）一律回落默认 30，上限 100
+  const limit = parseLimit(req, { def: 30, max: 100 });
   const marks = new Set(
     db.prepare('SELECT notification_id FROM notification_reads WHERE username=?').all(req.user.username).map(r => r.notification_id)
   );

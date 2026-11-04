@@ -1433,16 +1433,24 @@ CREATE INDEX IF NOT EXISTS idx_entity_relations_target ON entity_relations(targe
 CREATE INDEX IF NOT EXISTS idx_entity_name_type ON entities(name, type);
 `);
 
+const tableEntities = 'entities';
+const tableEntityRelations = 'entity_relations';
+
+module.exports = { db, hashPwd, hashPwdAsync, verifyPwd, now, daysAgo, tableEntities, tableEntityRelations };
+
 // ---------- V2.4 #4 收尾：providers/usermodels api_key 加密迁移（幂等） ----------
 // 启动时扫描明文 Key 自动加密成 iv.authTag.ciphertext 格式。加密密钥未配置时不动。
+// P1-1 修复 2026-11-04：本块必须位于 module.exports 赋值之后——crypto-util 已改为惰性 require('../db')，
+// 迁移块执行时（模块加载中）require 返回缓存中已赋值的 exports → encrypt 内 db 可用；
+// 此前块在 exports 之前 + crypto-util 顶层解构，构成加载期循环依赖（db 恒 undefined，
+// secrets 用例 upsert→encrypt→db.prepare 崩溃中断整个测试套件）。
 {
   let n = 0, m = 0;
   try {
     const { encrypt } = require('./lib/crypto-util');
     const rows = db.prepare("SELECT id, api_key FROM providers WHERE api_key!='' AND instr(api_key,'.')=0").all();
     for (const r of rows) { const enc = encrypt(r.api_key); if (enc !== r.api_key) { db.prepare('UPDATE providers SET api_key=? WHERE id=?').run(enc, r.id); n++; } }
-    // crypto-util loadEncryptionKey 内部 require('./db') 与此文件构成环——表未创建时被读会抛错。
-    // 但 providers 表在 db.js 中早于本迁移块创建，usermodels 也是。本迁移块确保两表都存在后的扫描：
+    // usermodels 表存在性防御（老库无此表时跳过该段）
     if (db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='usermodels'").get()) {
       const urows = db.prepare("SELECT id, api_key FROM usermodels WHERE api_key!='' AND instr(api_key,'.')=0").all();
       for (const r of urows) { const enc = encrypt(r.api_key); if (enc !== r.api_key) { db.prepare('UPDATE usermodels SET api_key=? WHERE id=?').run(enc, r.id); m++; } }
@@ -1450,11 +1458,6 @@ CREATE INDEX IF NOT EXISTS idx_entity_name_type ON entities(name, type);
   } catch (e) { console.error('[db] api_key 加密迁移异常（兜底：不加密）:', e.message); }
   if (n + m) console.log(`[db] 存量 api_key 加密迁移：providers ${n} 行、usermodels ${m} 行（AES-256-GCM）`);
 }
-
-const tableEntities = 'entities';
-const tableEntityRelations = 'entity_relations';
-
-module.exports = { db, hashPwd, hashPwdAsync, verifyPwd, now, daysAgo, tableEntities, tableEntityRelations };
 
 // ---------------- P5.27 本地桥设备与任务队列（2026-10-27）----------------
 // 轮询模式：网页对话发 local_exec → 任务入队 → 本地桥 daemon poll 拉取执行 → result 回推
