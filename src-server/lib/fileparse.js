@@ -36,14 +36,27 @@ async function parseFileBuffer(name, buf) {
     text = parsed.value || '';
   } else if (ext === 'xlsx' || ext === 'xls' || ext === 'csv') {
     // P5.28：表格类逐 sheet 提取为「Markdown 表格」文本（模型可直接做汇总/透视/脑图大纲）
-    const XLSX = require('xlsx');
-    const wb = XLSX.read(buf, { type: 'buffer' });
+    // P1-5 2026-11-03：exceljs 替换已弃用的 xlsx 包（xlsx 已从 package.json 移除，require 会报 MODULE_NOT_FOUND）
+    const ExcelJS = require('exceljs');
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.load(buf);
     const parts = [];
-    for (const sheetName of wb.SheetNames.slice(0, 10)) { // 最多 10 个 sheet 防爆炸
-      const ws = wb.Sheets[sheetName];
-      const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' }).slice(0, 200); // 每 sheet 最多 200 行
+    for (let si = 0; si < Math.min(wb.worksheets.length, 10); si++) {
+      const ws = wb.getWorksheet(si + 1);
+      if (!ws) continue;
+      const sheetName = ws.name || ('Sheet' + (si + 1));
+      const rows = [];
+      let rowIndex = 0;
+      ws.eachRow({ includeEmpty: false }, (row) => {
+        if (++rowIndex > 200) return; // 每 sheet 最多 200 行
+        const cells = [];
+        row.eachCell({ includeEmpty: false }, (cell) => {
+          cells.push(cell.value != null ? String(cell.value).replace(/\|/g, '\\|') : '');
+        });
+        rows.push('| ' + cells.join(' | ') + ' |');
+      });
       if (!rows.length) continue;
-      parts.push(`### Sheet: ${sheetName}\n` + rows.map(r => '| ' + r.map(c => String(c ?? '').replace(/\|/g, '\\|')).join(' | ') + ' |').join('\n'));
+      parts.push(`### Sheet: ${sheetName}\n` + rows.join('\n'));
     }
     text = parts.join('\n\n') || '（空表格）';
   } else if (ext === 'pptx') {
