@@ -946,6 +946,31 @@ router.get('/spaces/list', (req, res) => {
   res.json({ code: 0, data: db.prepare('SELECT * FROM spaces ORDER BY id').all() });
 });
 router.post('/spaces', (req, res) => {
+  if (req.user.role !== 'admin') return res.json({ code: 403, msg: '仅管理员可创建空间' });
+  const { name, type, owner, members } = req.body || {};
+  if (!name || !['enterprise', 'dept', 'personal'].includes(type)) return res.json({ code: 400, msg: '请填写空间名称并选择类型' });
+  const info = db.prepare(`INSERT INTO spaces (name,type,owner,members,created_at) VALUES (?,?,?,?,datetime('now','localtime'))`).run(name, type, owner || req.user.nickname || req.user.username, members || 1);
+  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)').run(req.user.username, '新建空间', name, req.ip, now());
+  res.json({ code: 0, data: { id: info.lastInsertRowid } });
+});
+router.put('/spaces/:id', (req, res) => {
+  if (req.user.role !== 'admin') return res.json({ code: 403, msg: '仅管理员可修改空间' });
+  const { name, type, owner, members } = req.body || {};
+  const old = db.prepare('SELECT * FROM spaces WHERE id=?').get(req.params.id);
+  if (!old) return res.json({ code: 404, msg: '空间不存在' });
+  db.prepare('UPDATE spaces SET name=?,type=?,owner=?,members=? WHERE id=?').run(name || old.name, type || old.type, owner ?? old.owner, members ?? old.members, old.id);
+  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)').run(req.user.username, '修改空间', old.name, req.ip, now());
+  res.json({ code: 0, msg: '已保存' });
+});
+router.delete('/spaces/:id', (req, res) => {
+  if (req.user.role !== 'admin') return res.json({ code: 403, msg: '仅管理员可删除空间' });
+  const old = db.prepare('SELECT * FROM spaces WHERE id=?').get(req.params.id);
+  if (!old) return res.json({ code: 404, msg: '空间不存在' });
+  db.prepare('DELETE FROM spaces WHERE id=?').run(req.params.id);
+  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)').run(req.user.username, '删除空间', old.name, req.ip, now());
+  res.json({ code: 0, msg: '已删除' });
+});
+router.post('/spaces', (req, res) => {
   const { name, type, owner, members } = req.body || {};
   if (!name || !['enterprise', 'dept', 'personal'].includes(type)) return res.json({ code: 400, msg: '请填写空间名称并选择类型' });
   const info = db.prepare(`INSERT INTO spaces (name,type,owner,members,created_at) VALUES (?,?,?,?,datetime('now','localtime'))`).run(name, type, owner || req.user.nickname || req.user.username, members || 1);
