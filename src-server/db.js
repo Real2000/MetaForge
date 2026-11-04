@@ -1433,6 +1433,24 @@ CREATE INDEX IF NOT EXISTS idx_entity_relations_target ON entity_relations(targe
 CREATE INDEX IF NOT EXISTS idx_entity_name_type ON entities(name, type);
 `);
 
+// ---------- V2.4 #4 收尾：providers/usermodels api_key 加密迁移（幂等） ----------
+// 启动时扫描明文 Key 自动加密成 iv.authTag.ciphertext 格式。加密密钥未配置时不动。
+{
+  let n = 0, m = 0;
+  try {
+    const { encrypt } = require('./lib/crypto-util');
+    const rows = db.prepare("SELECT id, api_key FROM providers WHERE api_key!='' AND instr(api_key,'.')=0").all();
+    for (const r of rows) { const enc = encrypt(r.api_key); if (enc !== r.api_key) { db.prepare('UPDATE providers SET api_key=? WHERE id=?').run(enc, r.id); n++; } }
+    // crypto-util loadEncryptionKey 内部 require('./db') 与此文件构成环——表未创建时被读会抛错。
+    // 但 providers 表在 db.js 中早于本迁移块创建，usermodels 也是。本迁移块确保两表都存在后的扫描：
+    if (db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='usermodels'").get()) {
+      const urows = db.prepare("SELECT id, api_key FROM usermodels WHERE api_key!='' AND instr(api_key,'.')=0").all();
+      for (const r of urows) { const enc = encrypt(r.api_key); if (enc !== r.api_key) { db.prepare('UPDATE usermodels SET api_key=? WHERE id=?').run(enc, r.id); m++; } }
+    }
+  } catch (e) { console.error('[db] api_key 加密迁移异常（兜底：不加密）:', e.message); }
+  if (n + m) console.log(`[db] 存量 api_key 加密迁移：providers ${n} 行、usermodels ${m} 行（AES-256-GCM）`);
+}
+
 const tableEntities = 'entities';
 const tableEntityRelations = 'entity_relations';
 
