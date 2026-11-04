@@ -238,7 +238,10 @@ router.get('/:id/memories', (req, res) => {
   const agent = db.prepare('SELECT * FROM agents WHERE id=?').get(req.params.id);
   if (!agent) return res.json({ code: 404, msg: '智能体不存在' });
   if (!canView(agent, req.user)) return res.json({ code: 403, msg: '无权查看该智能体的记忆' });
-  const rows = db.prepare('SELECT id, fact, created_at, username FROM agent_memories WHERE agent_id=? ORDER BY id DESC LIMIT 200').all(req.params.id);
+  // V2.4 #9 收尾：记忆归属校验——非管理员只返回自己创建的记忆（防越权查看其他用户在同一智能体上的聊天记忆）
+  const whereClause = req.user.role !== 'admin' ? ' AND username=?' : '';
+  const args = req.user.role !== 'admin' ? [req.user.username] : [];
+  const rows = db.prepare(`SELECT id, fact, created_at, username FROM agent_memories WHERE agent_id=? ${whereClause} ORDER BY id DESC LIMIT 200`).all(req.params.id, ...args);
   res.json({ code: 0, data: rows });
 });
 router.delete('/:id/memories', (req, res) => {
@@ -943,6 +946,7 @@ router.post('/import', (req, res) => {
 
 // ---------- 空间管理 ----------
 router.get('/spaces/list', (req, res) => {
+  if (req.user.role !== 'admin') return res.json({ code: 403, msg: '仅管理员可查看空间列表' });
   res.json({ code: 0, data: db.prepare('SELECT * FROM spaces ORDER BY id').all() });
 });
 router.post('/spaces', (req, res) => {
@@ -968,35 +972,6 @@ router.delete('/spaces/:id', (req, res) => {
   if (!old) return res.json({ code: 404, msg: '空间不存在' });
   db.prepare('DELETE FROM spaces WHERE id=?').run(req.params.id);
   db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)').run(req.user.username, '删除空间', old.name, req.ip, now());
-  res.json({ code: 0, msg: '已删除' });
-});
-router.post('/spaces', (req, res) => {
-  const { name, type, owner, members } = req.body || {};
-  if (!name || !['enterprise', 'dept', 'personal'].includes(type)) return res.json({ code: 400, msg: '请填写空间名称并选择类型' });
-  const info = db.prepare(`INSERT INTO spaces (name,type,owner,members,created_at) VALUES (?,?,?,?,datetime('now','localtime'))`).run(name, type, owner || req.user.nickname || req.user.username, members || 1);
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)').run(req.user.username, '新建空间', name, req.ip, now());
-  res.json({ code: 0, data: { id: info.lastInsertRowid } });
-});
-router.put('/spaces/:id', (req, res) => {
-  const { name, type, owner, members } = req.body || {};
-  const old = db.prepare('SELECT * FROM spaces WHERE id=?').get(req.params.id);
-  if (!old) return res.json({ code: 404, msg: '空间不存在' });
-  // 权限校验：仅管理员或空间创建者（owner 字段对于新空间存的是 nickname/username）可修改
-  if (req.user.role !== 'admin' && (!old.owner || old.owner !== (req.user.nickname || req.user.username))) {
-    return res.json({ code: 403, msg: '仅管理员或空间创建者可修改' });
-  }
-  db.prepare('UPDATE spaces SET name=?,type=?,owner=?,members=? WHERE id=?').run(name || old.name, type || old.type, owner ?? old.owner, members ?? old.members, old.id);
-  res.json({ code: 0, msg: '已保存' });
-});
-router.delete('/spaces/:id', (req, res) => {
-  const old = db.prepare('SELECT * FROM spaces WHERE id=?').get(req.params.id);
-  if (!old) return res.json({ code: 404, msg: '空间不存在' });
-  // 权限校验：仅管理员或空间创建者可删除（owner 字段对于新空间存的是 nickname/username）
-  if (req.user.role !== 'admin' && old.owner !== (req.user.nickname || req.user.username)) {
-    return res.json({ code: 403, msg: '仅管理员或空间创建者可删除' });
-  }
-  db.prepare('DELETE FROM spaces WHERE id=?').run(req.params.id);
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)').run(req.user.username, '删除空间', '#' + req.params.id, req.ip, now());
   res.json({ code: 0, msg: '已删除' });
 });
 
