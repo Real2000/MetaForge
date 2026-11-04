@@ -2494,6 +2494,49 @@ function t(name, fn) {
               assert.ok(sm.j && sm.j.code === 0 && sm.j.data && sm.j.data.mock === true, 'mock 消息应成功并带 mock 标记：' + JSON.stringify(sm.j).slice(0, 140));
               assert.strictEqual(sm.j.data.receivers, 2, '收件人数应回显');
             });
+            // ===== P1-2（2026-11-03）run_code 沙箱产物 XSS 链关闭 =====
+            // 测试在钉钉 H5 子进程中运行（完整 Express 中间件栈），确保 Content-Disposition/CSP 生效
+            // 本测试向沙箱产物目录写入测试 .html 文件后通过 HTTP 验证响应头，测试后清理
+            await t('P1-2：沙箱产物 .html 强制下载 + CSP sandbox 头（#14）', async () => {
+              const fs = require('fs'), path = require('path'), crypto = require('crypto');
+              const sandboxDir = path.join(__dirname, '..', 'public', 'uploads', 'sandbox');
+              const fname = 'test-' + crypto.randomBytes(4).toString('hex') + '.html';
+              const fpath = path.join(sandboxDir, fname);
+              fs.mkdirSync(sandboxDir, { recursive: true });
+              fs.writeFileSync(fpath, '<html><body><script>alert("xss")</script></body></html>', 'utf8');
+              try {
+                const r = await fetch(base2 + '/uploads/sandbox/' + fname);
+                const ctype = r.headers.get('content-type') || '';
+                const cdisp = r.headers.get('content-disposition') || '';
+                const csp = r.headers.get('content-security-policy') || '';
+                assert.strictEqual(ctype, 'application/octet-stream', '.html 应强制 application/octet-stream，实际 ' + ctype);
+                assert.ok(cdisp.includes('attachment'), 'Content-Disposition 应为 attachment，实际 ' + cdisp);
+                assert.ok(cdisp.includes('sandbox-output.txt'), '文件名应重命名为 sandbox-output.txt，实际 ' + cdisp);
+                assert.strictEqual(csp, 'sandbox', 'CSP 应为 sandbox，实际 ' + csp);
+                const txt = await r.text();
+                assert.ok(txt.length > 0, '响应内容不应为空');
+              } finally {
+                try { fs.unlinkSync(fpath); } catch { }
+              }
+            });
+            await t('P1-2：非 .html 沙箱产物正常输出（不强制下载，#14）', async () => {
+              const fs = require('fs'), path = require('path'), crypto = require('crypto');
+              const sandboxDir = path.join(__dirname, '..', 'public', 'uploads', 'sandbox');
+              const fname = 'test-' + crypto.randomBytes(4).toString('hex') + '.txt';
+              const fpath = path.join(sandboxDir, fname);
+              fs.writeFileSync(fpath, 'hello sandbox', 'utf8');
+              try {
+                const r = await fetch(base2 + '/uploads/sandbox/' + fname);
+                const ctype = r.headers.get('content-type') || '';
+                const cdisp = r.headers.get('content-disposition') || '';
+                assert.notStrictEqual(ctype, 'application/octet-stream', '非 .html 不应强制 application/octet-stream，实际 ' + ctype);
+                assert.ok(!cdisp.includes('attachment'), '非 .html 不应带 attachment 头，实际 ' + cdisp);
+                const txt = await r.text();
+                assert.strictEqual(txt, 'hello sandbox', '应原样返回文件内容');
+              } finally {
+                try { fs.unlinkSync(fpath); } catch { }
+              }
+            });
           } finally {
             try { child2.kill('SIGTERM'); } catch { }
             await new Promise(r2 => setTimeout(r2, 400));
@@ -4482,6 +4525,54 @@ function t(name, fn) {
       const r = enhancePdfText('');
       assert.strictEqual(r.text, '');
       assert.strictEqual(r.tables.length, 0);
+    });
+    // ===== P1-2 run_code 沙箱产物 XSS 链关闭（2026-11-03） =====
+    // 测试在独立子进程中运行，确保完整的 Express 中间件栈生效（Content-Disposition/CSP sandbox）
+    // 本测试要求子进程能访问 public/uploads/sandbox 目录（默认存在），测试用文件手动写入后删除
+    await t('P1-2：沙箱产物 .html 强制下载 + CSP sandbox 头（#12 安全加固）', async () => {
+      const fs = require('fs'), path = require('path'), crypto = require('crypto');
+      const base = `http://127.0.0.1:${port2}`;
+      // 写入一个测试 .html 文件到沙箱产物目录（模拟 run_code 执行结果）
+      const sandboxDir = path.join(__dirname, '..', 'public', 'uploads', 'sandbox');
+      const fname = 'test-' + crypto.randomBytes(4).toString('hex') + '.html';
+      const fpath = path.join(sandboxDir, fname);
+      fs.mkdirSync(sandboxDir, { recursive: true });
+      fs.writeFileSync(fpath, '<html><body><script>alert("xss")</script></body></html>', 'utf8');
+      try {
+        const r = await fetch(base + '/uploads/sandbox/' + fname);
+        // Content-Type 与 Content-Disposition 验证（强制下载）
+        const ctype = r.headers.get('content-type') || '';
+        const cdisp = r.headers.get('content-disposition') || '';
+        const csp = r.headers.get('content-security-policy') || '';
+        assert.strictEqual(ctype, 'application/octet-stream', '.html 文件应强制 application/octet-stream，实际 ' + ctype);
+        assert.ok(cdisp.includes('attachment'), 'Content-Disposition 应为 attachment，实际 ' + cdisp);
+        assert.ok(cdisp.includes('sandbox-output.txt'), '文件名应重命名为 sandbox-output.txt，实际 ' + cdisp);
+        assert.strictEqual(csp, 'sandbox', 'CSP 应为 sandbox，实际 ' + csp);
+        const txt = await r.text();
+        assert.ok(txt.length > 0, '响应内容不应为空');
+      } finally {
+        try { fs.unlinkSync(fpath); } catch { }
+      }
+    });
+    await t('P1-2：非 .html 沙箱产物正常输出（不强制下载）', async () => {
+      const fs = require('fs'), path = require('path'), crypto = require('crypto');
+      const base = `http://127.0.0.1:${port2}`;
+      const sandboxDir = path.join(__dirname, '..', 'public', 'uploads', 'sandbox');
+      const fname = 'test-' + crypto.randomBytes(4).toString('hex') + '.txt';
+      const fpath = path.join(sandboxDir, fname);
+      fs.writeFileSync(fpath, 'hello sandbox', 'utf8');
+      try {
+        const r = await fetch(base + '/uploads/sandbox/' + fname);
+        const ctype = r.headers.get('content-type') || '';
+        const cdisp = r.headers.get('content-disposition') || '';
+        // 非 .html 文件应正常提供（Content-Type 不等于 application/octet-stream，无强制下载头）
+        assert.notStrictEqual(ctype, 'application/octet-stream', '非 .html 不应强制 application/octet-stream，实际 ' + ctype);
+        assert.ok(!cdisp.includes('attachment'), '非 .html 不应带 attachment 头，实际 ' + cdisp);
+        const txt = await r.text();
+        assert.strictEqual(txt, 'hello sandbox', '应原样返回文件内容');
+      } finally {
+        try { fs.unlinkSync(fpath); } catch { }
+      }
     });
     // 【P3】P3 工程化：建表数 tripwire
     await t('P3 工程化：新库建表数 = 50（防 schema 误删/迁移遗漏）', () => {

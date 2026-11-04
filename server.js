@@ -17,7 +17,8 @@ app.use(express.json({ limit: '20mb' })); // 知识库支持 PDF/DOCX base64 上
 // 静态文件服务（必须在 API 路由之前，且沙箱产物中间件在最后）
 const staticOptions = { maxAge: 0, etag: false, lastModified: false };
 
-// P0-3 2026-10-28 安全加固：sandbox 产物强制下载（防 .html 文件同源执行窃取 localStorage token）
+// P0-3/#P1-2 2026-10-28/2026-11-03 安全加固：sandbox 产物强制下载（防 .html 文件同源执行窃取 localStorage token）
+// + #P1-2 CSP sandbox 头（2026-11-03：纵深防御层——即使浏览器忽略 Content-Disposition 也无法执行脚本）
 const expressStatic = require('express').static;
 app.use('/uploads/sandbox', (req, res, next) => {
   const filePath = path.join(__dirname, 'public', 'uploads', 'sandbox', path.normalize(req.path));
@@ -27,6 +28,7 @@ app.use('/uploads/sandbox', (req, res, next) => {
   if (ext === '.html' || ext === '.htm') {
     res.set('Content-Type', 'application/octet-stream');
     res.set('Content-Disposition', 'attachment; filename="sandbox-output.txt"');
+    res.set('Content-Security-Policy', 'sandbox'); // P1-2：沙箱产物禁止执行脚本/表单/导航等
   }
   next();
 }, expressStatic(path.join(__dirname, 'public'), staticOptions));
