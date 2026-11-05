@@ -21,6 +21,12 @@
  *   - fire-and-forget 三后处理触发条件不变：keywords 恒触发、metadata 仅 kb.auto_metadata 开启、
  *     regression 恒触发（各自内部静默/落 err_logs 语义保留），且不 await
  *
+ * P2-3 语义分片增强（2026-11-05，有意打破切片内容等价性——其余等价面全部保留）：
+ *   chunk 步骤由「短段落各自成块」改为「句边界切分（逐字沿用）+ 语义聚合（短段落贪心合并至
+ *   ~chunkSize；标题/章节号/序号开头的段落为强边界不合并）」。SQL/文案/日志等价面不变；
+ *   多短段落场景的块数与块内容由 N 变为聚合后的 ⌈总字数/chunkSize⌉——存量数据不迁移，
+ *   重新解析后生效。
+ *
  * 状态流转（kb_files.status）：
  *   执行前 INSERT 'pending'（拿 fileId）→ 首个同步步骤开始前 UPDATE 'processing'
  *   → 全部成功 UPDATE 'success'（chunk_count 落值 + parsed_at）→ 任何同步步骤失败 UPDATE 'failed'（error_msg）
@@ -127,27 +133,42 @@ const PIPELINE_STEPS = {
   chunk: {
     name: 'chunk',
     label: '智能切片',
-    desc: '按库配置（chunk_size/overlap/separator）段落+句边界切片并做重叠，同时生成父子切片映射；切片为空判失败',
+    desc: '按库配置（chunk_size/overlap/separator）句边界切分+语义聚合（短段落合并至~chunkSize，标题/章节号为强边界）并做重叠，同时生成父子切片映射；切片为空判失败',
     async run(ctx) {
       const kb = ctx.kb;
-      // ---- 以下切片逻辑自改造前路由 L167-198 逐字搬移（等价性硬指标） ----
+      // ---- P2-3 语义分片增强（2026-11-05）：两段式切片 = 句边界切分（逐字沿用改造前）+ 语义聚合（新增） ----
+      // 改造前（管道化自路由 L167-198 逐字搬移）：短段落各自成块 → 碎片化分块伤召回（一句话一块，语义信号弱）。
+      // P2-3 增强：相邻短段落贪心合并至 ~chunkSize；标题/章节号开头的段落视为语义强边界不与前面合并。
+      // 行为兼容：超长段落按句边界切分逐字沿用改造前；空段过滤（<8 字）沿用；
+      //          仅「多短段落」场景块数由 N 变为聚合后的 ⌈总字数/chunkSize⌉（重叠/父子切片/chapterIds 逻辑不变）。
       const chunkSize = kb.chunk_size || 500;
       const chunkOverlap = kb.chunk_overlap || 0;
       const sep = kb.chunk_separator || '\n\s*\n';
       const sepRe = new RegExp(sep);
-      const chunks = [];
+      // 第一步：段落级语义单元收集（超长段落：按句边界切 ~chunkSize 字——切分逻辑自改造前逐字搬移）
+      const units = [];
       for (const para of ctx.text.split(sepRe)) {
         const p = para.trim();
         if (p.length < 8) continue;
-        if (p.length <= chunkSize) { chunks.push(p); continue; }
-        // 超长段落：按句边界切 ~chunkSize 字
+        if (p.length <= chunkSize) { units.push(p); continue; }
         let cur = '';
         for (const sent of p.split(/(?<=[。！？；.!?;])/)) {
-          if ((cur + sent).length > chunkSize && cur) { chunks.push(cur.trim()); cur = sent; }
+          if ((cur + sent).length > chunkSize && cur) { units.push(cur.trim()); cur = sent; }
           else cur += sent;
         }
-        if (cur.trim().length >= 8) chunks.push(cur.trim());
+        if (cur.trim().length >= 8) units.push(cur.trim());
       }
+      // 第二步：语义聚合——markdown 标题 / 中文章节 / 序号开头的单元是强边界，其余贪心合并至 ~chunkSize
+      const HEADING_RE = /^(#{1,4}\s|第[一二三四五六七八九十百千0-9]+[章节篇部]|[一二三四五六七八九十]+[、.．]|[0-9]{1,3}[.、．][\s）)]|[（(][一二三四五六七八九十0-9]+[）)])/;
+      const chunks = [];
+      let agg = '';
+      for (const u of units) {
+        if (!agg || HEADING_RE.test(u) || agg.length + 2 + u.length > chunkSize) {
+          if (agg) chunks.push(agg);
+          agg = u;
+        } else agg += '\n\n' + u;
+      }
+      if (agg) chunks.push(agg);
       // 重叠切片：对相邻两块各取末尾 overlap 字符追加到前一块
       if (chunkOverlap > 0 && chunks.length > 1) {
         for (let i = chunks.length - 1; i > 0; i--) {

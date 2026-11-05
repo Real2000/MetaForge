@@ -8,7 +8,7 @@ const PIPELINE_STEPS = [
   { key: 'parse', name: '文件解析', desc: '提取 PDF/DOCX/TXT 等文档的原始文本' },
   { key: 'ocr', name: 'OCR 增强', desc: '识别扫描版 PDF/图片中的文字（未配置 OCR 服务时自动跳过）' },
   { key: 'clean', name: '文本清洗', desc: '去除页眉页脚、多余空白与乱码字符' },
-  { key: 'chunk', name: '智能切片', desc: '按切片配置分块，段落优先、超长按句边界切分' },
+  { key: 'chunk', name: '智能切片', desc: '句边界切分+语义聚合：短段落合并至~chunkSize，标题/章节号为强边界' },
   { key: 'toc', name: '目录提取', desc: '生成章节层级目录，检索命中自动带同章节上下文' },
   { key: 'metadata', name: '元数据抽取', desc: '抽取部门/密级/文档类型元数据（用于检索权限过滤）' },
   { key: 'keywords', name: '关键词生成', desc: '为分块生成检索关键词与问法（需已配置模型）' },
@@ -117,6 +117,10 @@ export async function render(el) {
       return;
     }
     // 文件管理视图
+    // P2-4 存储统计（2026-11-05）：库级文件数/存储量/分块量前端本地聚合（files 已在手，零后端往返）
+    const totalBytes = files.reduce((s, f) => s + (f.size || 0), 0);
+    const totalChunks = files.reduce((s, f) => s + (f.chunk_count || 0), 0);
+    const inFlight = files.filter(f => f.status === 'processing' || f.status === 'pending').length;
     paneKb.innerHTML = `
       <div class="toolbar">
         <div class="filters">
@@ -129,12 +133,29 @@ export async function render(el) {
           <button class="btn primary" id="uploadBtn">⬆ 上传文件</button>
         </div>
       </div>
+      <div class="grid-3">
+        <div class="stat-card">
+          <div class="label">📁 文件总数</div>
+          <div class="num">${files.length}</div>
+          <div class="sub">成功 ${files.filter(f => f.status === 'success').length} · 失败 ${files.filter(f => f.status === 'failed').length}${inFlight ? ` · 处理中 ${inFlight}` : ''}</div>
+        </div>
+        <div class="stat-card">
+          <div class="label">💾 存储总量</div>
+          <div class="num" style="font-size:22px">${fmtBytes(totalBytes)}</div>
+          <div class="sub">原始文件字节数（P2-4）</div>
+        </div>
+        <div class="stat-card">
+          <div class="label">🧩 分块总量</div>
+          <div class="num">${totalChunks}</div>
+          <div class="sub">解析成功文件的切片总数</div>
+        </div>
+      </div>
       <div class="card">
         <div class="table-wrap"><table class="tbl">
           <thead><tr><th>文件名</th><th>大小</th><th>片段数</th><th>状态</th><th>上传时间</th><th>操作</th></tr></thead>
           <tbody>${files.map(f => `
             <tr>
-              <td>📄 ${esc(f.name)}</td>
+              <td>📄 <a href="javascript:void(0)" data-pv="${f.id}" style="color:var(--brand);text-decoration:underline dotted" title="点击预览解析后全文（P2-4）">${esc(f.name)}</a></td>
               <td>${fmtBytes(f.size)}</td>
               <td>${f.chunk_count}</td>
               <td>${kbFileStatusTag(f.status)}</td>
@@ -162,6 +183,7 @@ export async function render(el) {
       toast('已删除'); loadFiles().then(renderKbList);
     });
     paneKb.querySelectorAll('[data-chunks]').forEach(b => b.onclick = () => openChunks(+b.dataset.chunks));
+    paneKb.querySelectorAll('[data-pv]').forEach(a => a.onclick = () => openChunks(+a.dataset.pv, true)); // P2-4：点击文件名 → 全文预览模式打开
     syncFilePolling(); // V2.3 #5：文件视图重渲染后按四态启停轮询（存在 pending/processing 行即启动）
   }
 
@@ -185,8 +207,9 @@ export async function render(el) {
     return `<div style="margin-top:6px"><span class="tag gray" style="font-size:10px" title="${esc(Object.entries(obj).map(([k, v]) => `${k}=${v}`).join('；'))}">🏷 ${parts}</span></div>`;
   }
 
-  // 查看分块弹窗（2026-10-29 增补：关键词/问法标签展示 + AI 生成关键词；V1.2 #2：元数据展示 + 结构化编辑）
-  async function openChunks(fileId) {
+  // 查看分块弹窗（2026-10-29 增补：关键词/问法标签展示 + AI 生成关键词；V1.2 #2：元数据展示 + 结构化编辑；
+  // P2-4 2026-11-05：双视图——「全文预览」（分块依序拼接，含编辑/删块后的最新态）/「分块列表」；preview=true 由文件名点击进入并默认全文）
+  async function openChunks(fileId, preview) {
     const j = await api(`/knowledge/files/${fileId}/chunks`);
     const { file, chunks } = j.data;
     const metaTags = (kw) => {
@@ -198,14 +221,21 @@ export async function render(el) {
         return (kws || qs) ? `<div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:4px">${kws} ${qs}</div>` : '';
       } catch { return ''; }
     };
+    const fullText = chunks.map(c => c.content).join('\n\n'); // 全文 = 分块依序拼接（后端已补 file.size/status 等头部字段）
     const body = `
         <div style="font-size:13px;color:var(--text-3);margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
-          <span>文件：${esc(file.name)}（共 ${chunks.length} 个片段）</span>
-          <div style="display:flex;gap:6px">
+          <span>文件：${esc(file.name)} · ${fmtBytes(file.size || 0)} · ${kbFileStatusTag(file.status)} · 共 ${chunks.length} 个片段</span>
+          <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+            <div style="display:flex;gap:4px">
+              <button class="btn sm ${preview ? 'primary' : ''}" id="oc_tab_full">📄 全文预览</button>
+              <button class="btn sm ${preview ? '' : 'primary'}" id="oc_tab_chunks">🧩 分块列表</button>
+            </div>
             <button class="btn sm" data-gen-meta="${file.id}" title="用已配置模型为每个分块抽取部门/密级/文档类型元数据（V1.2 审查加固：先传文件后开开关的存量文件补抽取途径）">🏷 AI 补抽取元数据</button>
             <button class="btn sm" data-gen-kw="${file.id}" title="用已配置模型为每个分块生成检索关键词与问法">✨ AI 生成关键词</button>
           </div>
         </div>
+        <div id="oc_full_view" style="display:${preview ? '' : 'none'};max-height:500px;overflow-y:auto;font-size:12px;color:var(--text);line-height:1.8;white-space:pre-wrap;word-break:break-word;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:12px">${esc(fullText)}</div>
+        <div id="oc_chunks_view" style="display:${preview ? 'none' : ''}">
         <div style="max-height:500px;overflow-y:auto">${chunks.map((c, i) => `
           <div class="card" style="box-shadow:none;border:1px solid var(--border);margin-bottom:8px" data-chunk-id="${c.id}">
             <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
@@ -220,12 +250,26 @@ export async function render(el) {
             ${metaBadgeHtml(c.metadata)}
             ${metaTags(c.keywords)}
           </div>`).join('')}
+        </div>
         </div>`;
     modal({
-      title: '查看分块', body, wide: true,
+      title: preview ? '文件预览' : '查看分块', body, wide: true,
       foot: '<button class="btn" data-close>关闭</button>',
       onMount(mask, close) {
         mask.querySelector('[data-close]').onclick = close;
+        // P2-4：全文/分块双视图切换（切换后仅改 display + 按钮高亮，数据零重拉）
+        const fullView = mask.querySelector('#oc_full_view');
+        const chunksView = mask.querySelector('#oc_chunks_view');
+        const tabFull = mask.querySelector('#oc_tab_full');
+        const tabChunks = mask.querySelector('#oc_tab_chunks');
+        const showFull = (on) => {
+          fullView.style.display = on ? '' : 'none';
+          chunksView.style.display = on ? 'none' : '';
+          tabFull.classList.toggle('primary', on);
+          tabChunks.classList.toggle('primary', !on);
+        };
+        tabFull.onclick = () => showFull(true);
+        tabChunks.onclick = () => showFull(false);
         mask.querySelectorAll('[data-gen-kw]').forEach(btn => btn.onclick = async () => {
           if (!await confirmBox('将为该文件全部分块调用模型生成关键词与问法（大文件可能耗时较久），继续？')) return;
           btn.disabled = true; btn.textContent = '⏳ 生成中…';
@@ -510,8 +554,8 @@ export async function render(el) {
       </div>
       <div id="u_file_pane">
         <div class="form-item"><label>选择文件<span class="req">*</span></label>
-          <input class="input" type="file" id="f_picker" accept=".txt,.md,.markdown,.pdf,.docx,.pptx,.xlsx,.xls,.csv">
-          <div class="hint">支持 txt / md / pdf / docx / pptx / xlsx / xls / csv，自动提取文本并智能切片（段落优先，超长段落按句边界 ~500 字切分）；扫描版 PDF 需先 OCR</div>
+          <input class="input" type="file" id="f_picker" accept=".txt,.md,.markdown,.pdf,.docx,.pptx,.xlsx,.xls,.csv" multiple>
+          <div class="hint">支持 txt / md / pdf / docx / pptx / xlsx / xls / csv，可按住 ⌘/Ctrl 多选批量上传（P2-4）；自动提取文本并智能切片（句边界切分+语义聚合）；扫描版 PDF 需先 OCR</div>
           <div id="f_pick_info" style="margin-top:6px;font-size:12px;color:var(--brand)"></div>
         </div>
       </div>
@@ -522,7 +566,7 @@ export async function render(el) {
         </div>
       </div>`;
     let mode = 'file';
-    let picked = null; // {name, b64}
+    let pickedList = []; // P2-4 批量上传：[{name, b64, size}]（multiple 多选；单文件时走原路径，文本模式不用）
     modal({
       title: `上传文件 → ${current.name}`, body, wide: true,
       foot: '<button class="btn" data-cancel>取消</button><button class="btn primary" data-save>上传并解析</button>',
@@ -534,32 +578,63 @@ export async function render(el) {
         tabFile.onclick = () => { mode = 'file'; filePane.style.display = ''; textPane.style.display = 'none'; tabFile.classList.add('primary'); tabText.classList.remove('primary'); };
         tabText.onclick = () => { mode = 'text'; filePane.style.display = 'none'; textPane.style.display = ''; tabText.classList.add('primary'); tabFile.classList.remove('primary'); };
         mask.querySelector('#f_picker').onchange = e => {
-          const file = e.target.files[0];
-          if (!file) { picked = null; return; }
-          if (file.size > 12 * 1024 * 1024) { toast('文件超过 12MB，请拆分后上传', 'err'); e.target.value = ''; picked = null; return; }
-          const r = new FileReader();
-          r.onload = () => {
-            picked = { name: file.name, b64: String(r.result).split(',')[1] || '' };
-            mask.querySelector('#f_pick_info').textContent = `已选择：${file.name}（${fmtBytes(file.size)}）`;
+          const chosen = Array.from(e.target.files || []);
+          if (!chosen.length) { pickedList = []; return; }
+          // P2-4：多选——超限文件跳过并点名提示，其余逐个读 b64（顺序读避免 FileReader 并发交错）
+          const oversize = chosen.filter(f => f.size > 12 * 1024 * 1024);
+          const okFiles = chosen.filter(f => f.size <= 12 * 1024 * 1024);
+          if (oversize.length) toast(`${oversize.map(f => f.name).join('、')} 超过 12MB，已跳过`, 'err');
+          if (!okFiles.length) { e.target.value = ''; pickedList = []; return; }
+          pickedList = [];
+          let idx = 0;
+          const readNext = () => {
+            if (idx >= okFiles.length) {
+              const totalSize = pickedList.reduce((s, p) => s + p.size, 0);
+              mask.querySelector('#f_pick_info').innerHTML = `已选择 ${pickedList.length} 个文件（共 ${fmtBytes(totalSize)}）：${pickedList.map(p => `<span title="${esc(p.name)}">${esc(p.name.length > 18 ? p.name.slice(0, 16) + '…' : p.name)}</span>`).join('、')}`;
+              return;
+            }
+            const file = okFiles[idx++];
+            const r = new FileReader();
+            r.onload = () => { pickedList.push({ name: file.name, b64: String(r.result).split(',')[1] || '', size: file.size }); readNext(); };
+            r.onerror = () => { toast(`读取 ${file.name} 失败，已跳过`, 'err'); readNext(); };
+            r.readAsDataURL(file);
           };
-          r.readAsDataURL(file);
+          readNext();
         };
         mask.querySelector('[data-cancel]').onclick = close;
         mask.querySelector('[data-save]').onclick = async () => {
+          const saveBtn = mask.querySelector('[data-save]');
           try {
-            let j;
             if (mode === 'file') {
-              if (!picked) return toast('请选择文件', 'err');
-              mask.querySelector('[data-save]').disabled = true;
-              mask.querySelector('[data-save]').textContent = '解析中…';
-              j = await api(`/knowledge/${current.id}/files`, { method: 'POST', body: { name: picked.name, file_b64: picked.b64 } });
+              if (!pickedList.length) return toast('请选择文件', 'err');
+              if (pickedList.length === 1) {
+                // 单文件：原路径（文案与交互逐字沿用，存量行为兼容）
+                saveBtn.disabled = true; saveBtn.textContent = '解析中…';
+                const j = await api(`/knowledge/${current.id}/files`, { method: 'POST', body: { name: pickedList[0].name, file_b64: pickedList[0].b64 } });
+                toast(`上传成功，解析为 ${j.data.chunks} 个片段`);
+              } else {
+                // P2-4 批量上传：串行逐个 POST（同步管道逐个跑完，避免并发写库压力与在途上限 429）；单个失败继续下一个
+                saveBtn.disabled = true;
+                const okList = []; const failList = [];
+                for (let i = 0; i < pickedList.length; i++) {
+                  const p = pickedList[i];
+                  saveBtn.textContent = `解析中…（${i + 1}/${pickedList.length}）`;
+                  try {
+                    const r = await api(`/knowledge/${current.id}/files`, { method: 'POST', body: { name: p.name, file_b64: p.b64 } });
+                    okList.push(`${p.name}（${r.data.chunks} 片段）`);
+                  } catch (err) { failList.push(`${p.name}：${err.message}`); }
+                }
+                if (failList.length) toast(`批量上传完成：成功 ${okList.length} / 失败 ${failList.length} —— ${failList.slice(0, 2).join('；')}${failList.length > 2 ? ' 等' : ''}`, 'err');
+                else toast(`批量上传完成：${okList.length} 个文件全部成功`);
+              }
             } else {
               const name = mask.querySelector('#f_name').value.trim();
               const content = mask.querySelector('#f_content').value;
               if (!name || !content.trim()) return toast('请填写文件名与内容', 'err');
-              j = await api(`/knowledge/${current.id}/files`, { method: 'POST', body: { name, content } });
+              saveBtn.disabled = true; saveBtn.textContent = '解析中…';
+              const j = await api(`/knowledge/${current.id}/files`, { method: 'POST', body: { name, content } });
+              toast(`上传成功，解析为 ${j.data.chunks} 个片段`);
             }
-            toast(`上传成功，解析为 ${j.data.chunks} 个片段`);
             close();
             if (activeTab === 'logs') renderLogs(1); // V1.1 #1：日志页上传后自动刷新（回第 1 页看最新记录）
             if (activeTab === 'evals') renderEvals(); // V1.3 #6：评测集页上传后刷新（后端已触发自动回归，分数将变化）
@@ -567,7 +642,7 @@ export async function render(el) {
           } catch (e) {
             toast(e.message, 'err');
             if (activeTab === 'logs') renderLogs(1); // V1.1 审查加固：失败记录 ORDER BY id DESC 固定在第 1 页，必须回第 1 页才能看到失败原因
-            mask.querySelector('[data-save]').disabled = false; mask.querySelector('[data-save]').textContent = '上传并解析';
+            saveBtn.disabled = false; saveBtn.textContent = '上传并解析';
           }
         };
       },
@@ -613,11 +688,16 @@ export async function render(el) {
         </div>
         <button class="btn primary" id="logsUpload">⬆ 上传文件</button>
       </div>
-      <div class="grid-3">
+      <div class="grid-4">
         <div class="stat-card">
           <div class="label">📁 文件总数</div>
           <div class="num">${stats.total}</div>
           <div class="sub">成功 ${stats.success} · 失败 ${stats.failed}</div>
+        </div>
+        <div class="stat-card">
+          <div class="label">💾 存储总量</div>
+          <div class="num" style="font-size:22px">${fmtBytes(stats.bytes || 0)}</div>
+          <div class="sub">共 ${stats.chunks || 0} 个分块（P2-4）</div>
         </div>
         <div class="stat-card">
           <div class="label">❌ 解析失败</div>

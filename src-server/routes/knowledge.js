@@ -183,12 +183,16 @@ router.get('/:id/logs', (req, res) => {
   const list = db.prepare(`SELECT id,name,source,size,status,chunk_count,error_msg,parsed_at,created_at
     FROM kb_files WHERE kb_id=? ORDER BY id DESC LIMIT ? OFFSET ?`).all(kb.id, pageSize, offset);
   // V1.1 审查加固 2026-10-30：stats 由 5 次独立 COUNT 合并为单条 GROUP BY（配合 idx_kb_files_kb 索引，防行数膨胀后同步驱动阻塞事件循环）
-  const stats = { total, success: 0, failed: 0, processing: 0 };
+  const stats = { total, success: 0, failed: 0, processing: 0, bytes: 0, chunks: 0 };
   db.prepare('SELECT status, COUNT(*) AS c FROM kb_files WHERE kb_id=? GROUP BY status').all(kb.id).forEach(r => {
     if (r.status === 'success') stats.success = r.c;
     else if (r.status === 'failed') stats.failed = r.c;
     else if (r.status === 'processing' || r.status === 'pending') stats.processing += r.c; // 四态预设计：#5 管道异步化后的预留态
   });
+  // P2-4 存储统计（2026-11-05）：库级存储量（bytes=SUM(size)）与分块总量（chunks=SUM(chunk_count)）——
+  // 单条聚合查询与 GROUP BY 同走 idx_kb_files_kb，均为 O(该库文件数)
+  const agg = db.prepare('SELECT COALESCE(SUM(size),0) AS bytes, COALESCE(SUM(chunk_count),0) AS chunks FROM kb_files WHERE kb_id=?').get(kb.id);
+  stats.bytes = agg.bytes; stats.chunks = agg.chunks;
   res.json({
     code: 0,
     data: {
@@ -297,7 +301,9 @@ router.get('/files/:fileId/chunks', (req, res) => {
   const deny = denyIfNotAllowed(kb, req.user);
   if (deny) return res.json(deny);
   const rows = db.prepare('SELECT c.id, c.content, c.file_id, c.kb_id, c.keywords, c.metadata FROM kb_chunks c WHERE c.file_id=? ORDER BY c.id').all(req.params.fileId); // V1.2 #2：带出 metadata（分块编辑回显）
-  res.json({ code: 0, data: { file: { id: f.id, name: f.name, kb_id: f.kb_id }, chunks: rows } });
+  // P2-4 文件预览（2026-11-05）：file 字段补全 size/status/chunk_count/parsed_at/created_at——
+  // 前端「全文预览」头部信息与文件管理页对齐（f 本就是 SELECT * 全行，此前只回 3 字段是窄化）
+  res.json({ code: 0, data: { file: { id: f.id, name: f.name, kb_id: f.kb_id, size: f.size, status: f.status, chunk_count: f.chunk_count, parsed_at: f.parsed_at, created_at: f.created_at }, chunks: rows } });
 });
 
 // 手动补生成/重新生成关键词+问法（对存量分块，或内容编辑后刷新；无模型时友好提示）

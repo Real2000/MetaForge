@@ -2622,7 +2622,7 @@ function t(name, fn) {
           const kbid = db.prepare(`SELECT id FROM kbs WHERE name='日志测试库'`).get().id;
           const own = await jfetch(`/api/knowledge/${kbid}/logs`, {}, tok1);
           assert.ok(own.j && own.j.code === 0, 'owner GET logs 应成功：' + JSON.stringify(own.j).slice(0, 120));
-          assert.deepStrictEqual(own.j.data.stats, { total: 0, success: 0, failed: 0, processing: 0 }, '空态 stats 应全 0：' + JSON.stringify(own.j.data.stats));
+          assert.deepStrictEqual(own.j.data.stats, { total: 0, success: 0, failed: 0, processing: 0, bytes: 0, chunks: 0 }, '空态 stats 应全 0（P2-4 增 bytes/chunks 两聚合字段）：' + JSON.stringify(own.j.data.stats));
           assert.strictEqual(own.j.data.list.length, 0, '空态 list 应为空');
           assert.strictEqual(own.j.data.page, 1, '默认 page 应为 1');
           const other = await jfetch(`/api/knowledge/${kbid}/logs`, {}, tok2);
@@ -2651,6 +2651,75 @@ function t(name, fn) {
           assert.strictEqual(logs.j.data.stats.failed, 1, 'stats.failed 应为 1：' + JSON.stringify(logs.j.data.stats));
           const del = await jfetch(`/api/knowledge/files/${row.id}`, { method: 'DELETE' }, tok1);
           assert.ok(del.j && del.j.code === 0, '失败记录应可删除：' + JSON.stringify(del.j));
+        });
+        // ===== P2-3 语义分片增强 + P2-4 知识库管理体验（2026-11-05）=====
+        await t('HTTP：P2-3 语义聚合——无标题多短段落合并至 ~chunkSize 单块（碎片化分块治理）', async () => {
+          db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('语义切片测试库','',1,'httpu1',datetime('now','localtime'))`).run();
+          const kbid = db.prepare(`SELECT id FROM kbs WHERE name='语义切片测试库'`).get().id;
+          const text = '本制度适用于公司全体正式员工与试用期员工。\n\n制度的解释权归人力资源部所有。\n\n员工对制度有疑问可向部门负责人咨询。';
+          const up = await jfetch(`/api/knowledge/${kbid}/files`, { method: 'POST', body: JSON.stringify({ name: '聚合测试.txt', content: text }) }, tok1);
+          assert.ok(up.j && up.j.code === 0, '上传应成功：' + JSON.stringify(up.j).slice(0, 100));
+          assert.strictEqual(up.j.data.chunks, 1, '三个短段落（共 57 字 << 500）应聚合为 1 块（旧逻辑各自成块=3 块）：' + JSON.stringify(up.j.data));
+          const row = db.prepare('SELECT content FROM kb_chunks WHERE file_id=? ORDER BY id').get(up.j.data.id);
+          assert.ok(row && row.content.includes('本制度适用于') && row.content.includes('人力资源部') && row.content.includes('部门负责人'), '聚合块应含全部三段（\\n\\n 连接）');
+          assert.ok(row.content.includes('\n\n'), '段落间应以空行连接保留段落边界');
+        });
+        await t('HTTP：P2-3 语义强边界——markdown 标题开头的段落不与前面合并', async () => {
+          const kbid = db.prepare(`SELECT id FROM kbs WHERE name='语义切片测试库'`).get().id;
+          const text = '# 安装指南与环境准备\n\n请先下载安装包并解压到本地目录后再运行安装程序。\n\n# 配置说明与修改\n\n修改配置文件后需要重启服务才能让新配置生效。';
+          const up = await jfetch(`/api/knowledge/${kbid}/files`, { method: 'POST', body: JSON.stringify({ name: '标题边界测试.txt', content: text }) }, tok1);
+          assert.ok(up.j && up.j.code === 0, '上传应成功：' + JSON.stringify(up.j).slice(0, 100));
+          assert.strictEqual(up.j.data.chunks, 2, '两个 # 标题后的段落应各自成块（标题=语义强边界不合并）：' + JSON.stringify(up.j.data));
+          const rows = db.prepare('SELECT content FROM kb_chunks WHERE file_id=? AND parent_id IS NOT NULL ORDER BY id').all(up.j.data.id); // 只看子块（父块为 P2 父子切片聚合行，另断言）
+          assert.strictEqual(rows.length, 2, '子块应恰为 2（父块另存）：' + rows.length);
+          assert.ok(rows[0].content.startsWith('# 安装指南'), '首子块应以第一个标题开头（标题归入本块而非上一块）：' + rows[0].content.slice(0, 20));
+          assert.ok(rows[1].content.startsWith('# 配置说明'), '第二子块应以第二个标题开头：' + rows[1].content.slice(0, 20));
+        });
+        await t('HTTP：P2-3 回归保护——超长单段落句边界切分行为不变（块长 ≤ chunkSize）', async () => {
+          const kbid = db.prepare(`SELECT id FROM kbs WHERE name='语义切片测试库'`).get().id;
+          const para = Array.from({ length: 60 }, (_, i) => `第${i + 1}条补充条款说明了相关的责任与义务履行的细节要求。`).join(''); // 单段落无空行 1170 字
+          const up = await jfetch(`/api/knowledge/${kbid}/files`, { method: 'POST', body: JSON.stringify({ name: '超长段落测试.txt', content: para }) }, tok1);
+          assert.ok(up.j && up.j.code === 0, '上传应成功：' + JSON.stringify(up.j).slice(0, 100));
+          assert.ok(up.j.data.chunks >= 3, '1170 字超长段落应切多块（句边界切分逐字沿用改造前）：' + JSON.stringify(up.j.data));
+          const rows = db.prepare('SELECT content FROM kb_chunks WHERE file_id=? AND parent_id IS NOT NULL ORDER BY id').all(up.j.data.id); // 只看子块（父块为 ~1000 字聚合行，天然 > chunkSize 不入断言）
+          assert.ok(rows.length >= 3, '子块数应 ≥ 3（与管道返回一致）：' + rows.length);
+          assert.ok(rows.every(r => r.content && r.content.length <= 500), '每个子块长度应 ≤ chunkSize（500）：' + rows.map(r => r.content ? r.content.length : 'NULL').join(','));
+        });
+        await t('HTTP：P2-4 文件预览数据源——GET /files/:id/chunks file 字段补全（size/status/chunk_count）', async () => {
+          const kbid = db.prepare(`SELECT id FROM kbs WHERE name='语义切片测试库'`).get().id;
+          const content = '预览数据源测试文档的内容段落，用于验证 chunks 端点 file 字段补全。';
+          const up = await jfetch(`/api/knowledge/${kbid}/files`, { method: 'POST', body: JSON.stringify({ name: '预览测试.txt', content }) }, tok1);
+          assert.ok(up.j && up.j.code === 0, '上传应成功：' + JSON.stringify(up.j).slice(0, 100));
+          const pv = await jfetch(`/api/knowledge/files/${up.j.data.id}/chunks`, {}, tok1);
+          assert.ok(pv.j && pv.j.code === 0, 'GET chunks 应成功：' + JSON.stringify(pv.j).slice(0, 100));
+          const f = pv.j.data.file;
+          assert.ok(f && typeof f.size === 'number' && f.size > 0, 'file.size 应为正数（预览头部展示用）：' + JSON.stringify(f));
+          assert.strictEqual(f.status, 'success', 'file.status 应同步终态：' + f.status);
+          assert.ok(f.chunk_count >= 1, 'file.chunk_count 应落值（与分块列表一致性校验源）：' + JSON.stringify(f));
+          assert.ok(Array.isArray(pv.j.data.chunks) && pv.j.data.chunks.length === f.chunk_count, 'chunks 长度应与 file.chunk_count 一致（全文拼接完整性）');
+        });
+        await t('HTTP：P2-4 存储统计——logs stats bytes/chunks 聚合与文件行逐项对账', async () => {
+          const kbid = db.prepare(`SELECT id FROM kbs WHERE name='语义切片测试库'`).get().id;
+          const logs = await jfetch(`/api/knowledge/${kbid}/logs`, {}, tok1);
+          assert.ok(logs.j && logs.j.code === 0, 'GET logs 应成功：' + JSON.stringify(logs.j).slice(0, 100));
+          const expectBytes = db.prepare('SELECT COALESCE(SUM(size),0) AS s FROM kb_files WHERE kb_id=?').get(kbid).s;
+          const expectChunks = db.prepare('SELECT COALESCE(SUM(chunk_count),0) AS s FROM kb_files WHERE kb_id=?').get(kbid).s;
+          assert.strictEqual(logs.j.data.stats.bytes, expectBytes, `stats.bytes 应等于库内文件 size 之和（${expectBytes}）：` + JSON.stringify(logs.j.data.stats));
+          assert.strictEqual(logs.j.data.stats.chunks, expectChunks, `stats.chunks 应等于库内文件 chunk_count 之和（${expectChunks}）：` + JSON.stringify(logs.j.data.stats));
+          assert.ok(expectBytes > 0 && expectChunks >= 4, '本库已有多个文件，聚合值应有意义（非恒 0）');
+        });
+        await t('HTTP：P2-4 批量上传链路——同库连续串行上传互不干扰（前端批量循环的后端契约）', async () => {
+          const kbid = db.prepare(`SELECT id FROM kbs WHERE name='语义切片测试库'`).get().id;
+          const before = db.prepare('SELECT COUNT(*) AS c FROM kb_files WHERE kb_id=?').get(kbid).c;
+          const u1 = await jfetch(`/api/knowledge/${kbid}/files`, { method: 'POST', body: JSON.stringify({ name: '批量文件甲.txt', content: '批量上传甲文件内容：第一条说明义务。批量上传甲文件内容：第二条说明权利。' }) }, tok1);
+          const u2 = await jfetch(`/api/knowledge/${kbid}/files`, { method: 'POST', body: JSON.stringify({ name: '批量文件乙.txt', content: '批量上传乙文件内容：另一主题的独立文档说明，用于验证串行链路隔离。' }) }, tok1);
+          assert.ok(u1.j && u1.j.code === 0 && u2.j && u2.j.code === 0, '连续两次上传均应成功：' + JSON.stringify([u1.j, u2.j]).slice(0, 150));
+          const c1 = db.prepare('SELECT content FROM kb_chunks WHERE file_id=?').all(u1.j.data.id).map(r => r.content).join('');
+          const c2 = db.prepare('SELECT content FROM kb_chunks WHERE file_id=?').all(u2.j.data.id).map(r => r.content).join('');
+          assert.ok(c1.includes('第一条说明义务') && !c1.includes('另一主题'), '甲文件分块不应串入乙文件内容（串行隔离）');
+          assert.ok(c2.includes('另一主题') && !c2.includes('第一条说明义务'), '乙文件分块不应串入甲文件内容');
+          const after = db.prepare('SELECT COUNT(*) AS c FROM kb_files WHERE kb_id=?').get(kbid).c;
+          assert.strictEqual(after, before + 2, '库内文件数应恰好 +2（无重名覆盖/重复落库）');
         });
         // ===== V1.1 审查加固（2026-10-30）：文件列表归属 + 部门管理权限/环校验 =====
         await t('HTTP：文件列表归属校验（V1.1 加固：非 owner GET /:id/files 403，error_msg 不经元数据外泄）', async () => {
