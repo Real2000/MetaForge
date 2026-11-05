@@ -2721,6 +2721,276 @@ function t(name, fn) {
           const after = db.prepare('SELECT COUNT(*) AS c FROM kb_files WHERE kb_id=?').get(kbid).c;
           assert.strictEqual(after, before + 2, '库内文件数应恰好 +2（无重名覆盖/重复落库）');
         });
+        // ===== P2 里程碑验收补测（2026-11-05）：24 条补齐 306→330+（P2-1×5 / P2-2×5 / P2-3×6 / P2-4×4 / P2-5+安全×4；单元部分在 rerank 单元组区域） =====
+        // 共享库 A「P2 验收补测库」：3 章节文本（每章=标题+正文 → 语义分片后恰 3 块），供召回类用例（vector_weight/top_n/threshold/默认重排）复用
+        db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('P2 验收补测库','',1,'httpu1',datetime('now','localtime'))`).run();
+        const p2KbId = db.prepare(`SELECT id FROM kbs WHERE name='P2 验收补测库'`).get().id;
+        await t('HTTP：P2 前置——验收补测库上传 3 章节文本得 3 块（召回类用例数据底座）', async () => {
+          const text = '第一章 考勤管理要求\n\n员工上下班均须打卡记录，不得代打卡。\n\n第二章 报销管理要求\n\n差旅费用须按时提交报销。\n\n第三章 保密管理要求\n\n涉密资料不得私自外带。';
+          const up = await jfetch(`/api/knowledge/${p2KbId}/files`, { method: 'POST', body: JSON.stringify({ name: '三章制度.txt', content: text }) }, tok1);
+          assert.ok(up.j && up.j.code === 0, '上传应成功：' + JSON.stringify(up.j).slice(0, 120));
+          assert.strictEqual(up.j.data.chunks, 3, '三章标题强边界应切 3 块：' + JSON.stringify(up.j.data));
+        });
+        await t('HTTP：P2-1 vector_weight 非法值鲁棒性——非有限数回落 0.5、合法数照常钳制（NaN 静默 0 命中缺陷修复锁定）', async () => {
+          const body = (w) => JSON.stringify({ query: '考勤管理', kb_id: p2KbId, top_n: 5, threshold: 0, rerank_enabled: false, ...(w !== undefined ? { vector_weight: w } : {}) });
+          const base = await jfetch('/api/knowledge/recall-test', { method: 'POST', body: body() }, tok1);
+          assert.ok(base.j && base.j.code === 0 && base.j.data.count >= 1, '基线召回应命中：' + JSON.stringify(base.j).slice(0, 120));
+          const baseIds = base.j.data.hits.map(h => h.id).join(',');
+          const wAbc = await jfetch('/api/knowledge/recall-test', { method: 'POST', body: body('abc') }, tok1);
+          assert.strictEqual(wAbc.j.code, 0, 'vector_weight=\'abc\' 应 code 0 不炸：' + JSON.stringify(wAbc.j).slice(0, 120));
+          assert.strictEqual(wAbc.j.data.count, base.j.data.count, `'abc' 应回落默认 0.5（修复前 Number('abc')=NaN → RRF 全 NaN → 静默 0 命中）：${wAbc.j.data.count} vs 基线 ${base.j.data.count}`);
+          assert.strictEqual(wAbc.j.data.hits.map(h => h.id).join(','), baseIds, '回落 0.5 后命中集应与基线一致');
+          const wNeg = await jfetch('/api/knowledge/recall-test', { method: 'POST', body: body(-1) }, tok1);
+          const ref0 = await jfetch('/api/knowledge/recall-test', { method: 'POST', body: body(0) }, tok1);
+          assert.deepStrictEqual(wNeg.j.data.hits.map(h => h.id), ref0.j.data.hits.map(h => h.id), '-1 应钳为 0（与显式 0 结果一致，纯 BM25）');
+          const wBig = await jfetch('/api/knowledge/recall-test', { method: 'POST', body: body(2) }, tok1);
+          const ref1 = await jfetch('/api/knowledge/recall-test', { method: 'POST', body: body(1) }, tok1);
+          assert.deepStrictEqual(wBig.j.data.hits.map(h => h.id), ref1.j.data.hits.map(h => h.id), '2 应钳为 1（与显式 1 结果一致，纯向量）');
+        });
+        await t('HTTP：P2-1 全标点 query 与 threshold>= 边界——纯符号 0 命中不炸、threshold=0 放行全部块', async () => {
+          const punc = await jfetch('/api/knowledge/recall-test', { method: 'POST', body: JSON.stringify({ query: '！！！？？？。。。', kb_id: p2KbId, top_n: 5, rerank_enabled: false }) }, tok1);
+          assert.ok(punc.j && punc.j.code === 0, '全标点 query 应 code 0：' + JSON.stringify(punc.j).slice(0, 120));
+          assert.strictEqual(punc.j.data.count, 0, '全标点 query 分词为空应 0 命中（retrieve 对空 terms 提前返回）');
+          const all = await jfetch('/api/knowledge/recall-test', { method: 'POST', body: JSON.stringify({ query: '考勤管理', kb_id: p2KbId, top_n: 10, threshold: 0, rerank_enabled: false }) }, tok1);
+          const totalRows = db.prepare('SELECT COUNT(*) AS c FROM kb_chunks WHERE kb_id=?').get(p2KbId).c; // 含父子切片的父块行（父块同池参与检索打分）
+          assert.strictEqual(all.j.data.count, totalRows, `threshold=0 应放行全部 ${totalRows} 行（score>=threshold 含等号边界，父子切片父块同池）：` + all.j.data.count);
+        });
+        await t('HTTP：P2-1 top_n 三态契约——0 回落 5、负数截尾、超大不放大（slice 语义锁定）', async () => {
+          const call = (top_n) => jfetch('/api/knowledge/recall-test', { method: 'POST', body: JSON.stringify({ query: '考勤管理', kb_id: p2KbId, top_n, threshold: 0, rerank_enabled: false }) }, tok1);
+          const t0 = await call(0);
+          assert.ok(t0.j.code === 0 && t0.j.data.count >= 1 && t0.j.data.count <= 5, 'top_n=0 应回落 5（路由 top_n||5），实得 ' + t0.j.data.count);
+          const tNeg = await call(-1);
+          const tAll = await call(10000);
+          assert.strictEqual(tNeg.j.data.count, tAll.j.data.count - 1, `top_n=-1 应 slice(0,-1) 截尾（${tAll.j.data.count}-1），实得 ${tNeg.j.data.count}`);
+          const totalRows2 = db.prepare('SELECT COUNT(*) AS c FROM kb_chunks WHERE kb_id=?').get(p2KbId).c;
+          assert.strictEqual(tAll.j.data.count, totalRows2, 'top_n=10000 不应放大候选（候选池=库内全部行）：' + tAll.j.data.count);
+        });
+        await t('HTTP：P2-1 threshold 分数量级契约——threshold=1 全滤除（RRF 上限 ~w/61）、threshold=-1 全放行', async () => {
+          const hi = await jfetch('/api/knowledge/recall-test', { method: 'POST', body: JSON.stringify({ query: '考勤管理', kb_id: p2KbId, top_n: 5, threshold: 1, rerank_enabled: false }) }, tok1);
+          assert.strictEqual(hi.j.data.count, 0, 'RRF 分数量级 ≈1/(60+1)~2/61 < 1，threshold=1 应全滤除');
+          const lo = await jfetch('/api/knowledge/recall-test', { method: 'POST', body: JSON.stringify({ query: '考勤管理', kb_id: p2KbId, top_n: 5, threshold: -1, rerank_enabled: false }) }, tok1);
+          const totalRows3 = db.prepare('SELECT COUNT(*) AS c FROM kb_chunks WHERE kb_id=?').get(p2KbId).c;
+          assert.strictEqual(lo.j.data.count, totalRows3, 'threshold=-1 应全放行（全部行入选）：' + lo.j.data.count);
+        });
+        await t('HTTP：P2-2 默认重排开启路径——rerank_enabled 缺省（=true）无供应商时静默退回 RRF 且命中正常', async () => {
+          const r = await jfetch('/api/knowledge/recall-test', { method: 'POST', body: JSON.stringify({ query: '考勤管理', kb_id: p2KbId, top_n: 5, threshold: 0 }) }, tok1);
+          assert.ok(r.j && r.j.code === 0, '缺省重排应 code 0（bgeRerank 无供应商返回 null → 退回 RRF）：' + JSON.stringify(r.j).slice(0, 120));
+          assert.ok(r.j.data.count >= 1, '退回 RRF 后应正常命中：' + r.j.data.count);
+          assert.ok(r.j.data.hits.every(h => h.rerank_score == null), '无供应商重排时不应有 rerank_score 字段落值');
+        });
+        await t('HTTP：P2-3 语义强边界——中文章节/中文序号/阿拉伯序号/圆括号序号四类形态（HEADING_RE 全形态锁定）', async () => {
+          db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('P2 验收标题边界库','',1,'httpu1',datetime('now','localtime'))`).run();
+          const kbid = db.prepare(`SELECT id FROM kbs WHERE name='P2 验收标题边界库'`).get().id;
+          const text = '第一章 会议总则要求\n\n公司实行周例会制度。\n\n一、考勤纪律要求\n\n员工须按时上下班。\n\n1. 打卡纪律要求\n\n上下班均须打卡记录。\n\n（一）补卡纪律要求\n\n漏打卡次日补卡。';
+          const up = await jfetch(`/api/knowledge/${kbid}/files`, { method: 'POST', body: JSON.stringify({ name: '四类标题.txt', content: text }) }, tok1);
+          assert.ok(up.j && up.j.code === 0, '上传应成功：' + JSON.stringify(up.j).slice(0, 120));
+          assert.strictEqual(up.j.data.chunks, 4, '四类标题（第X章/一、/1.␣/（一））应各自开新块=4 块：' + JSON.stringify(up.j.data));
+          const rows = db.prepare('SELECT content FROM kb_chunks WHERE file_id=? AND parent_id IS NOT NULL ORDER BY id').all(up.j.data.id);
+          assert.strictEqual(rows.length, 4, '子块应恰 4：' + rows.length);
+          ['第一章', '一、', '1. ', '（一）'].forEach((h, i) => {
+            assert.ok(rows[i].content.startsWith(h), `块 ${i + 1} 应以「${h}」开头（标题归入本块）：${rows[i].content.slice(0, 12)}`);
+          });
+          db.prepare('DELETE FROM kb_chunks WHERE kb_id=?').run(kbid);
+          db.prepare('DELETE FROM kb_files WHERE kb_id=?').run(kbid);
+          db.prepare('DELETE FROM kbs WHERE id=?').run(kbid);
+        });
+        await t('HTTP：P2-3 chunk_overlap=80 重叠切片——前块末尾并入后块开头（重叠分支零覆盖补齐）', async () => {
+          db.prepare(`INSERT INTO kbs (name,description,enabled,owner,chunk_size,chunk_overlap,created_at) VALUES ('P2 验收重叠库','',1,'httpu1',500,80,datetime('now','localtime'))`).run();
+          const kbid = db.prepare(`SELECT id FROM kbs WHERE name='P2 验收重叠库'`).get().id;
+          const para = Array.from({ length: 34 }, (_, i) => `重叠测试第${i + 1}号句子的内容说明。`).join(''); // 单段 510 字 → 句边界切 2 块
+          const up = await jfetch(`/api/knowledge/${kbid}/files`, { method: 'POST', body: JSON.stringify({ name: '重叠测试.txt', content: para }) }, tok1);
+          assert.ok(up.j && up.j.code === 0, '上传应成功：' + JSON.stringify(up.j).slice(0, 120));
+          assert.ok(up.j.data.chunks >= 2, '510 字单段应切 ≥2 块：' + JSON.stringify(up.j.data));
+          const rows = db.prepare('SELECT content FROM kb_chunks WHERE file_id=? AND parent_id IS NOT NULL ORDER BY id').all(up.j.data.id);
+          assert.ok(rows.length >= 2, '子块应 ≥2');
+          const overlapHead = rows[1].content.slice(0, 80);
+          assert.ok(rows[0].content.endsWith(overlapHead), `块 0 末尾应并入块 1 开头 80 字（prev + '\\n' + next.slice(0,overlap)）：…${rows[0].content.slice(-30)} vs ${overlapHead.slice(0, 30)}`);
+          assert.ok(rows[1].content.length === para.length - rows[0].content.length + 1 + overlapHead.length || rows[1].content.startsWith('重叠测试第'), '块 1 应保持原内容（重叠只修改前块）');
+          db.prepare('DELETE FROM kb_chunks WHERE kb_id=?').run(kbid);
+          db.prepare('DELETE FROM kb_files WHERE kb_id=?').run(kbid);
+          db.prepare('DELETE FROM kbs WHERE id=?').run(kbid);
+        });
+        await t('HTTP：P2-3 自定义 chunk_separator 生效——separator=||| 驱动切段（此前参数从未被验证影响切分）', async () => {
+          db.prepare(`INSERT INTO kbs (name,description,enabled,owner,chunk_size,chunk_separator,created_at) VALUES ('P2 验收分隔符库','',1,'httpu1',30,'\\|\\|\\|',datetime('now','localtime'))`).run();
+          const kbid = db.prepare(`SELECT id FROM kbs WHERE name='P2 验收分隔符库'`).get().id;
+          const text = '主题甲内容A句子说明。主题甲内容B句子说明。|||主题乙内容C句子说明。主题乙内容D句子说明。';
+          const up = await jfetch(`/api/knowledge/${kbid}/files`, { method: 'POST', body: JSON.stringify({ name: '分隔符.txt', content: text }) }, tok1);
+          assert.ok(up.j && up.j.code === 0, '上传应成功：' + JSON.stringify(up.j).slice(0, 120));
+          assert.strictEqual(up.j.data.chunks, 2, 'separator=||| + chunk_size=30（防语义聚合重新合并）应切 2 块：' + JSON.stringify(up.j.data));
+          const rows = db.prepare('SELECT content FROM kb_chunks WHERE file_id=? ORDER BY id').all(up.j.data.id); // chunk_size=30≤200 无父子切片（全块 parent_id=NULL），直接查全行
+          assert.ok(rows[0].content.includes('主题甲') && !rows[0].content.includes('主题乙'), '块 0 只含甲段');
+          assert.ok(rows[1].content.includes('主题乙') && !rows[1].content.includes('主题甲'), '块 1 只含乙段');
+          db.prepare('DELETE FROM kb_chunks WHERE kb_id=?').run(kbid);
+          db.prepare('DELETE FROM kb_files WHERE kb_id=?').run(kbid);
+          db.prepare('DELETE FROM kbs WHERE id=?').run(kbid);
+        });
+        await t('HTTP：P2-3 非法 separator 正则——PUT 放行、上传兜底 failed 且服务存活（防请求挂死静默回归）', async () => {
+          db.prepare(`INSERT INTO kbs (name,description,enabled,owner,chunk_separator,created_at) VALUES ('P2 验收非法分隔符库','',1,'httpu1','(',datetime('now','localtime'))`).run();
+          const kbid = db.prepare(`SELECT id FROM kbs WHERE name='P2 验收非法分隔符库'`).get().id;
+          const up = await jfetch(`/api/knowledge/${kbid}/files`, { method: 'POST', body: JSON.stringify({ name: '非法正则.txt', content: '这是一段足够长可以被切片的正常文本内容，用于验证非法正则的兜底路径。' }) }, tok1);
+          assert.strictEqual(up.j && up.j.code, 400, 'new RegExp(\'(\') 抛错应经执行器兜底为 400（改造前此路径挂起请求）：' + JSON.stringify(up.j).slice(0, 120));
+          const row = db.prepare('SELECT status, error_msg FROM kb_files WHERE kb_id=? ORDER BY id DESC').get(kbid);
+          assert.strictEqual(row.status, 'failed', '应落 failed 行：' + JSON.stringify(row));
+          assert.ok(/管道步骤执行失败|Invalid regular expression/.test(row.error_msg || ''), 'error_msg 应含兜底文案：' + row.error_msg);
+          const health = await jfetch('/api/health', {}, tok1);
+          assert.ok(health.status === 200, '兜底后服务应存活（health 200）');
+          db.prepare('DELETE FROM kb_files WHERE kb_id=?').run(kbid);
+          db.prepare('DELETE FROM kbs WHERE id=?').run(kbid);
+        });
+        await t('HTTP：P2-3 语义聚合上限——3 段各约 250 字聚合为 2 块而非 1 块（chunkSize 切分条件边界）', async () => {
+          db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('P2 验收聚合上限库','',1,'httpu1',datetime('now','localtime'))`).run();
+          const kbid = db.prepare(`SELECT id FROM kbs WHERE name='P2 验收聚合上限库'`).get().id;
+          const para240 = () => '聚合上限测试句子的内容说明。'.repeat(17); // 固定 14 字/句 × 17 = 238 字/段
+          const para250 = () => '聚合上限测试句子的内容说明。'.repeat(18); // 14 字 × 18 = 252 字/段
+          const up = await jfetch(`/api/knowledge/${kbid}/files`, { method: 'POST', body: JSON.stringify({ name: '聚合上限甲.txt', content: [para240(), para240()].join('\n\n') }) }, tok1);
+          assert.ok(up.j && up.j.code === 0, '上传甲应成功：' + JSON.stringify(up.j).slice(0, 120));
+          assert.strictEqual(up.j.data.chunks, 1, '两段 240 字（240+2+240=482≤500）应聚合为 1 块（贴近上限仍合并）：' + JSON.stringify(up.j.data));
+          const up2 = await jfetch(`/api/knowledge/${kbid}/files`, { method: 'POST', body: JSON.stringify({ name: '聚合上限乙.txt', content: [para250(), para250()].join('\n\n') }) }, tok1);
+          assert.ok(up2.j && up2.j.code === 0, '上传乙应成功：' + JSON.stringify(up2.j).slice(0, 120));
+          assert.strictEqual(up2.j.data.chunks, 2, '两段 250 字（250+2+250=502>500）应切 2 块（超上限不合并）：' + JSON.stringify(up2.j.data));
+          const rows = db.prepare('SELECT content FROM kb_chunks WHERE file_id=? AND parent_id IS NOT NULL ORDER BY id').all(up2.j.data.id);
+          assert.ok(rows.every(r => r.content.length <= 500), '每块应 ≤500：' + rows.map(r => r.content.length).join(','));
+          db.prepare('DELETE FROM kb_chunks WHERE kb_id=?').run(kbid);
+          db.prepare('DELETE FROM kb_files WHERE kb_id=?').run(kbid);
+          db.prepare('DELETE FROM kbs WHERE id=?').run(kbid);
+        });
+        await t('HTTP：P2-3 chunk_size 两端与 0 回落——100/2000 可存可传、0 回落 500（服务端无钳制的现状契约）', async () => {
+          db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('P2 验收尺寸库','',1,'httpu1',datetime('now','localtime'))`).run();
+          const kbid = db.prepare(`SELECT id FROM kbs WHERE name='P2 验收尺寸库'`).get().id;
+          const para = Array.from({ length: 30 }, (_, i) => `尺寸测试第${i + 1}号句子的内容说明。`).join(''); // ~300 字
+          const put = (cs) => jfetch(`/api/knowledge/${kbid}`, { method: 'PUT', body: JSON.stringify({ chunk_size: cs }) }, tok1);
+          const up = () => jfetch(`/api/knowledge/${kbid}/files`, { method: 'POST', body: JSON.stringify({ name: '尺寸.txt', content: para }) }, tok1);
+          await put(100);
+          const s100 = await up();
+          assert.ok(s100.j.code === 0 && s100.j.data.chunks >= 3, 'chunk_size=100：300 字应切 ≥3 块：' + JSON.stringify(s100.j.data));
+          const rows100 = db.prepare('SELECT content FROM kb_chunks WHERE file_id=? AND parent_id IS NULL').all(s100.j.data.id);
+          assert.ok(rows100.every(r => r.content.length <= 100), '每块应 ≤100（chunk_size≤200 无父子切片，parent_id 全 NULL）：' + rows100.map(r => r.content.length).join(','));
+          await put(2000);
+          const s2000 = await up();
+          assert.ok(s2000.j.code === 0 && s2000.j.data.chunks === 1, 'chunk_size=2000：300 字应 1 块：' + JSON.stringify(s2000.j.data));
+          await put(0);
+          const s0 = await up();
+          assert.ok(s0.j.code === 0 && s0.j.data.chunks === 1, 'chunk_size=0（falsy）应回落 500：300 字 1 块：' + JSON.stringify(s0.j.data));
+          const back = db.prepare('SELECT chunk_size FROM kbs WHERE id=?').get(kbid).chunk_size;
+          assert.strictEqual(back, 0, 'PUT 0 应原样落库（服务端现状不钳制，前端 slider 100~2000 为唯一防线）');
+          db.prepare('DELETE FROM kb_chunks WHERE kb_id=?').run(kbid);
+          db.prepare('DELETE FROM kb_files WHERE kb_id=?').run(kbid);
+          db.prepare('DELETE FROM kbs WHERE id=?').run(kbid);
+        });
+        // 库 C「P2 验收管理库」：预览端点 / 批量容错 / failed 空态 三用例共享
+        db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('P2 验收管理库','',1,'httpu1',datetime('now','localtime'))`).run();
+        const p2KbC = db.prepare(`SELECT id FROM kbs WHERE name='P2 验收管理库'`).get().id;
+        await t('HTTP：P2-4 chunks 预览端点三态——file.parsed_at/created_at 补全 + 404 文件不存在 + 403 非 owner', async () => {
+          const up = await jfetch(`/api/knowledge/${p2KbC}/files`, { method: 'POST', body: JSON.stringify({ name: '预览三态.txt', content: '预览端点三态验证的第一段内容说明。\n\n预览端点三态验证的第二段内容补充。' }) }, tok1);
+          assert.ok(up.j && up.j.code === 0, '上传应成功：' + JSON.stringify(up.j).slice(0, 120));
+          const pv = await jfetch(`/api/knowledge/files/${up.j.data.id}/chunks`, {}, tok1);
+          assert.ok(pv.j.code === 0, 'GET chunks 应成功');
+          assert.ok(pv.j.data.file.parsed_at && typeof pv.j.data.file.parsed_at === 'string', 'parsed_at 应为非空字符串（同步管道完成即落值）：' + JSON.stringify(pv.j.data.file));
+          assert.ok(pv.j.data.file.created_at, 'created_at 应存在（P2-4 字段补全面）');
+          const nf = await jfetch('/api/knowledge/files/999999/chunks', {}, tok1);
+          assert.strictEqual(nf.j.code, 404, '不存在文件应 404：' + JSON.stringify(nf.j));
+          const forb = await jfetch(`/api/knowledge/files/${up.j.data.id}/chunks`, {}, tok2);
+          assert.strictEqual(forb.j.code, 403, '非 owner 应 403（denyIfNotAllowed）：' + JSON.stringify(forb.j));
+        });
+        await t('HTTP：P2-4 批量上传容错——串行 3 连传中间失败不阻断后续（前端批量循环的后端契约异常面）', async () => {
+          const u1 = await jfetch(`/api/knowledge/${p2KbC}/files`, { method: 'POST', body: JSON.stringify({ name: '批量容错甲.txt', content: '批量容错甲文件的第一段内容说明，用于验证串行链路。\n\n批量容错甲文件的第二段内容补充。' }) }, tok1);
+          const u2 = await jfetch(`/api/knowledge/${p2KbC}/files`, { method: 'POST', body: JSON.stringify({ name: '批量容错乙.txt', content: '只有五个字' }) }, tok1);
+          const u3 = await jfetch(`/api/knowledge/${p2KbC}/files`, { method: 'POST', body: JSON.stringify({ name: '批量容错丙.txt', content: '批量容错丙文件的内容说明，主题独立的另一份文档，用于验证失败不污染后续。' }) }, tok1);
+          assert.ok(u1.j.code === 0 && u3.j.code === 0, '甲/丙应成功：' + JSON.stringify([u1.j, u3.j]).slice(0, 150));
+          assert.strictEqual(u2.j.code, 400, '乙（<8 字）应 400：' + JSON.stringify(u2.j));
+          const failed = db.prepare(`SELECT status, error_msg FROM kb_files WHERE name='批量容错乙.txt'`).get();
+          assert.strictEqual(failed.status, 'failed', '乙应落 failed 行');
+          assert.ok((failed.error_msg || '').includes('解析后无有效文本'), 'error_msg 应含失败原因：' + failed.error_msg);
+          const c3 = db.prepare('SELECT content FROM kb_chunks WHERE file_id=?').all(u3.j.data.id).map(r => r.content).join('');
+          assert.ok(c3.includes('丙文件') && !c3.includes('甲文件'), '丙分块不应串入甲内容（失败不污染后续）');
+        });
+        await t('HTTP：P2-4 failed 文件预览空态——file.status=failed + chunks=[] + chunk_count=0（前端空态渲染契约）', async () => {
+          const row = db.prepare(`SELECT id, chunk_count FROM kb_files WHERE name='批量容错乙.txt' AND status='failed'`).get();
+          assert.ok(row, '应复用上条用例的 failed 行');
+          const pv = await jfetch(`/api/knowledge/files/${row.id}/chunks`, {}, tok1);
+          assert.ok(pv.j.code === 0, 'failed 文件 GET chunks 应成功（不 404 不炸）');
+          assert.strictEqual(pv.j.data.file.status, 'failed', 'file.status 应为 failed：' + JSON.stringify(pv.j.data.file));
+          assert.deepStrictEqual(pv.j.data.chunks, [], 'chunks 应为空数组');
+          assert.strictEqual(pv.j.data.file.chunk_count, 0, 'chunk_count 应为 0');
+        });
+        await t('HTTP：P2-4 stats 四态口径——直插 pending/processing/failed 行后归类合并与 bytes/chunks 全量语义', async () => {
+          db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('P2 验收统计库','',1,'httpu1',datetime('now','localtime'))`).run();
+          const kbid = db.prepare(`SELECT id FROM kbs WHERE name='P2 验收统计库'`).get().id;
+          const ins = db.prepare(`INSERT INTO kb_files (kb_id,name,size,status,chunk_count,created_at) VALUES (?,?,?,?,?,datetime('now','localtime'))`);
+          ins.run(kbid, '四态-pending.txt', 10, 'pending', 0);
+          ins.run(kbid, '四态-processing.txt', 20, 'processing', 0);
+          ins.run(kbid, '四态-failed.txt', 77, 'failed', 3);
+          const logs = await jfetch(`/api/knowledge/${kbid}/logs`, {}, tok1);
+          assert.ok(logs.j.code === 0, 'GET logs 应成功');
+          const s = logs.j.data.stats;
+          assert.strictEqual(s.total, 3, 'total 应 3：' + JSON.stringify(s));
+          assert.strictEqual(s.processing, 2, 'pending+processing 应合并计入 processing：' + s.processing);
+          assert.strictEqual(s.failed, 1, 'failed 应 1');
+          assert.strictEqual(s.bytes, 107, 'bytes 应=10+20+77（SUM 不筛 status，failed 行 size 计入口径）：' + s.bytes);
+          assert.strictEqual(s.chunks, 3, 'chunks 应含 failed 行 chunk_count（SUM 口径）：' + s.chunks);
+          db.prepare('DELETE FROM kb_files WHERE kb_id=?').run(kbid);
+          db.prepare('DELETE FROM kbs WHERE id=?').run(kbid);
+        });
+        // 库 E「P2 验收越权库」：merge 三态 + 文件/分块级写越权 两用例共享
+        db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('P2 验收越权库','',1,'httpu1',datetime('now','localtime'))`).run();
+        const p2KbE = db.prepare(`SELECT id FROM kbs WHERE name='P2 验收越权库'`).get().id;
+        db.prepare(`INSERT INTO kb_files (kb_id,name,size,status,chunk_count,created_at) VALUES (?,'越权载体.txt',100,'success',2,datetime('now','localtime'))`).run(p2KbE);
+        const p2FileE = db.prepare('SELECT id FROM kb_files WHERE kb_id=? ORDER BY id DESC').get(p2KbE).id;
+        db.prepare('INSERT INTO kb_chunks (file_id,kb_id,content) VALUES (?,?,?)').run(p2FileE, p2KbE, '越权验证分块甲的内容标记词。');
+        db.prepare('INSERT INTO kb_chunks (file_id,kb_id,content) VALUES (?,?,?)').run(p2FileE, p2KbE, '越权验证分块乙的内容标记词。');
+        await t('HTTP：安全——merge 缺参 400/不存在 404/跨库 400/非 owner 403（同库约束+归属校验双层拦截）', async () => {
+          const c1 = db.prepare('SELECT id FROM kb_chunks WHERE kb_id=? ORDER BY id').all(p2KbE);
+          const m1 = await jfetch('/api/knowledge/chunks/merge', { method: 'POST', body: JSON.stringify({}) }, tok1);
+          assert.strictEqual(m1.j.code, 400, '缺参应 400：' + JSON.stringify(m1.j));
+          const m2 = await jfetch('/api/knowledge/chunks/merge', { method: 'POST', body: JSON.stringify({ sourceId: 999999, targetId: c1[0].id }) }, tok1);
+          assert.strictEqual(m2.j.code, 404, '不存在分块应 404：' + JSON.stringify(m2.j));
+          db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('P2 验收越权库B','',1,'httpu1',datetime('now','localtime'))`).run();
+          const kbB = db.prepare(`SELECT id FROM kbs WHERE name='P2 验收越权库B'`).get().id;
+          db.prepare(`INSERT INTO kb_files (kb_id,name,size,status,chunk_count,created_at) VALUES (?,'B库载体.txt',50,'success',1,datetime('now','localtime'))`).run(kbB);
+          const fileB = db.prepare('SELECT id FROM kb_files WHERE kb_id=? ORDER BY id DESC').get(kbB).id;
+          db.prepare('INSERT INTO kb_chunks (file_id,kb_id,content) VALUES (?,?,?)').run(fileB, kbB, 'B库独立分块内容。');
+          const chunkB = db.prepare('SELECT id FROM kb_chunks WHERE kb_id=?').get(kbB).id;
+          const m3 = await jfetch('/api/knowledge/chunks/merge', { method: 'POST', body: JSON.stringify({ sourceId: c1[0].id, targetId: chunkB }) }, tok1);
+          assert.strictEqual(m3.j.code, 400, '跨库合并应 400：' + JSON.stringify(m3.j));
+          const m4 = await jfetch('/api/knowledge/chunks/merge', { method: 'POST', body: JSON.stringify({ sourceId: c1[0].id, targetId: c1[1].id }) }, tok2);
+          assert.strictEqual(m4.j.code, 403, '非 owner 合并他人库分块应 403（denyIfNotAllowed 覆盖同库双方）：' + JSON.stringify(m4.j));
+          const m5 = await jfetch('/api/knowledge/chunks/merge', { method: 'POST', body: JSON.stringify({ sourceId: c1[0].id, targetId: c1[1].id }) }, tok1);
+          assert.ok(m5.j.code === 0, 'owner 合并应成功：' + JSON.stringify(m5.j));
+          const after = db.prepare('SELECT id, content FROM kb_chunks WHERE kb_id=? ORDER BY id').all(p2KbE);
+          assert.strictEqual(after.length, 1, '合并后 source 应删除（2 块 → 1 块）');
+          assert.ok(after[0].content.includes('甲') && after[0].content.includes('乙'), 'target 应含两块内容');
+          db.prepare('DELETE FROM kb_chunks WHERE kb_id=?').run(kbB);
+          db.prepare('DELETE FROM kb_files WHERE kb_id=?').run(kbB);
+          db.prepare('DELETE FROM kbs WHERE id=?').run(kbB);
+        });
+        await t('HTTP：安全——文件级/分块级写越权全家（token2 上传/删文件/reparse/PUT chunk/DELETE chunk 全 403 且数据原样）', async () => {
+          const cid = db.prepare('SELECT id, content FROM kb_chunks WHERE kb_id=? ORDER BY id').all(p2KbE)[0].id;
+          const r1 = await jfetch(`/api/knowledge/${p2KbE}/files`, { method: 'POST', body: JSON.stringify({ name: '越权上传.txt', content: '越权上传尝试内容，足够长可切片。' }) }, tok2);
+          assert.strictEqual(r1.j.code, 403, '他人库上传应 403：' + JSON.stringify(r1.j));
+          const r2 = await jfetch(`/api/knowledge/files/${p2FileE}`, { method: 'DELETE' }, tok2);
+          assert.strictEqual(r2.j.code, 403, '删他人文件应 403：' + JSON.stringify(r2.j));
+          const r3 = await jfetch(`/api/knowledge/files/${p2FileE}/reparse`, { method: 'POST' }, tok2);
+          assert.strictEqual(r3.j.code, 403, 'reparse 他人文件应 403：' + JSON.stringify(r3.j));
+          const r4 = await jfetch(`/api/knowledge/chunks/${cid}`, { method: 'PUT', body: JSON.stringify({ content: '被篡改的内容标记词' }) }, tok2);
+          assert.strictEqual(r4.j.code, 403, 'PUT 他人分块应 403：' + JSON.stringify(r4.j));
+          const r5 = await jfetch(`/api/knowledge/chunks/${cid}`, { method: 'DELETE' }, tok2);
+          assert.strictEqual(r5.j.code, 403, 'DELETE 他人分块应 403：' + JSON.stringify(r5.j));
+          const still = db.prepare('SELECT content FROM kb_chunks WHERE id=?').get(cid);
+          assert.ok(still && still.content.includes('标记词') && !still.content.includes('篡改'), '分块内容应原样未被篡改');
+          const fileStill = db.prepare('SELECT id FROM kb_files WHERE id=?').get(p2FileE);
+          assert.ok(fileStill, '文件行应仍存在');
+        });
+        // P2 验收共享库收尾——兑底式清理（前序用例断言失败时其内联清理不会执行，此处按前缀统一扫除）+ 对账
+        await t('HTTP：P2 验收收尾——共享库与独立库统一扫除对账（防测试数据泄漏到后续用例）', async () => {
+          const leftovers = db.prepare(`SELECT id FROM kbs WHERE name LIKE 'P2 验收%'`).all();
+          leftovers.forEach(kb => {
+            db.prepare('DELETE FROM kb_chunks WHERE kb_id=?').run(kb.id);
+            db.prepare('DELETE FROM kb_files WHERE kb_id=?').run(kb.id);
+            db.prepare('DELETE FROM kbs WHERE id=?').run(kb.id);
+          });
+          const left = db.prepare(`SELECT COUNT(*) AS c FROM kbs WHERE name LIKE 'P2 验收%'`).get().c;
+          assert.strictEqual(left, 0, 'P2 验收库应全部清理：' + left);
+        });
         // ===== V1.1 审查加固（2026-10-30）：文件列表归属 + 部门管理权限/环校验 =====
         await t('HTTP：文件列表归属校验（V1.1 加固：非 owner GET /:id/files 403，error_msg 不经元数据外泄）', async () => {
           const kbid = db.prepare(`SELECT id FROM kbs WHERE name='日志测试库'`).get().id;
@@ -4661,6 +4931,133 @@ function t(name, fn) {
       for (const idx of p2Indexes) {
         assert.ok(have.includes(idx), `缺失 P2 新增索引：${idx}`);
       }
+    });
+    // ===== P2 里程碑验收补测——单元组（2026-11-05）：rerankAndSlice/bgeRerank/bgeEmbed/parseVec/rerankModels/P2-5 契约 =====
+    // 顺序约束：rerankAndSlice（mock 重排成功）必须在 bgeRerank 熔断用例之前——熔断后 30s 内 bgeRerank 直接 null，
+    // mock 供应商不再被触达（rerankDownUntil 为模块级状态，跨用例泄漏是有意为之的降级保护语义）
+    await t('单元：P2-2 rerankAndSlice 重排生效——mock 逆序返回覆盖 RRF 序 + rerank_score 附加 + channels/hit_terms 保留 + topN 截断', async () => {
+      const { rerankAndSlice, __expireCircuitBreakers } = require('../src-server/lib/retriever');
+      __expireCircuitBreakers(); // 跨用例熔断状态重置（模块级 30s 记忆会短路本用例的 mock 供应商）
+      db.prepare(`INSERT INTO providers (name,base_url,api_key,models,configured,is_default) VALUES ('P2补测rerank供应商','http://127.0.0.1:1','sk-p2test','["bge-reranker-v2-m3"]',1,0)`).run();
+      const pid = db.prepare(`SELECT id FROM providers WHERE name='P2补测rerank供应商'`).get().id;
+      const origFetch = globalThis.fetch;
+      try {
+        globalThis.fetch = async () => ({ ok: true, json: async () => ({ results: [{ index: 3, relevance_score: 0.9 }, { index: 2, relevance_score: 0.6 }, { index: 1, relevance_score: 0.4 }, { index: 0, relevance_score: 0.2 }] }) });
+        const items = [0, 1, 2, 3].map(i => ({ id: i + 1, content: `RRF候选第${i}名内容标记词`, score: 0.01 * (4 - i), channels: 'both', hit_terms: ['标记词'] }));
+        const out = await rerankAndSlice('标记词', items, 10, {}); // rerankEnabled 缺省 true → 走 mock 重排
+        assert.deepStrictEqual(out.map(o => o.id), [4, 3, 2, 1], '重排后顺序应为 index 3,2,1,0（覆盖 RRF 逆序）：' + out.map(o => o.id).join(','));
+        assert.strictEqual(typeof out[0].rerank_score, 'number', '输出应附加 rerank_score：' + JSON.stringify(out[0].rerank_score));
+        assert.strictEqual(out[0].channels, 'both', '重排后应保留 finish 产物 channels（P2-5 溯源链路不断链）：' + out[0].channels);
+        assert.deepStrictEqual(out[0].hit_terms, ['标记词'], '重排后应保留 hit_terms');
+        const out2 = await rerankAndSlice('标记词', items, 2, {});
+        assert.strictEqual(out2.length, 2, 'topN=2 应截断：' + out2.length);
+        assert.strictEqual(out2[0].id, 4, '截断后仍保持重排序');
+      } finally {
+        globalThis.fetch = origFetch;
+        db.prepare('DELETE FROM providers WHERE id=?').run(pid);
+      }
+    });
+    await t('单元：P2-2 bgeRerank——results 降序解析 / data[] 备选格式 / HTTP 500 → null + 30s 熔断窗口内不再发请求', async () => {
+      const { bgeRerank, __expireCircuitBreakers } = require('../src-server/lib/retriever');
+      __expireCircuitBreakers(); // 前序用例可能触发熔断（如 bgeEmbed 失败路径），重置后本用例熔断断言才真实可控
+      db.prepare(`INSERT INTO providers (name,base_url,api_key,models,configured,is_default) VALUES ('P2补测rerank供应商2','http://127.0.0.1:1','sk-p2test2','["bge-reranker-v2-m3"]',1,0)`).run();
+      const pid = db.prepare(`SELECT id FROM providers WHERE name='P2补测rerank供应商2'`).get().id;
+      const origFetch = globalThis.fetch;
+      let calls = 0;
+      try {
+        globalThis.fetch = async () => ({ ok: true, json: async () => ({ results: [{ index: 2, relevance_score: 0.9 }, { index: 0, relevance_score: 0.5 }, { index: 1, relevance_score: 0.7 }] }) });
+        const r1 = await bgeRerank('查询', [{ content: '甲' }, { content: '乙' }, { content: '丙' }]);
+        assert.deepStrictEqual(r1.map(r => r.index), [2, 1, 0], 'results 应按 relevance_score 降序排列');
+        assert.deepStrictEqual(r1.map(r => r.score), [0.9, 0.7, 0.5], 'score 应映射 relevance_score');
+        globalThis.fetch = async () => ({ ok: true, json: async () => ({ data: [{ index: 1, relevance_score: 0.8 }, { index: 0, relevance_score: 0.3 }] }) });
+        const r2 = await bgeRerank('查询', [{ content: '甲' }, { content: '乙' }]);
+        assert.deepStrictEqual(r2.map(r => r.index), [1, 0], 'data[]（类 OpenAI）备选格式应同样解析');
+        globalThis.fetch = async () => { calls++; return { ok: false, json: async () => ({}) }; };
+        const r3 = await bgeRerank('查询', [{ content: '甲' }, { content: '乙' }]);
+        assert.strictEqual(r3, null, 'HTTP 500 应返回 null（跳过重排回落 RRF）');
+        assert.ok(calls >= 1, '失败路径应真实发出请求（计数 ' + calls + '）');
+        const before = calls;
+        const r4 = await bgeRerank('查询', [{ content: '甲' }, { content: '乙' }]);
+        assert.strictEqual(r4, null, '熔断窗口内二次调用直接 null');
+        assert.strictEqual(calls, before, '熔断窗口内不应再发请求（rerankDownUntil 30s 记忆）');
+      } finally {
+        globalThis.fetch = origFetch;
+        db.prepare('DELETE FROM providers WHERE id=?').run(pid);
+      }
+    });
+    await t('单元：P2-1 bgeEmbed——成功 1024 维列表 / 维度不符降级 / 条数不符降级（结构校验三态，mock fetch finally 恢复）', async () => {
+      const { bgeEmbed, __expireCircuitBreakers } = require('../src-server/lib/retriever');
+      __expireCircuitBreakers(); // HTTP 区无供应商调用已设 30s 熔断（无 provider 也落熔断行的实现语义），不重置会短路成功路径
+      db.prepare(`INSERT INTO providers (name,base_url,api_key,models,configured,is_default) VALUES ('P2补测embed供应商','http://127.0.0.1:1','sk-p2test3','["bge-m3"]',1,0)`).run();
+      const pid = db.prepare(`SELECT id FROM providers WHERE name='P2补测embed供应商'`).get().id;
+      const origFetch = globalThis.fetch;
+      try {
+        globalThis.fetch = async () => ({ ok: true, json: async () => ({ data: [{ embedding: new Array(1024).fill(0.5) }, { embedding: new Array(1024).fill(0.6) }] }) });
+        const ok = await bgeEmbed(['文本甲', '文本乙']);
+        assert.ok(Array.isArray(ok) && ok.length === 2 && ok.every(v => Array.isArray(v) && v.length === 1024), '成功路径应返回条数一致且 1024 维的列表');
+        globalThis.fetch = async () => ({ ok: true, json: async () => ({ data: [{ embedding: new Array(512).fill(0.5) }, { embedding: new Array(512).fill(0.6) }] }) });
+        const badDim = await bgeEmbed(['文本甲', '文本乙']);
+        assert.strictEqual(badDim, null, '维度不符（512≠1024）应视为结构异常返回 null（防 B3/H 混库串味）——本次失败真实走结构校验并触发 30s 熔断');
+        globalThis.fetch = async () => ({ ok: true, json: async () => ({ data: [{ embedding: new Array(1024).fill(0.5) }] }) });
+        const badCount = await bgeEmbed(['文本甲', '文本乙']);
+        assert.strictEqual(badCount, null, '条数不符（1≠2）同样返回 null（本次经 30s 熔断短路——bgeDownUntil 与 rerankDownUntil 同构，熔断语义已在 bgeRerank 用例独立覆盖）');
+      } finally {
+        globalThis.fetch = origFetch;
+        db.prepare('DELETE FROM providers WHERE id=?').run(pid);
+      }
+    });
+    await t('单元：P2-2 rerankModels 去重与容错——跨供应商同名模型去重、损坏 JSON 行跳过不炸（finally 清理直插行）', () => {
+      const { rerankModels } = require('../src-server/lib/retriever');
+      const ins = db.prepare(`INSERT INTO providers (name,base_url,api_key,models,configured,is_default) VALUES (?,?,?,?,1,0)`);
+      const names = ['P2补测rm供应商A', 'P2补测rm供应商B', 'P2补测rm供应商C'];
+      ins.run(names[0], 'http://127.0.0.1:1', 'sk-a', '["bge-reranker-v2-m3","chat-x"]'); // A：含 rerank + 非 rerank
+      ins.run(names[1], 'http://127.0.0.1:1', 'sk-b', '["bge-reranker-v2-m3","bge-reranker-large"]'); // B：同名 + 另一 rerank
+      ins.run(names[2], 'http://127.0.0.1:1', 'sk-c', '{broken json'); // C：损坏 models
+      const pids = names.map(n => db.prepare('SELECT id FROM providers WHERE name=?').get(n).id);
+      try {
+        const out = rerankModels();
+        const count = out.filter(m => m === 'bge-reranker-v2-m3').length;
+        assert.strictEqual(count, 1, '跨供应商同名 rerank 模型应去重为 1：' + JSON.stringify(out));
+        assert.ok(out.includes('bge-reranker-large'), '另一 rerank 模型应保留');
+        assert.ok(!out.includes('chat-x'), '非 rerank 模型应被过滤');
+        assert.ok(Array.isArray(out), '损坏 JSON 行不应导致整体失败（rerankModels 仍返回数组）');
+      } finally {
+        pids.forEach(id => db.prepare('DELETE FROM providers WHERE id=?').run(id));
+      }
+    });
+    await t('单元：P2-1 parseVec 三前缀契约——B3:/H:/裸 JSON 解析、维度不符拒收、损坏 JSON 不炸（防 B3/H 混库串味兜底）', () => {
+      const { parseVec } = require('../src-server/lib/retriever');
+      const v1024 = JSON.stringify(new Array(1024).fill(0.1));
+      const v256 = JSON.stringify(new Array(256).fill(0.2));
+      const b3 = parseVec('B3:' + v1024);
+      assert.ok(b3.engine === 'B3' && b3.v && b3.v.length === 1024, 'B3:+1024 维应解析为 B3 引擎');
+      const b3bad = parseVec('B3:' + v256);
+      assert.ok(b3bad.v === null && b3bad.engine === null, 'B3:+256 维（维度不符）应拒收为 null');
+      const h = parseVec('H:' + v256);
+      assert.ok(h.engine === 'H' && h.v && h.v.length === 256, 'H:+256 维应解析为 H 引擎');
+      const bare = parseVec(v256);
+      assert.ok(bare.engine === 'H' && bare.v && bare.v.length === 256, '裸 JSON 应按旧版本地哈希解析为 H');
+      const broken = parseVec('{broken');
+      assert.ok(broken.v === null && broken.engine === null, '损坏 JSON 应返回双 null 不炸');
+      const empty = parseVec('');
+      assert.ok(empty.v === null && empty.engine === null, '空串应返回双 null');
+    });
+    await t('单元：P2-5 引用溯源输出契约——retrieve 每条 hit 的 11 个溯源字段全存在 + engine=H + channels 枚举（前端 kb-ref 渲染数据源锁定）', async () => {
+      const { retrieve } = require('../src-server/lib/retriever');
+      const kbid = globalThis.__goldenKbId;
+      assert.ok(kbid, '黄金基线库应已由前置用例设置 globalThis.__goldenKbId');
+      const hits = await retrieve('迟到早退怎么处理', kbid, 3, 0, { rerankEnabled: false });
+      assert.ok(hits.length >= 1, '黄金问答应命中');
+      const REQUIRED = ['id', 'parent_id', 'chapter_id', 'content', 'file', 'kb', 'kb_id', 'metadata', 'score', 'bm25', 'vec', 'engine'];
+      hits.forEach((h, i) => {
+        const missing = REQUIRED.filter(k => !(k in h));
+        assert.ok(!missing.length, `hit[${i}] 应含全部溯源字段，缺失：${missing.join(',')}（finish 白名单任何回归都会静默破坏 kb-ref 渲染）`);
+        assert.ok(typeof h.score === 'number' && typeof h.bm25 === 'number' && typeof h.vec === 'number', 'score/bm25/vec 应为 number');
+        assert.ok(h.engine === 'H', '降级环境 engine 应为 H：' + h.engine);
+        assert.ok(['both', 'bm25', 'vec', 'none'].includes(h.channels), 'channels 应为四值枚举：' + h.channels);
+        assert.ok(Array.isArray(h.hit_terms), 'hit_terms 应为数组');
+        assert.ok(h.file && h.kb, 'file/kb 名称应非空（kb-ref 显示依赖）：' + h.file + '/' + h.kb);
+      });
     });
   }
 

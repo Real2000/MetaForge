@@ -229,7 +229,11 @@ function bm25Scores(rows, qTerms) {
  * 调用方全部 await retrieve(...)（原同步调用点已同步改造）。
  */
 async function retrieve(query, kbId = null, topN = 5, threshold = 0.01, opts = {}) {
-  const vecWeight = Math.min(1, Math.max(0, Number(opts.vecWeight ?? 0.5)));
+  // P2 里程碑补测修复（2026-11-05）：vector_weight 非法值鲁棒性——原实现 Number('abc')=NaN 后
+  // Math.min/max 对 NaN 透传 → wV/wB 全 NaN → RRF 全 NaN → score>=threshold 恒 false → 静默 0 命中；
+  // 修复后非有限数（'abc'/null 之外的 NaN 场景）回落默认 0.5，语义与缺省一致
+  const _w = Number(opts.vecWeight ?? 0.5);
+  const vecWeight = Number.isFinite(_w) ? Math.min(1, Math.max(0, _w)) : 0.5;
   const rows = db.prepare(`
     SELECT c.id, c.content, c.kb_id, c.file_id, c.parent_id, c.chapter_id, c.embedding, c.keywords, c.metadata, f.name AS file, k.name AS kb
     FROM kb_chunks c
@@ -456,4 +460,10 @@ function finish(rows, bm25, vecs, qVec, engine, topN, threshold, vecWeight = 0.5
   return out;
 }
 
-module.exports = { retrieve, embed, bgeEmbed, bgeRerank, rerankProviders, rerankModels };
+// parseVec 导出（P2 里程碑补测 2026-11-05）：B3/H/裸 JSON 三前缀解析 + 维度不符拒收的单测需要；
+// 本地嵌入缓存写入侧经 embed()，读取侧格式契约由此函数单点维护
+// rerankAndSlice 导出：重排生效行为（rerank_score 附加/顺序覆盖/topN 截断）单测需要
+// __expireCircuitBreakers 测试助手（下划线约定：生产代码不得调用）：bgeDownUntil/rerankDownUntil 为模块级
+// 熔断状态，且 bgeEmbed 在无供应商环境下每次调用也会设置 30s 熔断（for 循环空转后落熔断行）——
+// 跨用例泄漏会导致后续 mock 供应商用例被短路，单测前需主动过期重置
+module.exports = { retrieve, embed, bgeEmbed, bgeRerank, rerankProviders, rerankModels, parseVec, rerankAndSlice, __expireCircuitBreakers: () => { bgeDownUntil = 0; rerankDownUntil = 0; } };

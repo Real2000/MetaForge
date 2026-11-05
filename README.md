@@ -2369,4 +2369,16 @@ agent-platform/
 ### 验证
 冒烟 **306/0 全绿**（300 基线 + 6 条新增）；语义聚合算法独立五场景验证通过（多短段落聚合/标题强边界/超长段落等价/上限保护/冒烟文本兼容）；HTTP 完整链路实测（独立 33212 端口子进程独立数据目录）：超长段落 1560 字上传返回 4 子块（477/486/486/162 均 ≤500）+ 2 父块（964/649 ~1000 字目标）✓；期间定位两处用例级问题（父子切片的父块混入断言→加 parent_id IS NOT NULL 过滤；SELECT content 对象误用 r.length→r.content.length）。**浏览器实测全通过（临时 33212 端口）**：文件管理页三统计卡实时联动（2 文件→4、5.0KB→5.4KB、6 块→9 块）；文件名点击→「文件预览」弹窗（头部大小/状态/片段数 + 全文拼接视图 + 📄全文/🧩分块双 tab 切换，编辑/合并交互保留）；批量上传 ⌘ 多选两文件 → 清单展示「已选择 2 个文件（共 460.0 B）」→ 串行上传 → 列表+统计实时更新；P2-3 真实链路实证：含「第一章/第二章」标题的文件切 2 块（标题强边界），两短段落无标题文件聚合 1 块 71 字（语义聚合生效，旧逻辑为 2 块）；控制台零错误。生产生效需重启 3210 服务。
 
+## P2 里程碑验收补测——24+ 条用例补齐 306→331（2026-11-05）
+
+### 实现内容
+- **双专家并行覆盖差距分析**（测试结果分析师 + API 测试员）：交叉确认零覆盖盲区——bgeRerank/bgeEmbed 全链路（P2-2 核心零断言）、chunk_overlap/自定义 separator 分支、HEADING_RE 中文章节形态、404 语义、文件/分块级写越权、P2-5 溯源字段契约；Tech Lead 复核**否决 1 项误报**（API 测试员报告的「merge 跨 owner 写入洞」实为同库约束在先+归属校验覆盖双方，无需修复）
+- **修复 1 处真实缺陷：vector_weight 非法值 NaN 穿透**（retriever.js retrieve）——原 `Math.min(1, Math.max(0, Number('abc')))` 对 NaN 透传 → wV/wB 全 NaN → RRF 全 NaN → score>=threshold 恒 false → **静默 0 命中**；修复后非有限数回落默认 0.5（Number.isFinite 判定），合法数字照常钳制 [-1→0、2→1]
+- **补 2 处导出**（retriever.js module.exports）：rerankAndSlice（重排生效行为单测需要）、parseVec（B3/H/裸 JSON 三前缀契约单测需要）、`__expireCircuitBreakers` 测试助手（下划线约定：bgeDownUntil/rerankDownUntil 为模块级 30s 熔断状态，且 bgeEmbed 无供应商时每次调用也落熔断行——跨用例泄漏会短路 mock 用例，单测前主动过期重置；生产代码不得调用）
+- **新增 25 条用例**（HTTP 19 + 单元 6，306→331）：**P2-1×5**（vector_weight 三态修复锁定/全标点 query 与 threshold>= 边界/top_n 三态契约/threshold 分数量级两端/bgeEmbed 结构校验三态）+ **parseVec 五态**（B3:/H:/裸 JSON/维度不符拒收/损坏 JSON）；**P2-2×4**（bgeRerank results 降序解析+data[] 备选格式+HTTP 500 熔断/rerankAndSlice 重排生效——rerank_score 附加+channels/hit_terms 保留+topN 截断/rerankModels 跨供应商去重+损坏 JSON 容错/HTTP 默认重排开启路径）；**P2-3×6**（HEADING_RE 四类中文章节序号形态/chunk_overlap=80 重叠切片——前块末尾并入后块开头/自定义 separator=||| 生效/非法 separator 正则兜底 failed 且服务存活/语义聚合 240-250 字边界两侧/chunk_size 100/2000 两端与 0 回落现状契约）；**P2-4×5**（chunks 预览端点 404/403+时间字段/批量上传容错——串行 3 连传中间失败不阻断/failed 文件预览空态/stats 四态口径——pending+processing 合并与 bytes 含 failed size/收尾兜底清理对账）；**P2-5+安全×3**（recall-test 每条 hit 11 个溯源字段完整性契约+engine=H+channels 枚举/merge 缺参 400-不存在 404-跨库 400-非 owner 403/文件级分块级写越权全家 403 且数据原样）
+- 用例纪律：全部自建库自清理（收尾用例兜底扫除「P2 验收%」前缀残留）；mock fetch 全局注入 finally 恢复；直插 providers 行对称 DELETE；熔断状态用例前显式过期重置；断言失败不泄漏测试数据
+
+### 验证
+冒烟 **331/0 全绿**（306 基线 + 25 条新增，**达成 P2 里程碑 330+ 目标**）；期间定位并修正 5 处用例自身问题（造数字数误算×3——「第N句」两位数使段长超预期/chunk_size≤200 无父子切片使 parent_id 过滤落空/断言失败路径清理不执行的兜底化）；vector_weight NaN 修复经三态用例实证（'abc'→回落 0.5 与基线一致、-1→钳 0、2→钳 1）。**登记候补池**（本轮不做）：chunk_size/separator 服务端钳制（前端 slider 为唯一防线）、meta-options `__proto__` 原型污染防御、DELETE file 404 文案 quirk、rerankAndSlice 越界 index 的 filter(Boolean) 实际滤不掉孤儿条目（mock 无越界场景故未锁定）。3210 生产服务需重启生效 vector_weight 修复。
+
 > AI生成
