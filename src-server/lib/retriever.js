@@ -315,7 +315,7 @@ async function retrieve(query, kbId = null, topN = 5, threshold = 0.01, opts = {
   // 回退：全表扫描（LanceDB 不可用或无命中时）
 
   // 优先 bge-m3：任一分块缺 B3 缓存 → 批量补齐（查询向量同引擎）
-  let engine = 'B3';
+  let engine = 'H'; // P2-1 mocks: 默认本地哈希引擎，避免bgeEmbed不可用时的路径断裂（bgeProviders 无embedding模型时自动降级）
   if (parsed.every(p => p.engine === 'B3')) {
     // 全部已有 bge 缓存，查询向量走网关（失败则整体降级本地重算）
     const q = await bgeEmbed([query]);
