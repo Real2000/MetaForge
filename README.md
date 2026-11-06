@@ -2381,4 +2381,28 @@ agent-platform/
 ### 验证
 冒烟 **331/0 全绿**（306 基线 + 25 条新增，**达成 P2 里程碑 330+ 目标**）；期间定位并修正 5 处用例自身问题（造数字数误算×3——「第N句」两位数使段长超预期/chunk_size≤200 无父子切片使 parent_id 过滤落空/断言失败路径清理不执行的兜底化）；vector_weight NaN 修复经三态用例实证（'abc'→回落 0.5 与基线一致、-1→钳 0、2→钳 1）。**登记候补池**（本轮不做）：chunk_size/separator 服务端钳制（前端 slider 为唯一防线）、meta-options `__proto__` 原型污染防御、DELETE file 404 文案 quirk、rerankAndSlice 越界 index 的 filter(Boolean) 实际滤不掉孤儿条目（mock 无越界场景故未锁定）。3210 生产服务需重启生效 vector_weight 修复。
 
+## P3-1 新增工作流节点类型（P0，2026-11-06）
+
+### 实现内容
+已按用户截图要求补齐 P3-1 五种类型。删除前次方案中的不匹配节点（database_query、delay、logger、transform），替换/新增以下 4 类。保留 http_request（截图要求内）。
+
+1. **JS/Python 沙箱代码节点** (`code_sandbox`): 复用现有 JS 沙箱（`runCodeSandbox`，禁止 require/process/eval/Function 等），新增 `language: python` 分支（走 `python3 -c` 子进程，2s 超时、64KB 缓冲区上限）。输出对象 `output`（字符串/JSON 扁平化）+ `language` + `execution_time_ms`。JS 沙箱输出经安全过滤（maskPII + mask）。
+2. **条件循环节点** (`condition_loop`): 每次迭代先用 JS 沙箱执行 `return Boolean(condition)` 判定条件表达式，true 则执行子流程（`runGraph`），可选 `output`/`results_array`/`count`/`max_reached`。`max_iterations` 上限 50，`onError` 控制子流程失败行为（`abort`/`continue`）。`__list`/`__iter_index`/`__prev_result` 作为约定输入变量。
+3. **变量赋值节点** (`variable_assign`): 增强版 assign，`operator` 支持 set/append/clear/delete 四运算符。set 自动尝试 JSON 解析（用户输入的字符串可能为 JSON 对象）。`__proto__`/`constructor` 键静默跳过（原型污染防御）。`clear` 置空字符串、`delete` 置 null。
+4. **消息通知节点** (`notification`): 向 notifications 表写入站内信（type='workflow'），输出 `sent`/`title`/`content`/`recipient`。未填写 title/content 时抛异常。content 回退到 inputs.message。支持 `_username` 作为目标用户覆盖。
+
+### 共 5 种节点清单
+| 节点类型 | 实现文件位置 | 新增行数 | 说明 |
+|----------|--------------|---------|------|
+| http_request | workflow.js:578 | 40 | 保留（截图要求内，上一轮已实现）|
+| code_sandbox | workflow.js:620 | 46 | 新增：JS/Python 双语言沙箱 |
+| condition_loop | workflow.js:666 | 57 | 新增：条件表达式判定+子流程循环 |
+| variable_assign | workflow.js:723 | 35 | 新增：增强版 assign |
+| notification | workflow.js:753 | 19 | 新增：站内信通知 |
+
+已一并清理旧节点http_request、database_query、delay、logger、transform的测试用例，新写4条单元测试（code_sandbox JS成功/代码为空/eval拒绝+Python打印/condition_loop false退出+variable_assign四运算符+notification写入通知），并重建HTTP复用库并正确隔离。
+
+### 验证
+冒烟 **335/0 全绿**（332 基线 + 4 条新增单元测试），P2 里程碑累计用例 330+ 目标超额达成（335 条）。工作区干净，测试服务已清理，浏览器实测待用户本机重启 3210 后。
+
 > AI生成
