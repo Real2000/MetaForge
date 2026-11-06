@@ -202,10 +202,13 @@ export async function render(el) {
     const inFav = (type, id) => favSet.has(`${type}:${id}`);
 
     let items = [];
-    if (tab === 'tools') items = data.builtin_tools.map(x => ({ ...x, _t: 'builtin_tool' }));
-    else if (tab === 'wf') items = data.wf_templates.map(x => ({ ...x, _t: 'wf_template' }));
-    else if (tab === 'skill') items = data.skill_assets.map(x => ({ ...x, _t: 'skill_asset' }));
-    else if (tab === 'mcp') items = data.mcp_tools.map(x => ({ ...x, _t: 'mcp_tool' }));
+    // 版本兼容兑底（2026-11-06）：旧后端（P3-2 融合前）主端点无 builtin_tools 键——
+    // 缺失时归一为空数组而非 undefined.map 崩页，内置工具 tab 显示空态提示引导重启服务
+    const BT = Array.isArray(data.builtin_tools) ? data.builtin_tools : [];
+    if (tab === 'tools') items = BT.map(x => ({ ...x, _t: 'builtin_tool' }));
+    else if (tab === 'wf') items = (data.wf_templates || []).map(x => ({ ...x, _t: 'wf_template' }));
+    else if (tab === 'skill') items = (data.skill_assets || []).map(x => ({ ...x, _t: 'skill_asset' }));
+    else if (tab === 'mcp') items = (data.mcp_tools || []).map(x => ({ ...x, _t: 'mcp_tool' }));
     // F5：异构清单独立端点尚未返回——展示加载态空卡片（到达后 loadPlatforms 会按当前 tab 触发一次重绘）
     else if (!platLoaded) {
       grid.innerHTML = `<div class="empty-box" style="grid-column:1/-1"><div class="big">🔌</div>${t('外部平台清单加载中…')}<br><span style="font-size:12px">${t('Dify / 扣子应用经独立接口异步拉取，到达后自动展示')}</span></div>`;
@@ -226,8 +229,13 @@ export async function render(el) {
     });
 
     if (!shown.length) {
+      // 旧后端识别（2026-11-06）：主端点缺 builtin_tools 键 = 服务端跑的是融合前旧代码——
+      // 给出明确引导（重启服务生效）而非误导性的「注册异常」文案
+      const legacyBackend = tab === 'tools' && !Array.isArray(data.builtin_tools);
       const emptyMap = {
-        tools: ['🧰', '暂无内置工具', '平台工具清单为空（服务端 TOOL_DEFS 注册异常，请联系管理员）'],
+        tools: legacyBackend
+          ? ['⬆️', '内置工具区需要新版服务端', '当前服务端为融合前旧版本（未返回 builtin_tools 字段）——重启 3210 服务（node server.js）后刷新本页即可']
+          : ['🧰', '暂无内置工具', '平台工具清单为空（服务端 TOOL_DEFS 注册异常，请联系管理员）'],
         wf: ['📐', '暂无工作流模版', '在编排页画布上「💾 存为模板」沉淀你的高频流程'],
         skill: ['✨', '暂无技能资产', mineOnly ? '你还没有创建技能——点击右上「＋ 创建技能」开始' : '点击「＋ 创建技能」沉淀可复用的提示词+工具组合，发布后进入市场供他人克隆'],
         mcp: ['🔧', '暂无 MCP 工具', '管理员在「MCP 服务」注册并刷新工具清单后，这里自动聚合'],
@@ -390,7 +398,12 @@ export async function render(el) {
     if (!data) return;
     // 口径说明（F5 + P3-2）：stats.total 来自主端点=本地四区条数之和；异构清单到达后可选追加「+N 异构」展示，
     // 不并入 total——避免主/异构两套口径互相漂移，也避免平台未到达时徽章数字回跳
-    let s = t('共 N 项资产 · 我收藏 M').replace('N', data.stats.total).replace('M', favSet.size);
+    // 版本兼容兑底（2026-11-06）：旧后端无 builtin_tools 区，total 按三区实际数现算（stats.total 语义一致）
+    const btCount = Array.isArray(data.builtin_tools) ? data.builtin_tools.length : 0;
+    const total = (data.stats && typeof data.stats.total === 'number')
+      ? data.stats.total
+      : btCount + (data.wf_templates || []).length + (data.skill_assets || []).length + (data.mcp_tools || []).length;
+    let s = t('共 N 项资产 · 我收藏 M').replace('N', total).replace('M', favSet.size);
     if (platLoaded && !platErr && (data.platforms || []).length) s += ` · +${data.platforms.length} ${t('异构')}`;
     statsEl.textContent = s;
   }
