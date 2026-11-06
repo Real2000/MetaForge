@@ -64,6 +64,7 @@ app.use('/api/notify', require('./src-server/routes/notify'));
 app.use('/api/quota', require('./src-server/routes/quota'));
 // 用户自有模型源（P3）：自带 Key 接入个人 OpenAI 兼容服务，仅本人可见可用
 app.use('/api/usermodels', require('./src-server/routes/usermodels'));
+app.use('/api/tool-keys', require('./src-server/routes/tool-keys')); // P3-2：用户级工具 API Key（weather/translate 等，加密落盘掩码回显）
 // 技能资产（P3）：提示词+工具组合资产化，对话中 @技能名 调用
 app.use('/api/skillassets', require('./src-server/routes/skillassets'));
 // V2.2 #7 技能/模版市场：工作流模版/技能资产/MCP 工具/异构应用四区聚合 + 收藏 + 一键克隆

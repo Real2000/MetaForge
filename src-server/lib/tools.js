@@ -108,13 +108,26 @@ for (const _k of ['db_query', 'db_chart', 'web_search', 'web_fetch', 'stock_quot
   if (_extra[_k] && _extra[_k].schema) TOOL_DEFS[_k] = _extra[_k];
 }
 
+// P3-2 工具市场扩展（2026-11-06）：tools-market.js 注册 11 个新工具（15 → 26）——
+// 8 个纯本地计算（uuid_gen/hash_tool/base64_tool/json_tool/text_count/date_calc/unit_convert/cron_explain）
+// + 3 个网络查询（weather_query/translate_text/exchange_rate，前两者支持用户自有 API Key）
+// 同时 re-export getUserToolKey（用户级工具 key 读取，路由与测试用）
+const _market = require('./tools-market');
+for (const _k of ['uuid_gen', 'hash_tool', 'base64_tool', 'json_tool', 'text_count', 'date_calc', 'unit_convert', 'cron_explain', 'weather_query', 'translate_text', 'exchange_rate']) {
+  if (_market[_k] && _market[_k].schema) TOOL_DEFS[_k] = _market[_k];
+}
+const { getUserToolKey } = _market;
+
 // P5.25 工具风险分级（对话权限「默认权限/全自动执行」的判定依据）：
 //  - low（默认）：纯读/纯算，执行无副作用——get_datetime/calculator/kb_search/db_query/db_chart/web_search/web_fetch/stock_quote/doc_review
 //  - medium：产出外部可见产物或花费 token 较多——image_gen/export_word/tts/子智能体调用 agent_call_*
 //  - high：持久化自动执行实体（create_task，P5.31）与 MCP 任意工具（能力不可枚举，可能含写操作/对外发送）——按 mcp_ 前缀整体归 high
 // 「默认权限」下 medium/high 执行前需用户确认；「全自动执行」全部放行；low 永不拦截（确认疲劳无意义）。
 const TOOL_RISK = {
-  low: ['get_datetime', 'calculator', 'kb_search', 'db_query', 'db_chart', 'web_search', 'web_fetch', 'stock_quote', 'doc_review'],
+  low: ['get_datetime', 'calculator', 'kb_search', 'db_query', 'db_chart', 'web_search', 'web_fetch', 'stock_quote', 'doc_review',
+    // P3-2 工具市场（2026-11-06）：11 个新工具全部只读无副作用，与 web_search/stock_quote 同级 low
+    'uuid_gen', 'hash_tool', 'base64_tool', 'json_tool', 'text_count', 'date_calc', 'unit_convert', 'cron_explain',
+    'weather_query', 'translate_text', 'exchange_rate'],
   medium: ['image_gen', 'export_word', 'tts', 'run_code'],
   high: ['create_task'], // P5.31：定时任务 = 持久化自动执行实体，提示词注入最想拿到的能力，必弹确认卡
 };
@@ -252,4 +265,4 @@ async function runTool(name, argsJson, ctx = {}) {
   }
 }
 
-module.exports = { TOOL_DEFS, buildTools, runTool, loadMcpTools, toolRiskOf, validateAgentTools, AGENT_TOOL_DENY };
+module.exports = { TOOL_DEFS, buildTools, runTool, loadMcpTools, toolRiskOf, validateAgentTools, AGENT_TOOL_DENY, getUserToolKey };

@@ -14,8 +14,8 @@ const routes = {
   '/home': { page: () => import('./front/home.js'), layout: 'front', title: '前台首页' },
   '/agents': { page: () => import('./front/agents.js'), layout: 'front', title: '智能体' },
   '/square': { page: () => import('./front/square.js'), layout: 'front', title: '智能体广场' },
-  '/skills': { page: () => import('./front/skills.js'), layout: 'front', title: '技能' },
-  '/skills-market': { page: () => import('./front/market.js'), layout: 'front', title: '技能市场' }, // V2.2 #7 四区聚合运营位
+  '/skills': { redirect: '/skills-market' }, // P3-2 融合（2026-11-06）：原独立技能页并入市场页技能资产 tab——旧链接/书签重定向兼容
+  '/skills-market': { page: () => import('./front/market.js'), layout: 'front', title: '技能市场' }, // P3-2 融合：五区聚合（内置工具+技能CRUD+模版+MCP+异构）
   '/models': { page: () => import('./front/models.js'), layout: 'front', title: '我的模型' },
   '/chat': { page: () => import('./front/chat.js'), layout: 'chat', title: '智能体对话' },
   '/knowledge': { page: () => import('./front/knowledge.js'), layout: 'front', title: '知识库' },
@@ -47,8 +47,7 @@ const frontNav = [
   { href: '#/home', ic: '🏠', label: '前台首页' },
   { href: '#/agents', ic: '🤖', label: '智能体' },
   { href: '#/square', ic: '🛍️', label: '广场' },
-  { href: '#/skills', ic: '✨', label: '技能' },
-  { href: '#/skills-market', ic: '🛒', label: '技能市场' },
+  { href: '#/skills-market', ic: '🛒', label: '技能市场' }, // P3-2 融合：原「技能」「技能市场」两入口合为一（技能 CRUD 在市场页技能资产 tab）
   { href: '#/models', ic: '🧩', label: '我的模型' },
   { href: '#/knowledge', ic: '📚', label: '知识库' },
   { href: '#/tasks', ic: '⏰', label: '任务管理' },
@@ -215,6 +214,9 @@ async function route() {  const hash = location.hash || '#/home';
   const segs = path.split('/').filter(Boolean);
   const base = '/' + segs.slice(0, segs[0] === 'admin' ? 2 : 1).join('/');
   const conf = routes[base] || routes['/home'];
+
+  // P3-2 融合（2026-11-06）：路由重定向（旧链接/书签兼容——如 #/skills → #/skills-market）
+  if (conf.redirect) { location.hash = '#' + conf.redirect; return; }
 
   // 切页前清理上一页 destroy（防轮询/监听器泄漏）
   if (currentDestroy) { try { currentDestroy(); } catch (e) { console.warn('destroy err', e); } currentDestroy = null; }

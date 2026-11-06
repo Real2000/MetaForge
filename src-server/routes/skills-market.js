@@ -1,6 +1,6 @@
-/** 技能/模版市场（V2.2 #7 2026-10-31）：分散资产的统一聚合运营位
- *  对标 Dify 插件市场 / Coze Skills 商店——工作流模版 / 技能资产 / MCP 工具 / 异构纳管应用四区一页：
- *  - GET    /api/skills-market               本地三区聚合 + 统计（V2.3 F5：不再拉外部平台，立即返回保市场首屏速度；登录即可浏览）
+/** 技能/模版市场（V2.2 #7 2026-10-31；P3-2 融合 2026-11-06）：分散资产的统一聚合运营位
+ *  对标 Dify 插件市场 / Coze Skills 商店——内置工具 / 技能资产（含 CRUD 融合）/ 工作流模版 / MCP 工具 / 异构纳管应用五区一页：
+ *  - GET    /api/skills-market               本地四区聚合（内置工具 + 三区）+ 统计（V2.3 F5：不再拉外部平台，立即返回保市场首屏速度；登录即可浏览）
  *  - GET    /api/skills-market/platforms     异构应用清单独立端点（V2.3 F5+Y4：多平台并行拉取 + 10 分钟缓存 best-effort；
  *                                          F5 动机：外部平台故障/超时不拖慢市场首屏，前端异步加载填充「异构应用」tab）
  *  - GET    /api/skills-market/favorites     我的收藏列表（join 回资产详情，已下架资产标 available:false）
@@ -11,11 +11,15 @@
  *  克隆另挂 requireFeature('agents') 部署级版本闸门（V2.2 审查加固 F3：与 POST /api/agents 写入口同口径，
  *  community 起即含 agents 特性，不误伤基础功能——闸门意义在于未来收敛免费档位时无需再改市场路由）。
  *  注意：市场收藏走 market_favorites 表（username/item_type/item_id），与智能体收藏 favorites 表是两套，互不影响。
+ *  P3-2 融合（2026-11-06）：原独立「技能」页（#/skills，front/skills.js）CRUD 融合到市场页技能资产 tab；
+ *  builtin_tools 区从 TOOL_DEFS 动态生成（单一事实来源，排除 AGENT_TOOL_DENY 违禁工具）——
+ *  前端不再硬编码工具清单（旧 TOOL_META 仅 4 项已过时），含 P3-2 新增 11 个工具。
  */
 const express = require('express');
 const { db, now } = require('../db');
 const { auth } = require('../lib/auth');
-const { TOOL_DEFS, AGENT_TOOL_DENY } = require('../lib/tools');
+const { TOOL_DEFS, AGENT_TOOL_DENY, toolRiskOf } = require('../lib/tools');
+const { KEYED_TOOL_META } = require('../lib/tools-market');
 const { validateWorkflowV2 } = require('../lib/workflow-schema');
 const dify = require('../lib/dify');
 const coze = require('../lib/coze');
@@ -84,15 +88,52 @@ router.get('/', async (req, res) => {
   const favSet = new Set(db.prepare('SELECT item_type, item_id FROM market_favorites WHERE username=?').all(me)
     .map(f => `${f.item_type}:${f.item_id}`));
 
+  // 零区：内置工具（P3-2 融合 2026-11-06）——从 TOOL_DEFS 动态生成（单一事实来源），
+  // 排除 AGENT_TOOL_DENY 违禁工具（create_task/local_exec 不进市场）；keyed=key可配标记 +
+  // key_configured=当前用户已配置（user_tool_keys join）；risk 用 toolRiskOf 统一口径；
+  // params 拆必填/可选两个数组供卡片展示（技能挂载表单与市场卡片共用本结构）
+  const myKeyed = new Set(db.prepare('SELECT tool_name FROM user_tool_keys WHERE username=? AND status=1').all(me).map(r => r.tool_name));
+  const builtinTools = Object.values(TOOL_DEFS)
+    .filter(t => t?.schema?.function?.name && !AGENT_TOOL_DENY.has(t.schema.function.name))
+    .map(t => {
+      const f = t.schema.function;
+      const props = f.parameters?.properties || {};
+      const required = f.parameters?.required || [];
+      return {
+        name: f.name,
+        description: f.description || '',
+        params_required: required.filter(p => props[p]),
+        params_optional: Object.keys(props).filter(p => !required.includes(p)),
+        risk: toolRiskOf(f.name),
+        keyed: !!KEYED_TOOL_META[f.name],
+        key_label: KEYED_TOOL_META[f.name]?.label || '',
+        key_provider: KEYED_TOOL_META[f.name]?.provider || '',
+        key_configured: myKeyed.has(f.name) ? 1 : 0,
+      };
+    })
+    .sort((a, b) => a.name.localeCompare(b.name));
+
   // 一区：工作流模版（热度优先 use_count DESC, id DESC）
   const wfTemplates = db.prepare(`SELECT id,slug,name,icon,category,description,scene,use_count,builtin
     FROM workflow_templates ORDER BY use_count DESC, id DESC`).all()
     .map(t => ({ ...t, favorited: favSet.has(`wf_template:${t.id}`) }));
 
   // 二区：技能资产（我的全部 + 他人已发布——与 /api/skillassets 可见性口径一致，私有技能不进市场）
-  const skillAssets = db.prepare('SELECT id,name,description,icon,owner,status FROM skill_assets WHERE owner=? OR status=1 ORDER BY id DESC')
+  // P3-2 融合：附 mine 标记 + 全字段（prompt/tools/status）——市场页技能资产 tab 现在承担 CRUD（原独立技能页），
+  // 列表需渲染详情/编辑/删除/发布开关；私有技能仅 owner 本人可见（原 /api/skillassets 语义不变，这里多带字段）
+  const skillAssets = db.prepare('SELECT id,name,description,icon,owner,status,prompt,tools,created_at FROM skill_assets WHERE owner=? OR status=1 ORDER BY id DESC')
     .all(me)
-    .map(s => ({ id: s.id, name: s.name, description: s.description, icon: s.icon, owner: s.owner, owned_by_me: s.owner === me, favorited: favSet.has(`skill_asset:${s.id}`) }));
+    .map(s => {
+      let tools = [];
+      try { tools = JSON.parse(s.tools || '[]'); } catch { }
+      return {
+        id: s.id, name: s.name, description: s.description, icon: s.icon,
+        owner: s.owner, status: s.status, prompt: s.prompt, tools,
+        created_at: s.created_at,
+        owned_by_me: s.owner === me, mine: s.owner === me,
+        favorited: favSet.has(`skill_asset:${s.id}`),
+      };
+    });
 
   // 三区：MCP 工具（tools_cache 展开每工具一行；停用服务跳过；item_id = server_id:tool_name 供收藏定位）
   const mcpTools = [];
@@ -115,15 +156,16 @@ router.get('/', async (req, res) => {
   }
 
   // V2.3 F5：异构应用拉取已移出本端点（原四区同请求聚合时，外部平台慢/故障会拖住整个市场页首屏）——
-  // 主端点只聚合本地三区立即返回，异构清单改由 GET /platforms 独立端点承担、前端异步加载
+  // 主端点只聚合本地四区立即返回，异构清单改由 GET /platforms 独立端点承担、前端异步加载
   res.json({
     code: 0,
     data: {
+      builtin_tools: builtinTools,
       wf_templates: wfTemplates,
       skill_assets: skillAssets,
       mcp_tools: mcpTools,
       stats: {
-        total: wfTemplates.length + skillAssets.length + mcpTools.length, // 三区条数之和（异构清单独立端点另行返回，不并入 total）
+        total: builtinTools.length + wfTemplates.length + skillAssets.length + mcpTools.length, // 四区条数之和（异构清单独立端点另行返回，不并入 total）
         my_favorites: favSet.size,
       },
     },

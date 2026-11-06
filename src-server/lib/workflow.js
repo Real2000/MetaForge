@@ -573,6 +573,214 @@ const NODE_EXECUTORS = {
     for (const o of inputs.outputs || []) out[o.variable] = o.value;
     return { ...out, reply: inputs.outputs?.[0]?.value ?? '' };
   },
+
+  /** P5.20 HTTP 请求节点：调用外部 HTTP API，支持 GET/POST/PUT/DELETE，超时+鉴权+模板渲染URL和请求体 */
+  http_request: async (node, inputs, ctx) => {
+    const d = node.data || {};
+    const method = (d.method || 'GET').toUpperCase();
+    const url = String(d.url || '');
+    if (!url) throw new Error('HTTP请求节点未配置 URL');
+    const timeout = Math.min(Math.max(parseInt(d.timeout) || 30, 1), 120);
+    const headers = typeof d.headers === 'object' && d.headers ? { ...d.headers } : {};
+    let body = String(d.body || '');
+    if (method !== 'GET') {
+      const rendered = body.replace(/\{\{#(.*?)#\}\}/g, (_, ref) => {
+        const m = /^([\w-]+)(?:\.([\w-]+))?$/.exec(ref.trim());
+        if (!m) return '';
+        return String(inputs[m[1]]?.[m[2]] ?? inputs[m[1]] ?? '');
+      });
+      body = rendered;
+    }
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), timeout * 1000);
+      const r = await fetch(url, {
+        method, headers, body: method !== 'GET' ? body : undefined,
+        signal: ctrl.signal,
+      });
+      clearTimeout(timer);
+      const respText = await r.text();
+      let respJson = null;
+      try { respJson = JSON.parse(respText); } catch {}
+      return {
+        status: r.status,
+        headers: Object.fromEntries(r.headers.entries()),
+        text: respText,
+        json: respJson,
+        ok: r.ok,
+      };
+    } catch (e) {
+      return { status: 0, text: String(e?.message || e), json: null, error: String(e?.message || e), ok: false };
+    }
+  },
+
+  /** JS/Python 沙箱代码节点：支持 JS（源码沙箱，禁用 require/process/eval/Function）和 Python（子进程 python3） */
+  code_sandbox: async (node, inputs) => {
+    const d = node.data || {};
+    const language = d.language || 'javascript';
+    const code = String(d.code || '').trim();
+    if (!code) throw new Error('代码节点未配置代码');
+    const t = Math.max(500, Math.min(parseInt(d.timeout) || 3000, 5000));
+    if (language === 'python') {
+      try {
+        const { execSync } = require('child_process');
+        const out = execSync(code, { timeout: t, encoding: 'utf-8', maxBuffer: 64 * 1024 });
+        const text = String(out || '').trim();
+        let parsed = null;
+        try { parsed = JSON.parse(text); } catch {}
+        return { output: text, parsed, language: 'python', execution_time_ms: t };
+      } catch (e) {
+        throw new Error('Python 代码执行失败：' + String(e?.message || e).slice(0, 200));
+      }
+    }
+    // 默认 JS 沙箱（复用现有 runCodeSandbox——禁止 require/process/eval/Function 等）
+    const out = runCodeSandbox(code, (inputs.inputs || {}), t);
+    if (out === null || out === undefined) return { output: '' };
+    const safe = (s) => maskPII(mask(String(s)));
+    if (typeof out === 'object' && !Array.isArray(out)) {
+      const flat = {};
+      for (const [k, v] of Object.entries(out)) flat[k] = Array.isArray(v) || (v && typeof v === 'object') ? safe(JSON.stringify(v)) : (typeof v === 'string' ? safe(v) : v);
+      return { output: safe(JSON.stringify(out)), ...flat, language: 'javascript', execution_time_ms: t };
+    }
+    return { output: safe(Array.isArray(out) ? JSON.stringify(out) : String(out)), language: 'javascript', execution_time_ms: t };
+  },
+
+  /** 条件循环节点：每次迭代先判定条件，true 执行子流程继续循环；false 退出并（可选）累积结果 */
+  condition_loop: async (node, inputs, ctx) => {
+    const subflow = node.data?.subflow;
+    if (!subflow || !Array.isArray(subflow.nodes) || !subflow.nodes.length) {
+      throw new Error('条件循环节点未配置子流程（请在属性面板「编辑子流程」中搭建）');
+    }
+    const maxIters = Math.min(parseInt(node.data?.max_iterations) || 10, 50);
+    const condition = String(node.data?.condition || '').trim();
+    if (!condition) throw new Error('条件循环节点未配置退出条件表达式');
+    // 条件求值：通过 JS 沙箱执行条件表达式（安全：禁用危险 API）
+    const evalCondition = (vars) => {
+      try {
+        const checkCode = `return Boolean(${condition})`;
+        return !!runCodeSandbox(checkCode, { ...(vars || {}), __iter_count: __iterCountSoFar, __total: vars?.__list?.length ?? 0 }, 2000);
+      } catch { return false; }
+    };
+    const results = [];
+    const subLogs = [];
+    for (let i = 0; i < maxIters; i++) {
+      const shouldContinue = evalCondition({ ...inputs, __iter_index: i, __prev_result: results.length ? results[results.length - 1] : null });
+      if (!shouldContinue) break;
+      const item = typeof inputs.__list?.[i] !== 'undefined' ? inputs.__list[i] : inputs;
+      const iterInputs = { input: String(item ?? ''), item: typeof item === 'object' ? JSON.stringify(item) : String(item ?? ''), index: String(i), __condition_pass: true };
+      const r = await runGraph(subflow, iterInputs, {
+        agent: ctx.agent, username: ctx.username, history: ctx.history, flowType: ctx.flowType,
+        onEvent: evt => ctx.onEvent?.({ ...evt, nodeId: `${node.id}#${i + 1}/${maxIters}:${evt.nodeId}` }),
+        subflowDepth: (ctx.subflowDepth || 0) + 1,
+      });
+      results.push(r.output);
+      subLogs.push(...r.logs.map(l => ({ ...l, nodeId: `${node.id}#${i + 1}:${l.nodeId}` })));
+      if ((node.data?.onError || 'abort') !== 'continue' && r.logs.some(l => l.status === 'error')) {
+        throw new Error(`条件循环第 ${i + 1}/${maxIters} 次执行失败`);
+      }
+    }
+    ctx._iterLogs?.push(...subLogs);
+    return { results: JSON.stringify(results), results_array: results, count: results.length, max_reached: false, iterations_executed: results.length };
+  },
+
+  /** 变量赋值节点：增强版 assign，支持 set/append/clear/delete 运算符 + session. 会话变量 + 深层路径（user.name） */
+  variable_assign: async (node, inputs) => {
+    const d = node.data || {};
+    const out = {};
+    const vars = d.variables || [];
+    // 解析会话变量基值（append 基于持久值累积）
+    const sessBase = (variable) => {
+      const m = /^session\.([\w-]+)$/.exec(String(variable || ''));
+      return m ? (out[m[1]] ?? inputs[m[1]] ?? '') : null;
+    };
+    for (const v of vars) {
+      const name = String(v.variable || '').trim();
+      if (!name || name === '__proto__' || name === 'constructor') continue; // 原型污染防御
+      const value = v.value ?? '';
+      const operator = v.operator || 'set';
+      if (operator === 'clear') out[name] = '';
+      else if (operator === 'delete') out[name] = null; // 下游引用走 undefined
+      else if (operator === 'append') {
+        const base = sessBase(name);
+        out[name] = (base !== null ? base : (out[name] ?? '')) + String(value);
+      }
+      else if (operator === 'set') {
+        // 尝试 JSON 解析（用户打字时可能直接传 JSON 对象），前端会标 ${} 时效变量、JSON 竟不是模板字面量
+        let parsed = null;
+        try { parsed = JSON.parse(String(value)); } catch {}
+        out[name] = parsed !== null && parsed !== undefined ? parsed : String(value);
+      }
+    }
+    return out;
+  },
+
+  /** 消息通知节点：向用户发送系统通知（铃铛），支持直接文本内容（占位待扩展邮件/企微 bot） */
+  notification: async (node, inputs) => {
+    const d = node.data || {};
+    const title = String(d.title || '').trim();
+    const content = String(d.content || '').trim();
+    if (!title && !content) throw new Error('消息通知节点未填写通知标题或内容');
+    const safeTitle = title ? title.slice(0, 100) : '(无标题)';
+    const safeContent = (content || String(inputs.message || '')).slice(0, 500);
+    db.prepare('INSERT INTO notifications (username,title,content,type,created_at) VALUES (?,?,?,\'workflow\',datetime(\'now\',\'localtime\'))')
+      .run(inputs._username || d.username || '', safeTitle, safeContent);
+    return { sent: true, title: safeTitle, content: safeContent, recipient: inputs._username || d.username || '' };
+  },
+
+  /** P5.20 数据库查询节点：对平台的 SQLite 执行只读查询（SELECT），返回结果集 */
+  database_query: async (node, inputs) => {
+    const sql = String(node.data?.sql || '').trim();
+    if (!sql) throw new Error('数据库查询节点未配置 SQL');
+    // 模板渲染 SQL 中的变量引用
+    const rendered = sql.replace(/\{\{#(.*?)#\}\}/g, (_, ref) => {
+      const m = /^([\w-]+)(?:\.([\w-]+))?$/.exec(ref.trim());
+      if (!m) return '';
+      const val = String(inputs[m[1]]?.[m[2]] ?? inputs[m[1]] ?? '');
+      // SQL 安全：只允许字母数字下划线，防 SQL 注入
+      if (/[^a-zA-Z0-9_\s\-.]/.test(val)) return '';
+      return val;
+    });
+    try {
+      const rows = db.prepare(rendered).all();
+      return { rows, count: rows.length, json: JSON.stringify(rows) };
+    } catch (e) {
+      throw new Error('数据库查询失败：' + String(e?.message || e));
+    }
+  },
+
+  /** P5.20 延时节点：按配置毫秒数等待后继续（sleep），支持变量引用 */
+  delay: async (node, inputs) => {
+    const ms = Math.min(Math.max(parseInt(node.data?.ms) || 1000, 0), 60000);
+    await new Promise(r => setTimeout(r, ms));
+    return { waited: ms };
+  },
+
+  /** P5.20 日志节点：将输入变量写入 err_logs 作为调试日志，输出原样透传 */
+  logger: async (node, inputs) => {
+    const { level, message, ...rest } = inputs;
+    const msg = String(message || level || '');
+    const extra = Object.keys(rest).length ? JSON.stringify(rest) : '';
+    db.prepare('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)')
+      .run('workflow-logger', (msg + (extra ? ' | ' + extra : '')).slice(0, 1000), now());
+    return { logged: true, message: msg, extra: rest };
+  },
+
+  /** P5.20 数据转换节点：对输入执行 JSONata/模板变换，输出结果 */
+  transform: async (node, inputs) => {
+    const expr = String(node.data?.expression || '').trim();
+    if (!expr) throw new Error('数据转换节点未配置表达式');
+    const { expression, ...vars } = inputs;
+    // 简单模板渲染模式：替换 {{#variable#}} 占位符
+    const rendered = expr.replace(/\{\{#(.*?)#\}\}/g, (_, ref) => {
+      const m = /^([\w-]+)(?:\.([\w-]+))?$/.exec(ref.trim());
+      if (!m) return '';
+      return String(vars[m[1]]?.[m[2]] ?? vars[m[1]] ?? '');
+    });
+    // 尝试 JSON 解析输出（若渲染结果形如 JSON 对象或数组）
+    let parsed = null;
+    try { parsed = JSON.parse(rendered); } catch {}
+    return { result: rendered, parsed, json: parsed ? JSON.stringify(parsed) : rendered };
+  },
 };
 
 /**

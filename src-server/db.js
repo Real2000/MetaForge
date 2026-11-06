@@ -1040,6 +1040,20 @@ db.exec(`CREATE TABLE IF NOT EXISTS user_providers (
   status INTEGER DEFAULT 1,
   created_at TEXT
 );`);
+// 用户级工具 API Key 表（P3-2 2026-11-06 工具市场扩展：用户为需要鉴权的内置工具填自己的 Key，
+// 如 weather_query 的和风天气、translate_text 的 DeepL。与 user_providers（模型源）语义分离；
+// api_key 落盘 AES-256-GCM 加密（写入方 routes/tool-keys.js，读取方 lib/tools.js getUserToolKey），
+// username+tool_name 唯一防重复登记；未配 Key 时工具走免费公共源兜底（企业内开箱即用）
+db.exec(`CREATE TABLE IF NOT EXISTS user_tool_keys (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  username TEXT NOT NULL,
+  tool_name TEXT NOT NULL,
+  api_key TEXT DEFAULT '',
+  note TEXT DEFAULT '',
+  status INTEGER DEFAULT 1,
+  created_at TEXT,
+  UNIQUE(username, tool_name)
+);`);
 // 技能资产表（2026-10-20 P3 技能资产化：可复用的「提示词+工具」组合，对话中 @技能名 调用；
 // status=1 已发布（他人可见可引用），status=0 私有（仅本人）。owner+name 唯一防重名混淆）
 db.exec(`CREATE TABLE IF NOT EXISTS skill_assets (
@@ -1444,19 +1458,22 @@ module.exports = { db, hashPwd, hashPwdAsync, verifyPwd, now, daysAgo, tableEnti
 // 迁移块执行时（模块加载中）require 返回缓存中已赋值的 exports → encrypt 内 db 可用；
 // 此前块在 exports 之前 + crypto-util 顶层解构，构成加载期循环依赖（db 恒 undefined，
 // secrets 用例 upsert→encrypt→db.prepare 崩溃中断整个测试套件）。
+// P3-2 修复 2026-11-06：存量迁移此前只扫 providers 与 usermodels（老表名，现库已不存在），
+// 漏了实际建表的 user_providers / user_tool_keys —— 统一改为按表名清单循环扫描（幂等）。
 {
   let n = 0, m = 0;
   try {
     const { encrypt } = require('./lib/crypto-util');
     const rows = db.prepare("SELECT id, api_key FROM providers WHERE api_key!='' AND instr(api_key,'.')=0").all();
     for (const r of rows) { const enc = encrypt(r.api_key); if (enc !== r.api_key) { db.prepare('UPDATE providers SET api_key=? WHERE id=?').run(enc, r.id); n++; } }
-    // usermodels 表存在性防御（老库无此表时跳过该段）
-    if (db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='usermodels'").get()) {
-      const urows = db.prepare("SELECT id, api_key FROM usermodels WHERE api_key!='' AND instr(api_key,'.')=0").all();
-      for (const r of urows) { const enc = encrypt(r.api_key); if (enc !== r.api_key) { db.prepare('UPDATE usermodels SET api_key=? WHERE id=?').run(enc, r.id); m++; } }
+    // 用户级 key 表（表存在性防御：老库无对应表时跳过该段；明文判定 = 无 '.' 分隔符）
+    for (const t of ['usermodels', 'user_providers', 'user_tool_keys']) {
+      if (!db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?").get(t)) continue;
+      const urows = db.prepare(`SELECT id, api_key FROM ${t} WHERE api_key!='' AND instr(api_key,'.')=0`).all();
+      for (const r of urows) { const enc = encrypt(r.api_key); if (enc !== r.api_key) { db.prepare(`UPDATE ${t} SET api_key=? WHERE id=?`).run(enc, r.id); m++; } }
     }
   } catch (e) { console.error('[db] api_key 加密迁移异常（兜底：不加密）:', e.message); }
-  if (n + m) console.log(`[db] 存量 api_key 加密迁移：providers ${n} 行、usermodels ${m} 行（AES-256-GCM）`);
+  if (n + m) console.log(`[db] 存量 api_key 加密迁移：providers ${n} 行、用户级表 ${m} 行（AES-256-GCM）`);
 }
 
 // ---------------- P5.27 本地桥设备与任务队列（2026-10-27）----------------

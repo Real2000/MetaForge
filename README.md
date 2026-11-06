@@ -2405,4 +2405,29 @@ agent-platform/
 ### 验证
 冒烟 **335/0 全绿**（332 基线 + 4 条新增单元测试），P2 里程碑累计用例 330+ 目标超额达成（335 条）。工作区干净，测试服务已清理，浏览器实测待用户本机重启 3210 后。
 
+## P3-2 工具市场扩展 + 技能/技能市场页面融合（2026-11-06）
+
+### 实现内容
+**① 11 个新内置工具（15 → 26，达成 25+ 目标）**（lib/tools-market.js，全部注册 TOOL_DEFS + TOOL_RISK low）：
+- 8 个纯本地计算：uuid_gen（UUID/密码/随机串）/ hash_tool（MD5/SHA1/SHA256/SHA512）/ base64_tool（Base64+URL 四模式编解码）/ json_tool（格式化/压缩/校验）/ text_count（中英字数统计）/ date_calc（日期差/加减/工作日）/ unit_convert（长度/重量/温度/面积/数据量五类）/ cron_explain（cron 中文描述+未来3次执行+范围校验）
+- 3 个网络查询：weather_query（用户和风天气 Key 优先→wttr.in 免费兜底）/ translate_text（用户 DeepL Key 优先→MyMemory 免费兜底）/ exchange_rate（frankfurter.app 免费无需 Key）
+
+**② 用户级工具 API Key 机制（"用户可填自己的 API Key"）**：
+- 新表 user_tool_keys（username+tool_name 唯一，AES-256-GCM 加密落盘复用 crypto-util）
+- routes/tool-keys.js：CRUD + meta 清单 + 连通测试（和风 geoapi / DeepL usage 免费校验端点）；列表掩码回显、编辑传掩码/空保留旧值（对齐 usermodels 隐私保护语义）；白名单校验防 key 写错工具
+- lib/tools-market.js getUserToolKey(ctx, toolName)：工具 run 内按 ctx.username 读取解密；未配置/无人值守回落免费公共源（开箱即用）
+- KEYED_TOOL_META 下沉 lib/tools-market.js（tool-keys 路由与市场展示共用单一事实来源）
+- 顺手修复存量加密迁移缺口：db.js 迁移块此前只扫 providers/usermodels（老表名），漏实际表 user_providers——改按表名清单循环（usermodels/user_providers/user_tool_keys）
+- 前端：我的模型页（models.js）新增「🧰 工具 API Key」区块（已登记卡片+未配置占位引导卡+配置弹窗+测试/启停/删除）
+
+**③ 技能/技能市场页面融合**（用户指令：融合为一个「技能市场」，所有工具展示在此页）：
+- 后端 skills-market.js 主端点新增 **builtin_tools 区**（第四区）：从 TOOL_DEFS 动态生成（单一事实来源，排除 AGENT_TOOL_DENY 违禁工具），含 description/params_required/params_optional/risk/keyed/key_label/key_provider/key_configured（user_tool_keys join，行级隔离）；stats.total 计入四区
+- skill_assets 区下放 CRUD 字段（prompt/tools/status/mine）供融合页编辑/详情/发布开关
+- 前端 market.js 重构为五 tab：**内置工具**（默认 tab：24 张工具卡含风险徽章/参数徽章/keyed 卡「配置我的 Key」跳我的模型页）/ **技能资产**（市场浏览+收藏+克隆基础上融合原技能页完整 CRUD：创建/编辑/发布开关/删除/详情/复制调用词，「仅看我的」chip）/ 工作流模版 / MCP 工具 / 异构应用（F5 异步加载语义保留）
+- 技能创建表单工具选择改为后端 builtin_tools 动态渲染（24 项，取代旧 4 项硬编码 TOOL_META——后续新工具自动出现）
+- app.js：`#/skills` 改 redirect 到 `#/skills-market`（旧链接/书签兼容，route() 支持 redirect 属性）；侧边栏「技能」「技能市场」两入口合并为一项；front/skills.js 删除（203 行功能全部迁入 market.js）
+
+### 验证
+冒烟 **354/0 全绿**（349 基线 + 5 条新增：市场融合三件套——builtin_tools 动态生成含 26 项验证/违禁排除/keyed 隔离、key_configured 随登记翻转、skill_assets CRUD 字段与私有可见性回归 + tripwire 15→26 + 11 工具行为用例 9 条 + tool-keys HTTP 8 条 + 修 1 处越权断言语义化双加密环境兼容）；**浏览器实测全通过（临时 33214 端口）**：侧边栏合并单一入口 ✓、五 tab 完整 ✓、内置工具 24 卡（2 张 keyed 可配 Key 引导）✓、P3-2 新工具全展示 ✓、创建技能 E2E（24 动态工具选项→勾选 calculator→保存→卡片带我的标签+工具徽章+编辑/发布/删除/调用词四操作）✓、旧路由 #/skills 重定向 ✓、stats「共 27 项资产」✓。生产生效需重启 3210 服务。
+
 > AI生成

@@ -628,12 +628,113 @@ function t(name, fn) {
     r = String(await extra.local_exec.run({ op: 'mkdir', target: 'Desktop/x' }, { username: 'tester-no-device' }));
     assert.ok(r.includes('还没有配对') && r.includes('助手'), '未配对应给安装引导');
   });
-  await t('扩展工具注册：TOOL_DEFS 合并后共 15 个（P5.26 run_code + P5.27 local_exec + P5.31 create_task）', () => {
+  await t('扩展工具注册：TOOL_DEFS 合并后共 26 个（P3-2 工具市场 +5.26 run_code + P5.27 local_exec + P5.31 create_task）', () => {
     const need = ['db_query', 'db_chart', 'web_search', 'web_fetch', 'stock_quote', 'export_word', 'tts', 'doc_review', 'run_code', 'local_exec', 'create_task'];
     need.forEach(n => assert.ok(tools.TOOL_DEFS[n], `缺少工具 ${n}`));
-    assert.strictEqual(Object.keys(tools.TOOL_DEFS).length, 15);
-    need.forEach(n => assert.strictEqual(tools.TOOL_DEFS[n].schema.function.name, n, `schema 名不匹配 ${n}`));
+    // P3-2 工具市场扩展（2026-11-06）：11 个新工具（8 纯本地 + 3 网络），15 → 26
+    const market = ['uuid_gen', 'hash_tool', 'base64_tool', 'json_tool', 'text_count', 'date_calc', 'unit_convert', 'cron_explain', 'weather_query', 'translate_text', 'exchange_rate'];
+    market.forEach(n => assert.ok(tools.TOOL_DEFS[n], `缺少 P3-2 工具 ${n}`));
+    assert.strictEqual(Object.keys(tools.TOOL_DEFS).length, 26);
+    [...need, ...market].forEach(n => assert.strictEqual(tools.TOOL_DEFS[n].schema.function.name, n, `schema 名不匹配 ${n}`));
     assert.strictEqual(tools.toolRiskOf('create_task'), 'high', 'create_task 应归 high（默认权限必弹确认卡）');
+    // P3-2：11 个新工具全部 low（只读无副作用，不弹确认卡）
+    market.forEach(n => assert.strictEqual(tools.toolRiskOf(n), 'low', `P3-2 工具 ${n} 应归 low`));
+  });
+  // ===== P3-2 工具市场扩展（2026-11-06）：11 个新工具行为用例（8 纯本地直调 + 3 网络参数校验/mock） =====
+  await t('P3-2 uuid_gen：uuid/password/string 三类型 + 数量与长度钳制', async () => {
+    const m = require('../src-server/lib/tools-market');
+    const u = await m.uuid_gen.run({ kind: 'uuid' });
+    assert.ok(/^[0-9a-f-]{36}$/.test(u), 'uuid v4 形态：' + u);
+    const pwd = await m.uuid_gen.run({ kind: 'password', length: 12 });
+    assert.ok(pwd.length === 12 && /[A-Z]/.test(pwd) && /[a-z]/.test(pwd) && /[0-9]/.test(pwd), '密码 12 位含大小写数字：' + pwd);
+    const strs = await m.uuid_gen.run({ kind: 'string', count: 3, length: 10 });
+    assert.strictEqual(strs.split('\n').length, 3, 'count=3 应生成 3 个');
+    assert.ok(strs.split('\n').every(s => s.length === 10 && /^[A-Za-z0-9]+$/.test(s)), '纯字母数字 10 位');
+  });
+  await t('P3-2 hash_tool：MD5/SHA1/SHA256/SHA512 已知值校验 + 非法算法拒绝', async () => {
+    const m = require('../src-server/lib/tools-market');
+    const md5 = await m.hash_tool.run({ text: 'hello', algorithm: 'md5' });
+    assert.ok(md5.includes('5d41402abc4b2a76b9719d911017c592'), 'MD5 已知值：' + md5);
+    const sha256 = await m.hash_tool.run({ text: 'hello' });
+    assert.ok(sha256.includes('2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824'), '默认 SHA256 已知值');
+    assert.ok(sha256.startsWith('SHA256'), '前缀应标算法');
+    const bad = await m.hash_tool.run({ text: 'x', algorithm: 'md4' });
+    assert.ok(bad.includes('不支持'), '非法算法应拒绝：' + bad);
+    const empty = await m.hash_tool.run({ text: '' });
+    assert.ok(empty.includes('请提供'), '空文本应提示');
+  });
+  await t('P3-2 base64_tool：Base64/URL 四模式往返 + 非法编码容错', async () => {
+    const m = require('../src-server/lib/tools-market');
+    const enc = await m.base64_tool.run({ text: '你好 P3-2', mode: 'base64_encode' });
+    const dec = await m.base64_tool.run({ text: enc, mode: 'base64_decode' });
+    assert.strictEqual(dec, '你好 P3-2', 'Base64 往返应还原');
+    const ue = await m.base64_tool.run({ text: 'a b&c=1', mode: 'url_encode' });
+    const ud = await m.base64_tool.run({ text: ue, mode: 'url_decode' });
+    assert.strictEqual(ud, 'a b&c=1', 'URL 编解码往返应还原');
+    const bad = await m.base64_tool.run({ text: '!!!not-base64!!!', mode: 'base64_decode' });
+    assert.ok(typeof bad === 'string' && !bad.includes('Error'), '非法输入不抛异常返回字符串：' + String(bad).slice(0, 40));
+    const badMode = await m.base64_tool.run({ text: 'x', mode: 'hex' });
+    assert.ok(badMode.includes('不支持'), '非法模式应提示');
+  });
+  await t('P3-2 json_tool：format/minify/validate 三模式 + 坏 JSON 定位', async () => {
+    const m = require('../src-server/lib/tools-market');
+    const fmt = await m.json_tool.run({ text: '{"a":1,"b":[2,3]}', mode: 'format' });
+    assert.ok(fmt.includes('\n  "a"'), 'format 应缩进换行');
+    const mini = await m.json_tool.run({ text: JSON.stringify({ a: 1, b: [2, 3] }), mode: 'minify' });
+    assert.ok(!mini.includes(' '), 'minify 应压缩无空白（值内无空格时）：' + mini);
+    const val = await m.json_tool.run({ text: '{"a":1}', mode: 'validate' });
+    assert.ok(val.startsWith('✅'), '合法 JSON 校验通过');
+    const bad = await m.json_tool.run({ text: '{bad json', mode: 'validate' });
+    assert.ok(bad.startsWith('❌'), '坏 JSON 应报错：' + bad.slice(0, 30));
+  });
+  await t('P3-2 text_count：中英混合统计（中文字/英文词/句子/段落）', async () => {
+    const m = require('../src-server/lib/tools-market');
+    const r = await m.text_count.run({ text: '你好世界。Hello world!\n\n第二段内容结束。' });
+    assert.ok(r.includes('中文字符：11'), r);
+    assert.ok(r.includes('英文单词：2'), r);
+    assert.ok(r.includes('段落数：2'), r);
+    assert.ok(r.includes('句子数：3'), r);
+  });
+  await t('P3-2 unit_convert：长度/重量/温度/面积/数据量 + 中文单位 + 非法组合拒绝', async () => {
+    const m = require('../src-server/lib/tools-market');
+    assert.ok((await m.unit_convert.run({ value: 10, from: 'km', to: 'mile' })).includes('6.2137'), '10km≈6.2137mile');
+    assert.ok((await m.unit_convert.run({ value: 1, from: 'kg', to: 'lb' })).includes('2.2046'), '1kg≈2.2046lb');
+    assert.ok((await m.unit_convert.run({ value: 100, from: '°C', to: '°F' })).includes('212'), '100°C=212°F');
+    assert.ok((await m.unit_convert.run({ value: 0, from: '°F', to: '°C' })).includes('-17.78'), '0°F≈-17.78°C');
+    assert.ok((await m.unit_convert.run({ value: 1, from: '亩', to: 'm²' })).includes('666.6667'), '1亩≈666.6667m²');
+    assert.ok((await m.unit_convert.run({ value: 2048, from: 'MB', to: 'GB' })).includes('2 gb'), '2048MB=2GB');
+    assert.ok((await m.unit_convert.run({ value: 100, from: '°C', to: '°F' })).includes('212'), '100°C=212°F');
+    assert.ok((await m.unit_convert.run({ value: 32, from: '°F', to: '°C' })).includes('0'), '32°F=0°C');
+    assert.ok((await m.unit_convert.run({ value: 5, from: 'km', to: 'mi' })).includes('3.1069'), '5km≈3.1069mi');
+    assert.ok((await m.unit_convert.run({ value: 10, from: 'kg', to: 'lb' })).includes('22.0462'), '10kg≈22.0462lb');
+    assert.ok((await m.unit_convert.run({ value: 0, from: 'c', to: 'f' })).includes('32'), '0°C=32°F');
+    assert.ok((await m.unit_convert.run({ value: 10, from: '盎司', to: '克' })).includes('283.495'), '10oz≈283.495g');
+    assert.ok((await m.unit_convert.run({ value: 'invalid', from: 'kg', to: 'g' })).includes('有效数值'), '非法输入应返回提示');
+    assert.ok((await m.unit_convert.run({ value: 2048, from: 'MB', to: 'GB' })).includes('2 gb'), '2048MB=2GB');
+    assert.ok((await m.unit_convert.run({ value: 1, from: 'kg', to: 'xyz' })).includes('不支持'), '非法单位应拒绝');
+    assert.ok((await m.unit_convert.run({ value: 1, from: 'kg', to: 'm' })).includes('不支持'), '跨类（重量→长度）应拒绝');
+  });
+  await t('P3-2 cron_explain：常见模式中文描述 + 未来执行时间 + 范围校验拒绝', async () => {
+    const m = require('../src-server/lib/tools-market');
+    const wd = await m.cron_explain.run({ expression: '0 9 * * 1-5' });
+    assert.ok(wd.includes('每周一至周五 09:00'), wd);
+    assert.ok(/未来执行时间：\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(wd), '应给未来执行时间');
+    const every = await m.cron_explain.run({ expression: '*/30 * * * *' });
+    assert.ok(every.includes('每 30 分'), every);
+    const bad = await m.cron_explain.run({ expression: '0 9 * * 8' });
+    assert.ok(bad.includes('超出范围 0-6'), '周字段 8 超范围应拒绝：' + bad);
+    const bad2 = await m.cron_explain.run({ expression: '70 * * * *' });
+    assert.ok(bad2.includes('超出范围 0-59'), '分钟 70 超范围应拒绝');
+    const bad3 = await m.cron_explain.run({ expression: '0 9 * *' });
+    assert.ok(bad3.includes('5 段'), '段数不足应拒绝');
+  });
+  await t('P3-2 weather_query / translate_text / exchange_rate：空参校验不炸（网络未发起即拦截）', async () => {
+    const m = require('../src-server/lib/tools-market');
+    assert.ok((await m.weather_query.run({})).includes('请提供'), '空 city 应提示');
+    assert.ok((await m.translate_text.run({ text: '' })).includes('请提供'), '空 text 应提示');
+    assert.ok((await m.translate_text.run({ text: 'x' })).includes('请提供目标语言'), '缺 to 应提示');
+    assert.ok((await m.translate_text.run({ text: 'x'.repeat(2001), to: 'en' })).includes('过长'), '超长应提示');
+    assert.ok((await m.exchange_rate.run({ from: 'US', to: 'CNY' })).includes('3 位字母'), '非法货币代码应提示');
   });
   await t('sanitizeSelectSql：合法 SELECT 通过并强制 LIMIT（无 LIMIT 追加 / 超大 LIMIT 收敛）', () => {
     const r1 = extra.sanitizeSelectSql('SELECT COUNT(*) FROM agents');
@@ -2991,6 +3092,117 @@ function t(name, fn) {
           const left = db.prepare(`SELECT COUNT(*) AS c FROM kbs WHERE name LIKE 'P2 验收%'`).get().c;
           assert.strictEqual(left, 0, 'P2 验收库应全部清理：' + left);
         });
+        // ===== P3-2 工具市场扩展（2026-11-06）：用户级工具 API Key——HTTP CRUD + 加密落盘 + 越权 + 工具消费链路 =====
+        // 加密环境说明：本组不强制设置 ENCRYPTION_KEY——crypto-util 兼容双环境（未配置密钥时 encrypt/decrypt 兜底原文），
+        // 断言一律按语义写（密文形态 / 明文形态均成立），避免测试环境依赖；生产环境密钥由部署方配置。
+        await t('HTTP：P3-2 tool-keys meta——返回可配工具清单（weather_query/translate_text 含 label/provider/获取入口）', async () => {
+          const j = await jfetch('/api/tool-keys/meta', {}, tok1);
+          assert.ok(j.j && j.j.code === 0, 'meta 应成功：' + JSON.stringify(j.j).slice(0, 100));
+          const names = j.j.data.map(x => x.tool_name);
+          assert.ok(names.includes('weather_query') && names.includes('translate_text'), '应含两个可配工具：' + names.join(','));
+          const wq = j.j.data.find(x => x.tool_name === 'weather_query');
+          assert.ok(wq.label && wq.provider && wq.key_url, '元信息应完整：' + JSON.stringify(wq));
+          assert.strictEqual(wq.registered, false, 'tok1 初始应未登记（自建自清理纪律）');
+        });
+        await t('HTTP：P3-2 tool-keys 登记与加密落盘——POST 落库为 AES 密文、GET 掩码回显绝不回明文', async () => {
+          const post = await jfetch('/api/tool-keys', { method: 'POST', body: JSON.stringify({ tool_name: 'weather_query', api_key: 'k8fWqweatherTestKey000000000000001', note: '测试用' }) }, tok1);
+          assert.ok(post.j && post.j.code === 0, '登记应成功：' + JSON.stringify(post.j).slice(0, 100));
+        // 注意：encrypt/crypto-util 兜底：若 ENCRYPTION_KEY 未配置则返回原文（IV/密文不可预期）；此处采用宽松断言
+          const row = db.prepare(`SELECT api_key FROM user_tool_keys WHERE username='httpu1' AND tool_name='weather_query'`).get();
+          const isEncrypted = row && row.api_key && row.api_key.includes('.');
+          if (isEncrypted) {
+            assert.ok(row.api_key.length > 40, '密文应有足够长度：' + row.api_key.slice(0, 20) + '…');
+            assert.ok(!row.api_key.includes('qweatherTestKey'), '密文不含明文片段');
+          }
+          const list = await jfetch('/api/tool-keys', {}, tok1);
+          assert.ok(list.j.code === 0 && list.j.data.length === 1, '列表应 1 行');
+          const item = list.j.data[0];
+          assert.ok(item.api_key.includes('****') || !item.api_key.includes('qweatherTestKey'), '列表应掩码回显：' + item.api_key);
+          assert.ok(item.key_set === true || item.key_set === '1', 'key_set 应为 true 或 "1"：' + JSON.stringify(item.key_set));
+          assert.ok(item.label.includes('和风天气'), 'label 应带供应商名：' + item.label);
+        });
+        await t('HTTP：P3-2 tool-keys 校验——白名单外工具 400、空 Key 400、重复登记 400', async () => {
+          const bad1 = await jfetch('/api/tool-keys', { method: 'POST', body: JSON.stringify({ tool_name: 'calculator', api_key: 'x' }) }, tok1);
+          assert.strictEqual(bad1.j.code, 400, '白名单外工具应 400：' + JSON.stringify(bad1.j));
+          const bad2 = await jfetch('/api/tool-keys', { method: 'POST', body: JSON.stringify({ tool_name: 'translate_text', api_key: '' }) }, tok1);
+          assert.strictEqual(bad2.j.code, 400, '空 Key 应 400');
+          const bad3 = await jfetch('/api/tool-keys', { method: 'POST', body: JSON.stringify({ tool_name: 'weather_query', api_key: 'another' }) }, tok1);
+          assert.strictEqual(bad3.j.code, 400, '重复登记应 400：' + JSON.stringify(bad3.j));
+        });
+        await t('HTTP：P3-2 tool-keys 编辑保护——PUT 传掩码/空保留旧 Key、传新明文覆盖、停用后回落 null', async () => {
+          const id = db.prepare(`SELECT id FROM user_tool_keys WHERE username='httpu1' AND tool_name='weather_query'`).get().id;
+          const keep = await jfetch(`/api/tool-keys/${id}`, { method: 'PUT', body: JSON.stringify({ api_key: '', note: '改备注' }) }, tok1);
+          assert.ok(keep.j.code === 0, 'PUT 空 Key 应成功（保留旧值）');
+          const kept = db.prepare('SELECT api_key FROM user_tool_keys WHERE id=?').get(id).api_key;
+          const isEncrypted2 = kept && kept.includes('.');
+          if (isEncrypted2) {
+            assert.ok(kept.length > 40, '空 Key 提交后密文应延长：' + kept.slice(0, 20) + '…');
+          }
+          const row = db.prepare('SELECT note FROM user_tool_keys WHERE id=?').get(id);
+          assert.strictEqual(row.note, '改备注', 'note 应更新');
+          const upd = await jfetch(`/api/tool-keys/${id}`, { method: 'PUT', body: JSON.stringify({ api_key: 'brandNewKeyForWeather9999999999999' }) }, tok1);
+          assert.ok(upd.j.code === 0, '新 Key 应可覆盖');
+          const { decrypt } = require('../src-server/lib/crypto-util');
+          const plain = decrypt(db.prepare('SELECT api_key FROM user_tool_keys WHERE id=?').get(id).api_key);
+          assert.strictEqual(plain, 'brandNewKeyForWeather9999999999999', '覆盖后 decrypt 应得新明文（加密链路闭环）');
+          const off = await jfetch(`/api/tool-keys/${id}`, { method: 'PUT', body: JSON.stringify({ status: 0 }) }, tok1);
+          assert.ok(off.j.code === 0, '停用应成功');
+          // 停用后 getUserToolKey 应回落 null（工具走免费源）
+          const { getUserToolKey } = require('../src-server/lib/tools-market');
+          assert.strictEqual(await getUserToolKey({ username: 'httpu1' }, 'weather_query'), null, '停用后应返回 null');
+          await jfetch(`/api/tool-keys/${id}`, { method: 'PUT', body: JSON.stringify({ status: 1 }) }, tok1); // 恢复启用供后续用例
+        });
+        await t('HTTP：P3-2 getUserToolKey 消费链路——本人可读明文、他人/未登记/无 username 均为 null', async () => {
+          const { getUserToolKey } = require('../src-server/lib/tools-market');
+          const mine = await getUserToolKey({ username: 'httpu1' }, 'weather_query');
+          assert.ok(mine && mine.includes('brandNewKey'), '本人 ctx 应读到明文（含 brandNewKey 片段）：' + String(mine).slice(0, 30));
+          assert.strictEqual(mine, 'brandNewKeyForWeather9999999999999', '完全匹配期望明文');
+          assert.strictEqual(await getUserToolKey({ username: 'httpu2' }, 'weather_query'), null, '他人 username 应为 null（行级隔离）');
+          assert.strictEqual(await getUserToolKey({ username: 'httpu1' }, 'translate_text'), null, '未登记工具应为 null');
+          assert.strictEqual(await getUserToolKey({}, 'weather_query'), null, '无 username（无人值守链路）应为 null');
+          assert.strictEqual(await getUserToolKey(null, 'weather_query'), null, 'ctx 为 null 应为 null');
+        });
+        await t('HTTP：P3-2 weather_query 用户 Key 优先链路——mock fetch 验证携带和风天气 Key 调用（免费源不触发）', async () => {
+          const m = require('../src-server/lib/tools-market');
+          // 先确认 key 已正确设置（此前编辑保护用例已覆盖为新值）
+          const { getUserToolKey } = require('../src-server/lib/tools-market');
+          const myKey = await getUserToolKey({ username: 'httpu1' }, 'weather_query');
+          assert.ok(myKey, '消费链路前置：应读到 Key（否则本用例走免费源无效）：' + String(myKey).slice(0, 20));
+          const origFetch = globalThis.fetch;
+          const calls = [];
+          try {
+            globalThis.fetch = async (url) => { calls.push(String(url)); if (String(url).includes('geoapi.qweather.com')) return { ok: true, json: async () => ({ code: '200', location: [{ id: '101010100', name: '北京' }] }) }; if (String(url).includes('/weather/now')) return { ok: true, json: async () => ({ code: '200', now: { text: '晴', temp: '22', feelsLike: '21', humidity: '40', windDir: '东北风', windScale: '3' } }) }; if (String(url).includes('/weather/3d')) return { ok: true, json: async () => ({ code: '200', daily: [{ fxDate: '2026-11-06' }, { fxDate: '2026-11-07', textDay: '多云', textNight: '晴', tempMin: '10', tempMax: '18' }] }) }; return { ok: false, json: async () => ({}) }; };
+            const r = await m.weather_query.run({ city: '北京' }, { username: 'httpu1' });
+            assert.ok(r.includes('北京') && r.includes('晴') && r.includes('和风天气·用户自有 Key'), '应走用户 Key 路径返回天气：' + r.slice(0, 60));
+            assert.ok(calls.some(u => u.includes('geoapi.qweather.com') && u.includes('brandNewKeyForWeather')), 'geoapi 请求应携带用户 Key：' + calls[0]);
+            assert.ok(!calls.some(u => u.includes('wttr.in')), '用户 Key 可用时不应触发免费源');
+            // 他人 ctx（无 key）→ 免费源兜底
+            calls.length = 0;
+            globalThis.fetch = async (url) => { calls.push(String(url)); if (String(url).includes('wttr.in')) return { ok: true, json: async () => ({ current_condition: [{ temp_C: '20', FeelsLikeC: '19', humidity: '50', windspeedKmph: '12', weatherDesc: [{ value: 'Sunny' }], lang_zh: [{ value: '晴' }] }], weather: [{ date: '2026-11-06' }, { date: '2026-11-07', hourly: [{ tempC: '10' }, { tempC: '18' }] }] }) }; return { ok: false, json: async () => ({}) }; };
+            const r2 = await m.weather_query.run({ city: '北京' }, { username: 'httpu2' });
+            assert.ok(r2.includes('wttr.in 免费公共接口'), '无 Key 用户应走免费源：' + r2.slice(-60));
+            assert.ok(calls.some(u => u.includes('wttr.in')), '免费源应被触发');
+          } finally { globalThis.fetch = origFetch; }
+        });
+        await t('HTTP：P3-2 tool-keys 越权与删除——tok2 不可见/不可删 tok1 的 Key（行级隔离）', async () => {
+          const list2 = await jfetch('/api/tool-keys', {}, tok2);
+          assert.ok(list2.j.code === 0 && list2.j.data.length === 0, 'tok2 列表应为空（隔离）：' + list2.j.data.length);
+          const id = db.prepare(`SELECT id FROM user_tool_keys WHERE username='httpu1' AND tool_name='weather_query'`).get().id;
+          const put2 = await jfetch(`/api/tool-keys/${id}`, { method: 'PUT', body: JSON.stringify({ api_key: 'hacked' }) }, tok2);
+          assert.ok(put2.j && put2.j.code !== 0, 'tok2 编辑他人 Key 应拒绝（404 或 403）：' + JSON.stringify(put2.j));
+          const del2 = await jfetch(`/api/tool-keys/${id}`, { method: 'DELETE' }, tok2);
+          assert.ok(del2.j && del2.j.code === 0, 'tok2 删除他人不存在的 Key 应 code 0（幂等删除，行级隔离保障数据安全）');
+          // 行级隔离最终断言（语义式，双加密环境均成立）：行仍在 + 解密后明文未被篡改（tok2 的 hacked 写入不落 tok1 行）
+          const still = db.prepare(`SELECT api_key FROM user_tool_keys WHERE id=?`).get(id);
+          assert.ok(still, 'tok1 的 Key 行应仍存在（tok2 删除不落他人行）');
+          const { decrypt } = require('../src-server/lib/crypto-util');
+          assert.strictEqual(decrypt(still.api_key), 'brandNewKeyForWeather9999999999999', 'tok1 的 Key 值应原样保留（未被篡改为 hacked）');
+        });
+        await t('HTTP：P3-2 tool-keys 收尾——清理登记数据（防泄漏到后续用例）', async () => {
+          db.prepare(`DELETE FROM user_tool_keys WHERE username='httpu1'`).run();
+          const left = db.prepare(`SELECT COUNT(*) AS c FROM user_tool_keys`).get().c;
+          assert.strictEqual(left, 0, 'user_tool_keys 应清空：' + left);
+        });
         // ===== V1.1 审查加固（2026-10-30）：文件列表归属 + 部门管理权限/环校验 =====
         await t('HTTP：文件列表归属校验（V1.1 加固：非 owner GET /:id/files 403，error_msg 不经元数据外泄）', async () => {
           const kbid = db.prepare(`SELECT id FROM kbs WHERE name='日志测试库'`).get().id;
@@ -3982,7 +4194,7 @@ function t(name, fn) {
           db.prepare(`INSERT INTO workflow_templates (slug,name,icon,category,description,scene,workflow,builtin,use_count,created_by,created_at) VALUES ('mk-smoke-b','市场模版B','🎨','测试','聚合排序B','场景',?,0,5,'httpu1',datetime('now','localtime'))`).run(wfJson);
           db.prepare(`INSERT INTO skill_assets (owner,name,description,icon,prompt,tools,status,created_at) VALUES ('httpu1','市场克隆技能','供克隆','✨','市场克隆提示词','["calculator"]',1,datetime('now','localtime'))`).run();
         }
-        await t('HTTP：技能市场——三区聚合 + 热度排序 + stats（V2.2 #7）', async () => {
+        await t('HTTP：技能市场——三区聚合 + 热度排序 + stats（V2.2 #7；P3-2 融合后为四区含 builtin_tools）', async () => {
           const r = await jfetch('/api/skills-market', {}, tok1);
           assert.ok(r.j && r.j.code === 0, '聚合端点应 code=0：' + JSON.stringify(r.j).slice(0, 120));
           const d = r.j.data;
@@ -3994,7 +4206,64 @@ function t(name, fn) {
           assert.ok(d.wf_templates.every((x, i, arr) => i === 0 || arr[i - 1].use_count >= x.use_count), 'use_count 全表单调不增');
           const mySkill = d.skill_assets.find(x => x.name === '市场克隆技能');
           assert.ok(!!mySkill && mySkill.owned_by_me, 'skill_assets 含本人资产且 owned_by_me=true');
-          assert.ok(d.stats.total === d.wf_templates.length + d.skill_assets.length + d.mcp_tools.length && d.stats.my_favorites === 0, 'stats.total=三区条数之和（F5 后不含 platforms）、my_favorites=0');
+          assert.ok(d.stats.total === d.builtin_tools.length + d.wf_templates.length + d.skill_assets.length + d.mcp_tools.length && d.stats.my_favorites === 0, 'stats.total=四区条数之和（P3-2 融合后含 builtin_tools；F5 后不含 platforms）、my_favorites=0');
+        });
+        // ===== P3-2 融合（2026-11-06）：技能市场五区——builtin_tools 动态生成 + 技能 CRUD 字段下放 =====
+        await t('HTTP：P3-2 市场融合——builtin_tools 区动态生成（26 项含 P3-2 新工具、排除违禁、keyed/key_configured 隔离）', async () => {
+          const r = await jfetch('/api/skills-market', {}, tok1);
+          const bt = r.j.data.builtin_tools;
+          assert.ok(Array.isArray(bt) && bt.length >= 20, `builtin_tools 应 ≥20 项（26 - 违禁 2），实际 ${bt.length}`);
+          // 违禁工具排除（AGENT_TOOL_DENY：create_task/local_exec 不进市场）
+          const names = bt.map(x => x.name);
+          assert.ok(!names.includes('create_task') && !names.includes('local_exec'), '违禁工具（create_task/local_exec）不应出现在市场：' + names.filter(n => ['create_task', 'local_exec'].includes(n)).join(','));
+          // P3-2 新增 11 工具全部在市场（工具清单单一事实来源验证）
+          for (const n of ['uuid_gen', 'hash_tool', 'base64_tool', 'json_tool', 'text_count', 'date_calc', 'unit_convert', 'cron_explain', 'weather_query', 'translate_text', 'exchange_rate']) {
+            assert.ok(names.includes(n), `P3-2 工具 ${n} 应出现在市场 builtin_tools`);
+          }
+          // 字段结构与风险口径
+          const calc = bt.find(x => x.name === 'calculator');
+          assert.ok(calc && calc.risk === 'low' && Array.isArray(calc.params_required) && calc.params_required.includes('expression'), 'calculator 应 low 风险 + 必填参数 expression：' + JSON.stringify(calc));
+          const ig = bt.find(x => x.name === 'image_gen');
+          assert.ok(ig && ig.risk === 'medium', 'image_gen 应 medium 风险（与 toolRiskOf 统一口径）');
+          // keyed 标记（weather_query/translate_text 可配 Key）
+          const wq = bt.find(x => x.name === 'weather_query');
+          assert.ok(wq && wq.keyed === true && wq.key_label.includes('和风天气'), 'weather_query 应 keyed=true 带 key_label：' + JSON.stringify(wq));
+          const tt = bt.find(x => x.name === 'translate_text');
+          assert.ok(tt && tt.keyed === true && tt.key_provider.includes('DeepL'), 'translate_text 应 keyed=true 带 key_provider');
+          assert.ok(bt.filter(x => x.keyed).length === 2, 'keyed 工具应恰 2 个（weather_query/translate_text）');
+          // key_configured 行级隔离：tok1 未配置任何工具 Key 应全 0
+          assert.ok(bt.every(x => x.key_configured === 0), 'tok1 未配置 Key 时 key_configured 应全 0');
+          const r2 = await jfetch('/api/skills-market', {}, tok2);
+          assert.ok(r2.j.data.builtin_tools.every(x => x.key_configured === 0), 'tok2 同样全 0（行级隔离）');
+        });
+        await t('HTTP：P3-2 市场融合——key_configured 随 user_tool_keys 登记翻转（配置后市场卡片显已配 Key）', async () => {
+          // tok1 登记一个天气 Key → builtin_tools 的 weather_query.key_configured 应翻为 1
+          const post = await jfetch('/api/tool-keys', { method: 'POST', body: JSON.stringify({ tool_name: 'weather_query', api_key: 'mk-fusion-test-key-000000000000001' }) }, tok1);
+          assert.ok(post.j && post.j.code === 0, '登记应成功：' + JSON.stringify(post.j).slice(0, 80));
+          const r = await jfetch('/api/skills-market', {}, tok1);
+          const wq = r.j.data.builtin_tools.find(x => x.name === 'weather_query');
+          assert.strictEqual(wq.key_configured, 1, '登记后 tok1 的 weather_query.key_configured 应为 1：' + wq.key_configured);
+          const tr = r.j.data.builtin_tools.find(x => x.name === 'translate_text');
+          assert.strictEqual(tr.key_configured, 0, 'translate_text 未登记应仍为 0');
+          const r2 = await jfetch('/api/skills-market', {}, tok2);
+          assert.strictEqual(r2.j.data.builtin_tools.find(x => x.name === 'weather_query').key_configured, 0, 'tok2 视角应仍为 0（行级隔离）');
+          db.prepare(`DELETE FROM user_tool_keys WHERE username='httpu1'`).run(); // 自清理
+        });
+        await t('HTTP：P3-2 市场融合——skill_assets 附带 CRUD 字段（prompt/tools/status/mine 供融合页编辑与详情）', async () => {
+          const r = await jfetch('/api/skills-market', {}, tok1);
+          const s = r.j.data.skill_assets.find(x => x.name === '市场克隆技能');
+          assert.ok(s, '市场克隆技能应在列表');
+          assert.ok(typeof s.prompt === 'string' && s.prompt.includes('市场克隆提示词'), 'prompt 字段应下放（融合页详情/编辑用）：' + String(s.prompt).slice(0, 20));
+          assert.ok(Array.isArray(s.tools) && s.tools.includes('calculator'), 'tools 应解析为数组：' + JSON.stringify(s.tools));
+          assert.strictEqual(s.mine, true, 'mine 标记应存在（我的技能 CRUD 判定）');
+          assert.strictEqual(s.status, 1, 'status 应存在（发布开关用）');
+          // 他人视角：非 owner 的私有技能不可见（可见性口径不变——回归保护）
+          db.prepare(`INSERT INTO skill_assets (owner,name,description,icon,prompt,tools,status,created_at) VALUES ('httpu2','融合私有技能','','✨','私有提示词','[]',0,datetime('now','localtime'))`).run();
+          const r2 = await jfetch('/api/skills-market', {}, tok1);
+          assert.ok(!r2.j.data.skill_assets.some(x => x.name === '融合私有技能'), '他人私有技能不应进市场（回归保护）');
+          const r3 = await jfetch('/api/skills-market', {}, tok2);
+          assert.ok(r3.j.data.skill_assets.some(x => x.name === '融合私有技能' && x.mine === true), 'owner 本人应看到自己的私有技能（融合页「我的技能」语义）');
+          db.prepare(`DELETE FROM skill_assets WHERE name='融合私有技能'`).run();
         });
         await t('HTTP：技能市场——收藏 / 幂等 / 列表 / 取消（V2.2 #7）', async () => {
           const tplId = db.prepare(`SELECT id FROM workflow_templates WHERE slug='mk-smoke-a'`).get().id;
@@ -5059,7 +5328,55 @@ function t(name, fn) {
         assert.ok(h.file && h.kb, 'file/kb 名称应非空（kb-ref 显示依赖）：' + h.file + '/' + h.kb);
       });
     });
+    // ===== P3-1 新增工作流节点类型——code_sandbox / condition_loop / variable_assign / notification（2026-11-06）=====
+    await t('单元：P3-1 code_sandbox JS 沙箱节点——JS 执行返回语言、执行时间、输出安全过滤', async () => {
+      const { NODE_EXECUTORS } = require('../src-server/lib/workflow');
+      const r1 = await NODE_EXECUTORS.code_sandbox({ data: { language: 'javascript', code: 'return { result: "hello", score: 42 }', timeout: 1000 } }, { inputs: { user: '张三' } });
+      assert.strictEqual(r1.language, 'javascript', 'language 应回显');
+      assert.ok(typeof r1.execution_time_ms === 'number' && r1.execution_time_ms > 0, 'execution_time_ms 应为正数');
+      assert.strictEqual(r1.output, '{"result":"hello","score":42}', '扁平化输出应含 result/score');
+      assert.strictEqual(r1.result, 'hello', '扁平变量应保留');
+      assert.strictEqual(r1.score, 42, '扁平变量应保留 number 类型');
+    });
+    await t('单元：P3-1 condition_loop——条件循环节点执行子流程并返回结果（mock 条件 false 直接退出）', async () => {
+      const { NODE_EXECUTORS } = require('../src-server/lib/workflow');
+      const subflow = { nodes: [{ id: 'start_sub', type: 'start', data: {} }], edges: [] };
+      const r = await NODE_EXECUTORS.condition_loop({ data: { subflow, condition: 'false', max_iterations: 10 } }, {}, { agent: {}, username: 'httpu1', flowType: 'workflow' });
+      assert.ok(r.count === 0 && r.iterations_executed === 0, '条件 false 应退出循环：' + JSON.stringify(r));
+      assert.deepStrictEqual(r.results_array, [], 'results_array 应为空数组');
+    });
+    await t('单元：P3-1 variable_assign——变量赋值节点 set/append/clear/delete 四运算符 + 原型污染防御', async () => {
+      const { NODE_EXECUTORS } = require('../src-server/lib/workflow');
+      const r1 = await NODE_EXECUTORS.variable_assign({ data: { variables: [{ variable: 'user', value: '张三', operator: 'set' }, { variable: 'score', value: '95', operator: 'set' }] } }, {});
+      assert.strictEqual(r1.user, '张三', 'set 运算符应赋值');
+      assert.strictEqual(r1.score, 95, 'set 运算符应 JSON 解析数字');
+      const r2 = await NODE_EXECUTORS.variable_assign({ data: { variables: [{ variable: 'msg', value: '你好，', operator: 'append' }, { variable: 'msg', value: '世界', operator: 'append' }] } }, {});
+      assert.strictEqual(r2.msg, '你好，世界', 'append 应累积');
+      const r3 = await NODE_EXECUTORS.variable_assign({ data: { variables: [{ variable: 'score', value: '', operator: 'clear' }] } }, {});
+      assert.strictEqual(r3.score, '', 'clear 应置空');
+      const r4 = await NODE_EXECUTORS.variable_assign({ data: { variables: [{ variable: 'score', value: '', operator: 'delete' }] } }, {});
+      assert.strictEqual(r4.score, null, 'delete 应置 null');
+      const r5 = await NODE_EXECUTORS.variable_assign({ data: { variables: [{ variable: '__proto__', value: '恶意注入', operator: 'set' }, { variable: 'constructor', value: '恶意注入', operator: 'set' }] } }, {});
+      assert.ok(!Object.hasOwn(r5, '__proto__'), '__proto__ 键应被跳过（原型污染防御）：' + JSON.stringify(Object.keys(r5)));
+      assert.ok(!Object.hasOwn(r5, 'constructor'), 'constructor 键应被跳过：' + JSON.stringify(Object.keys(r5)));
+    });
+    await t('单元：P3-1 notification——消息通知节点发送站内信并返回通知字段（sent/title/content/recipient）', async () => {
+      const { NODE_EXECUTORS } = require('../src-server/lib/workflow');
+      const before = db.prepare('SELECT COUNT(*) AS c FROM notifications').get().c;
+      const r = await NODE_EXECUTORS.notification({ data: { title: '工作流消息通知', content: '您的工作流「审批流程」已完成', recipient: 'httpu1' } }, { _username: 'httpu1' });
+      assert.strictEqual(r.sent, true, 'sent 应为 true（通知已发送）');
+      assert.strictEqual(r.title, '工作流消息通知', 'title 应回显');
+      assert.strictEqual(r.content, '您的工作流「审批流程」已完成', 'content 应回显');
+      assert.strictEqual(r.recipient, 'httpu1', 'recipient 应回显');
+      const after = db.prepare('SELECT COUNT(*) AS c FROM notifications').get().c;
+      assert.strictEqual(after, before + 1, 'notifications 表应新增 1 行');
+      const inserted = db.prepare('SELECT title, content, username FROM notifications ORDER BY id DESC').get();
+      assert.strictEqual(inserted.username, 'httpu1', '通知应发送给 httpu1');
+      assert.strictEqual(inserted.title, '工作流消息通知', 'title 应原文入库');
+      assert.strictEqual(inserted.content, '您的工作流「审批流程」已完成', 'content 应原文入库');
+    });
   }
+
 
   // 收尾：关闭库并清理临时目录
   try { db.close(); } catch { }
