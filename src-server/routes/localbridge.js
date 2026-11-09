@@ -21,7 +21,11 @@ const { clientIp } = require('../lib/rate-limit');
 
 const router = express.Router();
 
-const OPS_WHITELIST = ['mkdir', 'list_dir', 'open_app', 'notify'];
+const OPS_WHITELIST = ['mkdir', 'list_dir', 'open_app', 'notify',
+  // A1 本地桥 op 扩展（2026-11-09）：截图/剪贴板/键鼠/窗口/文件类，共 12 个
+  'screenshot', 'clipboard_read', 'clipboard_write', 'key_type', 'mouse_click',
+  'window_list', 'window_focus', 'file_read', 'file_write',
+];
 // P2-1 修复：同配对码连续失败 3 次后锁定（防暴力枚举），并配置 IP 级别 10 次/5min 封禁
 const PAIRCODE_MAX_FAIL = 3;
 

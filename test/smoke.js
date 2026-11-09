@@ -5583,6 +5583,27 @@ function t(name, fn) {
       // handler 前应有 1 层限流中间件（route.stack = [limiter, handler]）
       assert.strictEqual(layer.route.stack.length, 2, `/v1/models 应挂限流中间件（当前 ${layer.route.stack.length} 层，预期 limiter+handler=2）`);
     });
+    await t('P2-3 / P2-3：A1 op 扩展12个白名单+A2审计日志落op_logs', () => {
+      const { OPS_WHITELIST } = require('../src-server/routes/localbridge');
+      // A1: op 白名单应有 13 个（原 4 + 扩展 9）
+      assert.ok(OPS_WHITELIST.length >= 13, `OPS_WHITELIST 应有 ≥13 个 op（当前 ${OPS_WHITELIST.length}）`);
+      const expected = ['mkdir','list_dir','open_app','notify','screenshot','clipboard_read','clipboard_write',
+        'key_type','mouse_click','window_list','window_focus','file_read','file_write'];
+      for (const e of expected) {
+        assert.ok(OPS_WHITELIST.includes(e), `应包含 op「${e}」`);
+      }
+      // A1: tools-extra.js local_exec schema 描述应包含扩展 op 名
+      const src = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'lib', 'tools-extra.js'), 'utf8');
+      for (const e of ['screenshot','clipboard_read','clipboard_write','key_type','mouse_click',
+          'window_list','window_focus','file_read','file_write']) {
+        assert.ok(src.includes(e), `tools-extra.js schema 应包含 ${e}`);
+      }
+      // A1: local_exec schema 的 op enum 应与白名单一致
+      assert.ok(src.includes("'screenshot', 'clipboard_read'"), 'schema op enum 应包含扩展 op');
+      // A2: local_exec run 应落审计日志（op_logs）
+      assert.ok(src.includes("op_logs"), 'tools-extra.js 应写入 op_logs 审计日志');
+      assert.ok(src.includes('本地桥操作:'), '审计日志 action 应包含 "本地桥操作" 前缀');
+    });
     await t('P3-8：/chat/models 不再 SELECT api_key 列（truthiness 改由 SQL has_key 表达）', () => {
       const src = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'routes', 'chat.js'), 'utf8');
       const m = /router\.get\('\/models',[\s\S]{0,400}?db\.prepare\((['"`])([\s\S]*?)\1\)/.exec(src);

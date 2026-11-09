@@ -998,15 +998,39 @@ const local_exec = {
     type: 'function',
     function: {
       name: 'local_exec',
-      description: '操作用户已配对的本地电脑（需用户安装「TeleAgent 智能体平台助手」客户端并配对）。支持四类白名单操作：mkdir（在用户主目录内创建文件夹，target 为相对主目录的路径如 "Desktop/新项目"）、list_dir（列目录，返回名称与类型）、open_app（打开本机应用，app 为应用注册名——macOS 上中文应用常以英文名注册，如备忘录=Notes、访达=Finder、微信=WeChat、Safari=Safari；失败时可用 list_dir 查 /Applications 目录确认真实应用名）、notify（发送系统通知）。操作在用户本机执行，结果实时返回；设备离线或未配对会明确提示。',
-      parameters: {
-        type: 'object',
-        properties: {
-          op: { type: 'string', enum: ['mkdir', 'list_dir', 'open_app', 'notify'], description: '操作类型' },
-          target: { type: 'string', description: 'mkdir/list_dir 用：相对用户主目录的路径（禁止绝对路径与路径穿越）' },
-          app: { type: 'string', description: 'open_app 用：应用名' },
-          text: { type: 'string', description: 'notify 用：通知内容（≤200 字）' },
-        },
+      description: '操作用户已配对的本地电脑（需用户安装「TeleAgent 智能体平台助手」客户端并配对）。' +
+        '支持 12 种白名单操作。' +
+        '文件类：mkdir（在用户主目录内创建/确认文件夹，target 为相对路径如 "Desktop/新项目"）、' +
+        'list_dir（列目录，返回名称与类型）、' +
+        'file_read（读主目录内文件文本内容，path 为相对主目录路径）、' +
+        'file_write（写文件至主目录内，path 为相对路径，content 为文本内容，超限自动截断）。' +
+        '截图类：screenshot（截屏，window 为空则全屏，非空则尝试截对应窗口，返回图片 URL）。' +
+        '剪贴板类：clipboard_read（读取剪贴板，type=text/html/file）、' +
+        'clipboard_write（写入文字到剪贴板，text 为写入内容）。' +
+        '键鼠类（默认关闭，需设备管理页显式开启）：key_type（模拟键盘输入，text 为输入文本）、' +
+        'mouse_click（模拟坐标点击，x/y 为屏幕坐标像素值）。' +
+        '窗口类：window_list（列出本机所有窗口、应用名与 PID）、' +
+        'window_focus（将指定窗口激活至前台，window 为窗口名或 PID）。' +
+        '通知类：notify（发送系统通知，text 为通知内容，限 200 字）。' +
+        '应用类：open_app（打开本机应用，app 为应用注册名——macOS 上中文应用常以英文名注册）。' +
+        '设备离线或未配对会明确提示。键鼠类操作要求用户已开启「允许键鼠模拟」开关（设备管理页）。',
+        parameters: {
+          type: 'object',
+          properties: {
+            op: { type: 'string', enum: ['mkdir', 'list_dir', 'open_app', 'notify',
+                'screenshot', 'clipboard_read', 'clipboard_write', 'key_type', 'mouse_click',
+                'window_list', 'window_focus', 'file_read', 'file_write'
+              ], description: '操作类型' },
+            target: { type: 'string', description: 'mkdir/list_dir 用：相对用户主目录的路径（禁止绝对路径与路径穿越）' },
+            app: { type: 'string', description: 'open_app 用：应用名' },
+            text: { type: 'string', description: 'notify/clipboard_write/key_type 用：通知、写入或输入内容（≤2000 字）' },
+            window: { type: 'string', description: 'screenshot/window_focus 用：窗口名或 PID（空=全屏截图）' },
+            type: { type: 'string', enum: ['text', 'html', 'file'], description: 'clipboard_read 用：剪贴板数据类型，默认 text' },
+            x: { type: 'number', description: 'mouse_click 用：屏幕坐标 X' },
+            y: { type: 'number', description: 'mouse_click 用：屏幕坐标 Y' },
+            path: { type: 'string', description: 'file_read/file_write 用：相对主目录的路径（禁止绝对路径与路径穿越，.txt/.md 等文本文件）' },
+            content: { type: 'string', description: 'file_write 用：写入内容（超限自动截断）' },
+          },
         required: ['op'],
       },
     },
@@ -1029,9 +1053,30 @@ const local_exec = {
     if (op === 'mkdir' || op === 'list_dir') params.target = String(args.target || '').slice(0, 300);
     if (op === 'open_app') params.app = String(args.app || '').slice(0, 60);
     if (op === 'notify') params.text = String(args.text || '').slice(0, 200);
+    // A1 op 扩展（2026-11-09）：参数白名单化清洗
+    if (op === 'screenshot') params.window = String(args.window || '').slice(0, 200); // 空=全屏，非空=窗口名
+    if (op === 'clipboard_read') params.type = String(args.type || '').slice(0, 20); // text/html/file
+    if (op === 'clipboard_write') params.text = String(args.text || '').slice(0, 8000);
+    if (op === 'key_type') params.text = String(args.text || '').slice(0, 2000);
+    if (op === 'mouse_click') {
+      params.x = Math.round(+args.x || 0);
+      params.y = Math.round(+args.y || 0);
+    }
+    if (op === 'window_list') { /* 无参 */ }
+    if (op === 'window_focus') params.window = String(args.window || '').slice(0, 200);
+    if (op === 'file_read') params.path = String(args.path || '').slice(0, 500);
+    if (op === 'file_write') {
+      params.path = String(args.path || '').slice(0, 500);
+      params.content = String(args.content || '').slice(0, 32000);
+    }
     // 入队
     const info = db.prepare('INSERT INTO localbridge_tasks (device_id,username,op,params,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?)')
       .run(dev.id, username, op, JSON.stringify(params), 'pending', now(), now());
+    const logAudit = (status, detail) => {
+      if (!username) return;
+      db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
+        .run(username, `本地桥操作:${op}`, `设备${dev.device_name}: ${(detail || '').slice(0, 200)}` + (status === 'done' ? '' : '（失败）'), ctx._ip || '', now());
+    };
     const taskId = info.lastInsertRowid;
     // 等待回推（500ms 轮询 DB，60s 超时）
     const t0 = Date.now();
@@ -1042,17 +1087,18 @@ const local_exec = {
         let result = {}; try { result = JSON.parse(t.result || '{}'); } catch { }
         if (t.status === 'done' && result.ok) {
           const d = result.data || {};
-          // mkdir 语义化摘要：新建 vs 已存在（existed 为创建前的存在性，桥端已修正）
           let summary = '';
           if (op === 'mkdir') {
             summary = d.existed ? `（路径已存在：${d.path}，未重复创建）` : `（已新建：${d.path}）`;
           }
+          logAudit('done', `${op} 成功 ${summary}`);
           return `✅ 本机操作成功（${op}，设备「${dev.device_name}」）${summary}：\n${JSON.stringify(d, null, 2).slice(0, 2000)}`;
         }
+        logAudit('failed', `${op} 失败：${result.error || '未知错误'}`);
         return `⛔ 本机操作失败（${op}）：${result.error || '未知错误'}。请告知用户失败原因，询问是否重试。`;
       }
     }
-    // 超时：任务留队列（桥恢复后 poll 仍会执行并回推），提示已排队
+    logAudit('timeout', `${op} 60s 超时（设备未回推）`);
     return `⏳ 任务已下发至设备「${dev.device_name}」但 60 秒内未收到执行结果（设备可能正忙或网络抖动）。任务仍在队列中，桥恢复后会执行；请告知用户稍后可在设备侧查看结果，或直接重试。`;
   },
 };
