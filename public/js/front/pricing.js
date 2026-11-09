@@ -1,13 +1,13 @@
 /** 对外价格页 #/pricing（免登录）：三档套餐展示 + 升级引导 CTA + 企业定制表单
  *  免登录访问（路由 public:true），已登录用户按钮直达控制台/账单。
  */
-import { api, getToken, getUser } from '../api.js';
+import { api, getUser } from '../api.js';
 import { esc, toast, modal } from '../ui.js';
 
 export async function render(el) {
   let plans = [];
   try { plans = (await api('/biz/plans')).data; } catch { }
-  const logged = !!getToken();
+  const logged = !!getUser(); // P2-3：登录态改用 user 判定（token 已 Cookie 化，getToken 仅内存态）
   const user = getUser() || {};
   const myPlan = logged ? user.plan || 'free' : null;
 

@@ -118,13 +118,13 @@ export async function render(el) {
       const from = +pane.querySelector('#m_from').value, to = +pane.querySelector('#m_to').value;
       if (from === to) return toast('源库与目标库不能相同', 'err');
       // 复制 chunks 到目标库
-      const res = await fetch(`/api/knowledge/${from}/files`, { headers: { Authorization: 'Bearer ' + localStorage.getItem('ap_token') } });
+      const res = await fetch(`/api/knowledge/${from}/files`); // P2-3：Cookie 化后同源自动鉴权
       const files = (await res.json()).data;
       let n = 0;
       for (const f of files) {
         const r = await fetch(`/api/knowledge/${to}/files`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + localStorage.getItem('ap_token') },
+          headers: { 'Content-Type': 'application/json' }, // P2-3：Cookie 化后同源自动鉴权
           body: JSON.stringify({ name: f.name + '（迁移自#' + from + '）', content: '' }),
         }).then(r => r.json());
         n++;

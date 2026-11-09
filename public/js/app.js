@@ -1,5 +1,5 @@
 /** Hash 路由 + 双布局（前台/后台）+ 主题/语言切换（P3） */
-import { api, getToken, getUser, logout } from './api.js';
+import { api, getToken, getUser, logout, setLogin } from './api.js';
 import { esc, toast, modal, confirmBox, getTheme, getThemePref, setTheme } from './ui.js';
 import { t, getLang, setLang } from './i18n.js';
 
@@ -221,8 +221,10 @@ async function route() {  const hash = location.hash || '#/home';
   // 切页前清理上一页 destroy（防轮询/监听器泄漏）
   if (currentDestroy) { try { currentDestroy(); } catch (e) { console.warn('destroy err', e); } currentDestroy = null; }
 
-  if (!getToken() && !conf.public && base !== '/login') { location.hash = '#/login'; return; }
-  if (base === '/login' && getToken()) { location.hash = '#/home'; return; }
+  // P2-3（2026-11-09 HttpOnly Cookie 改造）：登录态改用 user 存在性判定——token 已 Cookie 化，
+  // getToken 仅内存态（刷新即空）不能再作"已登录"依据；Cookie 过期时 api() 收到 401 会自动 logout 跳登录
+  if (!getUser() && !conf.public && base !== '/login') { location.hash = '#/login'; return; }
+  if (base === '/login' && getUser()) { location.hash = '#/home'; return; }
   if (conf.admin && getUser()?.role !== 'admin') { toast(t('需要管理员权限'), 'err'); location.hash = '#/home'; return; }
 
   const params = segs.slice(conf.layout === 'chat' ? 1 : (base.split('/').length - 1));
@@ -239,7 +241,14 @@ async function route() {  const hash = location.hash || '#/home';
     if (isEmbedMode()) postEmbedHeight();
     const lb = document.getElementById('logoutBtn');
     if (lb) lb.onclick = async () => {
-      if (await confirmBox('确定退出登录？')) { logout(); location.hash = '#/login'; }
+      if (await confirmBox('确定退出登录？')) {
+        // P2-3 连带修复（2026-11-09）：必须先调后端 /auth/logout（吊销当前 token + 清 HttpOnly Cookie）
+        // 再清本地态——否则 Cookie 在"退出"后仍有效至 TTL（7 天），共享电脑上属假登出；
+        // 此前该端点从未被前端接线（孤儿接口），Node 级测试只验了端点本身没验 UI 集成。
+        // 网络失败不阻断本地登出（避免用户被困），失败时 Cookie 靠 TTL 自然过期兜底。
+        try { await api('/auth/logout', { method: 'POST' }); } catch { }
+        logout(); location.hash = '#/login';
+      }
     };
     const uc = document.getElementById('userChip');
     if (uc) uc.onclick = () => location.hash = '#/home';
@@ -468,7 +477,7 @@ async function openFeedbackModal() {
 // 供对话页悬浮帮助按钮等外部入口唤起（app.js 模块作用域外不可见）
 window.__openFeedback = openFeedbackModal;
 
-/** 修改密码弹窗（自服务入口，复用 /auth/change-password：原密码验证 + 弱口令拦截 + 清除强制改密标记） */
+/** 修改密码弹窗（自服务入口，走 /auth/login/change-password：原密码验证 + 弱口令拦截 + 清除强制改密标记） */
 function mountPwdChange() {
   const btn = document.getElementById('pwdBtn') || document.getElementById('pwdChat');
   if (!btn || btn.dataset.mounted === '1') return;
@@ -494,7 +503,11 @@ function mountPwdChange() {
           if (p1.length < 6) return toast(t('新密码至少 6 位'), 'err');
           if (p1 !== p2) return toast(t('两次输入的新密码不一致'), 'err');
           try {
-            const j = await api('/auth/change-password', { method: 'POST', body: { oldPwd, newPwd: p1 } });
+            // P2-3 连带修复（2026-11-09）：①路径修正 /auth/login/change-password（原 /auth/change-password 恒 404，
+            // 与登录页 forceChangePwd 同款存量死链）；②后端改密即吊销旧 token 并重签 fresh token——必须同步
+            // setLogin 更新内存凭据，否则下一次请求携带已吊销的旧 Bearer 头压过新 Cookie，直接 401 被踢回登录页
+            const j = await api('/auth/login/change-password', { method: 'POST', body: { oldPwd, newPwd: p1 } });
+            if (j.data?.token) setLogin(j.data.token, getUser());
             toast(j.msg || t('已保存'));
             close();
           } catch (e) { toast(e.message, 'err'); }

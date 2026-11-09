@@ -82,7 +82,7 @@ export function mountChat(el, opts) {
           const b64 = await new Promise((ok, err) => { const rd = new FileReader(); rd.onload = () => ok(String(rd.result).split(',')[1] || ''); rd.onerror = err; rd.readAsDataURL(f); });
           const r = await fetch('/api/files', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + localStorage.getItem('ap_token') },
+            headers: { 'Content-Type': 'application/json' }, // P2-3：Cookie 化后同源自动鉴权
             body: JSON.stringify({ name: f.name, file_b64: b64, source: 'chat' }),
           });
           const j = await r.json();
@@ -506,29 +506,34 @@ export function mountChat(el, opts) {
         <div class="v-status">${t('任务已提交，生成完成后自动播放（通常 1~3 分钟）')}</div>
       </div>`);
     html = html.replace(/\[PPT:([^\|\]]+)\|([^\|\]]+)\|(\d+)\]/g, (all, url, fname, pages) =>
-      `<div class="ppt-card">
+      /^https?:\/\//i.test(url) || url.startsWith('/')
+        ? `<div class="ppt-card">
         <div class="ppt-icon">📊</div>
-        <div class="ppt-info"><b>${fname}</b><span>${pages} 页 · PPTX · 可下载编辑</span></div>
-        <a class="btn primary" href="${url}" download="${fname}" style="text-decoration:none">${t('⬇ 下载')}</a>
-      </div>`);
+        <div class="ppt-info"><b>${esc(fname)}</b><span>${pages} 页 · PPTX · 可下载编辑</span></div>
+        <a class="btn primary" href="${esc(url)}" download="${esc(fname)}" style="text-decoration:none">${t('⬇ 下载')}</a>
+      </div>` : '');
     // P3 扩展产物卡（2026-10-22）：[CHART:url|标题] 图表 iframe 卡 / [WORD:url|名] Word 下载卡 / [AUDIO:url] 音频播放卡
     html = html.replace(/\[CHART:([^\|\]]+)\|([^\|\]]*)\]/g, (all, url, title) =>
-      `<div class="chart-card">
+      // P2-4 修复：校验 URL 仅允许 http/https 或相对路径（拒 javascript: 等）
+      /^https?:\/\//i.test(url) || url.startsWith('/')
+        ? `<div class="chart-card">
         <div class="chart-head">📊 ${esc(title || t('数据图表'))}</div>
-        <iframe class="chart-frame" src="${url}" title="${esc(title || 'chart')}" loading="lazy"></iframe>
-        <div class="chart-actions"><a class="btn sm" href="${url}" target="_blank" rel="noopener" style="text-decoration:none">${t('🔍 大图查看')}</a></div>
-      </div>`);
+        <iframe class="chart-frame" src="${esc(url)}" title="${esc(title || 'chart')}" loading="lazy"></iframe>
+        <div class="chart-actions"><a class="btn sm" href="${esc(url)}" target="_blank" rel="noopener" style="text-decoration:none">${t('🔍 大图查看')}</a></div>
+      </div>` : '');
     html = html.replace(/\[WORD:([^\|\]]+)\|([^\|\]]+)\]/g, (all, url, fname) =>
-      `<div class="word-card">
+      /^https?:\/\//i.test(url) || url.startsWith('/')
+        ? `<div class="word-card">
         <div class="word-icon">📄</div>
-        <div class="word-info"><b>${fname}</b><span>DOCX · ${t('Word 文档')} · ${t('可下载编辑')}</span></div>
-        <a class="btn primary" href="${url}" download="${fname}" style="text-decoration:none">${t('⬇ 下载')}</a>
-      </div>`);
+        <div class="word-info"><b>${esc(fname)}</b><span>DOCX · ${t('Word 文档')} · ${t('可下载编辑')}</span></div>
+        <a class="btn primary" href="${esc(url)}" download="${esc(fname)}" style="text-decoration:none">${t('⬇ 下载')}</a>
+      </div>` : '');
     html = html.replace(/\[AUDIO:([^\|\]]+)\]/g, (all, url) =>
-      `<div class="audio-card">
+      /^https?:\/\//i.test(url) || url.startsWith('/')
+        ? `<div class="audio-card">
         <div class="audio-head">🔊 ${t('语音播报')}</div>
-        <audio controls preload="metadata" src="${url}"></audio>
-      </div>`);
+        <audio controls preload="metadata" src="${esc(url)}"></audio>
+      </div>` : '');
     if (m.kbHits?.length) {
       html += `<div class="kb-ref"><div class="kb-ref-title">📚 ${t('引用来源')}（${m.kbHits.length}）<span class="kb-ref-toggle" data-ref-toggle>${t('展开')}</span></div>
         <div class="kb-ref-list" style="display:none">${m.kbHits.map((h, i) => `

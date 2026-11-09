@@ -19,7 +19,7 @@ export async function render(el) {
       </div>
       <div id="srvInfoBox" style="font-size:13px;line-height:1.9;color:var(--text-2);margin-bottom:12px">加载中…</div>
       <div class="table-wrap"><table class="tbl">
-        <thead><tr><th>令牌</th><th>名称</th><th>状态</th><th>调用次数</th><th>最近使用</th><th>操作</th></tr></thead>
+        <thead><tr><th>令牌</th><th>名称</th><th>作用域</th><th>状态</th><th>调用次数</th><th>最近使用</th><th>操作</th></tr></thead>
         <tbody id="tokenBody"></tbody>
       </table></div>
       <div style="font-size:12px;color:var(--text-3);margin-top:8px">💡 在 Claude Code / Cursor / Cherry Studio 等 MCP 客户端添加自定义 Streamable HTTP 服务器：URL 填上方端点，鉴权头填 Authorization: Bearer &lt;令牌&gt;，即可调用平台已发布智能体（工具名 agent_&lt;id&gt;）。</div>
@@ -196,8 +196,14 @@ export async function render(el) {
   }
 
   el.querySelector('#newToken').onclick = () => {
+    // P2-2：可选绑定智能体（作用域令牌）——下拉源用服务端信息卡的已发布智能体清单
+    const agentOptions = (srvInfo?.tools || []).map(t => `<option value="${t.name.replace(/^agent_(\d+)-?.*$/, '$1')}">${esc(t.agent)}（${esc(t.name)}）</option>`).join('');
     const body = `
-      <div class="form-item"><label>令牌备注名</label><input class="input" id="t_name" placeholder="如：Claude Code 接入 / 部门网关"></div>`;
+      <div class="form-item"><label>令牌备注名</label><input class="input" id="t_name" placeholder="如：Claude Code 接入 / 部门网关"></div>
+      <div class="form-item"><label>绑定智能体（作用域）</label><select class="input" id="t_agent">
+        <option value="">全域令牌（可调用全部已发布智能体）</option>${agentOptions}
+      </select>
+      <div class="hint">推荐绑定单个智能体（最小授权）：令牌仅可调用绑定的智能体，泄露时影响面最小</div></div>`;
     modal({
       title: '生成 MCP 访问令牌', body,
       foot: '<button class="btn" data-cancel>取消</button><button class="btn primary" data-save>生成</button>',
@@ -205,7 +211,8 @@ export async function render(el) {
         mask.querySelector('[data-cancel]').onclick = close;
         mask.querySelector('[data-save]').onclick = async () => {
           try {
-            const j = await api('/mcp-server/tokens', { method: 'POST', body: { name: mask.querySelector('#t_name').value.trim() } });
+            const agentId = mask.querySelector('#t_agent').value || null;
+            const j = await api('/mcp-server/tokens', { method: 'POST', body: { name: mask.querySelector('#t_name').value.trim(), agent_id: agentId } });
             close();
             modal({
               title: '令牌已生成（仅展示一次，请立即保存）',

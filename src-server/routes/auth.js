@@ -2,7 +2,7 @@
 const express = require('express');
 const crypto = require('crypto');
 const { db, hashPwd, verifyPwd, hashPwdAsync, now } = require('../db');
-const { sign, auth, revokeToken, TOKEN_TTL_MS } = require('../lib/auth');
+const { sign, auth, revokeToken, TOKEN_TTL_MS, setAuthCookie, clearAuthCookie } = require('../lib/auth');
 const { createLimiter, clientIp } = require('../lib/rate-limit');
 const { loadSecrets } = require('../lib/secrets'); // 钉钉 OAuth 凭证（DINGTALK_APP_KEY/APP_SECRET）
 const { mint: mintExchange, consume: consumeExchange } = require('../lib/exchange-code'); // #14：一次性交换码换 JWT
@@ -29,14 +29,16 @@ router.post('/login', loginLimiter, async (req, res) => {
   const token = sign({ uid: user.id, exp: Date.now() + TOKEN_TTL_MS });
   db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
     .run(user.username, '登录系统', '密码登录成功', ip, now());
+  setAuthCookie(res, token); // P2-3：HttpOnly Cookie 签发（token 不再依赖前端 storage 持久化）
   res.json({ code: 0, data: { token, user: { id: user.id, username: user.username, nickname: user.nickname, role: user.role, dept: user.dept, onboarded: user.onboarded ? 1 : 0 }, must_change_pwd: user.must_change_pwd ? 1 : 0 } });
 });
 
 router.get('/me', auth, (req, res) => res.json({ code: 0, data: req.user }));
 
-// P0-4 登出：吊销当前 token（仅做令牌废弃，不改状态）
+// P0-4 登出：吊销当前 token（仅做令牌废弃，不改状态）；P2-3：同步清除认证 Cookie
 router.post('/logout', auth, (req, res) => {
   revokeToken(req);
+  clearAuthCookie(res);
   res.json({ code: 0, msg: '已退出登录' });
 });
 
@@ -56,11 +58,15 @@ router.post('/login/change-password', auth, async (req, res) => {
   const WEAK = ['123456', 'admin123', 'demo123', 'password', '111111', '000000', 'abc123'];
   if (WEAK.includes(newPwd)) return res.json({ code: 400, msg: '新密码过于简单（常见默认口令），请换一个' });
   db.prepare('UPDATE users SET password=?, must_change_pwd=0 WHERE id=?').run(await hashPwdAsync(newPwd), user.id);
-  // 改密后吊销当前 token（旧 token 立即失效）
+  // 改密后吊销当前 token（旧 token 立即失效）——P2-3 连带修复（2026-11-09）：吊销后必须重新签发，
+  // 否则改密成功即死会话（旧 Cookie 已吊销 / 前端无可用凭据，进入平台即被 401 踢回登录页）；
+  // 该缺陷属存量问题，此前因 must_change_pwd 标记失效（P1-3）+ 前端路径 404 双重死链从未暴露
   revokeToken(req);
+  const freshToken = sign({ uid: user.id, exp: Date.now() + TOKEN_TTL_MS });
+  setAuthCookie(res, freshToken); // 旧 Cookie 同名覆盖，浏览器立即换新
   db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
     .run(user.username, '修改密码', '密码已更新' + (user.must_change_pwd ? '（弱口令强制改密完成）' : ''), req.ip, now());
-  res.json({ code: 0, msg: '密码修改成功' });
+  res.json({ code: 0, msg: '密码修改成功', data: { token: freshToken } });
 });
 
 // ==================== 钉钉扫码登录（V1.3 #4 2026-10-30，mock 骨架：本地纯逻辑，真实联调后续单独立项） ====================
@@ -206,6 +212,7 @@ const dingExchangeLimiter = createLimiter({
 router.post('/dingtalk/exchange', dingExchangeLimiter, (req, res) => {
   const payload = consumeExchange(String((req.body || {}).code || ''));
   if (!payload) return res.status(401).json({ code: 401, msg: '交换码无效或已使用（60 秒有效），请重新扫码登录' });
+  setAuthCookie(res, payload.token); // P2-3：钉钉扫码登录同样落 HttpOnly Cookie（与密码登录同构）
   res.json({ code: 0, data: payload });
 });
 

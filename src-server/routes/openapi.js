@@ -25,6 +25,16 @@ const keyChatLimit = createLimiter({
   msg: 'API 调用超过频率限制（20 次/分钟），请稍后重试或联系管理员调整',
 });
 
+// P3-6（2026-11-09）：models 列表端点补限流——原先仅 chat 有限流，models 可被高频刷（响应含全部已发布智能体
+// 元信息且每次制UPDATE last_used_at 写库）；与 chat 同款 Key 尾段维度，列表类查询放宽至 60 次/分钟
+const keyModelsLimit = createLimiter({
+  name: 'openapi-models',
+  windowMs: 60000,
+  max: 60,
+  keyFn: req => (req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim().slice(-16),
+  msg: '模型列表查询超过频率限制（60 次/分钟），请稍后重试',
+});
+
 // CORS（供外部系统/网页直调）
 router.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -34,17 +44,23 @@ router.use((req, res, next) => {
   next();
 });
 
-/** Bearer 密钥 → 有效 key 记录（含 agent），并刷新 last_used_at */
+/** Bearer 密钥 → 有效 key 记录（不含 agent 校验，由各端点按需决定作用域）
+ *  P2-2 修复 2026-11-09：不再在此处校验 agent 存在性——下放到具体 endpoint 按需校验 agent 匹配。 */
 function authKey(req) {
   const h = req.headers.authorization || '';
   const key = h.startsWith('Bearer ') ? h.slice(7).trim() : '';
   if (!key) return null;
   const k = db.prepare('SELECT * FROM agent_api_keys WHERE key=? AND status=1').get(key);
   if (!k) return null;
-  const agent = db.prepare('SELECT * FROM agents WHERE id=? AND status=?').get(k.agent_id, 'published');
-  if (!agent) return null;
   db.prepare('UPDATE agent_api_keys SET last_used_at=? WHERE id=?').run(now(), k.id);
-  return { k, agent };
+  return { k };
+}
+
+/** P2-2 修复：校验 key 是否允许访问指定 agent——key 无 agent_id 限制或 agent_id 匹配则通过，否则返回错误消息 */
+function authKeyForAgent(k, agentId) {
+  if (!k.agent_id) return null; // 无 agent_id 限制（全域 Key）
+  if (k.agent_id === agentId) return null; // 匹配
+  return 'API Key 无权访问该智能体（Key 绑定到特定智能体，请创建对应 Key）';
 }
 
 function unauthorized(res) {
@@ -52,13 +68,15 @@ function unauthorized(res) {
 }
 
 // 模型列表：每个已发布智能体对外即一个"模型"
-router.get('/v1/models', (req, res) => {
+router.get('/v1/models', keyModelsLimit, (req, res) => {
   const h = authKey(req);
   if (!h) return unauthorized(res);
   const agents = db.prepare("SELECT id,name,description FROM agents WHERE status='published' AND (source='self' OR source='dify')").all();
+  // P2-2 修复：全域 Key（agent_id 为 null/0）能看到所有已发布智能体；绑定了 agent_id 的 Key 只看到绑定的智能体
+  const visible = !h.k.agent_id ? agents : agents.filter(a => a.id === h.k.agent_id);
   res.json({
     object: 'list',
-    data: agents.map(a => ({
+    data: visible.map(a => ({
       id: `agent-${a.id}-${a.name}`,
       object: 'model',
       owned_by: 'agent-platform',
@@ -76,7 +94,11 @@ router.post('/v1/chat/completions', keyChatLimit, async (req, res) => {
   if (!h) return unauthorized(res);
   const { model, messages, stream } = req.body || {};
   const m = /^agent-(\d+)-/.exec(model || '');
-  const agent = m ? db.prepare('SELECT * FROM agents WHERE id=? AND status=?').get(+m[1], 'published') : null;
+  const agentId = m ? +m[1] : 0;
+  // P2-2 修复：校验 Key 的作用域——绑定了 agent_id 的 Key 仅可调用绑定智能体
+  const scopeCheck = authKeyForAgent(h.k, agentId);
+  if (scopeCheck) return res.status(403).json({ error: { message: scopeCheck.msg, type: 'key_scope_denied' } });
+  const agent = m ? db.prepare('SELECT * FROM agents WHERE id=? AND status=?').get(agentId, 'published') : null;
   if (!agent) {
     return res.status(404).json({ error: { message: `模型不存在：${model}。请先 GET /openapi/v1/models 获取可用智能体列表`, type: 'model_not_found' } });
   }

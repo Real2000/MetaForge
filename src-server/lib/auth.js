@@ -50,6 +50,46 @@ function sign(payload) {
   const sig = crypto.createHmac('sha256', SECRET).update(body).digest('base64url');
   return body + '.' + sig;
 }
+
+// ---------------- P2-3 彻底修复（2026-11-09）：HttpOnly Cookie 认证通道 ----------------
+// 原状态：token 由前端存 localStorage/sessionStorage，XSS 一旦发生即可窃取（storage 对 JS 完全可读）。
+// 方案：服务端签发 HttpOnly Cookie（JS 不可读，XSS 无法外带）；Bearer 头通道保留（API 调用方/
+// openapi/embed 等非浏览器场景兼容）。零依赖手写 Cookie 解析（项目无 cookie-parser，遵循其零依赖哲学）。
+const AUTH_COOKIE_NAME = 'ap_token';
+
+/** 从请求中提取认证 token：优先 Authorization: Bearer 头，回落 HttpOnly Cookie
+ *  注意：HTTP 层会裁剪头值的尾部空白——前端 getToken() 为空时会发出 "Bearer "（到达即 "Bearer"），
+ *  剥离 scheme 后为空值时必须回落 Cookie，否则空 Bearer 头会短路掉 Cookie 通道（集成实测踩过） */
+function readToken(req) {
+  const h = String(req.headers.authorization || '').trim();
+  if (h) {
+    const bearerVal = h.replace(/^Bearer\s*/i, '').trim();
+    if (bearerVal) return bearerVal; // 有效 Bearer 值（或无 scheme 的裸 token，与旧中间件语义一致）
+    // 头存在但剥离后为空（"Bearer"/"Bearer "）→ 继续走 Cookie 回落
+  }
+  const cookie = req.headers.cookie;
+  if (!cookie) return '';
+  for (const part of cookie.split(';')) {
+    const eq = part.indexOf('=');
+    if (eq <= 0) continue;
+    if (part.slice(0, eq).trim() === AUTH_COOKIE_NAME) {
+      try { return decodeURIComponent(part.slice(eq + 1).trim()); } catch { return part.slice(eq + 1).trim(); }
+    }
+  }
+  return '';
+}
+
+/** 登录/换码成功后写 HttpOnly Cookie（与 token TTL 同寿；SameSite=Lax 兼容 SSE/顶层导航且防跨站 POST） */
+function setAuthCookie(res, token) {
+  const maxAge = Math.floor(TOKEN_TTL_MS / 1000);
+  res.setHeader('Set-Cookie', `${AUTH_COOKIE_NAME}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}`);
+}
+
+/** 登出时清除认证 Cookie（Max-Age=0 即删） */
+function clearAuthCookie(res) {
+  res.setHeader('Set-Cookie', `${AUTH_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`);
+}
+
 function verify(token) {
   if (!token || typeof token !== 'string' || !token.includes('.')) return null;
   const [body, sig] = token.split('.');
@@ -68,7 +108,7 @@ function verify(token) {
 }
 
 function auth(req, res, next) {
-  const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+  const token = readToken(req); // P2-3：Bearer 头 / HttpOnly Cookie 双通道
   const payload = verify(token);
   if (!payload) return res.status(401).json({ code: 401, msg: '未登录或登录已过期' });
   // P0-3 收尾 2026-10-30：SELECT 补 dept_id——此前缺该字段导致 req.user.dept_id 恒 undefined，
@@ -82,9 +122,11 @@ function adminOnly(req, res, next) {
   if (req.user.role !== 'admin') return res.status(403).json({ code: 403, msg: '需要管理员权限' });
   next();
 }
-/** P0-4 token 吊销：将当前请求携带的 token 加入黑名单 */
+/** P0-4 token 吊销：将当前请求携带的 token 加入黑名单（P2-3：双通道取 token——
+ *  前端改 Cookie 后不再发 Authorization 头，若仍只从头取 token，登出/改密的吊销会静默失效，
+ *  旧 cookie 在 TTL 内继续可用——这是 Cookie 化改造的关键连带点） */
 function revokeToken(req) {
-  const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+  const token = readToken(req);
   if (!token) return;
   try {
     const [body] = token.split('.');
@@ -96,4 +138,4 @@ function revokeToken(req) {
   } catch { }
 }
 
-module.exports = { sign, verify, auth, adminOnly, revokeToken, TOKEN_TTL_MS };
+module.exports = { sign, verify, auth, adminOnly, revokeToken, TOKEN_TTL_MS, readToken, setAuthCookie, clearAuthCookie };

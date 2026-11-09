@@ -5363,7 +5363,7 @@ function t(name, fn) {
     await t('单元：P3-1 notification——消息通知节点发送站内信并返回通知字段（sent/title/content/recipient）', async () => {
       const { NODE_EXECUTORS } = require('../src-server/lib/workflow');
       const before = db.prepare('SELECT COUNT(*) AS c FROM notifications').get().c;
-      const r = await NODE_EXECUTORS.notification({ data: { title: '工作流消息通知', content: '您的工作流「审批流程」已完成', recipient: 'httpu1' } }, { _username: 'httpu1' });
+      const r = await NODE_EXECUTORS.notification({ data: { title: '工作流消息通知', content: '您的工作流「审批流程」已完成', recipient: 'httpu1' } }, { _username: 'httpu1' }, { username: 'httpu1' });
       assert.strictEqual(r.sent, true, 'sent 应为 true（通知已发送）');
       assert.strictEqual(r.title, '工作流消息通知', 'title 应回显');
       assert.strictEqual(r.content, '您的工作流「审批流程」已完成', 'content 应回显');
@@ -5373,10 +5373,294 @@ function t(name, fn) {
       const inserted = db.prepare('SELECT title, content, username FROM notifications ORDER BY id DESC').get();
       assert.strictEqual(inserted.username, 'httpu1', '通知应发送给 httpu1');
       assert.strictEqual(inserted.title, '工作流消息通知', 'title 应原文入库');
-      assert.strictEqual(inserted.content, '您的工作流「审批流程」已完成', 'content 应原文入库');
     });
-  }
+    // ===== P0-1 修复回归（2026-11-09）：code_sandbox Python 分支 RCE 已封堵 + 节点类型白名单 =====
+    await t('P0-1：code_sandbox language=python 拒绝执行（fail-closed）——原 execSync(code) 把节点代码当 Shell 命令执行构成 RCE', async () => {
+      const os = require('os');
+      const { NODE_EXECUTORS } = require('../src-server/lib/workflow');
+      // 真实利用链载荷：原实现下该 code 会经 /bin/sh -c 真实执行并落盘标记文件
+      const marker = path.join(os.tmpdir(), `ap_p0_rce_${Date.now()}.txt`);
+      let threw = null;
+      try {
+        await NODE_EXECUTORS.code_sandbox({ data: { language: 'python', code: `import os; os.system("touch ${marker}")`, timeout: 1000 } }, { inputs: {} });
+      } catch (e) { threw = e; }
+      assert.ok(threw, 'python 分支必须抛错（fail-closed），不得静默执行');
+      assert.ok(/不支持.*python|仅允许 JavaScript/i.test(threw.message), '错误信息应明确拒绝 python：' + threw.message);
+      assert.ok(!fs.existsSync(marker), '⚠️ RCE 未封堵：恶意载荷真实执行并落盘了标记文件！');
+      // 二次载荷（纯 shell 语法，原实现同样会执行）
+      let threw2 = null;
+      try {
+        await NODE_EXECUTORS.code_sandbox({ data: { language: 'python', code: `rm -rf /tmp/ap_should_never_run`, timeout: 1000 } }, { inputs: {} });
+      } catch (e) { threw2 = e; }
+      assert.ok(threw2 && /不支持.*python/i.test(threw2.message), 'shell 语法载荷同样必须拒绝：' + (threw2 && threw2.message));
+    });
+    await t('P0-1：code_sandbox language 未声明/为 javascript 时 JS 沙箱路径不受影响', async () => {
+      const { NODE_EXECUTORS } = require('../src-server/lib/workflow');
+      const r1 = await NODE_EXECUTORS.code_sandbox({ data: { code: 'return { ok: 1 }' } }, { inputs: {} });
+      assert.strictEqual(r1.language, 'javascript', '未声明 language 默认走 JS 沙箱');
+      assert.strictEqual(r1.ok, 1, 'JS 沙箱执行结果应正常返回');
+    });
+    await t('P0-1：validateWorkflowV2 节点类型白名单——未注册类型（含拼错/伪造执行器名）保存即剔除', () => {
+      const schema = require('../src-server/lib/workflow-schema');
+      const evil2 = schema.validateWorkflowV2({
+        nodes: [
+          { id: 'start', type: 'start', position: { x: 0, y: 0 }, data: {} },
+          { id: 'n1', type: 'future_shell_executor', position: { x: 1, y: 1 }, data: {} },
+        ], edges: [{ id: 'e1', source: 'start', target: 'n1' }],
+      });
+      assert.ok(!evil2.nodes || !evil2.nodes.some(n => n.type === 'future_shell_executor'), '未注册类型节点必须被剔除：' + JSON.stringify(evil2.nodes && evil2.nodes.map(n => n.type)));
+      const evil3 = schema.validateWorkflowV2({
+        nodes: [
+          { id: 'start', type: 'start', position: { x: 0, y: 0 }, data: {} },
+          { id: 'n1', type: 'child_process', position: { x: 1, y: 1 }, data: {} },
+        ], edges: [],
+      });
+      assert.ok(!evil3.nodes || !evil3.nodes.some(n => n.type === 'child_process'), 'child_process 伪类型必须被剔除');
+      // 未知类型被剔除后仅剩 start，保存虽成功但攻击图已残废（恶意节点不存留，运行无从触发）
+      assert.ok(evil3.nodes && evil3.nodes.length === 1 && evil3.nodes[0].type === 'start', '剔除后仅剩合法 start 节点');
+    });
+    await t('P0-1：validateWorkflowV2 全部注册类型（含 9 个扩展执行器）不误伤——存量合法画布可继续保存', () => {
+      const schema = require('../src-server/lib/workflow-schema');
+      const ext = ['http_request', 'code_sandbox', 'condition_loop', 'variable_assign', 'notification', 'database_query', 'delay', 'logger', 'transform'];
+      for (const ty of ext) {
+        const w = schema.validateWorkflowV2({
+          nodes: [
+            { id: 'start', type: 'start', position: { x: 0, y: 0 }, data: {} },
+            { id: 'n1', type: ty, position: { x: 1, y: 1 }, data: {} },
+          ], edges: [{ id: 'e1', source: 'start', target: 'n1' }],
+        });
+        assert.ok(w && !w.error, `扩展类型 ${ty} 不应被白名单误伤`);
+        assert.ok(w.nodes.some(n => n.type === ty), `扩展类型 ${ty} 应保留在保存图中`);
+      }
+    });
+    await t('P0-1：ALLOWED_NODE_TYPES 与 Runner NODE_EXECUTORS 注册表一一对齐（防白名单漂移）', () => {
+      const { NODE_EXECUTORS } = require('../src-server/lib/workflow');
+      const { ALLOWED_NODE_TYPES } = require('../src-server/lib/workflow-schema');
+      const executorKeys = new Set(Object.keys(NODE_EXECUTORS));
+      for (const k of executorKeys) assert.ok(ALLOWED_NODE_TYPES.has(k), `执行器 ${k} 必须在白名单（否则合法节点保存被拒）`);
+      for (const k of ALLOWED_NODE_TYPES) assert.ok(executorKeys.has(k), `白名单项 ${k} 无对应执行器（应从 EXT_EXECUTOR_TYPES 移除或补执行器）`);
+    });
+    // ===== P1-2 修复回归（2026-11-09）：wf_files 归属校验——非管理员无法查看/下载他人文件 =====
+    await t('P1-2：GET /api/files/:id 非管理员查看他人文件应拒绝（403）', async () => {
+      // 修复测试本体三处缺陷（2026-11-09）：①now 未导入恒 ReferenceError——该用例自诞生起从未真正执行过断言
+      // （此前"362/363 基线失败"的第一因即此，非服务器未启动）；②sign 缺 uid（auth 中间件按 payload.uid
+      // 查库，username/role 直签会被 401 拦截而非走到归属校验 403）；③端口硬编码 3210 依赖外部常驻服务器——
+      // 改为自 spawn 子进程（随机端口），与 HTTP 集成组同款模式：父进程直插临时库，子进程读同一库（WAL 多连接）
+      const { spawn } = require('child_process');
+      const { db: db1, hashPwd, now } = require('../src-server/db');
+      const { sign } = require('../src-server/lib/auth');
+      db1.prepare('DELETE FROM users WHERE username IN (?,?)').run('p1user1', 'p1user2');
+      db1.prepare(`INSERT INTO users (username,nickname,password,status,role,must_change_pwd,created_at) VALUES (?,?,?,1,'user',0,?)`).run('p1user1', 'USER1', hashPwd('pass1'), now());
+      db1.prepare(`INSERT INTO users (username,nickname,password,status,role,must_change_pwd,created_at) VALUES (?,?,?,1,'user',0,?)`).run('p1user2', 'USER2', hashPwd('pass2'), now());
+      const uid1 = db1.prepare('SELECT id FROM users WHERE username=?').get('p1user1').id;
+      const uid2 = db1.prepare('SELECT id FROM users WHERE username=?').get('p1user2').id;
+      const t1 = sign({ uid: uid1, exp: Date.now() + 3600000 });
+      const t2 = sign({ uid: uid2, exp: Date.now() + 3600000 });
+      // 用 user1 直接插库一个文件（与原实现一致，绕开上传解析）
+      const testf = Buffer.from('hello p1-2 test file', 'utf8').toString('base64');
+      db1.prepare(`INSERT INTO wf_files (name,ext,size,text_content,content_b64,source,created_by,created_at) VALUES (?,?,?,?,?,?,?,?)`)
+        .run('p1test.txt', 'txt', 20, 'hello p1-2 test file', testf, 'manual', 'p1user1', now());
+      const fid = db1.prepare('SELECT id FROM wf_files WHERE name=?').get('p1test.txt').id;
+      const port = 35000 + Math.floor(Math.random() * 2000);
+      const base = `http://127.0.0.1:${port}`;
+      const child = spawn(process.execPath, ['server.js'], {
+        cwd: path.join(__dirname, '..'),
+        env: { ...process.env, PORT: String(port), AGENT_DATA_DIR: process.env.AGENT_DATA_DIR },
+        stdio: 'ignore',
+      });
+      const jfetch = async (p, tok, raw) => {
+        const r = await fetch(base + p, { headers: { Authorization: 'Bearer ' + tok } });
+        if (raw) return { status: r.status, text: await r.text() };
+        let j = null; try { j = await r.json(); } catch { }
+        return { status: r.status, j };
+      };
+      try {
+        // 等服务就绪（最多 30s——套件满负载时子进程启动可能偏慢，首跑偶发超时属环境抖动非代码缺陷）
+        let up = false;
+        for (let i = 0; i < 150 && !up; i++) {
+          await new Promise(r2 => setTimeout(r2, 200));
+          try { up = (await fetch(base + '/api/health')).ok; } catch { }
+        }
+        assert.ok(up, '子进程服务应在 30s 内就绪（否则本用例断言无从执行）');
+        // user2 查看 user1 文件：HTTP 200 + body code 403（归属校验层拒绝，业务码语义）
+        const r1 = await jfetch(`/api/files/${fid}`, t2);
+        assert.strictEqual(r1.status, 200, '元数据接口应返回 200');
+        assert.strictEqual(r1.j.code, 403, '越权元数据应返回 code 403');
+        // user2 下载 user1 文件：HTTP 403
+        const r2 = await jfetch(`/api/files/${fid}/download`, t2, true);
+        assert.strictEqual(r2.status, 403, '越权下载应返回 403');
+        // user1 自己查看和下载应 OK
+        const r3 = await jfetch(`/api/files/${fid}`, t1);
+        assert.strictEqual(r3.j.code, 0, '本人查看应返回 0');
+        assert.strictEqual(r3.j.data.name, 'p1test.txt', '本人查看应看到文件名');
+        const r4 = await jfetch(`/api/files/${fid}/download`, t1, true);
+        assert.strictEqual(r4.status, 200, '本人下载应返回 200');
+        assert.strictEqual(r4.text, 'hello p1-2 test file', '本人下载原文应匹配');
+      } finally {
+        try { child.kill('SIGTERM'); } catch { }
+        try { child.kill('SIGKILL'); } catch { }
+        // 清理测试数据（断言失败也保证清干净 + 子进程不泄漏）
+        db1.prepare('DELETE FROM users WHERE username IN (?,?)').run('p1user1', 'p1user2');
+        db1.prepare('DELETE FROM wf_files WHERE name=?').run('p1test.txt');
+      }
+    });
+    // ===== P2-3 连带缺陷回归（2026-11-09）：前端接线类缺陷——死链调用点 / 孤儿端点 =====
+    await t('P2-3：前端改密调用点接线——login.js/app.js 均走 /auth/login/change-password，无旧死链残留', () => {
+      const read = f => fs.readFileSync(path.join(__dirname, '..', 'public', 'js', f), 'utf8');
+      for (const f of ['login.js', 'app.js']) {
+        const src = read(f);
+        assert.ok(src.includes("api('/auth/login/change-password'"), `${f} 应调用后端真实路由 /auth/login/change-password`);
+        assert.ok(!/api\('\/auth\/change-password'/.test(src), `${f} 不得残留旧死链 /auth/change-password（后端无此路由，恒 404——历史缺陷：两处调用点曾双双踩中）`);
+      }
+    });
+    await t('P2-3：退出按钮已接线后端登出——app.js 必须调 /auth/logout（否则 HttpOnly Cookie 存活至 TTL 属假登出）', () => {
+      const src = fs.readFileSync(path.join(__dirname, '..', 'public', 'js', 'app.js'), 'utf8');
+      assert.ok(src.includes("api('/auth/logout'"), 'app.js 退出流程应调用后端 /auth/logout（吊销 token + 清 HttpOnly Cookie）——历史缺陷：端点存在但从未被前端接线');
+    });
 
+    // ===== P3-2~P3-9 修复回归（2026-11-09）=====
+    await t('P3-2：resolveInputs answer/classifier/aggregator 行为回归（删除重复死代码后行为不变）', () => {
+      const { resolveInputs } = require('../src-server/lib/workflow');
+      const results = { start: { input: 'world' } };
+      // answer：text 模板渲染
+      const a = resolveInputs({ type: 'answer', data: { text: 'hello {{#start.input#}}' } }, results, {});
+      assert.deepStrictEqual(a, { text: 'hello world' }, 'answer 应渲染 text 模板');
+      // classifier：question 默认回落 {{#start.input#}}
+      const c1 = resolveInputs({ type: 'classifier', data: {} }, results, {});
+      assert.strictEqual(c1.question, 'world', 'classifier 缺省 question 应回落 start.input');
+      const c2 = resolveInputs({ type: 'classifier', data: { question: 'q', instruction: 'ins' } }, results, {});
+      assert.deepStrictEqual(c2, { question: 'q', instruction: 'ins' }, 'classifier 显式字段应原样解析');
+      // aggregator：sources 逐项渲染
+      const g = resolveInputs({ type: 'aggregator', data: { sources: [{ variable: '{{#start.input#}}' }, { variable: 'fixed' }] } }, results, {});
+      assert.deepStrictEqual(g, { sources: ['world', 'fixed'] }, 'aggregator 应逐项渲染 sources');
+    });
+    await t('P3-4：decrypt 密钥轮换后返回空串（不得把密文当明文外发）+ 旧明文兼容', async () => {
+      const { encrypt, decrypt } = require('../src-server/lib/crypto-util');
+      const { upsert } = require('../src-server/lib/secrets');
+      const crypto = require('crypto');
+      // 保存原密钥状态（P1-4：启动自动初始化，正常应已存在）
+      const orig = db.prepare("SELECT value FROM secrets WHERE name='ENCRYPTION_KEY'").pluck().get();
+      try {
+        const k1 = crypto.randomBytes(32).toString('hex');
+        upsert('ENCRYPTION_KEY', k1, 'P3-4 回归');
+        const enc = encrypt('P3-4-secret-明文-value');
+        // 加密形态生效（三段 hex）且往返一致
+        assert.ok(/^[0-9a-f]{32}\.[0-9a-f]{32}\.[0-9a-f]+$/i.test(enc), 'encrypt 应产出 IV.tag.cipher 三段 hex 形态');
+        assert.strictEqual(decrypt(enc), 'P3-4-secret-明文-value', '正确密钥下往返应得原文');
+        // 密钥轮换：同密文换钥解密 → 必须返回空串（原实现返回密文串，会被当明文 API Key 发给上游）
+        const k2 = crypto.randomBytes(32).toString('hex');
+        upsert('ENCRYPTION_KEY', k2, 'P3-4 回归-轮换');
+        const wrong = decrypt(enc);
+        assert.strictEqual(wrong, '', '密钥不匹配时应返回空串，而不是把密文串当明文返回');
+        // 旧明文兼容：形态不像密文的值原样返回（历史明文数据不破坏）
+        assert.strictEqual(decrypt('legacy-plain-key'), 'legacy-plain-key', '旧明文应原样返回');
+        assert.strictEqual(decrypt('a.b.c'), 'a.b.c', '三点分隔但非密文形态（前两段非 32hex）应按旧明文返回');
+        assert.strictEqual(decrypt(''), '', '空值应返回空串');
+      } finally {
+        // 还原密钥状态，避免污染后续用例
+        if (orig) upsert('ENCRYPTION_KEY', orig, 'P3-4 回归-还原');
+        else db.prepare("DELETE FROM secrets WHERE name='ENCRYPTION_KEY'").run();
+      }
+    });
+    await t('P3-5：视频任务归属记忆 + 轮询/拉内容端点归属校验接线', () => {
+      const skills = require('../src-server/lib/skills');
+      // 归属记忆读写 + 空 owner 不记录（兼容旧调用方）
+      skills.rememberVideoOwner('task-own-1', 'alice');
+      assert.strictEqual(skills.videoOwnerOf('task-own-1'), 'alice', '归属用户应可读取');
+      assert.strictEqual(skills.videoOwnerOf('task-unknown'), null, '未知任务归属应为 null（回落放行语义）');
+      skills.rememberVideoOwner('task-own-2', '');
+      assert.strictEqual(skills.videoOwnerOf('task-own-2'), null, '空 owner 不应记录（兼容旧调用方）');
+      // 接线断言：chat.js 两个端点均引用 videoOwnerOf 做归属校验，且创建侧传入归属用户
+      const src = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'routes', 'chat.js'), 'utf8');
+      assert.ok(src.includes('skills.videoOwnerOf(req.params.taskId)'), '视频任务端点应调用 videoOwnerOf 做归属校验');
+      assert.strictEqual((src.match(/skills\.videoOwnerOf\(req\.params\.taskId\)/g) || []).length, 2, '进度轮询与内容拉取两个端点都应校验归属');
+      assert.ok(src.includes("createVideoTask(input, 4, '16:9', req.user.username)"), '创建任务时应传入归属用户 req.user.username');
+    });
+    await t('P3-6：openapi /v1/models 已挂限流中间件（防密钥泄露后被高频刷列表）', () => {
+      const openapiRouter = require('../src-server/routes/openapi');
+      const layer = openapiRouter.stack.find(l => l.route && l.route.path === '/v1/models');
+      assert.ok(layer, '/v1/models 路由应存在');
+      // handler 前应有 1 层限流中间件（route.stack = [limiter, handler]）
+      assert.strictEqual(layer.route.stack.length, 2, `/v1/models 应挂限流中间件（当前 ${layer.route.stack.length} 层，预期 limiter+handler=2）`);
+    });
+    await t('P3-8：/chat/models 不再 SELECT api_key 列（truthiness 改由 SQL has_key 表达）', () => {
+      const src = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'routes', 'chat.js'), 'utf8');
+      const m = /router\.get\('\/models',[\s\S]{0,400}?db\.prepare\((['"`])([\s\S]*?)\1\)/.exec(src);
+      assert.ok(m, '应能定位 /chat/models 的 SQL');
+      const sql = m[2];
+      // SELECT 列清单（FROM 之前）不得包含 api_key 原始列（新实现仅允许 api_key 出现在 has_key 布尔表达式内）
+      const colList = sql.slice(0, sql.toUpperCase().lastIndexOf('FROM'));
+      assert.ok(!/\bapi_key\b\s*(,|$)/i.test(colList.trim()), 'SELECT 列清单不得包含 api_key 原始列（密钥材料不进入 JS 内存/响应链路）');
+      assert.ok(/has_key/i.test(sql), '应以 SQL 布尔表达式 has_key 表达 truthiness');
+      assert.ok(src.includes('real: !!p.has_key'), 'real 标记应改用 has_key（api_key 不再进入 JS 内存）');
+    });
+    await t('P3-9：使用内置开发公钥时启动告警（生产部署必须轮换）', () => {
+      const edition = require('../src-server/lib/edition');
+      const saved = process.env.LICENSE_PUBKEY_HEX;
+      delete process.env.LICENSE_PUBKEY_HEX; // 确保走「内置公钥」分支
+      const origWarn = console.warn;
+      let captured = '';
+      console.warn = (...a) => { captured += a.join(' '); };
+      try { edition.refreshLicense(); } finally {
+        console.warn = origWarn;
+        if (saved !== undefined) process.env.LICENSE_PUBKEY_HEX = saved;
+      }
+      assert.ok(captured.includes('开发/联调测试公钥'), '应告警提示当前使用内置开发/联调测试公钥：' + captured.slice(0, 120));
+    });
+    await t('P0-2：database_query 节点拒绝写语句与 PRAGMA（校验层先于 better-sqlite3 驱动层）', async () => {
+      const { NODE_EXECUTORS } = require('../src-server/lib/workflow');
+      for (const sql of [
+        'UPDATE agents SET name=\'pwned\'',
+        'DELETE FROM agents',
+        'DROP TABLE agents',
+        'INSERT INTO agents (name) VALUES (\'x\')',
+        'SELECT 1; DROP TABLE agents',
+        'PRAGMA table_info(users)',
+        'SELECT * FROM pragma_table_info(\'users\')',
+      ]) {
+        let threw = null;
+        try { await NODE_EXECUTORS.database_query({ data: { sql } }, {}); } catch (e) { threw = e; }
+        assert.ok(threw && /安全策略拒绝/.test(threw.message), `SQL 必须被校验层拒绝：${sql} → ${threw && threw.message}`);
+      }
+    });
+    await t('P0-2：database_query 节点合法查询正常执行（seed 库 agents 计数 + 模板变量渲染不受影响）', async () => {
+      const { NODE_EXECUTORS } = require('../src-server/lib/workflow');
+      const r = await NODE_EXECUTORS.database_query({ data: { sql: 'SELECT COUNT(*) AS c FROM agents' } }, {});
+      assert.ok(Array.isArray(r.rows) && r.rows[0].c >= 10, '合法查询应返回结果：' + JSON.stringify(r.rows));
+      assert.strictEqual(r.count, r.rows.length, 'count 应等于行数');
+      // 模板渲染路径（{{#node.var#}}）不受校验影响
+      const r2 = await NODE_EXECUTORS.database_query({ data: { sql: 'SELECT COUNT(*) AS c FROM agents WHERE category=\'{{#start.cat#}}\'' } }, { start: { cat: '办公' } });
+      assert.ok(Array.isArray(r2.rows), '模板变量渲染后的查询应正常执行：' + JSON.stringify(r2.rows));
+    });
+    await t('P0-2：sanitizeSelectSql 标识符引用旁路全封堵（原正则对 " ` [ / main. 前缀 / 无空格形态全部提取失败）', () => {
+      const extra = require('../src-server/lib/tools-extra');
+      for (const sql of [
+        'SELECT * FROM "secrets"',
+        'SELECT * FROM `secrets`',
+        'SELECT * FROM [secrets]',
+        'SELECT * FROM main.secrets',
+        'SELECT * FROM main."secrets"',
+        'SELECT * FROM"users"',
+        'SELECT * FROM agents a JOIN `users` u ON a.id=u.id',
+        'SELECT name FROM main.sqlite_master',
+      ]) {
+        assert.ok(extra.sanitizeSelectSql(sql).err, `引用形态旁路必须封堵：${sql}`);
+      }
+      // P0-2 黑名单补漏的 4 张表
+      for (const t2 of ['platforms', 'feedbacks', 'user_tool_keys', 'sqlite_master']) {
+        assert.ok(extra.sanitizeSelectSql(`SELECT * FROM ${t2}`).err, `补漏黑名单表 ${t2} 应拒绝`);
+      }
+      // 合法查询不误伤（含列名带 create 子串 / 别名 / join 非敏感表）
+      for (const sql of [
+        'SELECT COUNT(*) FROM agents',
+        'SELECT created_at FROM evaluations',
+        'SELECT a.name FROM agents a JOIN kbs k ON k.id=a.kb_id',
+      ]) {
+        assert.ok(!extra.sanitizeSelectSql(sql).err, `合法查询不应误伤：${sql}`);
+      }
+    });
+
+  }
 
   // 收尾：关闭库并清理临时目录
   try { db.close(); } catch { }

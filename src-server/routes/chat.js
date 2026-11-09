@@ -338,13 +338,15 @@ router.patch('/sessions/:id', (req, res) => {
 const { classifyModel } = require('../lib/model-types');
 
 router.get('/models', (req, res) => {
-  const ps = db.prepare('SELECT name, models, configured, api_key, is_default FROM providers WHERE configured=1').all();
+  // P3-8（2026-11-09）：SELECT 移除 api_key 列——原仅用于 truthiness（real 标记），改为 SQL 端布尔表达式
+  // has_key，密钥材料不再进入 JS 内存/响应链路，防后续维护误用（真实 Key 使用方一律走 decrypt 专用查询）
+  const ps = db.prepare("SELECT name, models, configured, (api_key IS NOT NULL AND api_key != '') AS has_key, is_default FROM providers WHERE configured=1").all();
   const out = [];
   for (const p of ps) {
     let ms = [];
     try { ms = JSON.parse(p.models || '[]'); } catch { ms = []; }
     // P4（2026-10-22）：全量返回（对话/生图/视频/语音/嵌入），type 分类由前端按模式隔离；不再用 isChatModel 过滤
-    ms.forEach(m => out.push({ name: m, provider: p.name, real: !!(p.api_key), is_default: p.is_default, source: 'platform', type: classifyModel(m) }));
+    ms.forEach(m => out.push({ name: m, provider: p.name, real: !!p.has_key, is_default: p.is_default, source: 'platform', type: classifyModel(m) }));
   }
   // P3 用户自有模型：本人启用中的模型源追加（自带 Key，下拉标注「我的」；类型实时分类）
   const ups = db.prepare("SELECT id, name, models FROM user_providers WHERE username=? AND status=1 AND api_key != '' AND base_url != '' ORDER BY id").all(req.user.username);
@@ -484,7 +486,8 @@ router.post('/stream', async (req, res) => {
           reply = `图片已生成（QwenImage 1024×1024）：\n\n![生成图片](${r.url})`;
         } else if (skill === 'video') {
           send('notice', { msg: '🎬 视频任务已提交（minimax h3，异步生成，生成完成后自动展示）…' });
-          const r = await skills.createVideoTask(input);
+          // P3-5（2026-11-09）：创建时传入归属用户，轮询/拉内容端点据此拒绝非本人访问
+          const r = await skills.createVideoTask(input, 4, '16:9', req.user.username);
           reply = `视频生成任务已创建（${r.seconds}秒 · ${r.aspectRatio}）：\n\n[VIDEO:${r.taskId}]`;
         } else if (skill === 'ppt') {
           send('notice', { msg: '📊 正在构思大纲并生成 PPT（约需 30~60 秒）…' });
@@ -694,7 +697,12 @@ router.post('/stream', async (req, res) => {
     // P5.14 文件一等变量：聊天附件（POST /api/files 上传的 fileId）→ 画布 start 的 file/array[file] 变量自动配对；
     // 未定义 file 变量时文本化拼入输入（表单模式/普通智能体也能读附件）
     const attachIds = [...new Set((Array.isArray(attachments) ? attachments : []).map(Number).filter(Number.isFinite))].slice(0, 10);
-    const attachRows = attachIds.map(id => db.prepare('SELECT * FROM wf_files WHERE id=?').get(id)).filter(Boolean);
+    // P1-2 修复：attachments 注入 wf_files 数据时仅查询自己上传的文件（非管理员）
+    // 如果 attachRows.length < attachIds.length 说明有文件被过滤（非己上传），通知用户
+    const ownFilter = (req.user?.role !== 'admin' && req.user?.username)
+      ? (id) => db.prepare('SELECT * FROM wf_files WHERE id=? AND created_by=?').get(id, req.user.username)
+      : (id) => db.prepare('SELECT * FROM wf_files WHERE id=?').get(id);
+    const attachRows = attachIds.map(id => ownFilter(id)).filter(Boolean);
     if (attachIds.length !== attachRows.length) send('notice', { msg: '⚠️ 部分附件不存在或已被清理' });
     let attachVarMap = null; // 画布 file 变量 → fileId 映射（有映射时不拼文本防重复）
     if (attachRows.length) {
@@ -1095,6 +1103,12 @@ router.post('/stream', async (req, res) => {
 // 查询进度：前端轮询。完成时后端将 mp4 缓存到本地 public/uploads/videos/，
 // 返回静态 content_url（<video> 标签无法携带 Authorization 头，必须走静态文件）
 router.get('/video/tasks/:taskId', async (req, res) => {
+  // P3-5（2026-11-09）：任务归属校验——创建时已记录归属用户（内存），非本人且非管理员拒绝轮询；
+  // 重启后归属失忆则回落放行（与修复前一致，见 skills.js 注释的已知边界）
+  const owner = skills.videoOwnerOf(req.params.taskId);
+  if (owner && owner !== req.user.username && req.user.role !== 'admin') {
+    return res.json({ code: 403, msg: '无权查看该视频任务（仅创建者本人可查看）' });
+  }
   try {
     const q = await skills.queryVideoTask(req.params.taskId);
     const j = q.data;       // 任务状态（查询/拉内容直连归属供应商，不再绑死默认供应商）
@@ -1129,6 +1143,11 @@ router.get('/video/tasks/:taskId', async (req, res) => {
 
 // mp4 内容流式代理（上游需鉴权，浏览器直链不可达，经平台转发；归属供应商优先，否则逐个尝试）
 router.get('/video/tasks/:taskId/content', async (req, res) => {
+  // P3-5（2026-11-09）：内容拉取同归属校验（与进度轮询同口径；流式端点用 HTTP 403）
+  const owner = skills.videoOwnerOf(req.params.taskId);
+  if (owner && owner !== req.user.username && req.user.role !== 'admin') {
+    return res.status(403).json({ code: 403, msg: '无权获取该视频内容（仅创建者本人可下载）' });
+  }
   const candidates = skills.videoProviderOf(req.params.taskId)
     ? [skills.videoProviderOf(req.params.taskId)]
     : skills.providers();

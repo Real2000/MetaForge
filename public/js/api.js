@@ -1,11 +1,43 @@
-/** API 封装 + 登录态 */
+/** API 封装 + 登录态
+ *  P2-3 彻底修复 2026-11-09（HttpOnly Cookie 改造）：
+ *  - token 不再写入任何 JS 可读存储（localStorage/sessionStorage 全部撤除）——认证凭据由服务端
+ *    Set-Cookie 下发的 HttpOnly Cookie 承载（document.cookie 不可读，XSS 无法窃取外带）；
+ *    同源 fetch 默认携带 Cookie，服务端 auth 中间件 Bearer 头/ Cookie 双通道兼容。
+ *  - setLogin 的 token 参数仅保留在内存变量（页面级生命周期，刷新即失——刷新后由 Cookie 重新鉴权，
+ *    服务端 /auth/me 恢复用户态）；登录响应里的 token 仍存在（兼容 API 调用方），但前端不再持久化。
+ *  - ap_user（昵称/角色等 UI 展示信息，非凭据）仍存 localStorage 供路由守卫与界面渲染；
+ *    权限真正的边界在服务端 adminOnly，此处仅做展示层。
+ *  - 模块加载时清理历史版本遗留的存量 token（旧 token 在 TTL 内仍有效，不清理则 XSS 依旧可读——
+ *    迁移安全的关键一步）。 */
 const TOKEN_KEY = 'ap_token';
 const USER_KEY = 'ap_user';
 
-export function getToken() { return localStorage.getItem(TOKEN_KEY) || ''; }
-export function getUser() { try { return JSON.parse(localStorage.getItem(USER_KEY) || 'null'); } catch { return null; } }
-export function setLogin(token, user) { localStorage.setItem(TOKEN_KEY, token); localStorage.setItem(USER_KEY, JSON.stringify(user)); }
-export function logout() { localStorage.removeItem(TOKEN_KEY); localStorage.removeItem(USER_KEY); }
+let memToken = ''; // 内存态 token（仅本页生命周期，兼容少数需要显式携带 Bearer 的调用方）
+
+// 迁移清理：一次性移除历史版本写入 localStorage/sessionStorage 的存量 token（幂等）
+try { localStorage.removeItem(TOKEN_KEY); sessionStorage.removeItem(TOKEN_KEY); } catch { }
+
+function getUserStored() {
+  try { return JSON.parse(localStorage.getItem(USER_KEY) || 'null'); } catch { return null; }
+}
+function persistUser(user) {
+  try { localStorage.setItem(USER_KEY, JSON.stringify(user)); } catch { }
+}
+function clearUser() {
+  try { localStorage.removeItem(USER_KEY); } catch { }
+}
+
+export function getToken() { return memToken; }
+export function getUser() { return getUserStored(); }
+export function setLogin(token, user) { memToken = String(token || ''); persistUser(user); }
+export function logout() { memToken = ''; clearUser(); }
+
+/** 构造请求头：内存 token 存在时附 Bearer（显式通道），否则省略——同源请求自动带 HttpOnly Cookie */
+function authHeaders(extra) {
+  const h = { 'Content-Type': 'application/json', ...(extra || {}) };
+  if (memToken) h.Authorization = 'Bearer ' + memToken;
+  return h;
+}
 
 export async function api(path, opts = {}) {
   // P5.23 弱网反馈：>8s 未返回弹出慢请求提示（不中断请求，恢复后自动消失；toast 模块延迟引入避免环依赖）
@@ -16,7 +48,7 @@ export async function api(path, opts = {}) {
   try {
     const res = await fetch('/api' + path, {
       method: opts.method || 'GET',
-      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + getToken(), ...(opts.headers || {}) },
+      headers: authHeaders(opts.headers),
       body: opts.body ? JSON.stringify(opts.body) : undefined,
     });
     if (res.status === 401) { logout(); location.hash = '#/login'; throw new Error('登录已过期'); }
@@ -42,7 +74,7 @@ export async function sseChat(body, handlers) {
   try {
     res = await fetch('/api/chat/stream', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + getToken() },
+      headers: authHeaders(),
       body: JSON.stringify(body),
       signal: ctrl.signal, // P5.29：停止生成——中断请求（后端 req 'close' 感知断连后中止模型流）
     });

@@ -104,6 +104,17 @@ function denyKbNotOwned(kbId, user) {
   return { code: 403, msg: '无权挂载他人的知识库（仅创建者或管理员）' };
 }
 
+// P2-6 修复 2026-11-09：智能体挂载空间归属校验——space_id 存在时须为本人空间或管理员。
+// 此前 POST/PUT 均无校验：普通用户可把智能体挂到他人/企业空间（自增 ID 可枚举），放大了对其他用户的可见范围。
+function denySpaceNotOwned(spaceId, user) {
+  if (!spaceId) return null;
+  if (user.role === 'admin') return null;
+  const space = db.prepare('SELECT owner FROM spaces WHERE id=?').get(spaceId);
+  if (!space) return { code: 400, msg: '空间不存在' };
+  if (space.owner === user.username) return null;
+  return { code: 403, msg: '无权挂载到该空间（仅空间创建者或管理员）' };
+}
+
 function parseBody(b) {
   let tools = [];
   try { tools = Array.isArray(b.tools) ? b.tools : JSON.parse(b.tools || '[]'); } catch { tools = []; }
@@ -176,6 +187,8 @@ function parseBody(b) {
   if (a.tool_error) return res.json({ code: 400, msg: a.tool_error }); // P5.34：工具白名单
   const kbDeny = denyKbNotOwned(a.kb_id, req.user); // V1.2 审查加固：挂库归属校验
   if (kbDeny) return res.json(kbDeny);
+  const spaceDeny = denySpaceNotOwned(a.space_id, req.user); // P2-6 修复：空间归属校验
+  if (spaceDeny) return res.json(spaceDeny);
   // 商业化软约束：免费版智能体数达上限不硬拦，返回升级提示（upgrade_hint 前端弹引导）
   // V2.3 Y3：改用 lib/plans.js agentQuotaBlock 统一封装——与技能市场克隆通道（routes/skills-market.js）
   // 同口径，配额规则/文案变更只改一处；消息与 code/data 逐字对齐原内联实现（防测试断言漂移）
@@ -268,6 +281,8 @@ router.put('/:id', (req, res) => {
   if (a.tool_error) return res.json({ code: 400, msg: a.tool_error }); // P5.34：工具白名单
   const kbDeny = denyKbNotOwned(a.kb_id, req.user); // V1.2 审查加固：挂库归属校验（PUT 改绑同样拦截）
   if (kbDeny) return res.json(kbDeny);
+  const spaceDenyUpd = denySpaceNotOwned(a.space_id, req.user); // P2-6 修复：空间归属校验
+  if (spaceDenyUpd) return res.json(spaceDenyUpd);
   if (a.workflow && a.workflow.error) return res.json({ code: 400, msg: '画布工作流结构错误：' + a.workflow.error });
   // 有画布数据但无 start 节点 → 结构错误拒绝（前端画布模式应保证有 start）
   // 可见性与协作者名单：仅归属级（创建者/管理员）可改；协作者保存时保留原值（不能自我提权/改可见范围）

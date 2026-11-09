@@ -29,6 +29,21 @@ function videoProviderOf(taskId) {
   return videoTaskProvider.get(String(taskId)) || null;
 }
 
+// 视频任务归属用户记忆（taskId → username）：P3-5（2026-11-09）——创建时记录，轮询/拉内容端点做归属校验
+// 已知边界（与供应商记忆同构）：内存 Map，重启后失忆（校验回落放行，与修复前行为一致）；
+// 产物 mp4 缓存走静态目录（<video> 标签无法携带 Authorization 头，历史设计如此）——接口层校验收窄泄露面
+const videoTaskOwner = new Map();
+function rememberVideoOwner(taskId, username) {
+  if (!username) return;
+  videoTaskOwner.set(String(taskId), String(username));
+  if (videoTaskOwner.size > 1000) { // 防膨胀：超限丢弃最早记忆
+    videoTaskOwner.delete(videoTaskOwner.keys().next().value);
+  }
+}
+function videoOwnerOf(taskId) {
+  return videoTaskOwner.get(String(taskId)) || null;
+}
+
 const UPLOAD_ROOT = path.join(__dirname, '..', '..', 'public', 'uploads');
 
 /**
@@ -72,8 +87,9 @@ async function genImageOnce(prompt, size, p, model = 'QwenImage-Ascend') {
   throw new Error('图片渠道返回异常（' + (j.error ? JSON.stringify(j.error).slice(0, 100) : '无数据') + '）');
 }
 
-/** 文生视频：创建异步任务（逐供应商尝试默认优先，minimax h3 渠道可能在非默认供应商上；4~15 秒，按秒计费） */
-async function createVideoTask(prompt, seconds = 4, aspectRatio = '16:9') {
+/** 文生视频：创建异步任务（逐供应商尝试默认优先，minimax h3 渠道可能在非默认供应商上；4~15 秒，按秒计费）
+ *  P3-5（2026-11-09）：新增 owner 参数——创建时记录任务归属用户，轮询/拉内容端点据此做归属校验 */
+async function createVideoTask(prompt, seconds = 4, aspectRatio = '16:9', owner = '') {
   const ps = providers();
   if (!ps.length) throw new Error('未配置可用的模型供应商');
   const secs = Math.min(15, Math.max(4, +seconds || 4));
@@ -88,6 +104,7 @@ async function createVideoTask(prompt, seconds = 4, aspectRatio = '16:9') {
       const j = await res.json().catch(() => ({}));
       if (!res.ok || !j.task_id) throw new Error(j.error || 'HTTP ' + res.status);
       rememberVideoProvider(j.task_id, p); // 记住归属，后续查询/拉内容直连该供应商
+      rememberVideoOwner(j.task_id, owner);  // P3-5：记住任务归属用户（owner 为空则不记录，兼容旧调用方）
       db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
         .run('system', '视频生成任务', `minimax h3 ${secs}s ${ratio} @ ${p.name}（task ${String(j.task_id).slice(0, 20)}）`, '', now());
       return { taskId: j.task_id, model: j.model, seconds: secs, aspectRatio: ratio, status: j.status || 'queued', progress: j.progress || 0, price: j.price };
@@ -213,4 +230,4 @@ async function genTTS(text, voice = '') {
   throw new Error(`昇腾 TTS 合成失败（已尝试 ${providers.length} 个供应商）——${errs.join('；').slice(0, 160)}`);
 }
 
-module.exports = { genImage, createVideoTask, queryVideoTask, genPPT, genTTS, providers, videoProviderOf };
+module.exports = { genImage, createVideoTask, queryVideoTask, genPPT, genTTS, providers, videoProviderOf, rememberVideoOwner, videoOwnerOf };

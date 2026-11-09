@@ -111,6 +111,19 @@ function getNodeOutputs(node) {
 // V1 type → V2 type 映射
 const TYPE_MAP = { start: 'start', llm: 'llm', tool: 'tool', agent: 'agent', branch: 'if-else', output: 'end' };
 
+// P0-1 修复 2026-11-09：服务端节点类型白名单——原实现对未知类型"保留原值"直接放行（注释称
+// "Runner 落节点失败日志"，但保存成功的图可被运行测试/对话/定时/MCP/Webhook 链路真实执行；
+// 未来若新增同名执行器或存量图携带未注册类型，即成直通后门）。保存入口改为白名单强校验：
+// 白名单 = NODE_OUTPUT_SCHEMA 已建模类型 + Runner NODE_EXECUTORS 注册的扩展执行器类型。
+// 扩展类型以静态清单维护（不 require workflow.js——db.js 启动期即加载本模块，
+// workflow→db→workflow-schema→workflow 会构成加载环），与 NODE_EXECUTORS 的 keys 一一对应，
+// 新增执行器时须同步登记（smoke 有回归用例锁定清单不漂移）。
+const EXT_EXECUTOR_TYPES = [
+  'http_request', 'code_sandbox', 'condition_loop', 'variable_assign',
+  'notification', 'database_query', 'delay', 'logger', 'transform',
+];
+const ALLOWED_NODE_TYPES = new Set([...Object.keys(NODE_OUTPUT_SCHEMA), 'tool', ...EXT_EXECUTOR_TYPES]);
+
 /** V1→V2 单节点 config 转换 */
 function convertConfigV1(type, config) {
   const c = config || {};
@@ -207,7 +220,8 @@ function validateWorkflowV2(w) {
     if (ids.has(id)) return { error: `节点 id 重复：${id}` };
     ids.add(id);
     const type = TYPE_MAP[n.type] || String(n.type || '').slice(0, 20);
-    if (!NODE_OUTPUT_SCHEMA[type] && type !== 'tool') { /* 未知类型保留原值，Runner 落节点失败日志 */ }
+    // P0-1：未知/未注册节点类型拒绝（原"保留原值"放行 → 恶意/拼错类型可混入保存图，见 ALLOWED_NODE_TYPES 注释）
+    if (!ALLOWED_NODE_TYPES.has(type)) return { error: `不支持的节点类型：${type}` };
     return {
       id,
       type,
@@ -300,4 +314,4 @@ function checkRefs(wf) {
   return problems;
 }
 
-module.exports = { NODE_OUTPUT_SCHEMA, OPERATORS, TYPE_MAP, getNodeOutputs, migrateWorkflowData, convertTemplateV1, validateWorkflowV2, extractRefs, checkRefs };
+module.exports = { NODE_OUTPUT_SCHEMA, OPERATORS, TYPE_MAP, getNodeOutputs, migrateWorkflowData, convertTemplateV1, validateWorkflowV2, extractRefs, checkRefs, ALLOWED_NODE_TYPES };

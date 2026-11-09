@@ -42,29 +42,34 @@ function encrypt(plaintext) {
 
 /**
  * AES-256-GCM 解密
- * @param {string} encrypted - base64 编码的密文（IV + authTag + ciphertext）
- * @returns {string} 明文，如果解密失败返回空字符串
+ * @param {string} encrypted - 密文（IV.authTag.ciphertext 三段 hex）或旧版明文
+ * @returns {string} 明文；密文形态但解密失败（密钥轮换/数据损坏）返回空串
+ *  P3-4 修复 2026-11-09：原实现 catch 后返回原字符串——密钥轮换后 "iv.authTag.ciphertext"
+ *  密文串会被当作明文 API Key 使用发给上游（调用方无从分辨），现改为：
+ *  ① 先做密文形态校验（恰好 3 段且前两段各 32 位 hex）——形态不像密文的一律按旧明文原样返回（兼容历史明文数据）；
+ *  ② 形态是密文但解密失败 → 返回空串 + console.warn（宁缺勿错，上游会按 Key 无效失败而非拿到密文串）。
  */
 function decrypt(encrypted) {
   const key = loadEncryptionKey();
-  if (!key) return encrypted; // 未配置加密密钥时兜底返回原文（未加密的旧数据）
+  const str = String(encrypted ?? '');
+  if (!key) return str; // 未配置加密密钥时兜底返回原文（未加密的旧数据，encrypt 同环境也只存明文）
+  const parts = str.split('.');
+  const looksEncrypted = parts.length === 3
+    && /^[0-9a-f]{32}$/i.test(parts[0]) && /^[0-9a-f]{32}$/i.test(parts[1])
+    && /^[0-9a-f]+$/i.test(parts[2]) && parts[2].length > 0;
+  if (!looksEncrypted) return str; // 旧明文（含不含点/形态不符的值）原样返回
   try {
-    const parts = encrypted.split('.');
-    if (parts.length < 3) {
-      // 格式不对，可能是未加密的旧数据，原文返回
-      return encrypted;
-    }
     const iv = Buffer.from(parts[0], 'hex');
     const authTag = Buffer.from(parts[1], 'hex');
-    const ciphertext = parts[2];
     const decipher = crypto.createDecipheriv(ALGORITHM, key, iv);
     decipher.setAuthTag(authTag);
-    let decrypted = decipher.update(ciphertext, 'hex', 'utf8');
+    let decrypted = decipher.update(parts[2], 'hex', 'utf8');
     decrypted += decipher.final('utf8');
     return decrypted;
   } catch (e) {
-    // 解密失败（密钥变更或数据损坏）返回原字符串，避免阻塞业务
-    return encrypted;
+    // 解密失败（密钥变更或数据损坏）：返回空串并告警，避免密文被当明文外发上游
+    console.warn('[crypto-util] decrypt 失败（密钥不匹配或数据损坏），按空串处理：' + (e && e.message));
+    return '';
   }
 }
 

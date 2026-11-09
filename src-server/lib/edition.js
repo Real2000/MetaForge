@@ -96,6 +96,10 @@ function loadLicense() {
   // 的通道（照签发文档跑命令即可解锁全部特性），留审计痕迹+心理威慑；生产部署机禁设该变量（仅签发机轮换用）
   if (process.env.LICENSE_PUBKEY_HEX) {
     console.warn('[edition] 公钥经环境变量 LICENSE_PUBKEY_HEX 覆盖——请确认这是签发机轮换操作，生产部署机不应设置该变量');
+  } else if (getPublicKeyHex() === PUBLIC_KEY_HEX) {
+    // P3-9（2026-11-09）：使用内置开发/联调测试公钥时启动告警——该公钥已随源码仓库公开，任何拿到
+    // 源码的人都能照签发文档自签专业/企业版 License；生产部署必须按文件头「生产密钥轮换」流程替换
+    console.warn('[edition] 当前使用内置开发/联调测试公钥——生产部署请按文件头「生产密钥轮换」说明替换 PUBLIC_KEY_HEX（或经 LICENSE_PUBKEY_HEX 注入生产公钥）');
   }
   let lic = null;
   let reason = 'ok';

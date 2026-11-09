@@ -383,17 +383,41 @@ CREATE TABLE IF NOT EXISTS evaluations (
     db.exec('ALTER TABLE users ADD COLUMN must_change_pwd INTEGER DEFAULT 0');
     console.log('[db] users 表已迁移：新增 must_change_pwd 字段');
   }
-  // 存量弱口令账号一次性打标（检测真实哈希是否对应常见默认口令；改密后标记清除）
+  /** P1-3 重修 2026-11-09：弱口令检测——两版错误实现复盘：
+   *  ①原版 `u.password === hashPwd(w)`：hashPwd 每次生成随机盐，scrypt 哈希恒不相等（仅旧 SHA-256 格式命中）；
+   *  ②一修版 `scryptSync(w, 固定盐, 64)` vs `Buffer.from('salt.key','hex')`：存储格式是 `salt.derivedKey`
+   *    （每用户随机盐、keylen=32、需 SCRYPT_OPTS），固定盐 + keylen 64 + 点号 hex 解码抛错被吞 → 比对恒 false。
+   *  正确做法：按 verifyPwdScrypt 同款逻辑同步复刻——解析行内 salt、scryptSync(pwd, salt, 32, SCRYPT_OPTS)
+   *  与存储 keyHex 比较；旧格式 SHA-256 兼容 SALT 与 LEGACY_SALT 两种全局盐（与 verifyPwd 的两条 legacy 分支对齐）。
+   *  另修复连带问题：恢复被误删的 mark/unmark 预编译语句；SELECT 补 username 列（日志打印需要）。 */
+  function isWeakPwdSync(stored, candidate) {
+    if (typeof stored !== 'string' || !stored) return false;
+    if (stored.includes('.')) { // scrypt 格式：salt.derivedKey
+      const dot = stored.indexOf('.');
+      const salt = stored.slice(0, dot);
+      const keyHex = stored.slice(dot + 1);
+      if (!salt || !keyHex) return false;
+      try {
+        const derived = crypto.scryptSync(candidate, salt, SCRYPT_OPTS.keylen || 32, SCRYPT_OPTS);
+        return derived.toString('hex') === keyHex;
+      } catch { return false; }
+    }
+    // 旧格式 SHA-256：SALT（现行全局盐）与 LEGACY_SALT（升级前兜底盐）两条 legacy 分支
+    if (stored === crypto.createHash('sha256').update(SALT + candidate).digest('hex')) return true;
+    if (stored === crypto.createHash('sha256').update(LEGACY_SALT + candidate).digest('hex')) return true;
+    return false;
+  }
   const WEAK = ['admin123', '123456', 'demo123', 'password', '111111', '000000', 'abc123'];
-  const users = db.prepare('SELECT id, password, must_change_pwd FROM users').all();
+  const users = db.prepare('SELECT id, username, password, must_change_pwd FROM users').all().filter(u => !u.must_change_pwd);
   const mark = db.prepare('UPDATE users SET must_change_pwd=1 WHERE id=?');
   const unmark = db.prepare('UPDATE users SET must_change_pwd=0 WHERE id=?');
+  let weakMarked = 0;
   for (const u of users) {
-    if (u.must_change_pwd) continue;
-    const isWeak = WEAK.some(w => u.password === hashPwd(w) || u.password === crypto.createHash('sha256').update(LEGACY_SALT + w).digest('hex'));
-    if (isWeak) { mark.run(u.id); console.log(`[db] 弱口令账号已标记强制改密：#${u.id}`); }
+    const isWeak = WEAK.some(w => isWeakPwdSync(u.password, w));
+    if (isWeak) { mark.run(u.id); weakMarked++; console.log(`[db] 弱口令账号已标记强制改密：#${u.id}（用户名：${u.username}）`); }
     else unmark.run(u.id);
   }
+  if (weakMarked) console.log(`[db] 弱口令扫描完成：本次新标记 ${weakMarked} 个账号（改密后标记自动清除）`);
 }
 // users 表补充 onboarded（2026-10-20 帮助体系：新手引导完成标记，0=未看过 3 步引导）
 // 与 quota_alert_level（用量预警已提醒档位：0=未提醒 1=已提醒80% 2=已提醒90%，防重复站内信）
@@ -1099,6 +1123,16 @@ db.exec(`CREATE TABLE IF NOT EXISTS mcp_tokens (
   last_used_at TEXT,
   created_at TEXT
 );`);
+// P2-2 修复 2026-11-09：MCP 令牌作用域——agent_id 绑定单个智能体（NULL = 全域令牌，兼容存量）。
+// 此前任一有效令牌可调用全部已发布智能体，一把泄露令牌 = 全平台智能体访问；
+// 与 openapi.js 的 agent_api_keys 作用域校验（同日修复）对齐，堵齐两条对外链路。
+{
+  const mcpCols = db.prepare('PRAGMA table_info(mcp_tokens)').all().map(c => c.name);
+  if (!mcpCols.includes('agent_id')) {
+    db.exec('ALTER TABLE mcp_tokens ADD COLUMN agent_id INTEGER DEFAULT NULL');
+    console.log('[db] mcp_tokens 表已迁移：新增 agent_id 字段（P2-2 令牌作用域）');
+  }
+}
 
 // ---------------- P4 扩展迁移（2026-10-22）----------------
 // 模型类型标注：providers.model_types 存 {模型名: chat/image/video/tts/embedding} 映射（后台展示与按类型校验；前台实时分类）
@@ -1133,7 +1167,10 @@ db.exec(`CREATE TABLE IF NOT EXISTS mcp_tokens (
 // ---------------- 种子数据（仅首次） ----------------
 const userCount = db.prepare('SELECT COUNT(*) c FROM users').get().c;
 if (userCount === 0) {
-  const insUser = db.prepare('INSERT INTO users (username,password,nickname,role,dept,status,created_at) VALUES (?,?,?,?,?,1,?)');
+  // P1-3 2026-11-09：种子账号全部使用弱口令（admin123/123456/demo123），显式打 must_change_pwd=1——
+  // 弱口令扫描块位于建表迁移区（本行之前），首次启动时扫描先于种子执行扫不到这批账号；
+  // 二次启动起由扫描块接管（改密后标记清除，重设弱口令会再次被标记，双路径闭环）
+  const insUser = db.prepare('INSERT INTO users (username,password,nickname,role,dept,status,must_change_pwd,created_at) VALUES (?,?,?,?,?,1,1,?)');
   insUser.run('admin', hashPwd('admin123'), '管理员', 'admin', '信息部', daysAgo(30));
   insUser.run('zhangsan', hashPwd('123456'), '张三', 'user', '产品部', daysAgo(25));
   insUser.run('lisi', hashPwd('123456'), '李四', 'user', '研发部', daysAgo(20));
@@ -1375,14 +1412,13 @@ db.exec(`CREATE TABLE IF NOT EXISTS workflow_templates (
 // ---------------- 热表索引（2026-10-28 DB 优化：补齐 6 张高频表二级索引 + agents 高频查询）----------------
 // 幂等：IF NOT EXISTS 已存在则跳过；首次对存量数据建索引可能耗时数秒（WAL 下读不阻塞，但 better-sqlite3 同步会短暂冻结事件循环）
 // 索引与 stats.js 聚合下推必须同批上线（WHERE created_at>=? 依赖 idx_messages_created 才能走范围扫，否则仍全表扫）
-db.exec(`
-CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
 CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
 CREATE INDEX IF NOT EXISTS idx_chat_traces_msg ON chat_traces(message_id);
 CREATE INDEX IF NOT EXISTS idx_chat_traces_agent ON chat_traces(agent_id);
 CREATE INDEX IF NOT EXISTS idx_kb_chunks_kb ON kb_chunks(kb_id);
 CREATE INDEX IF NOT EXISTS idx_kb_chunks_file ON kb_chunks(file_id);
-CREATE INDEX IF NOT EXISTS idx_kb_files_kb ON kb_files(kb_id, status); -- V1.1 #1 2026-10-30：解析日志页 stats/list 查询索引（此前 kb_files 无任何索引，行数膨胀后同步驱动全表扫阻塞事件循环）
+CREATE INDEX IF NOT EXISTS idx_kb_files_kb ON kb_files(kb_id, status);
 CREATE INDEX IF NOT EXISTS idx_op_logs_created ON op_logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_err_logs_created ON err_logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(username, updated_at);
@@ -1392,19 +1428,17 @@ CREATE INDEX IF NOT EXISTS idx_agents_status_pub ON agents(status) WHERE status=
 CREATE INDEX IF NOT EXISTS idx_agents_owner ON agents(owner);
 CREATE INDEX IF NOT EXISTS idx_agents_share_token ON agents(share_token) WHERE share_token != '';
 CREATE INDEX IF NOT EXISTS idx_agents_source_ext ON agents(source, external_app_id);
--- P1 2026-10-28 性能地基：热路径复合索引按创建时间排序
 CREATE INDEX IF NOT EXISTS idx_messages_session_created ON messages(session_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_chat_traces_session ON chat_traces(session_id);
--- P0-4 2026-10-28 token 吊销表（登出/改密时插入，auth 中间件校验拦截）
 CREATE TABLE IF NOT EXISTS token_blacklist (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   jti TEXT NOT NULL,
   username TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_token_blacklist_jti ON token_blacklist(jti);
--- P0-5 2026-10-30 GraphRAG 知识图谱索引——实体表+关系表
-CREATE TABLE IF NOT EXISTS entities (
+CREATE INDEX IF NOT EXISTS idx_token_blacklist_jti ON token_blacklist(jti);`);
+// P0-5 2026-10-30 GraphRAG 知识图谱索引——实体表+关系表
+db.exec(`CREATE TABLE IF NOT EXISTS entities (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,
   type TEXT NOT NULL,             -- organization / person / geo / event / category / other
@@ -1423,34 +1457,31 @@ CREATE TABLE IF NOT EXISTS entity_relations (
 );
 CREATE INDEX IF NOT EXISTS idx_entity_relations_source ON entity_relations(source_id);
 CREATE INDEX IF NOT EXISTS idx_entity_relations_target ON entity_relations(target_id);
-CREATE INDEX IF NOT EXISTS idx_entity_name_type ON entities(name, type);
- -- P0-5 2026-10-30 GraphRAG 知识图谱索引——实体表+关系表
-CREATE TABLE IF NOT EXISTS entities (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  name TEXT NOT NULL,
-  type TEXT NOT NULL,             -- organization / person / geo / event / category / other
-  description TEXT DEFAULT '',
-  kb_ids TEXT DEFAULT '[]',        -- 关联的知识库 ID 列表 [1,2,3]
-  created_at TEXT
-);
-CREATE TABLE IF NOT EXISTS entity_relations (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  source_id INTEGER NOT NULL,
-  target_id INTEGER NOT NULL,
-  relation TEXT NOT NULL,          -- 关系类型（如「属于」「负责」「关联」等）
-  weight REAL DEFAULT 1.0,        -- 关系强度权重
-  source_chunk_ids TEXT DEFAULT '[]', -- 支撑此关系的事实来源分块 ID 列表
-  created_at TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_entity_relations_source ON entity_relations(source_id);
-CREATE INDEX IF NOT EXISTS idx_entity_relations_target ON entity_relations(target_id);
-CREATE INDEX IF NOT EXISTS idx_entity_name_type ON entities(name, type);
-`);
+CREATE INDEX IF NOT EXISTS idx_entity_name_type ON entities(name, type);`);
 
 const tableEntities = 'entities';
 const tableEntityRelations = 'entity_relations';
 
 module.exports = { db, hashPwd, hashPwdAsync, verifyPwd, now, daysAgo, tableEntities, tableEntityRelations };
+
+// ---------- P1-4 修复 2026-11-09：ENCRYPTION_KEY 自动初始化（secrets 表建表后幂等注入） ----------
+// 若 secrets 表中尚无 ENCRYPTION_KEY，自动生成 32 字节（64 hex）随机密钥写入。
+// 确保 encrypt() 始终有密钥可用——此前需管理员手动配置，缺省时 encrypt() 返回明文导致 API Key 明文落盘。
+// 仅当 secrets 表已创建且存在 name='ENCRYPTION_KEY' 的行时才视为已配置。
+{
+  try {
+    const row = db.prepare("SELECT value FROM secrets WHERE name='ENCRYPTION_KEY'").pluck().get();
+    if (!row || row.length !== 64) {
+      const key = crypto.randomBytes(32).toString('hex');
+      db.prepare('INSERT OR REPLACE INTO secrets (name,value,remark,created_at,updated_at) VALUES (?,?,?,?,?)')
+        .run('ENCRYPTION_KEY', key, 'AES-256-GCM 加密密钥（首次启动自动生成）', now(), now());
+      console.log('[db] 已自动初始化 ENCRYPTION_KEY（AES-256-GCM 加密密钥）');
+    }
+  } catch (e) {
+    // secrets 表不存在时跳过（保守兜底，release 构建一定有该表）
+    console.warn('[db] ENCRYPTION_KEY 自动初始化跳过（secrets 表不可用）:', e.message);
+  }
+}
 
 // ---------- V2.4 #4 收尾：providers/usermodels api_key 加密迁移（幂等） ----------
 // 启动时扫描明文 Key 自动加密成 iv.authTag.ciphertext 格式。加密密钥未配置时不动。

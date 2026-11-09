@@ -86,10 +86,14 @@ async function fetchWithRedirectGuard(url, opts = {}, maxHops = 3) {
 }
 
 /* =============== ① db_query：Text2SQL =============== */
-/** 敏感表黑名单：含凭据/密钥/鉴权信息的表不允许 LLM 生成 SQL 访问 */
+/** 敏感表黑名单：含凭据/密钥/鉴权信息的表不允许 LLM 生成 SQL 访问
+ *  P0-2 加固（2026-11-09）补漏 4 张：platforms（Dify/Coze token 与控制台口令——凭据类）、
+ *  feedbacks（实际表名 feedbacks；原误写 feedback 从未命中）、user_tool_keys（用户级工具 API Key，
+ *  与 user_providers 同类）、sqlite_master（sqlite_schema 的孪生视图，原只列了后者） */
 const DB_DENY_TABLES = new Set([
-  'users', 'providers', 'user_providers', 'agent_api_keys', 'share_sessions',
-  'secrets', 'sqlite_sequence', 'sqlite_stat1', 'sqlite_schema',
+  'users', 'providers', 'user_providers', 'user_tool_keys', 'agent_api_keys', 'share_sessions',
+  'secrets', 'platforms', 'feedbacks', 'sqlite_master',
+  'sqlite_sequence', 'sqlite_stat1', 'sqlite_schema',
   // P5.33 审查修复（F7）：消息/会话/审计类表拒绝 LLM 生成 SQL 横读（对话内容/任务产出/操作日志含
   // 全体用户数据；api 层已修 IDOR，SQL 层不可再开面）
   'messages', 'sessions', 'task_runs', 'chat_traces', 'op_logs', 'err_logs', 'agent_memories',
@@ -97,7 +101,13 @@ const DB_DENY_TABLES = new Set([
   'mcp_tokens', 'wf_files', 'words', 'word_categories',
 ]);
 
-/** SELECT 语句安全校验：单条、只读、无危险关键词、表黑名单、强制 LIMIT */
+/** SELECT 语句安全校验：单条、只读、无危险关键词、表黑名单、强制 LIMIT
+ *  P0-2 加固（2026-11-09）：表引用提取在归一副本上进行——原正则 \b(?:from|join)\s+([\w]+) 对
+ *  SQLite 接受的全部标识符引用形态均提取失败，敏感表黑名单可被直接旁路：
+ *    FROM "secrets"（双引号）/ FROM `secrets`（反引号，MySQL 兼容）/ FROM [secrets]（方括号，MSSQL 兼容）/
+ *    FROM main.secrets（默认库名前缀）/ FROM"secrets"（关键字与标识符间无空格——SQLite 词法宽松）
+ *  归一方式：引用符（" ` [）替换为空格 + 剥离 main. 前缀，只在归一副本上做引用提取与关键词检查
+ *  （执行的仍是清洗后的原句；归一只会让分析看到"更多"引用，不会更少——安全方向）。 */
 function sanitizeSelectSql(raw) {
   let sql = String(raw || '').trim()
     .replace(/^```(sql)?\s*/i, '').replace(/```\s*$/i, '')
@@ -107,10 +117,15 @@ function sanitizeSelectSql(raw) {
   if (!sql) return { err: 'SQL 为空' };
   if (/;/.test(sql)) return { err: '仅支持单条查询语句（禁止分号拼接多条语句）' };
   if (!/^(select|with)\b/i.test(sql)) return { err: '仅允许 SELECT / WITH 只读查询' };
-  if (/\b(insert|update|delete|drop|alter|create|attach|detach|vacuum|reindex|pragma|grant|revoke|replace\s+into|load_extension|readfile|writefile|fts3|fts4|fts5)\b/i.test(sql)) {
+  // P0-2 加固：pragma_ 前缀捕获 pragma_table_info 等 SQLite 表值函数（\bpragma\b 因后跟 _ 无词边界
+  // 原正则漏过——schema 探测面，与 sqlite_master 同类收口）
+  if (/\b(insert|update|delete|drop|alter|create|attach|detach|vacuum|reindex|pragma|pragma_[a-z_]*|grant|revoke|replace\s+into|load_extension|readfile|writefile|fts3|fts4|fts5)\b/i.test(sql)) {
     return { err: '检测到写操作或危险关键词，已拒绝执行' };
   }
-  const refs = [...sql.matchAll(/\b(?:from|join)\s+([a-zA-Z_][\w]*)/gi)].map(m => m[1].toLowerCase());
+  // P0-2 加固：归一副本上提取表引用（覆盖引用符 / 库名前缀 / 无空格三组旁路向量；
+  // 提取正则的 (?:前缀.)? 同样兼容归一后 'main . users' 的点号两侧空格形态）
+  const norm = sql.replace(/[`"\[]/g, ' ').replace(/\bmain\s*\.\s*/gi, ' ');
+  const refs = [...norm.matchAll(/\b(?:from|join)\s+(?:[a-zA-Z_][\w]*\s*\.\s*)?([a-zA-Z_][\w]*)/gi)].map(m => m[1].toLowerCase());
   for (const t of refs) {
     if (DB_DENY_TABLES.has(t)) return { err: `不允许访问敏感表：${t}` };
   }
@@ -949,7 +964,7 @@ async function reviewBody(doc, args) {
  *    网络调用（http/https/net/dns/fetch）、eval/Function 构造器、构造器链/globalThis/原型攀爬（P5.30）——防逃逸与横向移动
  *  - P5.30 运行时加固：沙箱上下文关闭字符串代码生成（eval/new Function 失效）+ 抹平注入宿主对象的 constructor 跳板；
  *    ⚠️ 已知边界：node:vm 非安全边界（官方文档明示），对不可信用户完全隔离需迁移子进程（中期项）
- *  - 运行时：子进程 10s 超时杀进程；stdout+stderr 各截 8KB；工作目录 = .temp/sandbox-<id>（一次性）
+ *  - 运行时：V8 脚本级 10s 超时（防同步死循环）+ 异步返回值 Promise.race 限时兑底；stdout+stderr 各截 8KB；工作目录 = .temp/sandbox-<id>（一次性）
  *  - fs 读写代理：只允许工作目录内路径（resolve 后前缀校验），读文件额外放行 /uploads 与项目内只读
  *  - 产物：沙箱目录内新文件 → 拷贝到 public/uploads/sandbox/ 供下载，回复中给链接
  */
@@ -1132,8 +1147,9 @@ const run_code = {
       const ctx = vm.createContext(sandbox, { codeGeneration: { strings: false, wasm: false } });
       const timer = setTimeout(() => { timedOut = true; }, SANDBOX_TIMEOUT_MS);
       const start = Date.now();
-      // runInContext 同步执行——长循环靠脚本超时器标记 + 主进程事件循环外强制手段：
-      // vm 无法安全中断同步死循环，改用 child_process 隔离 + kill 兜底（见下方）
+      // runInContext 同步执行：V8 脚本级 timeout 中断同步长循环（上方 timer 仅作标记兑底）
+      // P3-3（2026-11-09）：原注释声称「改用 child_process 隔离 + kill 兑底」与实现不符（实际为 vm + 脚本超时），已改为如实描述；
+      // 已知边界见函数头注释：node:vm 非完全安全隔离，不可信用户场景迁移子进程属中期项
       timer.unref?.();
       const value = script.runInContext(ctx, { timeout: SANDBOX_TIMEOUT_MS }); // V8 脚本级超时（防死循环）
       clearTimeout(timer);
@@ -1284,4 +1300,4 @@ const create_task = {
   },
 };
 
-module.exports = { db_query, db_chart, web_search, web_fetch, stock_quote, export_word, tts, doc_review, run_code, local_exec, create_task, sanitizeSelectSql, fileIdOf };
+module.exports = { db_query, db_chart, web_search, web_fetch, stock_quote, export_word, tts, doc_review, run_code, local_exec, create_task, sanitizeSelectSql, fileIdOf, assertPublicHttpUrl, fetchWithRedirectGuard, ipIsPrivate };

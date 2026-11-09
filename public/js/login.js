@@ -28,7 +28,10 @@ function forceChangePwd(user, token) {
           save.disabled = true; save.textContent = t('提交中…');
           try {
             // 注意：旧密码即当前登录密码（弱口令本身）
-            await api('/auth/change-password', { method: 'POST', body: { oldPwd: sessionStorage.getItem('__loginpwd') || '', newPwd: p1 } });
+            // P2-3 连带修复（2026-11-09）：①路径修正 /auth/login/change-password（原 /auth/change-password 恒 404，
+            // 因 must_change_pwd 标记长期失效该死链从未暴露）；②改密会吊销旧 token 并重新签发——前端同步更新凭据
+            const j2 = await api('/auth/login/change-password', { method: 'POST', body: { oldPwd: sessionStorage.getItem('__loginpwd') || '', newPwd: p1 } });
+            if (j2.data?.token) setLogin(j2.data.token, user); // 后端吊销旧 token 后签发的新凭据（Cookie 已同步换新）
             toast(t('密码已更新，欢迎使用'));
             m.close();
             resolve(true);

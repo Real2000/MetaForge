@@ -1,7 +1,7 @@
 /** 前台-智能体广场（对标 SinguX 广场）：已发布智能体集中展示
  *  分类筛选 / 官方筛选 / 我的收藏 / 搜索 / 卡片统计（用户·会话·收藏）/ 详情侧栏 / 开始使用 / 一键复制创建
  */
-import { api, getToken } from '../api.js';
+import { api } from '../api.js'; // P2-3：移除未使用的 getToken 导入（token 已 Cookie 化）
 import { esc, toast, modal, confirmBox } from '../ui.js';
 
 const AVA = [

@@ -2003,7 +2003,7 @@ export function createCanvas(root, opts = {}) {
                 const b64 = await new Promise((ok, err) => { const rd = new FileReader(); rd.onload = () => ok(String(rd.result).split(',')[1] || ''); rd.onerror = err; rd.readAsDataURL(f); });
                 const r = await fetch('/api/files', {
                   method: 'POST',
-                  headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + localStorage.getItem('ap_token') },
+                  headers: { 'Content-Type': 'application/json' }, // P2-3：Cookie 化后同源自动鉴权
                   body: JSON.stringify({ name: f.name, file_b64: b64, source: 'manual' }),
                 });
                 const j = await r.json();
@@ -2042,7 +2042,7 @@ export function createCanvas(root, opts = {}) {
           try {
             const res = await fetch(`/api/agents/${opts.agentId}/workflow-test`, {
               method: 'POST',
-              headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + localStorage.getItem('ap_token') },
+              headers: { 'Content-Type': 'application/json' }, // P2-3：Cookie 化后同源自动鉴权
               body: JSON.stringify(body),
             });
             if (!res.ok || !res.body) throw new Error('SSE 连接失败（' + res.status + '）');

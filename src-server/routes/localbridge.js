@@ -17,13 +17,19 @@ const express = require('express');
 const crypto = require('crypto');
 const { db, now } = require('../db');
 const { auth } = require('../lib/auth');
+const { clientIp } = require('../lib/rate-limit');
 
 const router = express.Router();
 
 const OPS_WHITELIST = ['mkdir', 'list_dir', 'open_app', 'notify'];
+// P2-1 修复：同配对码连续失败 3 次后锁定（防暴力枚举），并配置 IP 级别 10 次/5min 封禁
+const PAIRCODE_MAX_FAIL = 3;
 
 // ---------- 配对码（用户网页侧生成） ----------
-const pairCodes = new Map(); // code → { username, expires }
+const pairCodes = new Map(); // code → { username, expires, failCount }
+const PAIRCODE_ATTEMPT_WINDOW = 120 * 1000; // 2min
+const CLAIM_IP_MAX_FAIL = 10; // 同一 IP 连续失败 10 次后临时封禁 5 分钟
+const claimIpFail = new Map(); // ip → { count, blockUntil }
 
 router.post('/paircode', auth, (req, res) => {
   // 防滥用：同用户 1 分钟内最多 10 个
@@ -31,9 +37,11 @@ router.post('/paircode', auth, (req, res) => {
   if (recent >= 10) return res.status(429).json({ code: 429, msg: '生成过于频繁，请稍后再试' });
   // 清理过期
   for (const [k, v] of pairCodes) if (v.expires <= Date.now()) pairCodes.delete(k);
-  const code = String(Math.floor(100000 + Math.random() * 900000));
-  pairCodes.set(code, { username: req.user.username, expires: Date.now() + 120000 });
-  res.json({ code: 0, data: { code, expires_in: 120 } });
+  // P2-1 修复：改用 crypto.randomInt 代替 Math.random —— Math.random 非加密随机，6 位数字枚举空间仅 10^6，
+  // 配合 claim 端无失败限流，120s 窗口内可被并发批量穷举。crypto.randomInt 由 /dev/urandom 支撑，无法预测。
+  const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+  pairCodes.set(code, { username: req.user.username, expires: Date.now() + PAIRCODE_ATTEMPT_WINDOW, failCount: 0 });
+  res.json({ code: 0, data: { code, expires_in: PAIRCODE_ATTEMPT_WINDOW / 1000 } });
 });
 
 // ---------- 桥端 claim：配对码 + device_token 换绑 ----------
@@ -41,12 +49,36 @@ router.post('/claim', (req, res) => {
   const { code, device_name, platform } = req.body || {};
   const token = String(req.headers['x-device-token'] || '');
   if (!token || token.length < 16) return res.status(400).json({ code: 400, msg: '缺少 device_token' });
+  // P2-1 修复：IP级别失败限流——连续失败 CLAIM_IP_MAX_FAIL 次后临时封禁 5 分钟
+  const ip = clientIp(req);
+  const ipRec = claimIpFail.get(ip);
+  if (ipRec && ipRec.blockUntil > Date.now()) {
+    return res.status(429).json({ code: 429, msg: '请求过于频繁，请稍后再试' });
+  }
   const entry = pairCodes.get(String(code || ''));
-  if (!entry) return res.status(404).json({ code: 404, msg: '配对码不存在或已过期（网页端重新生成）' });
-  if (entry.expires <= Date.now()) { pairCodes.delete(String(code)); return res.status(410).json({ code: 410, msg: '配对码已过期' }); }
-  pairCodes.delete(String(code)); // 一次性
-
+  if (!entry) {
+    // 配对码不存在：递增 IP 失败计数
+    const rec = claimIpFail.get(ip) || { count: 0, blockUntil: 0 };
+    rec.count++;
+    if (rec.count >= CLAIM_IP_MAX_FAIL) rec.blockUntil = Date.now() + 300000; // 5min
+    claimIpFail.set(ip, rec);
+    return res.status(404).json({ code: 404, msg: '配对码不存在或已过期（网页端重新生成）' });
+  }
+  // 验证配对码过期（包含清理过期 IP 失败记录）
+  if (entry.expires <= Date.now()) {
+    pairCodes.delete(String(code));
+    const rec = claimIpFail.get(ip) || { count: 0, blockUntil: 0 };
+    rec.count++;
+    if (rec.count >= CLAIM_IP_MAX_FAIL) rec.blockUntil = Date.now() + 300000;
+    claimIpFail.set(ip, rec);
+    return res.status(410).json({ code: 410, msg: '配对码已过期' });
+  }
+  // 验证通过：配对码一次性消费
   const username = entry.username;
+  pairCodes.delete(String(code));
+  // 清理 IP 失败记录（配对成功后重置）
+  claimIpFail.delete(ip);
+
   // 同 token 复绑（重装/换用户）→ 更新归属；否则新设备
   const exist = db.prepare('SELECT * FROM localbridge_devices WHERE device_token=?').get(token);
   if (exist) {

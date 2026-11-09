@@ -19,6 +19,7 @@ const vm = require('node:vm');
 const { db } = require('../db');
 const { chat, chatOnce } = require('./llm');
 const { runTool, buildTools, loadMcpTools, toolRiskOf } = require('./tools'); // P5.34（Y3）：顶层解构——依赖图无环（tools 不回指 workflow），原延迟 require 包装属冗余间接层
+const { sanitizeSelectSql, assertPublicHttpUrl, fetchWithRedirectGuard } = require('./tools-extra'); // P0-2 修复 2026-11-09：database_query 节点 SQL 安全校验（与工具 db_query 同防线）；P1-1 修复 2026-11-09：http_request 节点 SSRF 防护复用 assertPublicHttpUrl + fetchWithRedirectGuard（tools-extra 不回指 workflow，与 tools.js 同依赖闭包，无加载环）
 const { renderEnv, maskSecrets } = require('./secrets');
 const { calcCost } = require('./cost');
 const { fileToRich, fileToText } = require('./fileparse'); // P5.14 文件一等变量
@@ -312,9 +313,7 @@ function resolveInputs(node, results, inputVars) {
     case 'answer': return { text: r(d.text || '') }; // P5.6 直接回复（Chatflow）
     case 'classifier': return { question: r(d.question || '{{#start.input#}}'), instruction: String(d.instruction || '') }; // P5.6 问题分类器
     case 'aggregator': return { sources: (d.sources || []).map(s => r(String(s?.variable ?? ''))) }; // P5.6 变量聚合器
-    case 'answer': return { text: r(d.text || '') }; // P5.6 直接回复（Chatflow）
-    case 'classifier': return { question: r(d.question || '{{#start.input#}}'), instruction: String(d.instruction || '') }; // P5.6 问题分类器
-    case 'aggregator': return { sources: (d.sources || []).map(s => r(String(s?.variable ?? ''))) }; // P5.6 变量聚合器
+    // P3-2（2026-11-09）：此处原有 answer/classifier/aggregator 三个 case 的整块重复粘贴（第二份为不可达死代码），已删除
     case 'if-else': {
       const vars = {};
       for (const c of d.cases || []) for (const cd of c.conditions || []) {
@@ -574,7 +573,9 @@ const NODE_EXECUTORS = {
     return { ...out, reply: inputs.outputs?.[0]?.value ?? '' };
   },
 
-  /** P5.20 HTTP 请求节点：调用外部 HTTP API，支持 GET/POST/PUT/DELETE，超时+鉴权+模板渲染URL和请求体 */
+  /** P5.20 HTTP 请求节点（P1-1 修复 2026-11-09：接入 SSRF 防护——复用 tools-extra.js 的
+   *  assertPublicHttpUrl + fetchWithRedirectGuard，连接前做私网/环回/元数据三层校验，重定向逐跳拦截；
+   *  FETCH_ALLOW_PRIVATE 环境变量可由管理员显式放行内网） */
   http_request: async (node, inputs, ctx) => {
     const d = node.data || {};
     const method = (d.method || 'GET').toUpperCase();
@@ -592,9 +593,10 @@ const NODE_EXECUTORS = {
       body = rendered;
     }
     try {
+      await assertPublicHttpUrl(url); // P1-1：SSRF 第一道防线（私网/环回/元数据 IP 校验）
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), timeout * 1000);
-      const r = await fetch(url, {
+      const r = await fetchWithRedirectGuard(url, { // P1-1：重定向逐跳校验（取代裸 fetch）
         method, headers, body: method !== 'GET' ? body : undefined,
         signal: ctrl.signal,
       });
@@ -614,26 +616,23 @@ const NODE_EXECUTORS = {
     }
   },
 
-  /** JS/Python 沙箱代码节点：支持 JS（源码沙箱，禁用 require/process/eval/Function）和 Python（子进程 python3） */
+  /** JS 沙箱代码节点（P0-1 修复 2026-11-09：删除 Python 分支——原实现把节点代码整串交给
+   *  execSync(code) 作为 Shell 命令执行：注释声称"子进程 python3"，实际从未启动 Python 进程，
+   *  也无任何静态扫描/白名单防护（JS 分支有 CODE_FORBIDDEN_RE，Python 分支零防护），
+   *  构成任意登录用户 RCE（保存画布 → 运行测试即触发）。
+   *  前端画布 NODE_TYPES 从未暴露 code_sandbox 的 Python 入口、测试套件无 Python 用例，
+   *  删除不影响任何合法功能；language != javascript 一律 fail-closed 明确拒绝，
+   *  不 fall through 到 JS 沙箱（防语义混淆与沙箱旁路面） */
   code_sandbox: async (node, inputs) => {
     const d = node.data || {};
     const language = d.language || 'javascript';
     const code = String(d.code || '').trim();
     if (!code) throw new Error('代码节点未配置代码');
-    const t = Math.max(500, Math.min(parseInt(d.timeout) || 3000, 5000));
-    if (language === 'python') {
-      try {
-        const { execSync } = require('child_process');
-        const out = execSync(code, { timeout: t, encoding: 'utf-8', maxBuffer: 64 * 1024 });
-        const text = String(out || '').trim();
-        let parsed = null;
-        try { parsed = JSON.parse(text); } catch {}
-        return { output: text, parsed, language: 'python', execution_time_ms: t };
-      } catch (e) {
-        throw new Error('Python 代码执行失败：' + String(e?.message || e).slice(0, 200));
-      }
+    if (language !== 'javascript') {
+      throw new Error(`代码节点不支持 ${language} 语言（安全策略：仅允许 JavaScript 沙箱执行）`);
     }
-    // 默认 JS 沙箱（复用现有 runCodeSandbox——禁止 require/process/eval/Function 等）
+    const t = Math.max(500, Math.min(parseInt(d.timeout) || 3000, 5000));
+    // JS 沙箱（复用现有 runCodeSandbox——静态扫描禁 require/process/eval/Function 等）
     const out = runCodeSandbox(code, (inputs.inputs || {}), t);
     if (out === null || out === undefined) return { output: '' };
     const safe = (s) => maskPII(mask(String(s)));
@@ -714,20 +713,30 @@ const NODE_EXECUTORS = {
     return out;
   },
 
-  /** 消息通知节点：向用户发送系统通知（铃铛），支持直接文本内容（占位待扩展邮件/企微 bot） */
-  notification: async (node, inputs) => {
+  /** P5.20 消息通知节点：向当前用户发送系统通知（铃铛），支持直接文本内容
+   *  P2-5 修复 2026-11-09：通知接收人固定为当前会话用户 ctx.username——原实现取 d.username（画布节点属性），
+   *  攻击者可在画布中指定任意接收人，向其他用户发送伪装成来自系统的钓鱼信息。 */
+  notification: async (node, inputs, ctx) => {
     const d = node.data || {};
     const title = String(d.title || '').trim();
     const content = String(d.content || '').trim();
     if (!title && !content) throw new Error('消息通知节点未填写通知标题或内容');
     const safeTitle = title ? title.slice(0, 100) : '(无标题)';
     const safeContent = (content || String(inputs.message || '')).slice(0, 500);
+    const username = ctx.username || ''; // P2-5：接收人固定为当前会话用户（ctx 由工作流引擎从请求上下文注入）
+    if (!username) throw new Error('消息通知节点无法确定接收用户');
     db.prepare('INSERT INTO notifications (username,title,content,type,created_at) VALUES (?,?,?,\'workflow\',datetime(\'now\',\'localtime\'))')
-      .run(inputs._username || d.username || '', safeTitle, safeContent);
-    return { sent: true, title: safeTitle, content: safeContent, recipient: inputs._username || d.username || '' };
+      .run(username, safeTitle, safeContent);
+    return { sent: true, title: safeTitle, content: safeContent, recipient: username };
   },
 
-  /** P5.20 数据库查询节点：对平台的 SQLite 执行只读查询（SELECT），返回结果集 */
+  /** P5.20 数据库查询节点：对平台的 SQLite 执行只读查询（SELECT），返回结果集
+   *  P0-2 修复 2026-11-09：渲染后的 SQL 必须先过 sanitizeSelectSql（与 LLM 工具 db_query 同一防线）——
+   *  单条 SELECT/WITH only、写关键词与 PRAGMA/ATTACH 黑名单、敏感表黑名单（users/secrets/
+   *  agent_api_keys/platforms 等）、强制 LIMIT≤500。此前节点版零校验直接 db.prepare(rendered).all()：
+   *  任意登录用户保存含 database_query 节点的画布 → 运行测试即可读全库（secrets.ENCRYPTION_KEY
+   *  明文、users.password 哈希、agent_api_keys.key、platforms.token 等），构成任意敏感数据读取。
+   *  校验失败按节点失败处理（fail-closed，错误原因进节点日志供排查，不返回任何行）。 */
   database_query: async (node, inputs) => {
     const sql = String(node.data?.sql || '').trim();
     if (!sql) throw new Error('数据库查询节点未配置 SQL');
@@ -736,12 +745,15 @@ const NODE_EXECUTORS = {
       const m = /^([\w-]+)(?:\.([\w-]+))?$/.exec(ref.trim());
       if (!m) return '';
       const val = String(inputs[m[1]]?.[m[2]] ?? inputs[m[1]] ?? '');
-      // SQL 安全：只允许字母数字下划线，防 SQL 注入
+      // SQL 安全：只允许字母数字下划线，防 SQL 注入（第一层：变量值字符白名单）
       if (/[^a-zA-Z0-9_\s\-.]/.test(val)) return '';
       return val;
     });
+    // P0-2：第二层——SQL 本体过 sanitizeSelectSql（工具 db_query 同款校验，含引用符/库名前缀旁路加固）
+    const check = sanitizeSelectSql(rendered);
+    if (check.err) throw new Error('数据库查询被安全策略拒绝：' + check.err);
     try {
-      const rows = db.prepare(rendered).all();
+      const rows = db.prepare(check.sql).all();
       return { rows, count: rows.length, json: JSON.stringify(rows) };
     } catch (e) {
       throw new Error('数据库查询失败：' + String(e?.message || e));
