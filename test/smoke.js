@@ -5602,7 +5602,7 @@ function t(name, fn) {
       assert.ok(src.includes("'screenshot', 'clipboard_read'"), 'schema op enum 应包含扩展 op');
       // A2: local_exec run 应落审计日志（op_logs）
       assert.ok(src.includes("op_logs"), 'tools-extra.js 应写入 op_logs 审计日志');
-      assert.ok(src.includes('本地桥操作:'), '审计日志 action 应包含 "本地桥操作" 前缀');
+      assert.ok(src.includes('本地桥:'), 'tools-extra.js 应写入 op_logs 审计日志（action 含本地桥前缀）');
     });
     await t('P3-8：/chat/models 不再 SELECT api_key 列（truthiness 改由 SQL has_key 表达）', () => {
       const src = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'routes', 'chat.js'), 'utf8');

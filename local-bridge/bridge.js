@@ -16,6 +16,7 @@
  *   4. 通知走 osascript display notification（固定模板，文本转义）
  *   5. 单飞任务：同一时刻最多执行 1 个任务，防并发滥用
  *   6. 全部动作写本地日志（~/Library/Logs/teleagent-bridge.log）可审计
+ *   7. 服务端每 op 执行后落 op_logs（含用户/操作/参数摘要/耗时/结果状态），运营页可检索（A2 完成 2026-11-09）
  *
  * 自启动：launchd（~/Library/LaunchAgents/com.teleagent.bridge.plist，KeepAlive）
  * 平台地址：默认 http://localhost:3210，安装时/配置可改

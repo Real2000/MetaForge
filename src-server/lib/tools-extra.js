@@ -1072,10 +1072,10 @@ const local_exec = {
     // 入队
     const info = db.prepare('INSERT INTO localbridge_tasks (device_id,username,op,params,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?)')
       .run(dev.id, username, op, JSON.stringify(params), 'pending', now(), now());
-    const logAudit = (status, detail) => {
+    const logAudit = (status, detail, duration) => {
       if (!username) return;
-      db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-        .run(username, `本地桥操作:${op}`, `设备${dev.device_name}: ${(detail || '').slice(0, 200)}` + (status === 'done' ? '' : '（失败）'), ctx._ip || '', now());
+      db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at,duration_ms) VALUES (?,?,?,?,?,?)')
+        .run(username, `本地桥:${op}`, `设备${dev.device_name}: ${(detail || '').slice(0, 200)}` + (status === 'done' ? '' : '（失败）'), ctx._ip || '', now(), duration || null);
     };
     const taskId = info.lastInsertRowid;
     // 等待回推（500ms 轮询 DB，60s 超时）
@@ -1091,14 +1091,14 @@ const local_exec = {
           if (op === 'mkdir') {
             summary = d.existed ? `（路径已存在：${d.path}，未重复创建）` : `（已新建：${d.path}）`;
           }
-          logAudit('done', `${op} 成功 ${summary}`);
+          logAudit('done', `${op} 成功 ${summary}`, Date.now() - t0);
           return `✅ 本机操作成功（${op}，设备「${dev.device_name}」）${summary}：\n${JSON.stringify(d, null, 2).slice(0, 2000)}`;
         }
-        logAudit('failed', `${op} 失败：${result.error || '未知错误'}`);
+        logAudit('failed', `${op} 失败：${result.error || '未知错误'}`, Date.now() - t0);
         return `⛔ 本机操作失败（${op}）：${result.error || '未知错误'}。请告知用户失败原因，询问是否重试。`;
       }
     }
-    logAudit('timeout', `${op} 60s 超时（设备未回推）`);
+    logAudit('timeout', `${op} 60s 超时（设备未回推）`, Date.now() - t0);
     return `⏳ 任务已下发至设备「${dev.device_name}」但 60 秒内未收到执行结果（设备可能正忙或网络抖动）。任务仍在队列中，桥恢复后会执行；请告知用户稍后可在设备侧查看结果，或直接重试。`;
   },
 };

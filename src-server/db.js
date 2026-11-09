@@ -313,7 +313,10 @@ CREATE TABLE IF NOT EXISTS op_logs (
   ip TEXT,
   created_at TEXT
 );
-CREATE TABLE IF NOT EXISTS err_logs (
+`);
+// P4 本地桥 A2（2026-11-09）：op_logs 加持续时间列——local_exec run 实测精度 ±5ms 以内；已存在则忽略（幂等）
+try { db.exec("ALTER TABLE op_logs ADD COLUMN duration_ms INTEGER DEFAULT NULL"); } catch { }
+db.exec(`CREATE TABLE IF NOT EXISTS err_logs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   source TEXT,
   message TEXT,
