@@ -20,8 +20,15 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-// 【内置公钥】Ed25519 公钥（32 字节 hex）——当前为开发/联调测试钥；生产部署请按上方「密钥轮换」替换
-const PUBLIC_KEY_HEX = '1578bab46a80278b79e4f871e063ecaeb7b64cf16eb6596f88cf719b819fedb4';
+// 【内置公钥】Ed25519 公钥（32 字节 hex）——2026-11-09 已轮换为生产钥（签发私钥只存签发机，
+//  绝不入库/仓库，见下方 license-signing 目录说明）；旧开发/联调测试钥保留在 DEV_PUBKEY_HEX 仅供告警比对
+// 【生产密钥轮换】在签发机执行 node scripts/issue-license.js --private-key <新路径> ...（首次自动
+//  生成新密钥对并打印公钥 hex）→ 把公钥 hex 替换下方 PUBLIC_KEY_HEX 常量（或免改代码：部署机设
+//  环境变量 LICENSE_PUBKEY_HEX 覆盖）→ 新签发 License 全部走新钥；旧 License 到期后自然收敛失效。
+const PUBLIC_KEY_HEX = 'a95707e3da62a263103e0c1ddf183894b3993d7650d88e98919ab638462b9d2f';
+// 【已知开发/联调测试钥】（2026-11-09 轮换前的旧公钥，已随历史源码公开、私钥可能在开发机出现过）——
+//  当前生效公钥等于此值时启动告警（P3-9）；签发新 License 一律走新钥，此值仅作检测基准，不再用于签发
+const DEV_PUBKEY_HEX = '1578bab46a80278b79e4f871e063ecaeb7b64cf16eb6596f88cf719b819fedb4';
 
 // License 参与签名的五个字段（canonical 序列化按字母序：customer/edition/expires_at/issued_at/license_key）
 const SIGNED_FIELDS = ['customer', 'edition', 'expires_at', 'issued_at', 'license_key'];
@@ -96,10 +103,12 @@ function loadLicense() {
   // 的通道（照签发文档跑命令即可解锁全部特性），留审计痕迹+心理威慑；生产部署机禁设该变量（仅签发机轮换用）
   if (process.env.LICENSE_PUBKEY_HEX) {
     console.warn('[edition] 公钥经环境变量 LICENSE_PUBKEY_HEX 覆盖——请确认这是签发机轮换操作，生产部署机不应设置该变量');
-  } else if (getPublicKeyHex() === PUBLIC_KEY_HEX) {
-    // P3-9（2026-11-09）：使用内置开发/联调测试公钥时启动告警——该公钥已随源码仓库公开，任何拿到
-    // 源码的人都能照签发文档自签专业/企业版 License；生产部署必须按文件头「生产密钥轮换」流程替换
-    console.warn('[edition] 当前使用内置开发/联调测试公钥——生产部署请按文件头「生产密钥轮换」说明替换 PUBLIC_KEY_HEX（或经 LICENSE_PUBKEY_HEX 注入生产公钥）');
+  }
+  // P3-9（2026-11-09）：生效公钥等于已知开发/联调测试钥时启动告警——该钥已随历史源码公开、私钥可能在
+  // 开发机出现过，任何拿到源码的人都能自签专业/企业版 License。2026-11-09 已轮换生产钥（内置常量不再是
+  // 此值，正常部署不触发）；独立于 env 来源判断（无论内置还是覆盖值命中都告警）
+  if (getPublicKeyHex() === DEV_PUBKEY_HEX) {
+    console.warn('[edition] 当前生效公钥是已知开发/联调测试钥（私钥可能已泄露）——请按文件头「生产密钥轮换」流程轮换 PUBLIC_KEY_HEX 或经 LICENSE_PUBKEY_HEX 注入生产公钥');
   }
   let lic = null;
   let reason = 'ok';
@@ -216,4 +225,4 @@ function checkExpiryNotice() {
 
 // V2.3 审查加固（P2-4/S2-4）：publicKeyFromHex / localDateStr 一并导出——scripts/verify-license.js 复用而非照抄，
 // 消灭 SPKI 封装与日期算式的双实现漂移（轮换自检工具与服务端验签必须同源）
-module.exports = { EDITIONS, currentEdition, hasFeature, requireFeature, refreshLicense, checkExpiryNotice, getPublicKeyHex, editionBanner, canonicalOf, reasonDescription, publicKeyFromHex, localDateStr };
+module.exports = { EDITIONS, currentEdition, hasFeature, requireFeature, refreshLicense, checkExpiryNotice, getPublicKeyHex, editionBanner, canonicalOf, reasonDescription, publicKeyFromHex, localDateStr, DEV_PUBKEY_HEX };

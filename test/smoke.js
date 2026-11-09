@@ -5594,18 +5594,29 @@ function t(name, fn) {
       assert.ok(/has_key/i.test(sql), '应以 SQL 布尔表达式 has_key 表达 truthiness');
       assert.ok(src.includes('real: !!p.has_key'), 'real 标记应改用 has_key（api_key 不再进入 JS 内存）');
     });
-    await t('P3-9：使用内置开发公钥时启动告警（生产部署必须轮换）', () => {
+    await t('P3-9：生效公钥为已知开发/联调测试钥时启动告警；轮换后内置生产钥不误报', () => {
       const edition = require('../src-server/lib/edition');
       const saved = process.env.LICENSE_PUBKEY_HEX;
-      delete process.env.LICENSE_PUBKEY_HEX; // 确保走「内置公钥」分支
       const origWarn = console.warn;
-      let captured = '';
-      console.warn = (...a) => { captured += a.join(' '); };
-      try { edition.refreshLicense(); } finally {
-        console.warn = origWarn;
+      const capture = () => { let s = ''; console.warn = (...a) => { s += a.join(' '); }; return { get: () => s, restore: () => { console.warn = origWarn; } }; };
+      try {
+        // 正例：生效公钥 = 已知开发测试钥（经 env 注入模拟）→ 必须告警（覆盖告警与开发钥告警相互独立，两条都会出现）
+        process.env.LICENSE_PUBKEY_HEX = edition.DEV_PUBKEY_HEX;
+        let c = capture();
+        try { edition.refreshLicense(); } finally { c.restore(); }
+        assert.ok(c.get().includes('开发/联调测试钥'), '生效公钥为已知开发测试钥时必须告警：' + c.get().slice(0, 160));
+        // 负例：内置生产钥（env 未设，2026-11-09 轮换后的常态）→ 不得再报「开发测试钥」告警
+        delete process.env.LICENSE_PUBKEY_HEX;
+        c = capture();
+        try { edition.refreshLicense(); } finally { c.restore(); }
+        assert.ok(!c.get().includes('开发/联调测试钥'), '轮换后内置生产钥不应再触发开发钥告警：' + c.get().slice(0, 160));
+        // 新内置公钥应可解析（32 字节 hex → SPKI KeyObject）
+        assert.ok(edition.publicKeyFromHex(edition.getPublicKeyHex()), '内置新公钥应可解析为 KeyObject');
+      } finally {
         if (saved !== undefined) process.env.LICENSE_PUBKEY_HEX = saved;
+        else delete process.env.LICENSE_PUBKEY_HEX;
+        console.warn = origWarn;
       }
-      assert.ok(captured.includes('开发/联调测试公钥'), '应告警提示当前使用内置开发/联调测试公钥：' + captured.slice(0, 120));
     });
     await t('P0-2：database_query 节点拒绝写语句与 PRAGMA（校验层先于 better-sqlite3 驱动层）', async () => {
       const { NODE_EXECUTORS } = require('../src-server/lib/workflow');
