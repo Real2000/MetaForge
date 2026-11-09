@@ -20,15 +20,20 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-// 【内置公钥】Ed25519 公钥（32 字节 hex）——2026-11-09 已轮换为生产钥（签发私钥只存签发机，
-//  绝不入库/仓库，见下方 license-signing 目录说明）；旧开发/联调测试钥保留在 DEV_PUBKEY_HEX 仅供告警比对
+// 【内置公钥】Ed25519 公钥（32 字节 hex）——2026-11-09 第二次轮换（第一轮生产钥 a95707e3…
+//  的私钥随「代码管理」目录误删彻底丢失、成孤儿公钥，当日重换；现私钥在签发机
+// ~/Desktop/APP/license-signing/，600 权限，绝不入库/仓库/部署机）。
 // 【生产密钥轮换】在签发机执行 node scripts/issue-license.js --private-key <新路径> ...（首次自动
 //  生成新密钥对并打印公钥 hex）→ 把公钥 hex 替换下方 PUBLIC_KEY_HEX 常量（或免改代码：部署机设
 //  环境变量 LICENSE_PUBKEY_HEX 覆盖）→ 新签发 License 全部走新钥；旧 License 到期后自然收敛失效。
-const PUBLIC_KEY_HEX = 'a95707e3da62a263103e0c1ddf183894b3993d7650d88e98919ab638462b9d2f';
-// 【已知开发/联调测试钥】（2026-11-09 轮换前的旧公钥，已随历史源码公开、私钥可能在开发机出现过）——
-//  当前生效公钥等于此值时启动告警（P3-9）；签发新 License 一律走新钥，此值仅作检测基准，不再用于签发
-const DEV_PUBKEY_HEX = '1578bab46a80278b79e4f871e063ecaeb7b64cf16eb6596f88cf719b819fedb4';
+const PUBLIC_KEY_HEX = 'b680ca655104ee21e51a278b7b222274a55c9e79252c5a8a0e6b4e178100ad30';
+// 【已知不安全公钥清单】（P3-9 告警比对基准，不再用于签发）：生效公钥命中任一项时启动告警——
+//  ① 1578bab4…：原始开发/联调测试钥（已随历史源码公开，私钥可能在开发机出现过）；
+//  ② a95707e3…：2026-11-09 第一次轮换的生产钥（私钥随签发目录误删，防有人从恢复工具找回私钥自签）
+const LEGACY_PUBKEY_HEXES = [
+  '1578bab46a80278b79e4f871e063ecaeb7b64cf16eb6596f88cf719b819fedb4',
+  'a95707e3da62a263103e0c1ddf183894b3993d7650d88e98919ab638462b9d2f',
+];
 
 // License 参与签名的五个字段（canonical 序列化按字母序：customer/edition/expires_at/issued_at/license_key）
 const SIGNED_FIELDS = ['customer', 'edition', 'expires_at', 'issued_at', 'license_key'];
@@ -104,11 +109,11 @@ function loadLicense() {
   if (process.env.LICENSE_PUBKEY_HEX) {
     console.warn('[edition] 公钥经环境变量 LICENSE_PUBKEY_HEX 覆盖——请确认这是签发机轮换操作，生产部署机不应设置该变量');
   }
-  // P3-9（2026-11-09）：生效公钥等于已知开发/联调测试钥时启动告警——该钥已随历史源码公开、私钥可能在
-  // 开发机出现过，任何拿到源码的人都能自签专业/企业版 License。2026-11-09 已轮换生产钥（内置常量不再是
-  // 此值，正常部署不触发）；独立于 env 来源判断（无论内置还是覆盖值命中都告警）
-  if (getPublicKeyHex() === DEV_PUBKEY_HEX) {
-    console.warn('[edition] 当前生效公钥是已知开发/联调测试钥（私钥可能已泄露）——请按文件头「生产密钥轮换」流程轮换 PUBLIC_KEY_HEX 或经 LICENSE_PUBKEY_HEX 注入生产公钥');
+  // P3-9（2026-11-09）：生效公钥命中已知不安全公钥清单（旧开发测试钥/孤儿钥）时启动告警——
+  //  这些钥的私钥或已公开、或已丢失（防有人从恢复工具找回自签）。独立于 env 来源判断
+  //  （无论内置还是覆盖值命中都告警）
+  if (LEGACY_PUBKEY_HEXES.includes(getPublicKeyHex())) {
+    console.warn('[edition] 当前生效公钥命中已知不安全公钥清单（开发测试钥/孤儿钥）——请按文件头「生产密钥轮换」流程轮换 PUBLIC_KEY_HEX 或经 LICENSE_PUBKEY_HEX 注入生产公钥');
   }
   let lic = null;
   let reason = 'ok';
@@ -225,4 +230,4 @@ function checkExpiryNotice() {
 
 // V2.3 审查加固（P2-4/S2-4）：publicKeyFromHex / localDateStr 一并导出——scripts/verify-license.js 复用而非照抄，
 // 消灭 SPKI 封装与日期算式的双实现漂移（轮换自检工具与服务端验签必须同源）
-module.exports = { EDITIONS, currentEdition, hasFeature, requireFeature, refreshLicense, checkExpiryNotice, getPublicKeyHex, editionBanner, canonicalOf, reasonDescription, publicKeyFromHex, localDateStr, DEV_PUBKEY_HEX };
+module.exports = { EDITIONS, currentEdition, hasFeature, requireFeature, refreshLicense, checkExpiryNotice, getPublicKeyHex, editionBanner, canonicalOf, reasonDescription, publicKeyFromHex, localDateStr, LEGACY_PUBKEY_HEXES };

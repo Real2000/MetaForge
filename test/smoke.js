@@ -5594,24 +5594,27 @@ function t(name, fn) {
       assert.ok(/has_key/i.test(sql), '应以 SQL 布尔表达式 has_key 表达 truthiness');
       assert.ok(src.includes('real: !!p.has_key'), 'real 标记应改用 has_key（api_key 不再进入 JS 内存）');
     });
-    await t('P3-9：生效公钥为已知开发/联调测试钥时启动告警；轮换后内置生产钥不误报', () => {
+    await t('P3-9：生效公钥命中已知不安全公钥清单时告警；现行生产钥不误报', () => {
       const edition = require('../src-server/lib/edition');
       const saved = process.env.LICENSE_PUBKEY_HEX;
       const origWarn = console.warn;
       const capture = () => { let s = ''; console.warn = (...a) => { s += a.join(' '); }; return { get: () => s, restore: () => { console.warn = origWarn; } }; };
       try {
-        // 正例：生效公钥 = 已知开发测试钥（经 env 注入模拟）→ 必须告警（覆盖告警与开发钥告警相互独立，两条都会出现）
-        process.env.LICENSE_PUBKEY_HEX = edition.DEV_PUBKEY_HEX;
+        // 正例：清单内每一个不安全公钥（旧开发测试钥 / 2026-11-09 孤儿钥）都应触发告警
+        for (const bad of edition.LEGACY_PUBKEY_HEXES) {
+          process.env.LICENSE_PUBKEY_HEX = bad;
+          let c = capture();
+          try { edition.refreshLicense(); } finally { c.restore(); }
+          assert.ok(c.get().includes('不安全公钥清单'), `不安全公钥 ${bad.slice(0, 8)}… 生效时必须告警：` + c.get().slice(0, 160));
+        }
+        // 负例：内置现行生产钥（env 未设）→ 不得误报
+        delete process.env.LICENSE_PUBKEY_HEX;
         let c = capture();
         try { edition.refreshLicense(); } finally { c.restore(); }
-        assert.ok(c.get().includes('开发/联调测试钥'), '生效公钥为已知开发测试钥时必须告警：' + c.get().slice(0, 160));
-        // 负例：内置生产钥（env 未设，2026-11-09 轮换后的常态）→ 不得再报「开发测试钥」告警
-        delete process.env.LICENSE_PUBKEY_HEX;
-        c = capture();
-        try { edition.refreshLicense(); } finally { c.restore(); }
-        assert.ok(!c.get().includes('开发/联调测试钥'), '轮换后内置生产钥不应再触发开发钥告警：' + c.get().slice(0, 160));
-        // 新内置公钥应可解析（32 字节 hex → SPKI KeyObject）
-        assert.ok(edition.publicKeyFromHex(edition.getPublicKeyHex()), '内置新公钥应可解析为 KeyObject');
+        assert.ok(!c.get().includes('不安全公钥清单'), '现行生产钥不应触发告警：' + c.get().slice(0, 160));
+        // 内置公钥应与清单无交集，且可解析（32 字节 hex → SPKI KeyObject）
+        assert.ok(!edition.LEGACY_PUBKEY_HEXES.includes(edition.getPublicKeyHex()), '内置公钥不得出现在不安全清单中');
+        assert.ok(edition.publicKeyFromHex(edition.getPublicKeyHex()), '内置公钥应可解析为 KeyObject');
       } finally {
         if (saved !== undefined) process.env.LICENSE_PUBKEY_HEX = saved;
         else delete process.env.LICENSE_PUBKEY_HEX;
