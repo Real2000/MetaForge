@@ -1,7 +1,8 @@
-/** 我的设备（P5.27 本地桥配对与管理）
+/** 我的设备（P5.27 本地桥配对与管理）+ A3 桌面 Agent 场景模板（2026-11-09）
  *  - 生成 6 位配对码（120s 有效，一次性）→ 在客户端「TeleAgent 智能体平台助手」安装后输入
  *  - 设备列表：在线状态（15s 心跳窗）/ 默认设备切换 / 解绑
  *  - 安装包下载（服务端 /api/localbridge/installer 提供的 zip）+ 安装引导
+ *  - A3 桌面场景模板：从模板一键创建桌面 Agent + 开场白 + 工具 + 定时任务整套
  */
 import { api } from '../api.js';
 import { esc, toast, modal, confirmBox } from '../ui.js';
@@ -29,10 +30,16 @@ export async function render(box) {
   <div class="card" style="margin-top:18px;padding:22px">
     <h3 style="margin-bottom:10px">📱 ${t('已配对设备')}</h3>
     <div id="devList">${t('加载中…')}</div>
+  </div>
+  <!-- A3 桌面场景模板（2026-11-09） -->
+  <div class="card" style="margin-top:18px;padding:22px">
+    <h3 style="margin-bottom:10px">🚀 ${t('桌面场景模板')} <span class="sub">${t('基于本地桥能力的一键创建方案，无需任何配置即可使用')}</span></h3>
+    <div id="desktopTemplates" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px">${t('加载场景模板…')}</div>
   </div>`;
 
   // 生成配对码
   box.querySelector('#genCodeBtn').onclick = async () => {
+    /* ... 原生成配对码逻辑不变 ... */
     try {
       const j = await api('/localbridge/paircode', { method: 'POST' });
       const { code, expires_in } = j.data;
@@ -47,7 +54,6 @@ export async function render(box) {
         if (!el || !box.isConnected) return clearInterval(tick);
       }, 1000);
       box.querySelector('#regen').onclick = () => { clearInterval(tick); render(box); };
-      // 配对成功检测（客户端 claim 后设备表出现）
       const poll = setInterval(async () => {
         if (!box.isConnected) return clearInterval(poll);
         try {
@@ -77,6 +83,80 @@ export async function render(box) {
     foot: `<button class="btn primary" data-close>知道了</button>`,
     onMount(m, close) { m.querySelector('[data-close]').onclick = close; },
   });
+
+  // A3 桌面场景模板加载
+  loadTemplates();
+
+  async function loadTemplates() {
+    const el = box.querySelector('#desktopTemplates');
+    try {
+      const j = await api('/templates/desktop');
+      const templates = j.data?.templates || [];
+      if (!templates.length) {
+        el.innerHTML = `<div style="grid-column:1/-1;padding:18px;text-align:center;color:var(--text-3);font-size:13px">${t('暂无桌面场景模板——请先安装客户端并完成配对。')}</div>`;
+        return;
+      }
+      el.innerHTML = templates.map(t => `
+        <div class="card" style="padding:16px;display:flex;flex-direction:column;gap:10px;cursor:default">
+          <div style="display:flex;align-items:center;gap:8px">
+            <span style="font-size:28px">${esc(t.icon || '🚀')}</span>
+            <div><b>${esc(t.title)}</b><br><span class="tag gray" style="font-size:11px">${esc(t.category || '通用')}</span></div>
+          </div>
+          <p style="font-size:12px;color:var(--text-3);line-height:1.6;flex:1">${esc(t.description || '')}</p>
+          <div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:4px">
+            ${(t.operations || []).map(op => `<span class="tag gray" style="font-size:10px">${esc(op)}</span>`).join('')}
+          </div>
+          <button class="btn primary sm" data-create-template="${t.id}" style="margin-top:auto">${t('一键创建')}</button>
+        </div>`).join('');
+
+      el.querySelectorAll('[data-create-template]').forEach(b => b.onclick = async () => {
+        const t = templates.find(x => x.id === b.dataset.createTemplate);
+        if (!t) return;
+        if (!(await confirmBox(`确定创建「${t.title}」桌面场景智能体？\n\n创建后将自动完成：智能体创建 + 开场白配置 + 定时任务设置（${t.default_cron || '手动触发'}）。\n\n后续可在「智能体」页编辑或调整。`))) return;
+        try {
+          // 创建智能体（使用模板中的 prompt/工具/开场白）
+          const agent = await api('/agents', {
+            method: 'POST',
+            body: {
+              name: t.title + '（桌面场景）',
+              description: t.description,
+              prompt: t.prompt,
+              tools: ['local_exec'],
+              opening: '我已就绪，请告诉我需要做什么。',
+              opening_questions: [],
+            },
+          });
+          if (agent.code !== 0) { toast('创建智能体失败：' + (agent.msg || '未知错误'), 'err'); return; }
+          const agentId = agent.data.id;
+
+          // 如果模板有定时任务 cron 表达式，创建定时任务
+          if (t.default_cron) {
+            const task = await api('/tasks', {
+              method: 'POST',
+              body: {
+                name: t.title + '（定时）',
+                target_id: agentId,
+                exec_type: 'cron',
+                cron: t.default_cron,
+                params: JSON.stringify({ agent_id: agentId }),
+              },
+            });
+            if (task.code !== 0) {
+              toast('已创建智能体，定时任务创建失败：' + (task.msg || '未知错误'), 'err');
+            } else {
+              toast(`🎉 已创建「${t.title}」智能体，并设置了定时任务（${t.default_cron}）`, 'ok');
+            }
+          } else {
+            toast(`🎉 已创建「${t.title}」智能体。在对话中召唤即可使用！`, 'ok');
+          }
+        } catch (e) {
+          toast('创建失败：' + e.message, 'err');
+        }
+      });
+    } catch (e) {
+      el.innerHTML = `<div style="grid-column:1/-1;padding:14px;color:var(--danger,#dc2626)">${esc('加载桌面场景模板失败：' + e.message)}</div>`;
+    }
+  }
 
   async function loadDevs() {
     const el = box.querySelector('#devList');
