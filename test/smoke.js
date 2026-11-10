@@ -1676,6 +1676,83 @@ function t(name, fn) {
       db.prepare('DELETE FROM agent_publish_history WHERE agent_id=901').run();
       db.prepare('DELETE FROM agents WHERE id=901').run();
     });
+    // ⑦ C2（2026-11-10）：diffWorkflows 纯函数——节点增删改 / position 忽略 / 深对象同构异序不算变
+    await t('C2 diff：节点增删改识别 + position 忽略 + 深对象同构异序不算变', () => {
+      const { diffWorkflows } = require('../src-server/lib/workflow-diff');
+      const a = {
+        nodes: [
+          { id: 'n1', type: 'start', position: { x: 0, y: 0 }, data: { label: '开始' } },
+          { id: 'n2', type: 'llm', position: { x: 100, y: 0 }, data: { label: '助手', model: 'qwen-plus', schema: { a: 1, b: [1, 2] } } },
+          { id: 'n3', type: 'end', position: { x: 200, y: 0 }, data: { label: '结束' } },
+        ],
+        edges: [{ id: 'e1', source: 'n1', target: 'n2', sourceHandle: 'out' }],
+      };
+      const b = {
+        nodes: [
+          { id: 'n1', type: 'start', position: { x: 88, y: 77 }, data: { label: '开始' } }, // 仅 position 变 → 忽略
+          { id: 'n2', type: 'llm', position: { x: 100, y: 0 }, data: { label: '助手v2', model: 'qwen-max', schema: { b: [1, 2], a: 1 } } }, // schema 同构异序不算变，label/model 算
+          { id: 'n4', type: 'tool', position: { x: 300, y: 0 }, data: { label: '搜索' } }, // 新增
+        ],
+        edges: [{ id: 'e1', source: 'n1', target: 'n2', sourceHandle: 'out' }],
+      };
+      const d = diffWorkflows(a, b);
+      assert.deepStrictEqual(d.nodes.added.map(n => n.id), ['n4'], '应识别新增 n4');
+      assert.deepStrictEqual(d.nodes.removed.map(n => n.id), ['n3'], '应识别删除 n3');
+      assert.strictEqual(d.nodes.changed.length, 1, '仅 n2 为变更');
+      assert.deepStrictEqual(d.nodes.changed[0].fields.map(f => f.key).sort(), ['label', 'model'], 'schema 同构异序不应计入字段变更');
+      assert.deepStrictEqual(d.summary, { nodesAdded: 1, nodesRemoved: 1, nodesChanged: 1, fieldsChanged: 2, edgesAdded: 0, edgesRemoved: 0, edgesChanged: 0, total: 3 }, '汇总计数应一致');
+    });
+    // ⑧ C2：连线匹配——有 id 用 id，无 id 用 source|target|sourceHandle 组合键；同 id 改 target 识别为变更
+    await t('C2 diff：连线 id/组合键匹配 + 连线内容变更识别', () => {
+      const { diffWorkflows } = require('../src-server/lib/workflow-diff');
+      const a = { nodes: [], edges: [
+        { id: 'e1', source: 'a', target: 'b', sourceHandle: 'out' },
+        { source: 'a', target: 'c', sourceHandle: 'yes' },   // 无 id → 组合键
+      ] };
+      const b = { nodes: [], edges: [
+        { id: 'e1', source: 'a', target: 'x', sourceHandle: 'out' }, // 同 id 改 target → changed
+        { source: 'a', target: 'c', sourceHandle: 'yes' },           // 组合键命中 → 不变
+        { source: 'c', target: 'd', sourceHandle: 'out' },           // 新增
+      ] };
+      const d = diffWorkflows(a, b);
+      assert.deepStrictEqual(d.edges.added.map(e => e.target), ['d'], '应识别新增连线');
+      assert.deepStrictEqual(d.edges.removed, [], '组合键命中不应误判删除');
+      assert.strictEqual(d.edges.changed.length, 1, '同 id 改 target 应识别为变更');
+      assert.ok(d.edges.changed[0].fields.some(f => f.key === 'target'), 'target 变更应出现在字段明细');
+    });
+    // ⑨ C2：SQL 链路——两版本快照 + 当前草稿，按 diff 接口同款取数逻辑验证（b=draft 走 agents.workflow）
+    await t('C2 diff：发布历史快照取数 → diff（接口取数核心段）', () => {
+      const { diffWorkflows } = require('../src-server/lib/workflow-diff');
+      const mk = (label, model) => {
+        const wf = wfOf(label);
+        wf.nodes[1].data.model = model; // 制造可断言的字段差异（code 节点）
+        return JSON.stringify(wf);
+      };
+      db.prepare(`INSERT INTO agents (id,name,edit_mode,routing_mode,workflow,status,created_at) VALUES (?,?,?,?,?,?,datetime('now','localtime'))`)
+        .run(903, 'C2对比测试', 'canvas', 'workflow', mk('draft', 'qwen-max'), 'draft');
+      db.prepare(`INSERT INTO agent_publish_history (agent_id, version, workflow, note, nodes, published_by, created_at) VALUES (?,?,?,?,?,?,datetime('now','localtime'))`)
+        .run(903, 1, mk('v1', 'qwen-plus'), '首版', 3, 'tester');
+      db.prepare(`INSERT INTO agent_publish_history (agent_id, version, workflow, note, nodes, published_by, created_at) VALUES (?,?,?,?,?,?,datetime('now','localtime'))`)
+        .run(903, 2, mk('v2', 'qwen-max'), '二版', 3, 'tester');
+      // 接口同款取数：a=v1 快照，b=draft → agents.workflow
+      const agentRow = db.prepare('SELECT workflow FROM agents WHERE id=903').get();
+      const v1 = db.prepare('SELECT workflow FROM agent_publish_history WHERE agent_id=903 AND version=1').get();
+      const d = diffWorkflows(JSON.parse(v1.workflow), JSON.parse(agentRow.workflow));
+      const c1 = d.nodes.changed.find(n => n.id === 'c1');
+      assert.ok(c1, 'code 节点应识别为变更');
+      const keys = c1.fields.map(f => f.key);
+      assert.ok(keys.includes('code'), 'code 字段（marker 不同）应变更');
+      assert.ok(keys.includes('model'), 'model 字段（plus→max）应变更');
+      // 版本间对比：v1 vs v2 同样两字段
+      const v2 = db.prepare('SELECT workflow FROM agent_publish_history WHERE agent_id=903 AND version=2').get();
+      const d12 = diffWorkflows(JSON.parse(v1.workflow), JSON.parse(v2.workflow));
+      assert.deepStrictEqual(d12.nodes.changed[0].fields.map(f => f.key).sort(), ['code', 'model'], 'v1↔v2 差异应为 code+model');
+      // 同快照自比 → 全 0
+      const d0 = diffWorkflows(JSON.parse(v1.workflow), JSON.parse(v1.workflow));
+      assert.strictEqual(d0.summary.total, 0, '同快照自比应无差异');
+      db.prepare('DELETE FROM agent_publish_history WHERE agent_id=903').run();
+      db.prepare('DELETE FROM agents WHERE id=903').run();
+    });
   }
 
   console.log('【P5.10】流式调试：LLM 节点逐字流出（nodeStream 事件）');

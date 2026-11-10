@@ -13,6 +13,7 @@ const { requireFeature, hasFeature } = require('../lib/edition'); // V2.2 #8 202
 const { spaceFilterSql } = require('../lib/space-utils'); // V2.4 #9 2026-10-31：统一空间过滤
 const { getSoftLimit, agentQuotaBlock } = require('../lib/plans'); // V2.4 #8 2026-10-31：edition+plan配额限制
 const { runTool, validateAgentTools, TOOL_DEFS, AGENT_TOOL_DENY } = require('../lib/tools'); // P5.34b copy 过滤依赖 AGENT_TOOL_DENY（此前漏导入被 catch 吞错致副本工具恒空——测试轮实锤修复）
+const { diffWorkflows } = require('../lib/workflow-diff'); // C2 2026-11-10：画布版本节点/连线级 diff（纯函数）
 
 const router = express.Router();
 router.use(auth);
@@ -626,6 +627,48 @@ router.post('/:id/publish-history/:version/rollback', (req, res) => {
   db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
     .run(req.user.username, '回滚智能体版本', `${old.name} → v${hist.version}`, req.ip, now());
   res.json({ code: 0, msg: `已回滚到 v${hist.version}（草稿与线上快照均已恢复该版本）` });
+});
+
+// C2（2026-11-10 V3.2 收尾）：画布版本对比——两份快照（或快照↔当前草稿）的节点/连线级 diff。
+// GET /:id/publish-history/diff?a=<version>&b=<version|draft>；核心算法在 lib/workflow-diff.js（纯函数，smoke 全覆盖）
+router.get('/:id/publish-history/diff', (req, res) => {
+  const old = db.prepare('SELECT * FROM agents WHERE id=?').get(req.params.id);
+  if (!old) return res.json({ code: 404, msg: '智能体不存在' });
+  if (!canEdit(old, req.user)) return res.json({ code: 403, msg: '无查看权限' });
+  const a = req.query.a, b = req.query.b;
+  if (!a || !b) return res.json({ code: 400, msg: '缺少 a/b 版本参数' });
+  // 取快照：draft = agents.workflow 当前草稿；数字 = agent_publish_history 快照
+  const load = (v) => {
+    if (v === 'draft') {
+      if (!old.workflow) return { err: '该智能体没有画布草稿' };
+      return { wf: old.workflow, label: '草稿' };
+    }
+    const row = db.prepare('SELECT workflow, created_at FROM agent_publish_history WHERE agent_id=? AND version=?').get(old.id, +v);
+    if (!row) return { err: `版本 v${v} 不存在` };
+    return { wf: row.workflow, label: `v${v}`, created_at: row.created_at };
+  };
+  const ra = load(a), rb = load(b);
+  if (ra.err) return res.json({ code: 404, msg: ra.err });
+  if (rb.err) return res.json({ code: 404, msg: rb.err });
+  // 快照解析容错（防损坏数据进入 diff）
+  const parse = (s, name) => { try { return JSON.parse(s || 'null'); } catch { return null; } };
+  const wa = parse(ra.wf), wb = parse(rb.wf);
+  if (!wa || !Array.isArray(wa.nodes)) return res.json({ code: 400, msg: `${ra.label} 快照数据损坏，无法对比` });
+  if (!wb || !Array.isArray(wb.nodes)) return res.json({ code: 400, msg: `${rb.label} 快照数据损坏，无法对比` });
+  // 节点 id → 展示信息（类型/名称）：两侧合并，供前端把连线两端渲染成节点名而非裸 id
+  const nodeMap = {};
+  for (const n of [...(wa.nodes || []), ...(wb.nodes || [])]) {
+    if (n && n.id != null && !nodeMap[n.id]) nodeMap[String(n.id)] = { type: n.type || '', label: String((n.data && (n.data.label || n.data.name)) || '') };
+  }
+  res.json({
+    code: 0,
+    data: {
+      a: { version: a, label: ra.label, created_at: ra.created_at || null },
+      b: { version: b, label: rb.label, created_at: rb.created_at || null },
+      diff: diffWorkflows(wa, wb),
+      nodeMap,
+    },
+  });
 });
 
 // ---------- LLMOps 提示词版本管理（2026-10-31 计划 #10） ----------

@@ -77,6 +77,8 @@ export function createCanvas(root, opts = {}) {
   }
   let agents = opts.agents || [];
   let wf = opts.initial && Array.isArray(opts.initial.nodes) ? JSON.parse(JSON.stringify(opts.initial)) : { nodes: [], edges: [], viewport: { x: 60, y: 40, zoom: 1 } };
+  // 容错兜底：外部造数/导入的 JSON 可能缺 viewport（正常保存链路经 validateWorkflowV2 会补），缺失会使 applyViewport 崩掉整页
+  if (!wf.viewport || typeof wf.viewport !== 'object') wf.viewport = { x: 60, y: 40, zoom: 1 };
   // P5.6 根字段规范化：flow_type（Workflow/Chatflow 双模式）+ groups（节点分组）+ notes（P5.15 便签，纯注释）
   if (wf.flow_type !== 'chatflow') wf.flow_type = 'workflow';
   if (!Array.isArray(wf.groups)) wf.groups = [];

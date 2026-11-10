@@ -2624,6 +2624,26 @@ const EN = {
   '暂无线索——价格页「企业定制」表单提交后进入这里': 'No leads yet — appears after submitting the "Enterprise Custom" form on the Pricing page',
   'Streamable HTTP（JSON-RPC 2.0）': 'Streamable HTTP (JSON-RPC 2.0)',
   'Authorization: Bearer <令牌>': 'Authorization: Bearer <token>',
+
+  // ---------- C1 第十八批：C2 画布版本对比 ----------
+  '与上一版对比节点/连线差异': 'Compare with previous version (node/edge diff)',
+  '与当前草稿对比节点/连线差异': 'Compare with current draft (node/edge diff)',
+  '上一版': 'Previous',
+  '加载对比失败': 'Failed to load diff',
+  '对比数据为空': 'Empty diff data',
+  '（空）': '(empty)',
+  '（出口 {h}）': '(output {h})',
+  '旧值': 'Old value',
+  '新值': 'New value',
+  '新增节点': 'Added nodes',
+  '修改节点': 'Modified nodes',
+  '新增连线': 'Added edges',
+  '删除连线': 'Deleted edges',
+  '变更连线': 'Changed edges',
+  '画布完全一致': 'Canvas identical',
+  '{n} 处字段变更': '{n} field change(s)',
+  '当前草稿（未发布）': 'Current draft (unpublished)',
+  '🔍 画布版本对比：{a} ↔ {b}': '🔍 Canvas Version Diff: {a} ↔ {b}',
 };
 
 /** 翻译：中文即 key；英文查词典，缺失回退中文 */

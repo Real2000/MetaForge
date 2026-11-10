@@ -7,7 +7,7 @@ import { api, getUser } from '../api.js';
 import { esc, toast, modal, confirmBox } from '../ui.js';
 import { t } from '../i18n.js';
 import { mountChat } from '../chat-component.js';
-import { createCanvas } from './canvas.js';
+import { createCanvas, NODE_TYPES } from './canvas.js';
 
 const TYPE_NAME = { enterprise: '企业智能体', digital: '数字员工', dept: '部门AI助理', other: '其他' };
 const ICON_POOL = ['🤖', '🎯', '📝', '💡', '📊', '🛠️', '🌐', '📚', '✍️', '🧩', '🧠', '💼', '🛡️', '📈', '🎨', '🎬', '⚖️', '🏦', '💬', '🔍'];
@@ -1165,12 +1165,14 @@ export async function render(el, params) {
             const rows = j.data || [];
             if (!rows.length) { host.innerHTML = `<div class="hint" style="padding:14px">${t('暂无发布版本——发布一次画布智能体即存快照（表单模式无版本）')}</div>`; return; }
             host.innerHTML = `<div class="hint" style="margin-bottom:8px">💾 ${t('每次发布存一份画布快照；运行时走已发布快照（编辑草稿不影响线上）。回滚 = 把该版本写回草稿并同步线上（即刻生效）')}。</div>` +
-              rows.map(r => `
+              rows.map((r, i) => `
               <div style="display:flex;gap:10px;align-items:center;padding:9px 12px;border:1px solid var(--border,#eef0f3);border-radius:8px;margin-bottom:6px">
                 <b style="min-width:46px;color:#2563eb">v${r.version}</b>
                 <span style="color:var(--text-2);font-size:12px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(r.note || '')}">${esc(r.note || t('（无发布说明）'))}</span>
                 <span style="font-size:11px;color:var(--text-3)">${r.nodes} ${t('节点')}</span>
                 <span style="font-size:11px;color:var(--text-3)">${esc(r.published_by || '')} · ${esc((r.created_at || '').slice(5, 16))}</span>
+                ${rows[i + 1] ? `<button class="btn sm" data-cmp="${r.version}" data-prev="${rows[i + 1].version}" title="${t('与上一版对比节点/连线差异')}">⇆ ${t('上一版')}</button>` : ''}
+                <button class="btn sm" data-cmpd="${r.version}" title="${t('与当前草稿对比节点/连线差异')}">⇆ ${t('草稿')}</button>
                 ${r.version === pubInfo.version ? `<span class="tag green">${t('当前线上')}</span>` : `<button class="btn sm" data-rb="${r.version}">⏪ ${t('回滚到此')}</button>`}
               </div>`).join('');
             host.querySelectorAll('[data-rb]').forEach(b => b.onclick = async () => {
@@ -1183,11 +1185,94 @@ export async function render(el, params) {
                 location.reload(); // 草稿已变——整页重载加载新图
               } catch (e) { toast(e.message, 'err'); }
             });
+            // C2：画布版本对比入口（基准=上一版/当前版本 → 目标=本版本/草稿；diff 语义恒为「目标相对基准的变化」）
+            host.querySelectorAll('[data-cmp]').forEach(b => b.onclick = () => showCanvasDiff(b.dataset.prev, b.dataset.cmp));
+            host.querySelectorAll('[data-cmpd]').forEach(b => b.onclick = () => showCanvasDiff(b.dataset.cmpd, 'draft'));
           } catch (e) { host.innerHTML = `<div style="color:#dc2626;padding:12px">❌ ${esc(e.message)}</div>`; }
         })();
       },
     });
   };
+
+  // ---------- C2 画布版本对比（2026-11-10 V3.2 收尾）：节点/连线级 diff 弹窗 ----------
+  // 值展示：字符串截 80，对象/数组 JSON 截 80（title 挂全文）；空值显示占位
+  function diffVal(v) {
+    if (v == null) return t('（空）');
+    let s = typeof v === 'string' ? v : JSON.stringify(v);
+    if (s.length > 80) s = s.slice(0, 80) + '…';
+    return s;
+  }
+
+  async function showCanvasDiff(aV, bV) {
+    let j;
+    try {
+      j = await api(`/agents/${id}/publish-history/diff?a=${encodeURIComponent(aV)}&b=${encodeURIComponent(bV)}`);
+    } catch (e) { toast(e.message || t('加载对比失败'), 'err'); return; }
+    const { a, b, diff, nodeMap } = j.data || {};
+    if (!diff) { toast(t('对比数据为空'), 'err'); return; }
+    const typeHtml = (ty) => {
+      const nt = NODE_TYPES[ty];
+      return nt ? `${nt.icon} ${esc(nt.label)}` : `<span class="tag gray">${esc(ty || '?')}</span>`;
+    };
+    const nodeName = (n) => `${typeHtml(n.type)} <b style="margin-left:4px">${esc(n.label || '')}</b> <span style="color:var(--text-3);font-size:11px">${esc(n.id)}</span>`;
+    const nodeRef = (nid) => {
+      const m = nodeMap && nodeMap[nid];
+      return `<span class="mono" style="font-size:11px" title="${esc(nid)}">${esc((m && (m.label || m.type)) || nid)}</span>`;
+    };
+    const edgeName = (e) => `<span class="mono" style="font-size:11px">${nodeRef(e.source)} → ${nodeRef(e.target)}${e.sourceHandle ? t('（出口 {h}）').replace('{h}', e.sourceHandle) : ''}</span>`;
+    const section = (title, cls, items, renderItem) => !items.length ? '' : `
+      <div style="margin-bottom:12px">
+        <span class="tag ${cls}" style="margin-bottom:6px;display:inline-block">${title}</span>
+        <div style="border:1px solid var(--border,#eef0f3);border-radius:8px;overflow:hidden">
+          ${items.map(renderItem).join('')}
+        </div>
+      </div>`;
+    const fieldTable = (fields) => `
+      <table class="tbl" style="margin:6px 0 2px;font-size:11.5px">
+        <thead><tr><th style="width:110px">${t('字段')}</th><th>${t('旧值')}</th><th>${t('新值')}</th></tr></thead>
+        <tbody>${fields.map(f => `
+          <tr>
+            <td class="mono">${esc(f.key)}</td>
+            <td style="color:#b91c1c;word-break:break-all" title="${esc(diffVal(f.from))}">${esc(diffVal(f.from))}</td>
+            <td style="color:#15803d;word-break:break-all" title="${esc(diffVal(f.to))}">${esc(diffVal(f.to))}</td>
+          </tr>`).join('')}</tbody>
+      </table>`;
+    const sum = diff.summary;
+    const badges = [
+      [sum.nodesAdded, 'green', `＋${sum.nodesAdded} ${t('新增节点')}`],
+      [sum.nodesRemoved, 'red', `－${sum.nodesRemoved} ${t('删除节点')}`],
+      [sum.nodesChanged, 'orange', `✎${sum.nodesChanged} ${t('修改节点')}`],
+      [sum.edgesAdded, 'green', `＋${sum.edgesAdded} ${t('新增连线')}`],
+      [sum.edgesRemoved, 'red', `－${sum.edgesRemoved} ${t('删除连线')}`],
+      [sum.edgesChanged, 'orange', `✎${sum.edgesChanged} ${t('变更连线')}`],
+    ].filter(x => x[0]).map(x => `<span class="tag ${x[1]}" style="margin:2px">${x[2]}</span>`).join('') || `<span class="tag gray">${t('画布完全一致')}</span>`;
+    const bInfo = b.version === 'draft' ? t('当前草稿（未发布）') : `${esc(b.label)}${b.created_at ? ' · ' + esc(b.created_at.slice(0, 16)) : ''}`;
+    const aInfo = `${esc(a.label)}${a.created_at ? ' · ' + esc(a.created_at.slice(0, 16)) : ''}`;
+    modal({
+      title: t('🔍 画布版本对比：{a} ↔ {b}').replace('{a}', a.label).replace('{b}', b.label),
+      wide: true,
+      body: `
+        <div style="margin-bottom:10px;font-size:12px;color:var(--text-3)">${aInfo} ↔ ${bInfo}</div>
+        <div style="margin-bottom:14px">${badges}</div>
+        ${section(t('新增节点'), 'green', diff.nodes.added, n => `<div style="padding:7px 10px;border-bottom:1px solid rgba(0,0,0,.04)">${nodeName(n)}</div>`)}
+        ${section(t('删除节点'), 'red', diff.nodes.removed, n => `<div style="padding:7px 10px;border-bottom:1px solid rgba(0,0,0,.04)">${nodeName(n)}</div>`)}
+        ${section(t('修改节点'), 'orange', diff.nodes.changed, n => `
+          <div style="padding:7px 10px;border-bottom:1px solid rgba(0,0,0,.04)">
+            ${nodeName(n)} <span class="tag orange" style="margin-left:6px">${t('{n} 处字段变更').replace('{n}', n.fields.length)}</span>
+            ${fieldTable(n.fields)}
+          </div>`)}
+        ${section(t('新增连线'), 'green', diff.edges.added, e => `<div style="padding:6px 10px;border-bottom:1px solid rgba(0,0,0,.04)">${edgeName(e)}</div>`)}
+        ${section(t('删除连线'), 'red', diff.edges.removed, e => `<div style="padding:6px 10px;border-bottom:1px solid rgba(0,0,0,.04)">${edgeName(e)}</div>`)}
+        ${section(t('变更连线'), 'orange', diff.edges.changed, e => `
+          <div style="padding:6px 10px;border-bottom:1px solid rgba(0,0,0,.04)">
+            ${edgeName(e)} <span class="tag orange" style="margin-left:6px">${t('{n} 处字段变更').replace('{n}', e.fields.length)}</span>
+            ${fieldTable(e.fields)}
+          </div>`)}
+      `,
+      foot: `<button class="btn" data-close>${t('关闭')}</button>`,
+      onMount(mask, close) { mask.querySelector('[data-close]').onclick = close; },
+    });
+  }
 
   function openPublishDlg() {
     const isPub = S.status === 'published';
