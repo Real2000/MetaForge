@@ -1,6 +1,7 @@
 /** 前台-帮助中心（2026-10-20 帮助体系）：快速开始 / FAQ / 图文教程 / 文档链接 / 反馈入口 */
 import { api } from '../api.js';
 import { esc, toast, modal } from '../ui.js';
+import { t } from '../i18n.js';
 
 const FAQS = [
   {
@@ -99,77 +100,77 @@ export async function render(el) {
     .hp-doc:hover{border-color:#93c5fd;color:#2563eb}
   </style>
   <div class="page-head">
-    <h2>帮助中心</h2>
-    <div class="desc">快速上手、常见问题与图文教程——遇到问题先来这里，解决不了随时反馈给我们。</div>
+    <h2>${t('帮助中心')}</h2>
+    <div class="desc">${t('快速上手、常见问题与图文教程——遇到问题先来这里，解决不了随时反馈给我们。')}</div>
   </div>
 
   <div class="hp-hero">
-    <h2>🚀 三步开启你的 AI 助手</h2>
-    <div style="font-size:13px;color:var(--text-2)">从零到对话，只需要三步</div>
+    <h2>${t('🚀 三步开启你的 AI 助手')}</h2>
+    <div style="font-size:13px;color:var(--text-2)">${t('从零到对话，只需要三步')}</div>
     <div class="hp-steps">
-      <div class="hp-step"><span class="no">第 1 步</span><b>创建智能体</b><div style="font-size:12px;color:var(--text-3);margin-top:6px;line-height:1.7">后台「智能体管理」创建并编排：提示词 + 模型 + 开场白</div><a class="btn sm" style="margin-top:10px" href="#/admin/agents">去创建 →</a></div>
-      <div class="hp-step"><span class="no">第 2 步</span><b>上传知识库</b><div style="font-size:12px;color:var(--text-3);margin-top:6px;line-height:1.7">前台「知识库」上传公司文档，智能体关联后精准作答</div><a class="btn sm" style="margin-top:10px" href="#/knowledge">去上传 →</a></div>
-      <div class="hp-step"><span class="no">第 3 步</span><b>开始对话</b><div style="font-size:12px;color:var(--text-3);margin-top:6px;line-height:1.7">到广场或对话页开始使用，支持多模态与技能调用</div><a class="btn sm" style="margin-top:10px" href="#/home">去对话 →</a></div>
+      <div class="hp-step"><span class="no">${t('第 1 步')}</span><b>${t('创建智能体')}</b><div style="font-size:12px;color:var(--text-3);margin-top:6px;line-height:1.7">${t('后台「智能体管理」创建并编排：提示词 + 模型 + 开场白')}</div><a class="btn sm" style="margin-top:10px" href="#/admin/agents">${t('去创建')} →</a></div>
+      <div class="hp-step"><span class="no">${t('第 2 步')}</span><b>${t('上传知识库')}</b><div style="font-size:12px;color:var(--text-3);margin-top:6px;line-height:1.7">${t('前台「知识库」上传公司文档，智能体关联后精准作答')}</div><a class="btn sm" style="margin-top:10px" href="#/knowledge">${t('去上传')} →</a></div>
+      <div class="hp-step"><span class="no">${t('第 3 步')}</span><b>${t('开始对话')}</b><div style="font-size:12px;color:var(--text-3);margin-top:6px;line-height:1.7">${t('到广场或对话页开始使用，支持多模态与技能调用')}</div><a class="btn sm" style="margin-top:10px" href="#/home">${t('去对话')} →</a></div>
     </div>
   </div>
 
   <div class="card" style="padding:16px 18px">
-    <h3 style="margin:0 0 12px">📖 常见问题（FAQ）</h3>
+    <h3 style="margin:0 0 12px">📖 ${t('常见问题（FAQ）')}</h3>
     <div class="hp-faq">
       ${FAQS.map((f, i) => `
       <details ${i === 0 ? 'open' : ''}>
-        <summary>Q${i + 1}：${esc(f.q)}</summary>
-        <div class="a">${esc(f.a)}${f.link ? ` <a href="${f.link.href}" style="color:#2563eb;font-weight:600">${f.link.label} →</a>` : ''}</div>
+        <summary>Q${i + 1}：${esc(t(f.q))}</summary>
+        <div class="a">${esc(t(f.a))}${f.link ? ` <a href="${f.link.href}" style="color:#2563eb;font-weight:600">${t(f.link.label)} →</a>` : ''}</div>
       </details>`).join('')}
     </div>
   </div>
 
   <div class="card" style="padding:16px 18px;margin-top:14px">
-    <h3 style="margin:0 0 12px">🎬 图文教程</h3>
+    <h3 style="margin:0 0 12px">🎬 ${t('图文教程')}</h3>
     <div class="hp-tutos" id="tutos">
-      ${TUTORIALS.map((t, i) => `
+      ${TUTORIALS.map((tu, i) => `
       <div class="hp-tuto" data-t="${i}">
-        <div class="hp-play">${t.ic}</div>
-        <b style="font-size:13.5px">${esc(t.title)}</b>
-        <div style="font-size:11px;color:var(--text-3);margin-top:6px">${t.time} · 点击展开</div>
+        <div class="hp-play">${tu.ic}</div>
+        <b style="font-size:13.5px">${esc(t(tu.title))}</b>
+        <div style="font-size:11px;color:var(--text-3);margin-top:6px">${t(tu.time)} · ${t('点击展开')}</div>
       </div>`).join('')}
     </div>
   </div>
 
   <div class="card" style="padding:16px 18px;margin-top:14px">
-    <h3 style="margin:0 0 12px">🔗 相关文档与入口</h3>
+    <h3 style="margin:0 0 12px">🔗 ${t('相关文档与入口')}</h3>
     <div class="hp-docs">
-      <a class="hp-doc" href="#/admin/access">🔌 API 接入文档</a>
-      <a class="hp-doc" href="#/admin/models">🧠 模型接入管理</a>
-      <a class="hp-doc" href="#/models">🧩 我的模型</a>
-      <a class="hp-doc" href="#/admin/quota">💳 用量与配额说明</a>
-      <a class="hp-doc" href="#/skills">✨ 技能使用指南</a>
-      <a class="hp-doc" href="#/admin/users">👥 账号与密码</a>
+      <a class="hp-doc" href="#/admin/access">🔌 ${t('API 接入文档')}</a>
+      <a class="hp-doc" href="#/admin/models">🧠 ${t('模型接入管理')}</a>
+      <a class="hp-doc" href="#/models">🧩 ${t('我的模型')}</a>
+      <a class="hp-doc" href="#/admin/quota">💳 ${t('用量与配额说明')}</a>
+      <a class="hp-doc" href="#/skills">✨ ${t('技能使用指南')}</a>
+      <a class="hp-doc" href="#/admin/users">👥 ${t('账号与密码')}</a>
     </div>
   </div>
 
   <div class="card" style="padding:16px 18px;margin-top:14px;display:flex;justify-content:space-between;align-items:center;gap:14px;flex-wrap:wrap;background:linear-gradient(135deg,#fffbeb,#fef3c7);border-color:#fde68a">
     <div>
-      <b style="font-size:14px">💬 没找到答案？</b>
-      <div style="font-size:12px;color:var(--text-3);margin-top:4px">提交意见反馈（Bug / 建议 / 咨询），管理员处理后会通过站内通知回复你</div>
+      <b style="font-size:14px">💬 ${t('没找到答案？')}</b>
+      <div style="font-size:12px;color:var(--text-3);margin-top:4px">${t('提交意见反馈（Bug / 建议 / 咨询），管理员处理后会通过站内通知回复你')}</div>
     </div>
     <div style="display:flex;gap:8px">
-      <button class="btn" id="askAI">🤖 问 AI 助手</button>
-      <button class="btn primary" id="goFeedback">💬 提交反馈</button>
+      <button class="btn" id="askAI">🤖 ${t('问 AI 助手')}</button>
+      <button class="btn primary" id="goFeedback">💬 ${t('提交反馈')}</button>
     </div>
   </div>`;
 
   // 图文教程弹窗
   el.querySelectorAll('.hp-tuto').forEach(card => card.onclick = () => {
-    const t = TUTORIALS[+card.dataset.t];
+    const tu = TUTORIALS[+card.dataset.t];
     modal({
-      title: `${t.ic} ${t.title}`,
+      title: `${tu.ic} ${t(tu.title)}`,
       body: `
-        <div style="font-size:12px;color:var(--text-3);margin-bottom:12px">${t.time}</div>
+        <div style="font-size:12px;color:var(--text-3);margin-bottom:12px">${t(tu.time)}</div>
         <ol style="margin:0;padding-left:20px;font-size:13px;line-height:2.2;color:var(--text)">
-          ${t.steps.map(s => `<li style="margin-bottom:4px">${esc(s)}</li>`).join('')}
+          ${tu.steps.map(s => `<li style="margin-bottom:4px">${esc(t(s))}</li>`).join('')}
         </ol>`,
-      foot: `<button class="btn" data-close>关闭</button>`,
+      foot: `<button class="btn" data-close>${t('关闭')}</button>`,
       onMount(mask, close) { mask.querySelector('[data-close]').onclick = close; },
     });
   });
