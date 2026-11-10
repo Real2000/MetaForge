@@ -1797,7 +1797,6 @@ const EN = {
   '钉钉免登（演示）': 'DingTalk SSO (demo)',
   '免登中…': 'Signing in…',
   '钉钉免登演示': 'DingTalk SSO demo',
-};
   // ---------- C1 第十二批：编排页 studio.js（含动态键 TOOL_META/DIVERSITY/TYPE_TAG/TYPE_GUIDE/密级/分类） ----------
   '加载失败': 'Load failed',
   '编辑模式切换': 'Switch edit mode',
@@ -1992,7 +1991,6 @@ const EN = {
   '生活': 'Lifestyle',
   '金融': 'Finance',
   '教育': 'Education',
-};
   // ---------- C1 第十三批：画布 canvas.js（节点注册表/操作符/校验/变量标签/模板弹窗/分组） ----------
   '闲聊': 'Chitchat',
   '业务咨询': 'Business inquiry',
@@ -2365,7 +2363,17 @@ const EN = {
   '展开中': 'expanded',
   '解散分组': 'Dissolve group',
   '分组已解散（节点保留）': 'Group dissolved (nodes kept)',
-};
+  // ---------- C1 第十四批：零星收尾（market 空态/app 导航与语言按钮/security 批量导入占位） ----------
+  '我的设备': 'My Devices',
+  '切换中英文 / Switch language': 'Switch language',
+  '词汇1&#10;词汇2&#10;词汇3': 'word1&#10;word2&#10;word3',
+  '内置工具区需要新版服务端': 'Built-in tools area needs a newer server',
+  '当前服务端为融合前旧版本（未返回 builtin_tools 字段）——重启 3210 服务（node server.js）后刷新本页即可': 'The server is a pre-merge legacy build (no builtin_tools field) — restart the 3210 service (node server.js) and refresh this page',
+  '平台工具清单为空（服务端 TOOL_DEFS 注册异常，请联系管理员）': 'Platform tool list is empty (server TOOL_DEFS registration issue; contact the admin)',
+  '在编排页画布上「💾 存为模板」沉淀你的高频流程': 'Save your frequent flows with "💾 Save as template" on the orchestration canvas',
+  '管理员在「MCP 服务」注册并刷新工具清单后，这里自动聚合': 'Admins register MCP services and refresh tool lists on the "MCP Services" page; they aggregate here automatically',
+  '管理员在「接入管理」配置 Dify/扣子并同步后，这里自动聚合（外部平台故障时静默跳过）': 'Admins configure Dify/Coze under "API Access" and sync; they aggregate here automatically (external failures are skipped silently)',
+  '（初始密码只作过渡）。请通过安全渠道告知对方。': '(initial password is temporary only). Share it with the user via a secure channel.',
 };
 
 /** 翻译：中文即 key；英文查词典，缺失回退中文 */

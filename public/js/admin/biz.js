@@ -67,7 +67,7 @@ export async function render(el) {
             <td><span class="tag ${l.status === 'new' ? 'orange' : l.status === 'won' ? 'green' : l.status === 'lost' ? 'gray' : 'blue'}">${LEAD_ST[l.status]() || l.status}</span></td>
             <td style="font-size:12px;color:var(--text-3)">${esc((l.created_at || '').slice(0, 16))}</td>
             <td><button class="btn sm primary" data-follow="${l.id}">${t('跟进')}</button></td>
-          </tr>`).join('') || ''}</tbody>
+          </tr>`).join('') : `<tr><td colspan="7" class="empty">${t('暂无线索——价格页「企业定制」表单提交后进入这里')}</td></tr>`}</tbody>
       </table></div>
     </div>`;
     box.querySelectorAll('[data-follow]').forEach(b => b.onclick = () => {
@@ -125,7 +125,7 @@ export async function render(el) {
               <button class="btn sm primary" data-inv="${i.id}" data-st="issued">✅ ${t('开票')}</button>
               <button class="btn sm" data-inv="${i.id}" data-st="rejected">${t('驳回')}</button>` : `<button class="btn sm" data-inv="${i.id}" data-st="pending">${t('重开')}</button>`}
             </td>
-          </tr>`).join('') || `<tr><td colspan="7" class="empty">${t('暂无发票申请')}</td></tr>`}</tbody>
+          </tr>`).join('') : `<tr><td colspan="7" class="empty">${t('暂无发票申请')}</td></tr>`}</tbody>
       </table></div>
     </div>`;
     box.querySelectorAll('[data-inv]').forEach(b => b.onclick = async () => {

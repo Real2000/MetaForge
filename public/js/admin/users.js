@@ -199,7 +199,7 @@ export async function render(el) {
       title: `🔑 ${t('重置密码')} - ${u.nickname || u.username}`,
       body: `
         <div style="font-size:12px;color:var(--text-3);line-height:1.7;margin-bottom:4px">
-          ${t('重置后该用户')}<b>${t('下次登录将被要求修改密码')}</b>（${t('初始密码只作过渡）'}。${t('请通过安全渠道告知对方。')}）
+          ${t('重置后该用户')}<b>${t('下次登录将被要求修改密码')}</b>${t('（初始密码只作过渡）。请通过安全渠道告知对方。')}
         </div>
         <div class="u-form"><label>${t('新密码（至少 6 位，非常见默认口令）')}</label>
           <input class="input" id="fPwd" type="password" autocomplete="new-password" placeholder="${t('输入新密码')}"></div>`,

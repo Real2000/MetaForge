@@ -78,7 +78,7 @@ export async function render(el) {
           ${a.ratedCount ? `<span><b style="color:${a.ratingUp <= 0 ? '#dc2626' : '#059669'}">${a.ratingUp > 0 ? '+' : ''}${a.ratingUp}</b>${t('口碑')}</span>` : ''}
         </div>
         <a class="btn sm" href="#/admin/studio/${a.id}">${t('编排')}</a>
-      </div>`).join('') || `<div class="empty-box"><div class="big">🤖</div>${t('还没有自己的智能体——从右侧行业模板快速创建一个')}</div>`;
+      </div>`).join('') : `<div class="empty-box"><div class="big">🤖</div>${t('还没有自己的智能体——从右侧行业模板快速创建一个')}</div>`;
 
     const advs = data.advises;
     el.querySelector('#advises').innerHTML = advs.length ? advs.map(a => `

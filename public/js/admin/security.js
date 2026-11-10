@@ -147,7 +147,7 @@ export async function render(el) {
     const body = `
       <div class="form-item"><label>${t('选择分类')}</label><select class="input" id="im_cate">${cates.map(c => `<option value="${c.id}">${esc(c.name)}</option>`).join('')}</select></div>
       <div class="form-item"><label>${t('词汇内容（每行一个）')}<span class="req">*</span></label>
-        <textarea class="input mono" id="im_text" style="min-height:180px" placeholder="词汇1&#10;词汇2&#10;词汇3"></textarea></div>
+        <textarea class="input mono" id="im_text" style="min-height:180px" placeholder="${t('词汇1&#10;词汇2&#10;词汇3')}"></textarea></div>
       <div class="form-row">
         <div class="form-item"><label>${t('输入拦截')}</label><input type="checkbox" id="im_in" checked style="width:16px;height:16px"></div>
         <div class="form-item"><label>${t('输出拦截')}</label><input type="checkbox" id="im_out" checked style="width:16px;height:16px"></div>

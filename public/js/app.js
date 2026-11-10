@@ -83,7 +83,7 @@ const THEME_BTN = { auto: { icon: '🖥️', title: () => t('主题：跟随系�
 function themeBtnHTML() { const p = getThemePref(); return `<button class="btn sm" id="themeBtn" title="${THEME_BTN[p].title()}">${THEME_BTN[p].icon}</button>`; }
 function prefToggleHTML() {
   return `${themeBtnHTML()}
-  <button class="btn sm" id="langBtn" title="切换中英文 / Switch language">${getLang() === 'en' ? 'EN' : '中'}</button>`;
+  <button class="btn sm" id="langBtn" title="${t('切换中英文 / Switch language')}">${getLang() === 'en' ? 'EN' : '中'}</button>`;
 }
 function mountPrefToggles() {
   const tb = document.getElementById('themeBtn');
