@@ -36,7 +36,7 @@ const SYS_VARS = ['SYS_USER_ID', 'USER_UID', 'USER_NAME', 'USER_LANG', 'AGENT_ID
 
 export async function render(el, params) {
   const id = params[0] ? +params[0] : null;
-  if (!id) { el.innerHTML = '<div class="empty-box">缺少智能体 ID</div>'; return; }
+  if (!id) { el.innerHTML = `<div class="empty-box">${t('缺少智能体 ID')}</div>`; return; }
 
   let cfg, models, kbs, mcpServers, childCandidates = [], members = [];
   let pubInfo = { has: false, version: 0, nodes: 0, draftDirty: false }; // P5.9 发布快照状态
@@ -52,7 +52,7 @@ export async function render(el, params) {
     // 协作成员选择数据源（P3）：失败不阻塞页面
     try { members = (await api('/agents/members')).data || []; } catch { }
   } catch (e) {
-    el.innerHTML = `<div class="empty-box"><div class="big">⚠️</div>${esc(e.message || '加载失败')}<button class="btn" style="margin-top:12px" onclick="location.hash='${me.role === 'admin' ? '#/admin/agents' : '#/agents'}'">${t('返回')}</button></div>`;
+    el.innerHTML = `<div class="empty-box"><div class="big">⚠️</div>${esc(e.message || t('加载失败'))}<button class="btn" style="margin-top:12px" onclick="location.hash='${me.role === 'admin' ? '#/admin/agents' : '#/agents'}'">${t('返回')}</button></div>`;
     return;
   }
 
@@ -193,17 +193,17 @@ export async function render(el, params) {
       <span id="stIcon" style="font-size:22px">${esc(S.icon)}</span>
       <div>
         <div class="t-name" id="stName">${esc(S.name)}</div>
-        <div style="font-size:11px;color:var(--text-3,#9ca3af)" id="stMeta">${esc(TYPE_NAME[S.type] || S.type)} · <span id="stStatus">${S.status === 'published' ? '已发布' : S.status === 'review' ? '审核中' : S.status === 'rejected' ? '已驳回' : '草稿'}</span>${S.status === 'rejected' && S.review_comment ? `<span style="color:var(--danger)">（${esc(S.review_comment.slice(0, 40))}${S.review_comment.length > 40 ? '…' : ''}）</span>` : ''}<span id="stPubVer"></span></div>
+        <div style="font-size:11px;color:var(--text-3,#9ca3af)" id="stMeta">${esc(t(TYPE_NAME[S.type]) || S.type)} · <span id="stStatus">${S.status === 'published' ? t('已发布') : S.status === 'review' ? t('审核中') : S.status === 'rejected' ? t('已驳回') : t('草稿')}</span>${S.status === 'rejected' && S.review_comment ? `<span style="color:var(--danger)">（${esc(S.review_comment.slice(0, 40))}${S.review_comment.length > 40 ? '…' : ''}）</span>` : ''}<span id="stPubVer"></span></div>
       </div>
       <div style="flex:1"></div>
       <span style="font-size:12px;color:var(--text-3,#9ca3af)" id="stSaved"></span>
-      <div class="seg" id="stModeSeg" title="编辑模式切换">
+      <div class="seg" id="stModeSeg" title="${t('编辑模式切换')}">
         <button data-m="form" class="on">📝 ${t('表单模式')}</button>
         <button data-m="canvas">🎨 ${t('画布模式')}</button>
       </div>
       <button class="btn" id="stSave">${t('保存')}</button>
       <button class="btn" id="stVersionBtn" title="${t('发布版本历史（快照/说明/一键回滚）')}">🕘 ${t('版本')}</button>
-      <button class="btn primary" id="stPublish">${S.status === 'published' ? '下架' : S.status === 'review' ? '审核中…' : S.status === 'rejected' ? '重新提审' : '发布'}</button>
+      <button class="btn primary" id="stPublish">${S.status === 'published' ? t('下架') : S.status === 'review' ? t('审核中…') : S.status === 'rejected' ? t('重新提审') : t('发布')}</button>
     </div>
     <div class="studio-body" id="stBody">
       <div id="stFormArea" style="display:flex;flex:1;min-height:0">
@@ -231,22 +231,22 @@ export async function render(el, params) {
   // ---------- 左栏：六大配置区块 ----------
   function renderLeft() {
     const sections = [
-      { group: '提示词', items: [
-        { key: 'prompt', icon: '✍️', label: '提示词设定', sub: S.prompt ? '已配置' : '待配置' },
+      { group: t('提示词'), items: [
+        { key: 'prompt', icon: '✍️', label: t('提示词设定'), sub: S.prompt ? t('已配置') : t('待配置') },
       ] },
-      { group: '工具', items: [
-        { key: 'tools', icon: '🛠️', label: '插件与工具', sub: `${S.tools.length + S.mcp_servers.length} 个 · ${S.child_ids.length} 子智能体` },
+      { group: t('工具'), items: [
+        { key: 'tools', icon: '🛠️', label: t('插件与工具'), sub: t('{n} 个 · {m} 子智能体').replace('{n}', S.tools.length + S.mcp_servers.length).replace('{m}', S.child_ids.length) },
       ] },
-      { group: '知识', items: [
-        { key: 'kb', icon: '📚', label: '文本知识库', sub: S.kb_id ? ((kbs.find(k => k.id === S.kb_id)?.name || '已关联') + (S.kb_metadata_filter ? ' · 已设过滤' : '')) : '未关联' },
+      { group: t('知识'), items: [
+        { key: 'kb', icon: '📚', label: t('文本知识库'), sub: S.kb_id ? ((kbs.find(k => k.id === S.kb_id)?.name || t('已关联')) + (S.kb_metadata_filter ? t(' · 已设过滤') : '')) : t('未关联') },
       ] },
-      { group: '记忆', items: [
-        { key: 'memory', icon: '🧠', label: '变量与长期记忆', sub: `${S.variables.length} 变量 · ${S.long_memory ? '记忆开' : '记忆关'}` },
+      { group: t('记忆'), items: [
+        { key: 'memory', icon: '🧠', label: t('变量与长期记忆'), sub: t('{n} 变量 · {s}').replace('{n}', S.variables.length).replace('{s}', S.long_memory ? t('记忆开') : t('记忆关')) },
       ] },
-      { group: '对话体验', items: [
-        { key: 'exp', icon: '💬', label: '体验设置', sub: `${S.suggest_enabled ? '建议开' : '建议关'} · ${S.allow_user_model ? '可选模型' : '锁定模型'}` },
+      { group: t('对话体验'), items: [
+        { key: 'exp', icon: '💬', label: t('体验设置'), sub: `${S.suggest_enabled ? t('建议开') : t('建议关')} · ${S.allow_user_model ? t('可选模型') : t('锁定模型')}` },
       ] },
-      { group: '界面配置', items: [
+      { group: t('界面配置'), items: [
         { key: 'ui', icon: '🎨', label: t('开场白与形象'), sub: S.opening ? t('已配置') : t('待配置') },
       ] },
       { group: t('协作'), items: [
@@ -268,21 +268,21 @@ export async function render(el, params) {
       box.innerHTML = `
         <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">
           <div class="seg">
-            <button data-pt="system" class="${promptTab === 'system' ? 'on' : ''}">系统提示词</button>
-            <button data-pt="user" class="${promptTab === 'user' ? 'on' : ''}">用户提示词</button>
+            <button data-pt="system" class="${promptTab === 'system' ? 'on' : ''}">${t('系统提示词')}</button>
+            <button data-pt="user" class="${promptTab === 'user' ? 'on' : ''}">${t('用户提示词')}</button>
           </div>
           <div style="flex:1"></div>
-          <button class="btn sm" id="stPromptHist" title="查看历史版本并对比 / 回滚">🕘 历史版本</button>
+          <button class="btn sm" id="stPromptHist" title="${t('查看历史版本并对比 / 回滚')}">🕘 ${t('历史版本')}</button>
         </div>
         ${promptTab === 'system' ? `
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-            <span style="font-size:12px;color:var(--text-2,#6b7280)">对大模型进行角色塑造（支持变量占位符 {{USER_NAME}} 等）</span>
-            <button class="btn sm" id="stOptimize">✨ AI 优化</button>
+            <span style="font-size:12px;color:var(--text-2,#6b7280)">${t('对大模型进行角色塑造（支持变量占位符 {{USER_NAME}} 等）')}</span>
+            <button class="btn sm" id="stOptimize">✨ ${t('AI 优化')}</button>
           </div>
-          <textarea class="st-ta" id="edPrompt" rows="16" placeholder="# 角色&#10;你是…">${esc(S.prompt)}</textarea>
+          <textarea class="st-ta" id="edPrompt" rows="16" placeholder="${t('# 角色&#10;你是…')}">${esc(S.prompt)}</textarea>
         ` : `
-          <div style="font-size:12px;color:var(--text-2,#6b7280);margin-bottom:8px">预置指令、问题或请求——对话时自动填入用户输入框，可修改后发送</div>
-          <textarea class="st-ta" id="edUserPrompt" rows="14" placeholder="如：请帮我总结这篇研报的核心观点">${esc(S.user_prompt)}</textarea>
+          <div style="font-size:12px;color:var(--text-2,#6b7280);margin-bottom:8px">${t('预置指令、问题或请求——对话时自动填入用户输入框，可修改后发送')}</div>
+          <textarea class="st-ta" id="edUserPrompt" rows="14" placeholder="${t('如：请帮我总结这篇研报的核心观点')}">${esc(S.user_prompt)}</textarea>
         `}`;
       box.querySelectorAll('[data-pt]').forEach(b => b.onclick = () => { promptTab = b.dataset.pt; renderEdit(); });
       box.querySelector('#stPromptHist').onclick = () => openPromptVersions();
@@ -291,12 +291,12 @@ export async function render(el, params) {
         p.oninput = () => { S.prompt = p.value; scheduleSave(); };
         box.querySelector('#stOptimize').onclick = async () => {
           const btn = box.querySelector('#stOptimize');
-          btn.disabled = true; btn.textContent = '优化中…';
+          btn.disabled = true; btn.textContent = t('优化中…');
           try {
             const j = await api('/agents/optimize-prompt', { method: 'POST', body: { name: S.name, description: S.description, prompt: S.prompt } });
-            S.prompt = j.data.prompt; renderEdit(); toast('已生成结构化提示词'); scheduleSave();
+            S.prompt = j.data.prompt; renderEdit(); toast(t('已生成结构化提示词')); scheduleSave();
           } catch (e) { toast(e.message, 'err'); }
-          btn.disabled = false; btn.textContent = '✨ AI 优化';
+          btn.disabled = false; btn.textContent = `✨ ${t('AI 优化')}`;
         };
       }
       const up = box.querySelector('#edUserPrompt');
@@ -305,43 +305,43 @@ export async function render(el, params) {
 
     if (view === 'tools') {
       box.innerHTML = `
-        <div class="st-field"><label>内置工具（Function Calling，多选）</label>
+        <div class="st-field"><label>${t('内置工具（Function Calling，多选）')}</label>
           ${Object.entries(TOOL_META).map(([k, m]) => `
             <label style="display:flex;gap:8px;align-items:center;padding:8px 10px;border:1px solid var(--border,#e5e7eb);border-radius:8px;margin-bottom:6px;cursor:pointer;background:var(--card,#fff)">
               <input type="checkbox" data-tool="${k}" ${S.tools.includes(k) ? 'checked' : ''}>
-              <span>${m.icon} <b>${m.label}</b></span>
-              <span style="font-size:11px;color:var(--text-3,#9ca3af)">${m.tip}</span>
+              <span>${m.icon} <b>${t(m.label)}</b></span>
+              <span style="font-size:11px;color:var(--text-3,#9ca3af)">${t(m.tip)}</span>
             </label>`).join('')}
         </div>
-        <div class="st-field"><label>MCP 服务挂载（多选，工具名 mcp_ 前缀）</label>
+        <div class="st-field"><label>${t('MCP 服务挂载（多选，工具名 mcp_ 前缀）')}</label>
           ${mcpServers.length ? mcpServers.map(m => `
             <label style="display:flex;gap:8px;align-items:center;padding:8px 10px;border:1px solid var(--border,#e5e7eb);border-radius:8px;margin-bottom:6px;cursor:pointer;background:var(--card,#fff)">
               <input type="checkbox" data-mcp="${m.id}" ${S.mcp_servers.includes(m.id) ? 'checked' : ''}>
               <span>🧩 <b>${esc(m.name)}</b></span>
-              <span style="font-size:11px;color:var(--text-3,#9ca3af)">状态 ${m.status ? '启用' : '停用'}</span>
-            </label>`).join('') : '<div class="hint">暂无已注册的 MCP 服务（可在「MCP 服务」页注册）</div>'}
+              <span style="font-size:11px;color:var(--text-3,#9ca3af)">${t('状态')} ${m.status ? t('启用') : t('停用')}</span>
+            </label>`).join('') : `<div class="hint">${t('暂无已注册的 MCP 服务（可在「MCP 服务」页注册）')}</div>`}
         </div>
-        <div class="st-field"><label>子智能体编排（SinguX 式多智能体：本智能体作编排器，按需路由到子智能体执行）</label>
+        <div class="st-field"><label>${t('子智能体编排（SinguX 式多智能体：本智能体作编排器，按需路由到子智能体执行）')}</label>
           ${childCandidates.length ? childCandidates.map(c => `
             <label style="display:flex;gap:8px;align-items:center;padding:8px 10px;border:1px solid var(--border,#e5e7eb);border-radius:8px;margin-bottom:6px;cursor:pointer;background:var(--card,#fff)">
               <input type="checkbox" data-child="${c.id}" ${S.child_ids.includes(c.id) ? 'checked' : ''}>
               <span>${esc(c.icon || '🤖')} <b>${esc(c.name)}</b></span>
               <span style="font-size:11px;color:var(--text-3,#9ca3af);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc((c.description || '').slice(0, 40))}</span>
-            </label>`).join('') : '<div class="hint">暂无可选的已发布智能体（先发布其他智能体后可挂为子智能体）</div>'}
-          <div class="hint">开启后对话时主模型自动判断并把任务分给子智能体（各带自己的提示词/模型/知识库），适合「1 编排器 + N 专家」架构</div>
-          <div class="st-field" style="margin-top:10px"><label>路由模式（到达子智能体的方式）</label>
+            </label>`).join('') : `<div class="hint">${t('暂无可选的已发布智能体（先发布其他智能体后可挂为子智能体）')}</div>`}
+          <div class="hint">${t('开启后对话时主模型自动判断并把任务分给子智能体（各带自己的提示词/模型/知识库），适合「1 编排器 + N 专家」架构')}</div>
+          <div class="st-field" style="margin-top:10px"><label>${t('路由模式（到达子智能体的方式）')}</label>
             <div style="display:flex;gap:10px">
               <label style="flex:1;display:flex;gap:6px;align-items:flex-start;padding:8px 10px;border:1px solid var(--border,#e5e7eb);border-radius:8px;cursor:pointer;background:var(--card,#fff)">
                 <input type="radio" name="rtMode" value="function" ${S.routing_mode === 'function' ? 'checked' : ''}>
-                <span><b>🤖 主模型编排</b>（默认）<br><span style="font-size:11px;color:var(--text-3,#9ca3af)">function calling：主模型自主决定何时调用哪个子智能体，可多轮协作</span></span>
+                <span><b>🤖 ${t('主模型编排')}</b>${t('（默认）')}<br><span style="font-size:11px;color:var(--text-3,#9ca3af)">${t('function calling：主模型自主决定何时调用哪个子智能体，可多轮协作')}</span></span>
               </label>
               <label style="flex:1;display:flex;gap:6px;align-items:flex-start;padding:8px 10px;border:1px solid var(--border,#e5e7eb);border-radius:8px;cursor:pointer;background:var(--card,#fff)">
                 <input type="radio" name="rtMode" value="classifier" ${S.routing_mode === 'classifier' ? 'checked' : ''}>
-                <span><b>🧭 分类器直达</b><br><span style="font-size:11px;color:var(--text-3,#9ca3af)">先意图分类，高置信直接交给子智能体（更快更省）；低置信自动回退主模型</span></span>
+                <span><b>🧭 ${t('分类器直达')}</b><br><span style="font-size:11px;color:var(--text-3,#9ca3af)">${t('先意图分类，高置信直接交给子智能体（更快更省）；低置信自动回退主模型')}</span></span>
               </label>
               <label style="flex:1;display:flex;gap:6px;align-items:flex-start;padding:8px 10px;border:1px solid var(--border,#e5e7eb);border-radius:8px;cursor:pointer;background:var(--card,#fff)">
                 <input type="radio" name="rtMode" value="workflow" ${S.routing_mode === 'workflow' ? 'checked' : ''}>
-                <span><b>🎨 画布工作流</b><br><span style="font-size:11px;color:var(--text-3,#9ca3af)">按画布编排的节点图执行（切换到「画布模式」搭建流程，含分支/工具/子智能体节点）</span></span>
+                <span><b>🎨 ${t('画布工作流')}</b><br><span style="font-size:11px;color:var(--text-3,#9ca3af)">${t('按画布编排的节点图执行（切换到「画布模式」搭建流程，含分支/工具/子智能体节点）')}</span></span>
               </label>
             </div>
           </div>
@@ -378,23 +378,23 @@ export async function render(el, params) {
     if (view === 'kb') {
       const f = S.kb_metadata_filter || {};
       box.innerHTML = `
-        <div class="st-field"><label>关联文本知识库（RAG 检索增强）</label>
+        <div class="st-field"><label>${t('关联文本知识库（RAG 检索增强）')}</label>
           <select class="st-select" id="edKb">
-            <option value="">不关联</option>
-            ${kbs.map(k => `<option value="${k.id}" ${S.kb_id === k.id ? 'selected' : ''}>📚 ${esc(k.name)}（${k.doc_count || 0} 文档）</option>`).join('')}
+            <option value="">${t('不关联')}</option>
+            ${kbs.map(k => `<option value="${k.id}" ${S.kb_id === k.id ? 'selected' : ''}>📚 ${esc(k.name)}（${k.doc_count || 0} ${t('文档')}）</option>`).join('')}
           </select>
-          <div class="hint">对话时自动检索关联知识库并注入上下文，回答带来源编号</div>
+          <div class="hint">${t('对话时自动检索关联知识库并注入上下文，回答带来源编号')}</div>
         </div>
         ${S.kb_id ? `
-        <div class="st-field"><label>🛡️ 知识库检索过滤（元数据）</label>
-          <div class="hint" style="margin-bottom:8px">配置后该智能体检索知识库时仅命中满足条件的分块；未配置元数据的分块将被过滤（fail-closed）。部门选“跟随用户部门”时按对话用户所属部门动态过滤</div>
+        <div class="st-field"><label>🛡️ ${t('知识库检索过滤（元数据）')}</label>
+          <div class="hint" style="margin-bottom:8px">${t('配置后该智能体检索知识库时仅命中满足条件的分块；未配置元数据的分块将被过滤（fail-closed）。部门选“跟随用户部门”时按对话用户所属部门动态过滤')}</div>
           <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:8px">
-            <div style="flex:1;min-width:180px"><label style="display:block;font-size:12px;font-weight:600;color:var(--text,#374151);margin-bottom:6px">密级（level）</label>
+            <div style="flex:1;min-width:180px"><label style="display:block;font-size:12px;font-weight:600;color:var(--text,#374151);margin-bottom:6px">${t('密级（level）')}</label>
               <select class="st-select" id="kbFLevel">
                 <option value="" ${!f.level ? 'selected' : ''}>${t('不过滤')}</option>
-                ${['公开', '内部', '机密'].map(l => `<option value="${l}" ${f.level === l ? 'selected' : ''}>${l}</option>`).join('')}
+                ${['公开', '内部', '机密'].map(l => `<option value="${l}" ${f.level === l ? 'selected' : ''}>${t(l)}</option>`).join('')}
               </select></div>
-            <div style="flex:1;min-width:180px"><label style="display:block;font-size:12px;font-weight:600;color:var(--text,#374151);margin-bottom:6px">部门（dept）</label>
+            <div style="flex:1;min-width:180px"><label style="display:block;font-size:12px;font-weight:600;color:var(--text,#374151);margin-bottom:6px">${t('部门（dept）')}</label>
               <select class="st-select" id="kbFDept">
                 <option value="" ${!f.dept ? 'selected' : ''}>${t('不过滤')}</option>
                 <option value="$user.dept" ${f.dept === '$user.dept' ? 'selected' : ''}>${t('跟随用户部门')}（$user.dept）</option>
@@ -445,21 +445,21 @@ export async function render(el, params) {
 
     if (view === 'memory') {
       box.innerHTML = `
-        <div class="st-field"><label>长期记忆</label>
+        <div class="st-field"><label>${t('长期记忆')}</label>
           <div style="display:flex;align-items:center;gap:10px;padding:10px;border:1px solid var(--border,#e5e7eb);border-radius:8px;background:var(--card,#fff)">
             <div class="sw ${S.long_memory ? 'on' : ''}" id="swMem"></div>
-            <div style="flex:1"><b style="font-size:13px">跨会话记住用户特征</b>
-              <div class="hint">开启后每轮对话自动提取值得记住的用户特征（职业/偏好/称呼），后续对话自动注入，无需重复告知</div></div>
+            <div style="flex:1"><b style="font-size:13px">${t('跨会话记住用户特征')}</b>
+              <div class="hint">${t('开启后每轮对话自动提取值得记住的用户特征（职业/偏好/称呼），后续对话自动注入，无需重复告知')}</div></div>
           </div>
           <div id="memFacts" style="margin-top:10px"></div>
         </div>
-        <div class="st-field"><label>自定义变量（用户特征）</label>
-          <div class="hint" style="margin-bottom:8px">用于保存用户个人信息，让智能体记住用户的特征，使回复更加个性化。对话中自然获取。</div>
+        <div class="st-field"><label>${t('自定义变量（用户特征）')}</label>
+          <div class="hint" style="margin-bottom:8px">${t('用于保存用户个人信息，让智能体记住用户的特征，使回复更加个性化。对话中自然获取。')}</div>
           <div style="margin-bottom:8px;padding:8px 10px;background:var(--surface-2,#f9fafb);border:1px dashed #d1d5db;border-radius:8px;font-size:11px;color:var(--text-2,#6b7280)">
-            系统变量（提示词中可直接用 {{变量名}} 占位）：${SYS_VARS.map(v => '{{' + v + '}}').join(' ')}
+            ${t('系统变量（提示词中可直接用 {{变量名}} 占位）：')}${SYS_VARS.map(v => '{{' + v + '}}').join(' ')}
           </div>
           <div id="varList"></div>
-          <button class="btn sm" id="addVar">＋ 添加变量</button>
+          <button class="btn sm" id="addVar">＋ ${t('添加变量')}</button>
         </div>`;
       $('#swMem').onclick = async () => {
         S.long_memory = S.long_memory ? 0 : 1; scheduleSave(); renderEdit(); renderLeft();
@@ -470,22 +470,22 @@ export async function render(el, params) {
 
     if (view === 'exp') {
       box.innerHTML = `
-        <div class="st-field"><label>对话体验设置</label>
+        <div class="st-field"><label>${t('对话体验设置')}</label>
           <div style="display:flex;align-items:center;gap:10px;padding:10px;border:1px solid var(--border,#e5e7eb);border-radius:8px;margin-bottom:8px;background:var(--card,#fff)">
             <div class="sw ${S.suggest_enabled ? 'on' : ''}" id="swSug"></div>
-            <div style="flex:1"><b style="font-size:13px">用户问题建议</b>
-              <div class="hint">回复完成后自动推荐 3 条追问，点击即可继续对话</div></div>
+            <div style="flex:1"><b style="font-size:13px">${t('用户问题建议')}</b>
+              <div class="hint">${t('回复完成后自动推荐 3 条追问，点击即可继续对话')}</div></div>
           </div>
           <div style="display:flex;align-items:center;gap:10px;padding:10px;border:1px solid var(--border,#e5e7eb);border-radius:8px;margin-bottom:8px;background:var(--card,#fff)">
             <div class="sw ${S.allow_user_model ? 'on' : ''}" id="swModel"></div>
-            <div style="flex:1"><b style="font-size:13px">允许用户选择自有模型</b>
-              <div class="hint">关闭后对话页隐藏模型下拉，锁定为编排配置的会话模型</div></div>
+            <div style="flex:1"><b style="font-size:13px">${t('允许用户选择自有模型')}</b>
+              <div class="hint">${t('关闭后对话页隐藏模型下拉，锁定为编排配置的会话模型')}</div></div>
           </div>
           <div style="display:flex;align-items:center;gap:10px;padding:10px;border:1px solid var(--border,#e5e7eb);border-radius:8px;background:var(--card,#fff)">
             <span style="font-size:20px">⏰</span>
-            <div style="flex:1"><b style="font-size:13px">定时任务</b>
-              <div class="hint">让智能体定时自动执行任务（Cron）</div></div>
-            <a class="btn sm" href="#/tasks" target="_self">前往任务中心</a>
+            <div style="flex:1"><b style="font-size:13px">${t('定时任务')}</b>
+              <div class="hint">${t('让智能体定时自动执行任务（Cron）')}</div></div>
+            <a class="btn sm" href="#/tasks" target="_self">${t('前往任务中心')}</a>
           </div>
         </div>`;
       $('#swSug').onclick = () => { S.suggest_enabled = S.suggest_enabled ? 0 : 1; scheduleSave(); renderEdit(); renderLeft(); };
@@ -494,28 +494,28 @@ export async function render(el, params) {
 
     if (view === 'ui') {
       box.innerHTML = `
-        <div class="st-field"><label>名称与类型</label>
-          <input class="st-input" id="edName" value="${esc(S.name)}" maxlength="50" style="margin-bottom:8px" placeholder="智能体名称（50 字内）">
-          <textarea class="st-ta" id="edDesc" rows="2" style="margin-bottom:8px" placeholder="智能体功能介绍，将展示给用户">${esc(S.description)}</textarea>
+        <div class="st-field"><label>${t('名称与类型')}</label>
+          <input class="st-input" id="edName" value="${esc(S.name)}" maxlength="50" style="margin-bottom:8px" placeholder="${t('智能体名称（50 字内）')}">
+          <textarea class="st-ta" id="edDesc" rows="2" style="margin-bottom:8px" placeholder="${t('智能体功能介绍，将展示给用户')}">${esc(S.description)}</textarea>
           <select class="st-select" id="edType">
-            ${Object.entries(TYPE_NAME).map(([k, v]) => `<option value="${k}" ${S.type === k ? 'selected' : ''}>${v}</option>`).join('')}
+            ${Object.entries(TYPE_NAME).map(([k, v]) => `<option value="${k}" ${S.type === k ? 'selected' : ''}>${t(v)}</option>`).join('')}
           </select>
         </div>
-        <div class="st-field"><label>图标</label>
+        <div class="st-field"><label>${t('图标')}</label>
           <div class="icon-grid" id="iconGrid">
             ${ICON_POOL.map(ic => `<span class="${S.icon === ic ? 'on' : ''}" data-ic="${ic}">${ic}</span>`).join('')}
           </div>
         </div>
-        <div class="st-field"><label>开场白文案</label>
-          <textarea class="st-ta" id="edOpening" rows="3" placeholder="您好！我是…，可以帮您…">${esc(S.opening)}</textarea>
+        <div class="st-field"><label>${t('开场白文案')}</label>
+          <textarea class="st-ta" id="edOpening" rows="3" placeholder="${t('您好！我是…，可以帮您…')}">${esc(S.opening)}</textarea>
         </div>
-        <div class="st-field"><label>开场白预置问题</label>
+        <div class="st-field"><label>${t('开场白预置问题')}</label>
           <div id="oqList"></div>
-          <button class="btn sm" id="addOq">＋ 添加预置问题</button>
+          <button class="btn sm" id="addOq">＋ ${t('添加预置问题')}</button>
         </div>`;
       $('#edName').oninput = e => { S.name = e.target.value; $('#stName').textContent = S.name; scheduleSave(); };
       $('#edDesc').oninput = e => { S.description = e.target.value; scheduleSave(); };
-      $('#edType').onchange = e => { S.type = e.target.value; $('#stMeta').textContent = `${TYPE_NAME[S.type]} · ${S.status === 'published' ? '已发布' : '草稿'}`; scheduleSave(); };
+      $('#edType').onchange = e => { S.type = e.target.value; $('#stMeta').textContent = `${t(TYPE_NAME[S.type])} · ${S.status === 'published' ? t('已发布') : t('草稿')}`; scheduleSave(); };
       $('#edOpening').oninput = e => { S.opening = e.target.value; scheduleSave(); renderLeft(); };
       $('#iconGrid').querySelectorAll('[data-ic]').forEach(s => s.onclick = () => {
         S.icon = s.dataset.ic; $('#stIcon').textContent = S.icon;
@@ -670,18 +670,18 @@ export async function render(el, params) {
     try {
       const j = await api(`/agents/${id}/memories`);
       box.innerHTML = j.data.length ? `
-        <div style="font-size:12px;font-weight:600;color:var(--text,#374151);margin-bottom:6px">已记住 ${j.data.length} 条用户特征</div>
+        <div style="font-size:12px;font-weight:600;color:var(--text,#374151);margin-bottom:6px">${t('已记住 {n} 条用户特征').replace('{n}', j.data.length)}</div>
         ${j.data.slice(0, 10).map(m => `<div class="mem-row">📌 ${esc(m.fact)}<span style="color:var(--text-3,#9ca3af);font-size:10px">${esc((m.created_at || '').slice(5, 10))}</span></div>`).join('')}
-        ${j.data.length > 10 ? `<div class="hint">仅显示最近 10 条</div>` : ''}
-        <button class="btn sm danger" id="clearMem" style="margin-top:6px">清空记忆</button>` :
-        '<div class="hint">暂无记忆。开启长期记忆并对话后，系统自动提取用户特征。</div>';
+        ${j.data.length > 10 ? `<div class="hint">${t('仅显示最近 10 条')}</div>` : ''}
+        <button class="btn sm danger" id="clearMem" style="margin-top:6px">${t('清空记忆')}</button>` :
+        `<div class="hint">${t('暂无记忆。开启长期记忆并对话后，系统自动提取用户特征。')}</div>`;
       const btn = el.querySelector('#clearMem');
       if (btn) btn.onclick = async () => {
-        if (!await confirmBox('清空该智能体对当前用户的全部记忆？')) return;
+        if (!await confirmBox(t('清空该智能体对当前用户的全部记忆？'))) return;
         await api(`/agents/${id}/memories`, { method: 'DELETE' });
-        toast('已清空'); renderMemFacts();
+        toast(t('已清空')); renderMemFacts();
       };
-    } catch { box.innerHTML = '<div class="hint">记忆加载失败</div>'; }
+    } catch { box.innerHTML = `<div class="hint">${t('记忆加载失败')}</div>`; }
   }
 
   // 变量列表编辑
@@ -690,10 +690,10 @@ export async function render(el, params) {
     if (!box) return;
     box.innerHTML = S.variables.map((v, i) => `
       <div class="mem-row">
-        <input class="st-input" style="width:150px" data-vn="${i}" value="${esc(v.name || '')}" placeholder="变量名（如 user_role）">
-        <input class="st-input" style="flex:1" data-vd="${i}" value="${esc(v.desc || '')}" placeholder="描述（如 用户所属业务条线）">
+        <input class="st-input" style="width:150px" data-vn="${i}" value="${esc(v.name || '')}" placeholder="${t('变量名（如 user_role）')}">
+        <input class="st-input" style="flex:1" data-vd="${i}" value="${esc(v.desc || '')}" placeholder="${t('描述（如 用户所属业务条线）')}">
         <span class="del" data-vdel="${i}">✕</span>
-      </div>`).join('') || '<div class="hint" style="margin-bottom:6px">暂无自定义变量</div>';
+      </div>`).join('') || `<div class="hint" style="margin-bottom:6px">${t('暂无自定义变量')}</div>`;
     box.querySelectorAll('[data-vn]').forEach(inp => inp.oninput = () => { S.variables[+inp.dataset.vn].name = inp.value.trim(); scheduleSave(); });
     box.querySelectorAll('[data-vd]').forEach(inp => inp.oninput = () => { S.variables[+inp.dataset.vd].desc = inp.value; scheduleSave(); });
     box.querySelectorAll('[data-vdel]').forEach(d => d.onclick = () => { S.variables.splice(+d.dataset.vdel, 1); renderVars(); renderLeft(); scheduleSave(); });
@@ -705,9 +705,9 @@ export async function render(el, params) {
     if (!box) return;
     box.innerHTML = S.opening_questions.map((q, i) => `
       <div class="mem-row">
-        <input class="st-input" style="flex:1" data-oq="${i}" value="${esc(q)}" placeholder="预置问题，如：帮我总结平台功能">
+        <input class="st-input" style="flex:1" data-oq="${i}" value="${esc(q)}" placeholder="${t('预置问题，如：帮我总结平台功能')}">
         <span class="del" data-oqdel="${i}">✕</span>
-      </div>`).join('') || '<div class="hint" style="margin-bottom:6px">暂无预置问题</div>';
+      </div>`).join('') || `<div class="hint" style="margin-bottom:6px">${t('暂无预置问题')}</div>`;
     box.querySelectorAll('[data-oq]').forEach(inp => inp.oninput = () => { S.opening_questions[+inp.dataset.oq] = inp.value; scheduleSave(); });
     box.querySelectorAll('[data-oqdel]').forEach(d => d.onclick = () => { S.opening_questions.splice(+d.dataset.oqdel, 1); renderOq(); scheduleSave(); });
   }
@@ -719,38 +719,38 @@ export async function render(el, params) {
   function modelOptionsForm(sel) {
     const chats = (models || []).filter(m => (m.type || 'chat') === 'chat');
     const others = (models || []).filter(m => (m.type || 'chat') !== 'chat');
-    return `<option value="">跟随平台默认供应商</option>` +
-      (chats.length ? `<optgroup label="💬 对话模型（会话可用）">${chats.map(m => `<option value="${esc(m.name)}" ${sel === m.name ? 'selected' : ''}>${esc(m.name)}${m.real ? '' : '（演示）'}</option>`).join('')}</optgroup>` : '') +
-      (others.length ? `<optgroup label="其他类型模型（会话不可用，仅供查看）">${others.map(m => `<option disabled>⛔ ${esc(m.name)} · ${TYPE_TAG[m.type] || m.type}——${TYPE_GUIDE[m.type] || ''}</option>`).join('')}</optgroup>` : '');
+    return `${t('跟随平台默认供应商')}` +
+      (chats.length ? `<optgroup label="💬 ${t('对话模型（会话可用）')}">${chats.map(m => `<option value="${esc(m.name)}" ${sel === m.name ? 'selected' : ''}>${esc(m.name)}${m.real ? '' : t('（演示）')}</option>`).join('')}</optgroup>` : '') +
+      (others.length ? `<optgroup label="${t('其他类型模型（会话不可用，仅供查看）')}">${others.map(m => `<option disabled>⛔ ${esc(m.name)} · ${TYPE_TAG[m.type] ? t(TYPE_TAG[m.type]) : m.type}——${TYPE_GUIDE[m.type] ? t(TYPE_GUIDE[m.type]) : ''}</option>`).join('')}</optgroup>` : '');
   }
   function openModelCfg() {
     const body = `
-      <div class="st-field"><label>会话模型</label>
+      <div class="st-field"><label>${t('会话模型')}</label>
         <select class="st-select" id="mdModel">
           ${modelOptionsForm(S.model)}
         </select>
-        <div class="hint" style="margin-top:4px;font-size:11px;color:var(--text-3)">💡 平台共 ${ (models || []).length } 个模型：对话 ${(models || []).filter(m => (m.type || 'chat') === 'chat').length} 个可选；生图/视频/语音模型各有专用入口（已在下方标注）</div>
+        <div class="hint" style="margin-top:4px;font-size:11px;color:var(--text-3)">💡 ${t('平台共 {n} 个模型：对话 {c} 个可选；生图/视频/语音模型各有专用入口（已在下方标注）').replace('{n}', (models || []).length).replace('{c}', (models || []).filter(m => (m.type || 'chat') === 'chat').length)}</div>
       </div>
-      <div class="st-field"><label>生成多样性</label>
+      <div class="st-field"><label>${t('生成多样性')}</label>
         <div class="seg" id="mdSeg">
-          ${Object.entries(DIVERSITY).map(([k, v]) => `<button data-dm="${k}" class="${S.diversity_mode === k ? 'on' : ''}">${v.label}</button>`).join('')}
+          ${Object.entries(DIVERSITY).map(([k, v]) => `<button data-dm="${k}" class="${S.diversity_mode === k ? 'on' : ''}">${t(v.label)}</button>`).join('')}
         </div>
       </div>
-      <div class="st-field"><label>生成随机性 temperature（0~2，调高更发散，降低更遵循指令）</label>
+      <div class="st-field"><label>${t('生成随机性 temperature（0~2，调高更发散，降低更遵循指令）')}</label>
         <input class="st-input" id="mdTemp" type="number" step="0.1" min="0" max="2" value="${S.temperature}">
       </div>
-      <div class="st-field"><label>Top p（0~1，累计概率采样，建议不与 temperature 同时大幅调整）</label>
+      <div class="st-field"><label>${t('Top p（0~1，累计概率采样，建议不与 temperature 同时大幅调整）')}</label>
         <input class="st-input" id="mdTopP" type="number" step="0.05" min="0" max="1" value="${S.top_p}">
       </div>
-      <div class="st-field"><label>携带上下文轮数（越多越连贯，Token 消耗越大）</label>
+      <div class="st-field"><label>${t('携带上下文轮数（越多越连贯，Token 消耗越大）')}</label>
         <input class="st-input" id="mdRounds" type="number" step="1" min="0" max="100" value="${S.context_rounds}">
       </div>
-      <div class="st-field"><label>最大回复长度（Tokens，100 Tokens ≈ 150 汉字）</label>
+      <div class="st-field"><label>${t('最大回复长度（Tokens，100 Tokens ≈ 150 汉字）')}</label>
         <input class="st-input" id="mdMax" type="number" step="128" min="128" max="32768" value="${S.max_reply}">
       </div>`;
     modal({
-      title: '🧠 模型设置', body,
-      foot: '<button class="btn" data-cancel>取消</button><button class="btn primary" data-save>确定</button>',
+      title: `🧠 ${t('模型设置')}`, body,
+      foot: `<button class="btn" data-cancel>${t('取消')}</button><button class="btn primary" data-save>${t('确定')}</button>`,
       onMount(mask, close) {
         mask.querySelector('[data-cancel]').onclick = close;
         const seg = mask.querySelector('#mdSeg');
@@ -776,7 +776,7 @@ export async function render(el, params) {
           S.top_p = +mask.querySelector('#mdTopP').value || 0.7;
           S.context_rounds = +mask.querySelector('#mdRounds').value || 10;
           S.max_reply = +mask.querySelector('#mdMax').value || 1024;
-          $('#stModelBtn').textContent = S.model || '未选择（用平台默认）';
+          $('#stModelBtn').textContent = S.model || t('未选择（用平台默认）');
           await save(true);
           close();
         };
@@ -826,13 +826,13 @@ export async function render(el, params) {
       return `<div style="margin-bottom:16px">
         <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
           <b style="font-size:13px">${esc(title)}</b>
-          <span class="tag ${changed ? 'orange' : 'gray'}">${changed ? `${changed} 行不同（黄色高亮）` : '完全一致'}</span>
+          <span class="tag ${changed ? 'orange' : 'gray'}">${changed ? t('{n} 行不同（黄色高亮）').replace('{n}', changed) : t('完全一致')}</span>
         </div>
         <div style="border:1px solid var(--border,#e5e7eb);border-radius:8px;overflow:hidden">
           <div style="display:flex;font-size:11px;color:var(--text-3,#9ca3af);border-bottom:1px solid var(--border,#e5e7eb);background:var(--surface-3,#f9fafb)">
-            <div style="flex:1;padding:5px 8px">📼 v${esc(String(v.version))}（历史版本）</div>
+            <div style="flex:1;padding:5px 8px">📼 v${esc(String(v.version))} ${t('（历史版本）')}</div>
             <div style="width:1px;background:var(--border,#e5e7eb)"></div>
-            <div style="flex:1;padding:5px 8px">✏️ 当前编辑中（未保存）</div>
+            <div style="flex:1;padding:5px 8px">✏️ ${t('当前编辑中（未保存）')}</div>
           </div>
           <div style="max-height:240px;overflow:auto;display:flex;flex-direction:column;font:12px/1.9 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">
             ${rows.map(r => `<div style="display:flex;border-bottom:1px solid rgba(0,0,0,.03)">${cell(r.l, r.diff)}<div style="width:1px;background:var(--border,#e5e7eb)"></div>${cell(r.r, r.diff)}</div>`).join('')}
@@ -841,9 +841,9 @@ export async function render(el, params) {
       </div>`;
     };
     modal({
-      title: `🔍 版本对比：v${v.version} ↔ 当前编辑内容`,
+      title: t('🔍 版本对比：v{v} ↔ 当前编辑内容').replace('{v}', v.version),
       wide: true,
-      body: sect('系统提示词', v.prompt, S.prompt) + sect('用户提示词', v.user_prompt, S.user_prompt),
+      body: sect(t('系统提示词'), v.prompt, S.prompt) + sect(t('用户提示词'), v.user_prompt, S.user_prompt),
       foot: `<button class="btn" data-close>${t('关闭')}</button>`,
       onMount(mask, close) { mask.querySelector('[data-close]').onclick = close; },
     });
@@ -855,23 +855,23 @@ export async function render(el, params) {
     try {
       const j = await api(`/agents/${id}/prompt-versions`);
       list = (j.data || []).slice().sort((a, b) => (b.version || 0) - (a.version || 0)); // 最新在前
-    } catch (e) { toast(e.message || '加载历史版本失败', 'err'); return; }
+    } catch (e) { toast(e.message || t('加载历史版本失败'), 'err'); return; }
     modal({
-      title: `🕘 提示词历史版本${list.length ? `（共 ${list.length} 个）` : ''}`,
+      title: `${t('🕘 提示词历史版本')}${list.length ? t('（共 {n} 个）').replace('{n}', list.length) : ''}`,
       wide: true,
       body: `<div id="pvList">${list.length ? `
         <div class="table-wrap"><table class="tbl">
-          <thead><tr><th style="width:64px">版本</th><th style="width:140px">时间</th><th style="width:110px">操作者</th><th>说明</th><th style="width:172px">操作</th></tr></thead>
+          <thead><tr><th style="width:64px">${t('版本')}</th><th style="width:140px">${t('时间')}</th><th style="width:110px">${t('操作者')}</th><th>${t('说明')}</th><th style="width:172px">${t('操作')}</th></tr></thead>
           <tbody>${list.map(v => `
             <tr>
               <td><b>v${esc(String(v.version))}</b></td>
               <td style="font-size:12px;color:var(--text-3)">${esc((v.created_at || '').slice(0, 16))}</td>
               <td style="font-size:12px">${esc(v.edited_by || '—')}</td>
               <td style="font-size:12px">${esc(v.note || '')}</td>
-              <td><button class="btn sm" data-diff="${esc(String(v.id))}">查看对比</button> <button class="btn sm" data-rb="${esc(String(v.id))}" data-vn="${esc(String(v.version))}">回滚</button></td>
+              <td><button class="btn sm" data-diff="${esc(String(v.id))}">${t('查看对比')}</button> <button class="btn sm" data-rb="${esc(String(v.id))}" data-vn="${esc(String(v.version))}">${t('回滚')}</button></td>
             </tr>`).join('')}</tbody>
         </table></div>` : `
-        <div style="padding:32px;text-align:center;color:var(--text-3,#9ca3af);font-size:13px">暂无历史版本（修改提示词后自动记录）</div>`}
+        <div style="padding:32px;text-align:center;color:var(--text-3,#9ca3af);font-size:13px">${t('暂无历史版本（修改提示词后自动记录）')}</div>`}
       </div>`,
       foot: `<button class="btn" data-close>${t('关闭')}</button>`,
       onMount(mask, close) {
@@ -880,13 +880,13 @@ export async function render(el, params) {
           showPromptDiff(list.find(x => String(x.id) === b.dataset.diff)));
         mask.querySelectorAll('[data-rb]').forEach(b => b.onclick = async () => {
           const vn = b.dataset.vn;
-          if (!await confirmBox(`将把提示词恢复到 v${vn} 保存时的内容，当前未保存的修改将丢失，继续？`, '回滚确认')) return;
+          if (!await confirmBox(t('将把提示词恢复到 v{v} 保存时的内容，当前未保存的修改将丢失，继续？').replace('{v}', vn), t('回滚确认'))) return;
           try {
             const r = await api(`/agents/${id}/prompt-versions/${b.dataset.rb}/rollback`, { method: 'POST' });
-            toast(r.msg || `已回滚到 v${vn}`);
+            toast(r.msg || t('已回滚到 v{v}').replace('{v}', vn));
             close();
             await reloadConfig(); // 重新加载 agent 配置（含乐观锁基准），覆盖本地编辑态
-          } catch (e) { toast(e.message || '回滚失败', 'err'); }
+          } catch (e) { toast(e.message || t('回滚失败'), 'err'); }
         });
       },
     });
@@ -972,7 +972,7 @@ export async function render(el, params) {
           ${errors.map(p => `<div class="st-vrow st-verr" data-node="${esc(p.nodeId)}"><b style="color:#dc2626">●</b><span class="code">${esc(p.nodeId)}</span><span style="flex:1">${esc(p.msg)}</span></div>`).join('')}
           ${warns.map(p => `<div class="st-vrow st-vwarn" data-node="${esc(p.nodeId)}"><b style="color:#9ca3af">●</b><span class="code">${esc(p.nodeId)}</span><span style="flex:1">${esc(p.msg)}</span></div>`).join('')}
           </div>`,
-        foot: `${errors.length ? `<button class="btn" data-fix>${t('去修复')}</button><button class="btn warn" data-anyway>${t('仍然保存')}</button>` : `<button class="btn primary" data-fix>知道了</button>`}`,
+        foot: `${errors.length ? `<button class="btn" data-fix>${t('去修复')}</button><button class="btn warn" data-anyway>${t('仍然保存')}</button>` : `<button class="btn primary" data-fix>${t('知道了')}</button>`}`,
         onMount(mask, close) {
           const style = document.createElement('style');
           style.textContent = '.st-vrow{display:flex;gap:8px;align-items:center;padding:6px 10px;border-radius:6px;margin-bottom:4px;font-size:12px;cursor:pointer}.st-vrow:hover{background:var(--surface-3,#eff6ff)}.st-verr{background:rgba(220,38,38,.05)}.st-vwarn{background:rgba(156,163,175,.08)}';
@@ -995,7 +995,7 @@ export async function render(el, params) {
 
   function scheduleSave() {
     dirty = true;
-    $('#stSaved').textContent = '修改中…';
+    $('#stSaved').textContent = t('修改中…');
     clearTimeout(saveTimer);
     saveTimer = setTimeout(() => save(true), 2000);
   }
@@ -1025,7 +1025,7 @@ export async function render(el, params) {
   // 内置工具 → 工具节点链（llm 后，按表单勾选顺序串联，链尾输出进 end）；
   // 提示词/模型/温度/max_reply → llm 节点。MCP 工具无画布节点类型，保留在表单字段（toast 提示）。
   function buildWorkflowFromForm() {
-    const nodes = [{ id: 'start', type: 'start', position: { x: 60, y: 160 }, data: { title: '开始（输入）', variables: [] } }];
+    const nodes = [{ id: 'start', type: 'start', position: { x: 60, y: 160 }, data: { title: t('开始（输入）'), variables: [] } }];
     const edges = [];
     let prev = 'start', seq = 0;
     const nid = () => 'node_' + (++seq);
@@ -1034,13 +1034,13 @@ export async function render(el, params) {
     let kbNodeId = null;
     if (S.kb_id) {
       kbNodeId = nid();
-      nodes.push({ id: kbNodeId, type: 'tool', position: { x: 340, y: 40 }, data: { title: '知识库检索', toolId: 'kb_search', args: '{"query":"{{#start.input#}}","top_k":4}' } });
+      nodes.push({ id: kbNodeId, type: 'tool', position: { x: 340, y: 40 }, data: { title: t('知识库检索'), toolId: 'kb_search', args: '{"query":"{{#start.input#}}","top_k":4}' } });
       link();
     }
     // 大模型节点（知识库结果作为上下文注入 prompt）
     const llmId = nid();
     nodes.push({ id: llmId, type: 'llm', position: { x: 340, y: 200 }, data: {
-      title: '大模型', model: S.model || '', system_prompt: S.prompt || '',
+      title: t('大模型'), model: S.model || '', system_prompt: S.prompt || '',
       prompt: kbNodeId ? '{{#start.input#}}\n\n【知识库检索结果（优先依据）】\n{{#' + kbNodeId + '.result#}}' : '{{#start.input#}}',
       max_tokens: S.max_reply || 1024, temperature: S.temperature ?? 0.7,
     } });
@@ -1058,7 +1058,7 @@ export async function render(el, params) {
       lastOut = `${id}.result`;
     }
     // end 引用链尾
-    nodes.push({ id: 'node_' + (++seq), type: 'end', position: { x: 340, y: 200 + seq * 150 + 60 }, data: { title: '输出（结束）', outputs: [{ variable: 'result', value: `{{#${lastOut}#}}` }] } });
+    nodes.push({ id: 'node_' + (++seq), type: 'end', position: { x: 340, y: 200 + seq * 150 + 60 }, data: { title: t('输出（结束）'), outputs: [{ variable: 'result', value: `{{#${lastOut}#}}` }] } });
     link();
     return { nodes, edges, viewport: { x: 40, y: 40, zoom: 1 }, flow_type: 'workflow', groups: [] };
   }
@@ -1110,9 +1110,12 @@ export async function render(el, params) {
       if (!S.workflow?.nodes?.length && (S.prompt || '').trim()) {
         S.workflow = buildWorkflowFromForm();
         const extra = [];
-        if (S.kb_id) extra.push('📚知识库检索节点');
-        if ((S.tools || []).filter(x => TOOL_META[x]).length) extra.push(`🛠️${(S.tools || []).filter(x => TOOL_META[x]).length}个工具节点`);
-        toast('已按表单配置生成画布：开始' + (S.kb_id ? '→知识库检索' : '') + '→大模型' + ((S.tools || []).filter(x => TOOL_META[x]).length ? '→工具链' : '') + '→输出（提示词已带入）' + (extra.length ? '，含 ' + extra.join('、') : ''));
+        if (S.kb_id) extra.push(t('📚知识库检索节点'));
+        if ((S.tools || []).filter(x => TOOL_META[x]).length) extra.push(t('🛠️{n}个工具节点').replace('{n}', (S.tools || []).filter(x => TOOL_META[x]).length));
+        toast(t('已按表单配置生成画布：开始{kb}→大模型{tools}→输出（提示词已带入）{extra}')
+          .replace('{kb}', S.kb_id ? t('→知识库检索') : '')
+          .replace('{tools}', (S.tools || []).filter(x => TOOL_META[x]).length ? t('→工具链') : '')
+          .replace('{extra}', extra.length ? t('，含 {list}').replace('{list}', extra.join(t('、'))) : ''));
       }
       initCanvas();
       if (S.workflow?.nodes?.length) cvAPI.setWorkflow(S.workflow);
@@ -1125,7 +1128,7 @@ export async function render(el, params) {
       // P5.4 画布→表单：简单单链图回填表单提示词/模型（复杂图不覆盖表单）
       if (cvAPI) {
         const changed = syncFormFromCanvas();
-        if (changed) { toast('简单链画布配置已同步回表单（提示词/模型/工具清单）'); renderEdit(); }
+        if (changed) { toast(t('简单链画布配置已同步回表单（提示词/模型/工具清单）')); renderEdit(); }
         else if (!isSimpleChain(cvAPI.getWorkflow())) toast(t('复杂画布结构：表单提示词保持不变（对话按画布图执行）'));
       }
     }
@@ -1143,8 +1146,8 @@ export async function render(el, params) {
     if (!el) return;
     const isCanvas = S.edit_mode === 'canvas' || S.routing_mode === 'workflow';
     if (!isCanvas || !pubInfo.has) { el.innerHTML = ''; return; }
-    el.innerHTML = ` · <span style="color:#059669">快照 v${pubInfo.version}（${pubInfo.nodes} 节点）</span>` +
-      (pubInfo.draftDirty ? `<span style="color:#d97706"> · ⚠️ 草稿有未发布改动（线上不受影响）</span>` : '');
+    el.innerHTML = ` · <span style="color:#059669">${t('快照 v{v}（{n} 节点）').replace('{v}', pubInfo.version).replace('{n}', pubInfo.nodes)}</span>` +
+      (pubInfo.draftDirty ? `<span style="color:#d97706"> · ⚠️ ${t('草稿有未发布改动（线上不受影响）')}</span>` : '');
   }
   renderPubVerBadge();
   // 版本历史弹窗：列表（版本/说明/发布人/节点数）+ 一键回滚（快照写回草稿+线上，确认后生效）
@@ -1165,17 +1168,17 @@ export async function render(el, params) {
               rows.map(r => `
               <div style="display:flex;gap:10px;align-items:center;padding:9px 12px;border:1px solid var(--border,#eef0f3);border-radius:8px;margin-bottom:6px">
                 <b style="min-width:46px;color:#2563eb">v${r.version}</b>
-                <span style="color:var(--text-2);font-size:12px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(r.note || '')}">${esc(r.note || '（无发布说明）')}</span>
+                <span style="color:var(--text-2);font-size:12px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(r.note || '')}">${esc(r.note || t('（无发布说明）'))}</span>
                 <span style="font-size:11px;color:var(--text-3)">${r.nodes} ${t('节点')}</span>
                 <span style="font-size:11px;color:var(--text-3)">${esc(r.published_by || '')} · ${esc((r.created_at || '').slice(5, 16))}</span>
                 ${r.version === pubInfo.version ? `<span class="tag green">${t('当前线上')}</span>` : `<button class="btn sm" data-rb="${r.version}">⏪ ${t('回滚到此')}</button>`}
               </div>`).join('');
             host.querySelectorAll('[data-rb]').forEach(b => b.onclick = async () => {
               const v = b.dataset.rb;
-              if (!await confirmBox(`回滚到 v${v}：该版本快照将写回草稿并同步线上（即刻生效，当前草稿改动会被覆盖）。确定回滚？`, '回滚确认')) return;
+              if (!await confirmBox(t('回滚到 v{v}：该版本快照将写回草稿并同步线上（即刻生效，当前草稿改动会被覆盖）。确定回滚？').replace('{v}', v), t('回滚确认'))) return;
               try {
                 const rj = await api(`/agents/${id}/publish-history/${v}/rollback`, { method: 'POST', body: {} });
-                toast(rj.msg || '已回滚');
+                toast(rj.msg || t('已回滚'));
                 close();
                 location.reload(); // 草稿已变——整页重载加载新图
               } catch (e) { toast(e.message, 'err'); }
@@ -1189,12 +1192,12 @@ export async function render(el, params) {
   function openPublishDlg() {
     const isPub = S.status === 'published';
     if (isPub) { // 已发布 → 直接下架（保持轻量）
-      confirmBox('下架后该智能体将从广场与前台隐藏（历史会话保留）。确定下架？', '下架确认').then(async ok => {
+      confirmBox(t('下架后该智能体将从广场与前台隐藏（历史会话保留）。确定下架？'), t('下架确认')).then(async ok => {
         if (!ok) return;
         const j = await api(`/agents/${id}/publish`, { method: 'POST', body: {} });
         S.status = 'draft';
-        $('#stStatus').textContent = '已下架（草稿）';
-        $('#stPublish').textContent = '发布';
+        $('#stStatus').textContent = t('已下架（草稿）');
+        $('#stPublish').textContent = t('发布');
         toast(j.msg);
       });
       return;
@@ -1202,52 +1205,52 @@ export async function render(el, params) {
     const cats = ['未分类', '办公', '工作', '通用', '市场', '研发', '数据', '生活', '金融', '教育'];
     const isCanvas = S.edit_mode === 'canvas' || S.routing_mode === 'workflow';
     modal({
-      title: '🚀 发布智能体',
+      title: `🚀 ${t('发布智能体')}`,
       body: `
         ${isCanvas ? `<div style="padding:8px 12px;border:1px dashed #93c5fd;border-radius:8px;background:rgba(37,99,235,.04);margin-bottom:10px;font-size:12px;color:var(--text-2)">💾 ${t('发布将存画布快照')} <b>v${pubInfo.version + 1}</b>${pubInfo.draftDirty ? `（${t('当前草稿有未发布改动，本次一并生效')}）` : ''}——${t('运行时走快照，后续编辑草稿不影响线上，改坏可从「🕘 版本」一键回滚')}</div>` : ''}
-        <div class="st-field"><label>发布记录（本次更新说明，≤200 字）</label>
-          <textarea class="st-ta" id="pbRecord" rows="3" placeholder="如：新增知识库检索增强，优化回复结构">${esc(S.publish_record || '')}</textarea>
+        <div class="st-field"><label>${t('发布记录（本次更新说明，≤200 字）')}</label>
+          <textarea class="st-ta" id="pbRecord" rows="3" placeholder="${t('如：新增知识库检索增强，优化回复结构')}">${esc(S.publish_record || '')}</textarea>
         </div>
-        <div class="st-field"><label>分类选择（广场分类筛选项）</label>
-          <input class="st-input" id="pbCat" list="pbCatList" value="${esc(S.category || '未分类')}" maxlength="20">
+        <div class="st-field"><label>${t('分类选择（广场分类筛选项）')}</label>
+          <input class="st-input" id="pbCat" list="pbCatList" value="${esc(S.category || t('未分类'))}" maxlength="20">
           <datalist id="pbCatList">${cats.map(c => `<option value="${c}">`).join('')}</datalist>
         </div>
-        <div class="st-field"><label>发布范围</label>
+        <div class="st-field"><label>${t('发布范围')}</label>
           <label style="display:flex;gap:8px;align-items:center;padding:9px 11px;border:1px solid var(--border,#e5e7eb);border-radius:8px;margin-bottom:6px;background:#fff;cursor:pointer">
             <input type="checkbox" id="pbSquare" checked>
-            <span><b style="font-size:13px">发布到广场</b><span style="font-size:11px;color:var(--text-3,#9ca3af);margin-left:6px">全员广播通知 + 广场卡片展示</span></span>
+            <span><b style="font-size:13px">${t('发布到广场')}</b><span style="font-size:11px;color:var(--text-3,#9ca3af);margin-left:6px">${t('全员广播通知 + 广场卡片展示')}</span></span>
           </label>
           <label style="display:flex;gap:8px;align-items:center;padding:9px 11px;border:1px solid var(--border,#e5e7eb);border-radius:8px;margin-bottom:6px;background:#fff;cursor:pointer">
             <input type="checkbox" id="pbCopy" ${S.allow_copy ? 'checked' : ''}>
-            <span><b style="font-size:13px">允许复制（模板）</b><span style="font-size:11px;color:var(--text-3,#9ca3af);margin-left:6px">他人可在广场一键复制为草稿</span></span>
+            <span><b style="font-size:13px">${t('允许复制（模板）')}</b><span style="font-size:11px;color:var(--text-3,#9ca3af);margin-left:6px">${t('他人可在广场一键复制为草稿')}</span></span>
           </label>
           <label style="display:flex;gap:8px;align-items:center;padding:9px 11px;border:1px solid var(--border,#e5e7eb);border-radius:8px;background:#fff;cursor:pointer">
             <input type="checkbox" id="pbOfficial" ${S.is_official ? 'checked' : ''}>
-            <span><b style="font-size:13px">官方智能体</b><span style="font-size:11px;color:var(--text-3,#9ca3af);margin-left:6px">广场优先展示 + 官方徽标</span></span>
+            <span><b style="font-size:13px">${t('官方智能体')}</b><span style="font-size:11px;color:var(--text-3,#9ca3af);margin-left:6px">${t('广场优先展示 + 官方徽标')}</span></span>
           </label>
         </div>`,
-      foot: '<button class="btn" data-cancel>取消</button><button class="btn primary" data-save>发 布</button>',
+      foot: `<button class="btn" data-cancel>${t('取消')}</button><button class="btn primary" data-save>${t('发 布')}</button>`,
       onMount(mask, close) {
         mask.querySelector('[data-cancel]').onclick = close;
         mask.querySelector('[data-save]').onclick = async () => {
           if (dirty) await save(true);
           if (!S.prompt.trim()) {
-            if (!await confirmBox('提示词为空，发布后智能体将使用默认系统提示词。仍要发布？')) return;
+            if (!await confirmBox(t('提示词为空，发布后智能体将使用默认系统提示词。仍要发布？'))) return;
           }
           try {
             const j = await api(`/agents/${id}/publish`, { method: 'POST', body: {
               record: mask.querySelector('#pbRecord').value.trim(),
-              category: mask.querySelector('#pbCat').value.trim() || '未分类',
+              category: mask.querySelector('#pbCat').value.trim() || t('未分类'),
               to_square: mask.querySelector('#pbSquare').checked,
               allow_copy: mask.querySelector('#pbCopy').checked,
               is_official: mask.querySelector('#pbOfficial').checked,
             } });
             S.status = j.code === 0 && /提交审核/.test(j.msg || '') ? 'review' : 'published'; // V3.1 #12：企业版非 admin 提审返回「已提交审核」
-            S.category = mask.querySelector('#pbCat').value.trim() || '未分类';
-            $('#stStatus').textContent = S.status === 'review' ? '审核中（等待管理员审批）' : '已发布';
-            $('#stPublish').textContent = S.status === 'review' ? '审核中…' : '下架';
+            S.category = mask.querySelector('#pbCat').value.trim() || t('未分类');
+            $('#stStatus').textContent = S.status === 'review' ? t('审核中（等待管理员审批）') : t('已发布');
+            $('#stPublish').textContent = S.status === 'review' ? t('审核中…') : t('下架');
             if (j.data?.version) { pubInfo.has = true; pubInfo.version = j.data.version; pubInfo.draftDirty = false; renderPubVerBadge(); }
-            toast(j.msg || '已发布');
+            toast(j.msg || t('已发布'));
             close();
           } catch (e) { toast(e.message, 'err'); }
         };
