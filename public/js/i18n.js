@@ -2571,6 +2571,59 @@ const EN = {
   '如需修改 API 服务地址 / Token / 启停，请前往「接入管理」。': 'To change the API endpoint / token / enablement, go to "API Access".',
   '配置搭建入口 - {n}': 'Configure Builder - {n}',
   '请填写搭建页地址': 'Enter the builder URL',
+  // ---------- C1 第十六批：后端数据键（空间筛选/套餐/工具市场/行业与桌面模板） ----------
+  '全部空间': 'All spaces',
+  '天气查询 · 和风天气': 'Weather · QWeather',
+  '和风天气（qweather.com）': 'QWeather (qweather.com)',
+  '控制台创建凭据后复制 Key（32 位）。未配置时使用 wttr.in 免费公共源。': 'Create a credential in the console and copy the Key (32 chars). Falls back to the free wttr.in source when unset.',
+  '文本翻译 · DeepL': 'Text translation · DeepL',
+  'DeepL（Free 计划即可）': 'DeepL (Free plan suffices)',
+  'DeepL 账户 → API Key（DeepL-Auth-Key）。未配置时使用 MyMemory 免费公共源。': 'DeepL account → API Key (DeepL-Auth-Key). Falls back to the free MyMemory source when unset.',
+  '信贷审查助手': 'Credit Review Assistant',
+  '银行': 'Banking',
+  '辅助信贷审查：解析借款人资料，按风控规则初筛风险点，输出审查要点清单': 'Credit review support: parses borrower profiles, screens risks against rules, outputs a review checklist',
+  '合规问答助手': 'Compliance Q&A Assistant',
+  '证券/保险': 'Securities/Insurance',
+  '监管制度/内部合规制度问答，回答必须带来源引用，无依据时如实说明': 'Regulatory & internal compliance Q&A; answers must cite sources and admit unknowns honestly',
+  '招标文件解析助手': 'Tender Document Analyzer',
+  '通用/ToB': 'General/ToB',
+  '解析招标/采购文件：提取关键条款（资质要求/评分标准/时间节点），输出摘要与风险提示': 'Parses tender/procurement documents: extracts key clauses (qualification/scoring/timeline), outputs summary and risk alerts',
+  '反洗钱审查助手': 'AML Review Assistant',
+  '银行/支付': 'Banking/Payments',
+  '客户身份识别（CDD）与可疑交易初筛：对照监管要求输出尽调要点与可疑特征': 'CDD and suspicious-transaction screening: outputs due-diligence points and red flags per regulatory requirements',
+  '投研摘要助手': 'Research Summary Assistant',
+  '证券/基金': 'Securities/Funds',
+  '研报/公告长文摘要：提取核心观点、财务数据变化、风险因素，输出结构化摘要': 'Research/announcement summaries: core views, financial changes, risk factors — structured output',
+  '客服质检助手': 'Customer-service QC Assistant',
+  '金融/通用': 'Finance/General',
+  '客服对话质检：按服务规范检查应答合规性，输出违规点与改进建议': 'Chat QC: checks replies against service standards, outputs violations and improvements',
+  '定时截图巡检': 'Scheduled Screenshot Patrol',
+  '自动化': 'Automation',
+  '每天定时扫描下载文件夹，按文件类型（图片/文档/压缩包/安装包）归类到对应子目录；超过7天的临时文件移至废纸篓。让桌面保持整洁。': 'Scans the Downloads folder on a schedule, sorts files by type (images/docs/archives/installers) into subfolders; moves temp files older than 7 days to Trash. Keeps the desktop tidy.',
+  '按设定时间间隔截图用户桌面，分析窗口分布与活跃应用。可用于：工作回顾、时间追踪、下班后检查是否有未保存的工作。截图仅用于当前对话，不存储。': 'Screenshots the desktop at set intervals and analyzes window layout and active apps. Use cases: work recap, time tracking, after-hours check for unsaved work. Screenshots stay in the current chat; nothing is stored.',
+  '剪贴板即译': 'Clipboard Instant Translate',
+  '效率工具': 'Productivity',
+  '监控剪贴板内容变化，将外文内容自动翻译为中文（或中文翻译为外文）并替换回剪贴板。支持中/英/日/韩四种语言识别。快捷操作：复制外文文本后，随即在本对话中即可收到翻译结果。': 'Watches clipboard changes and auto-translates foreign text to Chinese (or Chinese to foreign), replacing it in place. Detects Chinese/English/Japanese/Korean. Quick flow: copy foreign text and get the translation right in this chat.',
+  '窗口巡场提醒': 'Window Patrol Reminder',
+  '办公辅助': 'Office assist',
+  '按周期查看用户当前打开的窗口。当检测到游戏、视频等非办公窗口持续超过指定时长时，提示用户收心。也支持：帮忙找某个应用窗口，或者列出所有已打开窗口让用户选择焦点。': 'Periodically checks open windows; warns when game/video windows stay on top too long. Also finds a specific app window or lists all open windows to focus.',
+  '开会倒计时通知': 'Meeting Countdown Notice',
+  '时间管理': 'Time management',
+  '设定倒计时后定时提醒。常用场景：午休结束、会议前准备、项目截止。倒计时到期后自动触发系统通知。也支持「还有N分钟提醒我发消息」「几分钟后提醒我去开会」。': 'Sets a countdown and reminds on schedule: lunch end, pre-meeting prep, deadlines. Fires a system notification on expiry. Also handles "remind me to send a message in N minutes" and "remind me about the meeting in a few minutes".',
+  '一键锁屏清剪贴板': 'One-click Lock & Clear Clipboard',
+  '安全': 'Security',
+  '一键快速锁屏 + 清空剪贴板中的文字内容，防止离开时信息泄露。剪切板清空后，读取剪贴板确认。适合临时离开工位时快速操作。': 'Locks the screen and clears clipboard text to prevent leaks when stepping away; reads the clipboard back to confirm. Great for quick desk-away moments.',
+
+  // ---------- C1 第十七批：收官（运行时长单位/后端数据 remark/线索空态） ----------
+  ' 天 ': 'd ',
+  ' 小时 ': 'h ',
+  ' 分': 'm',
+  '平台自营额度账户，可兑换或充值': 'Platform-provided quota account (redeemable or top-up)',
+  '已配置 6 个模型；未填 API Key 时对话自动降级为模拟回复': '6 models configured; chats auto-fall back to simulated replies when no API Key is set',
+  'AES-256-GCM 加密密钥（首次启动自动生成）': 'AES-256-GCM encryption key (auto-generated on first start)',
+  '暂无线索——价格页「企业定制」表单提交后进入这里': 'No leads yet — appears after submitting the "Enterprise Custom" form on the Pricing page',
+  'Streamable HTTP（JSON-RPC 2.0）': 'Streamable HTTP (JSON-RPC 2.0)',
+  'Authorization: Bearer <令牌>': 'Authorization: Bearer <token>',
 };
 
 /** 翻译：中文即 key；英文查词典，缺失回退中文 */
@@ -2578,3 +2631,12 @@ export function t(zh) {
   if (getLang() !== 'en') return zh;
   return EN[zh] || zh;
 }
+
+// 静态 HTML 文案（模块延迟执行时 DOM 已就绪）：英文模式下替换 index.html 固定中文
+try {
+  if (getLang() === 'en') {
+    const skip = document.querySelector('.skip-link');
+    if (skip) skip.textContent = 'Skip to main content';
+    document.title = 'Agent Platform';
+  }
+} catch { }

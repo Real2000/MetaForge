@@ -63,7 +63,7 @@ export async function render(el) {
       ${p.highlight ? `<span class="pr-hot">🔥 ${t('最受欢迎')}</span>` : ''}
       <div class="pr-name">${esc(t(p.name))}</div>
       <div class="pr-tag">${esc(t(p.tagline))}</div>
-      <div class="pr-price"><b>${esc(p.priceLabel)}</b><span>/ ${esc(t(p.period))}</span></div>
+      <div class="pr-price"><b>${esc(t(p.priceLabel))}</b><span>/ ${esc(t(p.period))}</span></div>
       <ul class="pr-ul">
         ${p.features.map(f => `<li>${esc(t(f))}</li>`).join('')}
         ${p.notIncluded.map(f => `<li class="no">${esc(t(f))}</li>`).join('')}
@@ -72,7 +72,7 @@ export async function render(el) {
         ? `<button class="btn pr-cta" data-contact>${t('联系销售定制方案')}</button>`
         : p.key === 'free'
           ? `<a class="btn pr-cta" href="#${logged ? '/home' : '/login'}">${logged ? t('开始使用') : t('免费开始')}</a>`
-          : `<button class="btn primary pr-cta" data-upgrade="${p.key}">${t('升级')}${esc(p.name)}</button>`}
+          : `<button class="btn primary pr-cta" data-upgrade="${p.key}">${t('升级')}${esc(t(p.name))}</button>`}
     </div>`).join('')}
   </div>
 

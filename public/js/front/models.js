@@ -209,7 +209,7 @@ export async function render(el) {
       </div>`).join('') + unregistered.map(m => `
       <div class="um-card" style="border-style:dashed;background:#fafbfc">
         <div class="um-name" style="color:var(--text-3)">➕ ${esc(t(m.label))}</div>
-        <div class="um-meta">${esc(m.provider)}<br>${esc(t(m.hint))}</div>
+        <div class="um-meta">${esc(t(m.provider))}<br>${esc(t(m.hint))}</div>
         <div class="um-foot">
           <button class="btn sm primary" data-tk-new="${m.tool_name}">${t('配置 Key')}</button>
           <a class="btn sm" href="${m.key_url}" target="_blank" rel="noopener">${t('获取 Key →')}</a>

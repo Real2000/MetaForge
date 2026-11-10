@@ -192,5 +192,5 @@ export function fmtBytes(n) {
 export function fmtNum(n) { return (n || 0).toLocaleString('zh-CN'); }
 export function fmtUptime(s) {
   const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
-  return (d ? d + ' 天 ' : '') + h + ' 小时 ' + m + ' 分';
+  return (d ? d + t(' 天 ') : '') + h + t(' 小时 ') + m + t(' 分');
 }

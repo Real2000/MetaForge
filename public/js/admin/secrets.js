@@ -47,7 +47,7 @@ export async function render(el) {
       host.innerHTML = j.data.map(r => `
         <div class="sec-row">
           <b>{{env.${esc(r.name)}}}</b>
-          <span class="meta">${esc(r.remark || '')} · ${r.len} ${t('字符')} · ${esc((r.updated_at || r.created_at || '').slice(0, 16))}</span>
+          <span class="meta">${esc(t(r.remark || ''))} · ${r.len} ${t('字符')} · ${esc((r.updated_at || r.created_at || '').slice(0, 16))}</span>
           <button class="btn sm" data-edit="${esc(r.name)}" data-remark="${esc(r.remark || '')}">${t('更新')}</button>
           <button class="btn sm danger" data-del="${esc(r.name)}">${t('删除')}</button>
         </div>`).join('');

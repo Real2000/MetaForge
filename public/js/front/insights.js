@@ -87,9 +87,9 @@ export async function render(el) {
 
     el.querySelector('#tpls').innerHTML = data.templates.map(tpl => `
       <div class="tpl" data-tpl="${tpl.id}">
-        <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px"><span style="font-size:20px">${esc(tpl.icon || '📋')}</span><b style="font-size:13px">${esc(tpl.name)}</b></div>
-        <div style="font-size:11px;color:var(--text-3);margin-bottom:6px">${esc(tpl.industry)} ${t('行业')}</div>
-        <div style="font-size:12px;color:var(--text-2);line-height:1.6">${esc((tpl.description || '').slice(0, 46))}…</div>
+        <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px"><span style="font-size:20px">${esc(tpl.icon || '📋')}</span><b style="font-size:13px">${esc(t(tpl.name))}</b></div>
+        <div style="font-size:11px;color:var(--text-3);margin-bottom:6px">${esc(t(tpl.industry))} ${t('行业')}</div>
+        <div style="font-size:12px;color:var(--text-2);line-height:1.6">${esc(t(tpl.description || '').slice(0, 46))}…</div>
       </div>`).join('');
     el.querySelectorAll('[data-tpl]').forEach(d => d.onclick = () => location.hash = '#/admin/agents');
   }

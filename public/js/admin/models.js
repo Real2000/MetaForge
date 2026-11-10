@@ -50,7 +50,7 @@ export async function render(el) {
         <div class="kv" style="margin-bottom:12px">
           <span class="k">${t('服务地址')}</span><span class="mono" style="word-break:break-all">${esc(p.base_url || '-')}</span>
           <span class="k">${t('模型列表')}</span><span>${models.length ? models.slice(0, 9).map(m => modelTag(m, p)).join('') + (models.length > 9 ? ` <span style="color:var(--text-3)">${t('等')} ${models.length} ${t('个')}</span>` : '') : `<span style="color:var(--text-3)">${t('暂未接入模型')}</span>`}</span>
-          <span class="k">${t('说明')}</span><span style="color:var(--text-2);font-size:12px">${esc(p.remark || '')}</span>
+          <span class="k">${t('说明')}</span><span style="color:var(--text-2);font-size:12px">${esc(t(p.remark || ''))}</span>
         </div>
         <div style="display:flex;gap:8px;flex-wrap:wrap">
           <button class="btn sm" data-cfg="${p.id}">${t('配置')}</button>

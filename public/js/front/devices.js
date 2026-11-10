@@ -100,9 +100,9 @@ export async function render(box) {
         <div class="card" style="padding:16px;display:flex;flex-direction:column;gap:10px;cursor:default">
           <div style="display:flex;align-items:center;gap:8px">
             <span style="font-size:28px">${esc(tpl.icon || '🚀')}</span>
-            <div><b>${esc(tpl.title)}</b><br><span class="tag gray" style="font-size:11px">${esc(t(tpl.category || '通用'))}</span></div>
+            <div><b>${esc(t(tpl.title))}</b><br><span class="tag gray" style="font-size:11px">${esc(t(tpl.category || '通用'))}</span></div>
           </div>
-          <p style="font-size:12px;color:var(--text-3);line-height:1.6;flex:1">${esc(tpl.description || '')}</p>
+          <p style="font-size:12px;color:var(--text-3);line-height:1.6;flex:1">${esc(t(tpl.description || ''))}</p>
           <div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:4px">
             ${(tpl.operations || []).map(op => `<span class="tag gray" style="font-size:10px">${esc(op)}</span>`).join('')}
           </div>

@@ -438,9 +438,9 @@ export async function render(el) {
           <div class="card" style="box-shadow:none;border:1px solid var(--border);padding:14px">
             <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
               <span style="font-size:22px">${tpl.icon}</span>
-              <div><b>${esc(tpl.name)}</b><div style="font-size:11px;color:var(--text-3)">${esc(tpl.industry)} · ${tpl.type === 'digital' ? t('数字员工') : t('企业智能体')}</div></div>
+              <div><b>${esc(t(tpl.name))}</b><div style="font-size:11px;color:var(--text-3)">${esc(tpl.industry)} · ${tpl.type === 'digital' ? t('数字员工') : t('企业智能体')}</div></div>
             </div>
-            <div style="font-size:12px;color:var(--text-2);line-height:1.6;margin-bottom:8px">${esc(tpl.description)}</div>
+            <div style="font-size:12px;color:var(--text-2);line-height:1.6;margin-bottom:8px">${esc(t(tpl.description))}</div>
             <div style="font-size:11px;color:var(--text-3);margin-bottom:10px">${t('工具：')}${tpl.tools.length ? esc(tpl.tools.join('、')) : t('无')}${tpl.opening_questions?.length ? t('｜预置问题 {n} 条').replace('{n}', tpl.opening_questions.length) : ''}</div>
             <button class="btn primary" data-tpl="${tpl.id}" style="padding:4px 14px;font-size:12px">${t('从此模板创建')}</button>
           </div>`).join('')}

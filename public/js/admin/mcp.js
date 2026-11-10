@@ -168,7 +168,7 @@ export async function render(el) {
     if (!srvInfo) { el.querySelector('#srvInfoBox').innerHTML = t('服务端信息加载失败'); return; }
     const agentTags = (srvInfo.tools || []).map(tp => `<span class="tag purple" style="font-size:10px;margin:1px">${esc(tp.name)} · ${esc(tp.agent)}</span>`).join('') || `<span style="color:var(--text-3)">${t('（暂无已发布智能体）')}</span>`;
     el.querySelector('#srvInfoBox').innerHTML = `
-      <div>${t('端点：')}<span class="mono" style="padding:2px 8px;background:var(--surface-3);border-radius:6px">${esc(srvInfo.endpoint)}</span>　${t('协议：')}${esc(srvInfo.protocol)}　${t('鉴权：')}<span class="mono">${esc(srvInfo.auth)}</span></div>
+      <div>${t('端点：')}<span class="mono" style="padding:2px 8px;background:var(--surface-3);border-radius:6px">${esc(srvInfo.endpoint)}</span>　${t('协议：')}${esc(t(srvInfo.protocol))}　${t('鉴权：')}<span class="mono">${esc(t(srvInfo.auth))}</span></div>
       <div style="margin-top:4px">${t('可调用工具（已发布智能体）：')}${agentTags}</div>`;
   }
 

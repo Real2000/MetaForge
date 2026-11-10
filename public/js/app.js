@@ -152,7 +152,7 @@ function layoutShell(kind, currentPath, title, contentHTML) {
           ${prefToggleHTML()}
           <div class="space-selector" id="spaceSelector">
             <select class="input" id="spaceSelect" style="width:160px;font-size:12px">
-              <option value="">全部空间</option>
+              <option value="">${t('全部空间')}</option>
             </select>
           </div>
           <span class="user-chip" id="userChip">

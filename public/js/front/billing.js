@@ -86,7 +86,7 @@ export async function render(el) {
   function renderAll() {
     const p = billing.plan;
     el.querySelector('#overview').innerHTML = `
-      <div class="stat"><div class="s-label">${t('当前套餐')}</div><div class="s-num" style="font-size:20px;padding-top:6px">${esc(p.name)}</div><div class="s-unit">${t('月费')} ${p.monthlyFee == null ? t('定制') : '¥' + p.monthlyFee}</div></div>
+      <div class="stat"><div class="s-label">${t('当前套餐')}</div><div class="s-num" style="font-size:20px;padding-top:6px">${esc(t(p.name))}</div><div class="s-unit">${t('月费')} ${p.monthlyFee == null ? t('定制') : '¥' + p.monthlyFee}</div></div>
       <div class="stat"><div class="s-label">${t('本月已用')}</div><div class="s-num">${fmt(billing.quota.used)}</div><div class="s-unit">tokens</div></div>
       <div class="stat"><div class="s-label">${t('额度')}</div><div class="s-num" style="font-size:20px;padding-top:6px">${billing.quota.unlimited ? t('不限') : fmt(billing.quota.total)}</div><div class="s-unit">tokens / ${t('月')}</div></div>
       <div class="stat"><div class="s-label">${t('发票记录')}</div><div class="s-num">${invoices.length}</div><div class="s-unit">${t('其中待处理')} ${invoices.filter(i => i.status === 'pending').length}</div></div>`;
