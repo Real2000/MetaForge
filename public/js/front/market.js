@@ -287,7 +287,7 @@ export async function render(el) {
           <div class="a-ava" style="background:linear-gradient(135deg,#059669,#0d9488)">${esc(x.icon || '✨')}</div>
           <div class="a-info">
             <div class="mk-name">${esc(x.name)} ${x.owned_by_me ? `<span class="tag blue">${t('我的')}</span>` : `<span class="tag gray">${esc(x.owner)}</span>`}${x.owned_by_me && !x.status ? `<span class="tag orange">${t('私有')}</span>` : ''}</div>
-            <div class="a-desc">${esc(x.description || '提示词 + 工具组合技能')}</div>
+            <div class="a-desc">${esc(x.description || t('提示词 + 工具组合技能'))}</div>
             <div class="sk-tools">${(x.tools || []).map(tl => `<span class="tag purple" style="font-size:10px">${TOOL_ICON[tl] || '🔧'} ${esc(tl)}</span>`).join('') || `<span style="font-size:11px;color:#c0c4cc">${t('纯提示词技能')}</span>`}</div>
             <div class="mk-cardbtn">
               <button class="btn sm" data-copy="${x.id}">⧉ ${t('调用词')}</button>
@@ -304,7 +304,7 @@ export async function render(el) {
           <div class="a-info">
             <div class="mk-name">${esc(x.tool_name)} <span class="tag ${r.cls}">${t(r.label)}</span>${x.server_trusted ? '<span class="tag green" title="' + t('服务已信任：只读工具对话中免确认') + '">🛡 ' + t('可信') + '</span>' : ''}</div>
             <div class="mk-sub">📦 ${t('服务')}：${esc(x.server_name)}</div>
-            <div class="a-desc">${esc(x.description || 'MCP 工具（描述由服务清单提供）')}</div>
+            <div class="a-desc">${esc(x.description || t('MCP 工具（描述由服务清单提供）'))}</div>
           </div>
         </div>`;
       }
@@ -315,7 +315,7 @@ export async function render(el) {
         <div class="a-info">
           <div class="mk-name">${esc(x.app_name || x.app_id)} <span class="tag ${pm.cls}">${esc(pm.label)}</span></div>
           <div class="mk-sub">${esc(x.mode || '')}${x.platform_name ? ' · ' + esc(x.platform_name) : ''}</div>
-          <div class="a-desc">${esc(x.app_desc || '外部平台应用（经异构纳管同步）')}</div>
+          <div class="a-desc">${esc(x.app_desc || t('外部平台应用（经异构纳管同步）'))}</div>
           <div class="a-meta"><span class="tag gray">${t('来源：异构纳管')}</span></div>
         </div>
       </div>`;

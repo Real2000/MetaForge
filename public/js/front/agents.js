@@ -84,72 +84,72 @@ export async function render(el) {
     const body = document.createElement('div');
     body.innerHTML = `
       <div class="tabs" id="cfgTabs" style="margin-bottom:16px">
-        <div class="tab active" data-i="0">基本配置</div>
-        <div class="tab" data-i="1">AI 模型配置</div>
-        <div class="tab" data-i="2">页面配置</div>
+        <div class="tab active" data-i="0">${t('基本配置')}</div>
+        <div class="tab" data-i="1">${t('AI 模型配置')}</div>
+        <div class="tab" data-i="2">${t('页面配置')}</div>
       </div>
       <div data-pane="0">
-        <div class="form-item"><label>智能体名称<span class="req">*</span></label><input class="input" id="f_name" maxlength="20" placeholder="最多 20 字"></div>
-        <div class="form-item"><label>简介</label><textarea class="input" id="f_desc" maxlength="100" placeholder="简单描述你的智能体（100 字内）"></textarea></div>
-        <div class="form-item"><label>角色 / 提示词设定<span class="req">*</span>
-          <button class="btn" id="aiOptimize" style="padding:2px 10px;font-size:12px">✨ AI 优化</button></label>
-          <textarea class="input" id="f_prompt" style="min-height:120px" maxlength="2000" placeholder="定义智能体的身份定位、能力范围、回复规则。也可只写一句简单描述，点击右上角「AI 优化」自动生成结构化提示词"></textarea>
-          <div class="hint">支持一键导入示例：<a href="javascript:;" id="impPrompt">公文写作专家提示词</a>　<a href="javascript:;" id="impPrompt2">翻译助手提示词</a></div>
+        <div class="form-item"><label>${t('智能体名称')}<span class="req">*</span></label><input class="input" id="f_name" maxlength="20" placeholder="${t('最多 20 字')}"></div>
+        <div class="form-item"><label>${t('简介')}</label><textarea class="input" id="f_desc" maxlength="100" placeholder="${t('简单描述你的智能体（100 字内）')}"></textarea></div>
+        <div class="form-item"><label>${t('角色 / 提示词设定')}<span class="req">*</span>
+          <button class="btn" id="aiOptimize" style="padding:2px 10px;font-size:12px">✨ ${t('AI 优化')}</button></label>
+          <textarea class="input" id="f_prompt" style="min-height:120px" maxlength="2000" placeholder="${t('定义智能体的身份定位、能力范围、回复规则。也可只写一句简单描述，点击右上角「AI 优化」自动生成结构化提示词')}"></textarea>
+          <div class="hint">${t('支持一键导入示例：')}<a href="javascript:;" id="impPrompt">${t('公文写作专家提示词')}</a>　<a href="javascript:;" id="impPrompt2">${t('翻译助手提示词')}</a></div>
         </div>
         <div class="form-row">
-          <div class="form-item"><label>所属分类</label><input class="input" id="f_cat" placeholder="如：办公 / 研发 / 市场" value="办公"></div>
-          <div class="form-item"><label>关联知识库</label>
-            <select class="input" id="f_kb"><option value="">不关联（仅大模型回复）</option>${kbs.map(k => `<option value="${k.id}">${esc(k.name)}</option>`).join('')}</select>
-            <div class="hint">仅显示有权限的知识库；关联后对话自动检索增强</div>
+          <div class="form-item"><label>${t('所属分类')}</label><input class="input" id="f_cat" placeholder="${t('如：办公 / 研发 / 市场')}" value="${t('办公')}"></div>
+          <div class="form-item"><label>${t('关联知识库')}</label>
+            <select class="input" id="f_kb"><option value="">${t('不关联（仅大模型回复）')}</option>${kbs.map(k => `<option value="${k.id}">${esc(k.name)}</option>`).join('')}</select>
+            <div class="hint">${t('仅显示有权限的知识库；关联后对话自动检索增强')}</div>
           </div>
         </div>
       </div>
       <div data-pane="1" style="display:none">
-        <div class="form-item"><label>AI 模型<span class="req">*</span></label>
-          <select class="input" id="f_model">${models.map(m => `<option value="${esc(m.name)}">${esc(m.name)}${m.real ? '' : '（演示）'}</option>`).join('')}</select>
+        <div class="form-item"><label>${t('AI 模型')}<span class="req">*</span></label>
+          <select class="input" id="f_model">${models.map(m => `<option value="${esc(m.name)}">${esc(m.name)}${m.real ? '' : t('（演示）')}</option>`).join('')}</select>
         </div>
-        <div class="form-item"><label>温度 <span class="hint" style="display:inline">（精准 ←→ 创意）</span></label>
+        <div class="form-item"><label>${t('温度')} <span class="hint" style="display:inline">${t('（精准 ←→ 创意）')}</span></label>
           <input type="range" id="f_temp" min="0" max="1" step="0.1" value="0.7" style="width:100%">
-          <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text-3)"><span>精准</span><span>平衡</span><span>创意</span></div>
+          <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text-3)"><span>${t('精准')}</span><span>${t('平衡')}</span><span>${t('创意')}</span></div>
         </div>
         <div class="form-row">
-          <div class="form-item"><label>携带上下文轮数</label><input class="input" id="f_ctx" type="number" min="1" max="50" value="10"></div>
-          <div class="form-item"><label>最大回复长度（tokens）</label><input class="input" id="f_max" type="number" min="128" max="8192" value="1024"></div>
+          <div class="form-item"><label>${t('携带上下文轮数')}</label><input class="input" id="f_ctx" type="number" min="1" max="50" value="10"></div>
+          <div class="form-item"><label>${t('最大回复长度（tokens）')}</label><input class="input" id="f_max" type="number" min="128" max="8192" value="1024"></div>
         </div>
       </div>
       <div data-pane="2" style="display:none">
-        <div class="form-item"><label>开场白</label><textarea class="input" id="f_open" maxlength="200" placeholder="对话开始时智能体主动发送的欢迎语（200 字内）"></textarea></div>
-        <div class="form-item"><label>开场预置问题</label>
+        <div class="form-item"><label>${t('开场白')}</label><textarea class="input" id="f_open" maxlength="200" placeholder="${t('对话开始时智能体主动发送的欢迎语（200 字内）')}"></textarea></div>
+        <div class="form-item"><label>${t('开场预置问题')}</label>
           <div id="qList"></div>
-          <button class="btn sm" id="addQ" style="margin-top:8px">＋ 添加问题</button>
-          <div class="hint">展示在对话开场，用户点击即可快速提问</div>
+          <button class="btn sm" id="addQ" style="margin-top:8px">＋ ${t('添加问题')}</button>
+          <div class="hint">${t('展示在对话开场，用户点击即可快速提问')}</div>
         </div>
       </div>`;
 
-    const typeName = { enterprise: '企业智能体', digital: '数字员工', dept: '部门AI助理', other: '其他' };
+    const typeName = { enterprise: t('企业智能体'), digital: t('数字员工'), dept: t('部门AI助理'), other: t('其他') };
     const m = modal({
-      title: `新增智能体（${typeName[createType] || '数字员工'}）`,
+      title: `${t('新增智能体（')} ${typeName[createType] || t('数字员工')}）`,
       body, wide: true,
-      foot: '<button class="btn" data-cancel>取消</button><button class="btn primary" data-save>创建</button>',
+      foot: `<button class="btn" data-cancel>${t('取消')}</button><button class="btn primary" data-save>${t('创建')}</button>`,
       onMount(mask, close) {
         const qs = [];
         const qList = mask.querySelector('#qList');
         function addQ(v = '') {
           const row = document.createElement('div');
           row.style.cssText = 'display:flex;gap:8px;margin-bottom:8px';
-          row.innerHTML = `<input class="input" placeholder="问题内容" maxlength="60" value="${esc(v)}"><button class="btn sm danger">删除</button>`;
+          row.innerHTML = `<input class="input" placeholder="${t('问题内容')}" maxlength="60" value="${esc(v)}"><button class="btn sm danger">${t('删除')}</button>`;
           row.querySelector('button').onclick = () => { row.remove(); };
           qList.appendChild(row);
         }
         mask.querySelector('#addQ').onclick = () => addQ();
-        mask.querySelector('#impPrompt').onclick = () => { mask.querySelector('#f_prompt').value = '你是公文写作专家，熟悉企业行政公文的规范格式。根据用户需求撰写通知、请示、会议纪要、通报等文体，格式规范、用语严谨。'; };
-        mask.querySelector('#impPrompt2').onclick = () => { mask.querySelector('#f_prompt').value = '你是一位专业、精准的翻译助手。将用户输入的中文翻译成英文，或英文翻译成中文。译文准确传达原意、表达自然流畅。只输出译文本身。'; };
+        mask.querySelector('#impPrompt').onclick = () => { mask.querySelector('#f_prompt').value = t('你是公文写作专家，熟悉企业行政公文的规范格式。根据用户需求撰写通知、请示、会议纪要、通报等文体，格式规范、用语严谨。'); };
+        mask.querySelector('#impPrompt2').onclick = () => { mask.querySelector('#f_prompt').value = t('你是一位专业、精准的翻译助手。将用户输入的中文翻译成英文，或英文翻译成中文。译文准确传达原意、表达自然流畅。只输出译文本身。'); };
         // AI 优化提示词：简单描述 → 结构化提示词（借鉴 SinguX「优化」按钮）
         mask.querySelector('#aiOptimize').onclick = async () => {
           const btn = mask.querySelector('#aiOptimize');
           const pe = mask.querySelector('#f_prompt');
-          if (!pe.value.trim() && !mask.querySelector('#f_name').value.trim()) return toast('请先填写名称或简单描述', 'err');
-          btn.disabled = true; btn.textContent = '⏳ 优化中…';
+          if (!pe.value.trim() && !mask.querySelector('#f_name').value.trim()) return toast(t('请先填写名称或简单描述'), 'err');
+          btn.disabled = true; btn.textContent = `⏳ ${t('优化中…')}`;
           try {
             const j = await api('/agents/optimize-prompt', { method: 'POST', body: {
               name: mask.querySelector('#f_name').value.trim(),
@@ -157,16 +157,16 @@ export async function render(el) {
               prompt: pe.value.trim(),
             } });
             pe.value = j.data.prompt;
-            toast('提示词已优化生成');
+            toast(t('提示词已优化生成'));
           } catch (e) { toast(e.message, 'err'); }
-          btn.disabled = false; btn.textContent = '✨ AI 优化';
+          btn.disabled = false; btn.textContent = `✨ ${t('AI 优化')}`;
         };
 
-        mask.querySelectorAll('#cfgTabs .tab').forEach(t => {
-          t.onclick = () => {
+        mask.querySelectorAll('#cfgTabs .tab').forEach(tn => {
+          tn.onclick = () => {
             mask.querySelectorAll('#cfgTabs .tab').forEach(x => x.classList.remove('active'));
-            t.classList.add('active');
-            mask.querySelectorAll('[data-pane]').forEach(p => p.style.display = p.dataset.pane === t.dataset.i ? '' : 'none');
+            tn.classList.add('active');
+            mask.querySelectorAll('[data-pane]').forEach(p => p.style.display = p.dataset.pane === tn.dataset.i ? '' : 'none');
           };
         });
         mask.querySelector('[data-cancel]').onclick = close;
@@ -186,11 +186,11 @@ export async function render(el) {
             opening_questions: [...qList.querySelectorAll('input')].map(i => i.value.trim()).filter(Boolean),
             space_id: window.__currentSpace || 0,
           };
-          if (!payload.name) return toast('请填写智能体名称', 'err');
-          if (!payload.prompt) return toast('请填写提示词设定', 'err');
+          if (!payload.name) return toast(t('请填写智能体名称'), 'err');
+          if (!payload.prompt) return toast(t('请填写提示词设定'), 'err');
           try {
             await api('/agents', { method: 'POST', body: payload });
-            toast('智能体创建成功（草稿）');
+            toast(t('智能体创建成功（草稿）'));
             close(); load();
           } catch (e) { toast(e.message, 'err'); }
         };

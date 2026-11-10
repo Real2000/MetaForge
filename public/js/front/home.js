@@ -9,25 +9,25 @@ import { t } from '../i18n.js';
 function showOnboarding() {
   const STEPS = [
     {
-      ic: '🤖', title: '创建你的智能体', desc: '后台「智能体管理」创建并编排——提示词定义能力，选择模型，配置开场白；也可以到广场一键复制现成的智能体',
-      btn: '前往创建', href: '#/admin/agents',
+      ic: '🤖', title: t('创建你的智能体'), desc: t('后台「智能体管理」创建并编排——提示词定义能力，选择模型，配置开场白；也可以到广场一键复制现成的智能体'),
+      btn: t('前往创建'), href: '#/admin/agents',
     },
     {
-      ic: '📚', title: '上传知识库', desc: '把公司制度、产品文档传到「知识库」，智能体关联后回答自带引用来源——这是让 AI 说「行话」的关键一步',
-      btn: '前往上传', href: '#/knowledge',
+      ic: '📚', title: t('上传知识库'), desc: t('把公司制度、产品文档传到「知识库」，智能体关联后回答自带引用来源——这是让 AI 说「行话」的关键一步'),
+      btn: t('前往上传'), href: '#/knowledge',
     },
     {
-      ic: '💬', title: '开始对话', desc: '到广场或直接在本页开始使用：支持知识库检索、多模型切换、技能调用与图片/视频/PPT 生成',
-      btn: '开始体验', href: '#/home',
+      ic: '💬', title: t('开始对话'), desc: t('到广场或直接在本页开始使用：支持知识库检索、多模型切换、技能调用与图片/视频/PPT 生成'),
+      btn: t('开始体验'), href: '#/home',
     },
   ];
   let cur = 0;
   const m = modal({
-    title: '👋 欢迎使用智能体平台',
+    title: t('👋 欢迎使用智能体平台'),
     body: `<div id="obBody"></div>`,
-    foot: `<button class="btn" id="obSkip" style="color:var(--text-3)">跳过引导</button>
-           <button class="btn" id="obPrev">上一步</button>
-           <button class="btn primary" id="obNext">下一步</button>`,
+    foot: `<button class="btn" id="obSkip" style="color:var(--text-3)">${t('跳过引导')}</button>
+           <button class="btn" id="obPrev">${t('上一步')}</button>
+           <button class="btn primary" id="obNext">${t('下一步')}</button>`,
     onMount(mask, close) {
       const render = () => {
         const s = STEPS[cur];
@@ -45,7 +45,7 @@ function showOnboarding() {
             <a href="${s.href}" id="obGo" class="btn primary" style="margin-top:10px">${s.btn} →</a>
           </div>`;
         mask.querySelector('#obPrev').style.visibility = cur === 0 ? 'hidden' : '';
-        mask.querySelector('#obNext').textContent = cur === STEPS.length - 1 ? '完成引导' : '下一步';
+        mask.querySelector('#obNext').textContent = cur === STEPS.length - 1 ? t('完成引导') : t('下一步');
         const go = mask.querySelector('#obGo');
         go.onclick = () => { markDone(); close(); };
       };
@@ -56,7 +56,7 @@ function showOnboarding() {
       mask.querySelector('#obPrev').onclick = () => { if (cur > 0) { cur--; render(); } };
       mask.querySelector('#obNext').onclick = () => {
         if (cur < STEPS.length - 1) { cur++; render(); }
-        else { markDone(); close(); toast('引导完成，祝你使用愉快！'); }
+        else { markDone(); close(); toast(t('引导完成，祝你使用愉快！')); }
       };
       render();
     },
@@ -66,7 +66,7 @@ function showOnboarding() {
 export async function render(el) {
   // front 布局下的对话页：去掉 .content 的 padding 与滚动（chat-layout 自管高度，避免双滚动条/输入框被裁）
   el.classList.add('chat-fullscreen');
-  el.innerHTML = '<div class="empty-box"><div class="big">⏳</div>加载中…</div>';
+  el.innerHTML = `<div class="empty-box"><div class="big">⏳</div>${t('加载中…')}</div>`;
   mountChat(el, {
     skills: true,
     getAgentId: () => null, // 首页助手，不绑定智能体

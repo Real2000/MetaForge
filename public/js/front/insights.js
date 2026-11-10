@@ -4,6 +4,7 @@
  */
 import { api } from '../api.js';
 import { esc, toast, modal } from '../ui.js';
+import { t } from '../i18n.js';
 
 export async function render(el) {
   let data = null;
@@ -22,23 +23,23 @@ export async function render(el) {
     .is-tpl .tpl:hover{border-color:#93c5fd;box-shadow:0 6px 18px rgba(37,99,235,.08)}
   </style>
   <div class="page-head">
-    <h2>使用分析</h2>
-    <div class="desc">你的智能体运行数据、优化建议与行业最佳实践——让智能体越用越好。</div>
+    <h2>${t('使用分析')}</h2>
+    <div class="desc">${t('你的智能体运行数据、优化建议与行业最佳实践——让智能体越用越好。')}</div>
   </div>
   <div class="grid-4" id="overview" style="margin-bottom:14px"></div>
   <div class="grid-2" style="align-items:start">
     <div class="card">
-      <h3 style="margin:0 0 12px">🤖 我的智能体</h3>
+      <h3 style="margin:0 0 12px">🤖 ${t('我的智能体')}</h3>
       <div id="agents"></div>
     </div>
     <div>
       <div class="card" style="margin-bottom:14px">
-        <h3 style="margin:0 0 12px">💡 优化建议</h3>
+        <h3 style="margin:0 0 12px">💡 ${t('优化建议')}</h3>
         <div id="advises"></div>
       </div>
       <div class="card">
-        <h3 style="margin:0 0 12px;display:flex;justify-content:space-between;align-items:center">📚 行业最佳实践
-          <a class="btn sm" href="#/admin/agents">从模板创建 →</a>
+        <h3 style="margin:0 0 12px;display:flex;justify-content:space-between;align-items:center">📚 ${t('行业最佳实践')}
+          <a class="btn sm" href="#/admin/agents">${t('从模板创建 →')}</a>
         </h3>
         <div class="is-tpl" id="tpls"></div>
       </div>
@@ -55,40 +56,40 @@ export async function render(el) {
     const published = list.filter(a => a.status === 'published').length;
     const activeAgent = list.filter(a => a.weekCalls > 0).length;
     el.querySelector('#overview').innerHTML = `
-      <div class="stat"><div class="s-label">本周总调用</div><div class="s-num">${fmt(totalWeek)}</div><div class="s-unit">次</div></div>
-      <div class="stat"><div class="s-label">活跃智能体</div><div class="s-num">${activeAgent}<span class="s-unit">/ ${list.length}</span></div><div class="s-unit">近 7 天有调用</div></div>
-      <div class="stat"><div class="s-label">已发布</div><div class="s-num">${published}</div><div class="s-unit">个智能体</div></div>
-      <div class="stat"><div class="s-label">累计调用</div><div class="s-num">${fmt(list.reduce((s, a) => s + a.totalCalls, 0))}</div><div class="s-unit">次（全部历史）</div></div>`;
+      <div class="stat"><div class="s-label">${t('本周总调用')}</div><div class="s-num">${fmt(totalWeek)}</div><div class="s-unit">${t('次')}</div></div>
+      <div class="stat"><div class="s-label">${t('活跃智能体')}</div><div class="s-num">${activeAgent}<span class="s-unit">/ ${list.length}</span></div><div class="s-unit">${t('近 7 天有调用')}</div></div>
+      <div class="stat"><div class="s-label">${t('已发布')}</div><div class="s-num">${published}</div><div class="s-unit">${t('个智能体')}</div></div>
+      <div class="stat"><div class="s-label">${t('累计调用')}</div><div class="s-num">${fmt(list.reduce((s, a) => s + a.totalCalls, 0))}</div><div class="s-unit">${t('次（全部历史）')}</div></div>`;
 
     el.querySelector('#agents').innerHTML = list.length ? list.map((a, i) => `
       <div class="is-agent">
         <div class="a-ava" style="background:linear-gradient(135deg,${AVA[i % AVA.length][0]},${AVA[i % AVA.length][1]})">${esc(a.icon || '🤖')}</div>
         <div style="min-width:140px;flex:1">
           <b style="font-size:14px">${esc(a.name)}</b>
-          ${a.status === 'published' ? '<span class="tag green" style="font-size:10px">已发布</span>' : '<span class="tag gray" style="font-size:10px">草稿</span>'}
-          ${a.kb_id ? '<span class="tag blue" style="font-size:10px">📚 知识库</span>' : ''}
-          <div style="font-size:11px;color:var(--text-3);margin-top:3px">创建于 ${esc((a.created_at || '').slice(0, 10))}</div>
+          ${a.status === 'published' ? `<span class="tag green" style="font-size:10px">${t('已发布')}</span>` : `<span class="tag gray" style="font-size:10px">${t('草稿')}</span>`}
+          ${a.kb_id ? `<span class="tag blue" style="font-size:10px">📚 ${t('知识库')}</span>` : ''}
+          <div style="font-size:11px;color:var(--text-3);margin-top:3px">${t('创建于')} ${esc((a.created_at || '').slice(0, 10))}</div>
         </div>
         <div class="is-stats">
-          <span><b>${a.weekCalls}</b>本周调用</span>
-          <span><b>${a.activeUsers}</b>活跃用户</span>
-          <span><b>${fmt(a.totalCalls)}</b>累计</span>
-          ${a.kbHitRate != null ? `<span><b style="color:${a.kbHitRate < 30 ? '#d97706' : '#059669'}">${a.kbHitRate}%</b>召回率</span>` : ''}
-          ${a.ratedCount ? `<span><b style="color:${a.ratingUp <= 0 ? '#dc2626' : '#059669'}">${a.ratingUp > 0 ? '+' : ''}${a.ratingUp}</b>口碑</span>` : ''}
+          <span><b>${a.weekCalls}</b>${t('本周调用')}</span>
+          <span><b>${a.activeUsers}</b>${t('活跃用户')}</span>
+          <span><b>${fmt(a.totalCalls)}</b>${t('累计')}</span>
+          ${a.kbHitRate != null ? `<span><b style="color:${a.kbHitRate < 30 ? '#d97706' : '#059669'}">${a.kbHitRate}%</b>${t('召回率')}</span>` : ''}
+          ${a.ratedCount ? `<span><b style="color:${a.ratingUp <= 0 ? '#dc2626' : '#059669'}">${a.ratingUp > 0 ? '+' : ''}${a.ratingUp}</b>${t('口碑')}</span>` : ''}
         </div>
-        <a class="btn sm" href="#/admin/studio/${a.id}">编排</a>
-      </div>`).join('') : '<div class="empty-box"><div class="big">🤖</div>还没有自己的智能体——从右侧行业模板快速创建一个</div>';
+        <a class="btn sm" href="#/admin/studio/${a.id}">${t('编排')}</a>
+      </div>`).join('') || `<div class="empty-box"><div class="big">🤖</div>${t('还没有自己的智能体——从右侧行业模板快速创建一个')}</div>`;
 
     const advs = data.advises;
     el.querySelector('#advises').innerHTML = advs.length ? advs.map(a => `
-      <div class="is-adv ${a.level}">${a.level === 'warn' ? '⚠️' : 'ℹ️'} <span>${esc(a.text)}</span></div>`).join('')
-      : '<div style="padding:20px;text-align:center;color:var(--text-3);font-size:13px">🎉 一切正常——智能体配置与运行状态良好，继续保持</div>';
+      <div class="is-adv ${a.level}">${a.level === 'warn' ? '⚠️' : 'ℹ️'} <span>${esc(t(a.text))}</span></div>`).join('')
+      : `<div style="padding:20px;text-align:center;color:var(--text-3);font-size:13px">🎉 ${t('一切正常——智能体配置与运行状态良好，继续保持')}</div>`;
 
-    el.querySelector('#tpls').innerHTML = data.templates.map(t => `
-      <div class="tpl" data-tpl="${t.id}">
-        <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px"><span style="font-size:20px">${esc(t.icon || '📋')}</span><b style="font-size:13px">${esc(t.name)}</b></div>
-        <div style="font-size:11px;color:var(--text-3);margin-bottom:6px">${esc(t.industry)} 行业</div>
-        <div style="font-size:12px;color:var(--text-2);line-height:1.6">${esc((t.description || '').slice(0, 46))}…</div>
+    el.querySelector('#tpls').innerHTML = data.templates.map(tpl => `
+      <div class="tpl" data-tpl="${tpl.id}">
+        <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px"><span style="font-size:20px">${esc(tpl.icon || '📋')}</span><b style="font-size:13px">${esc(tpl.name)}</b></div>
+        <div style="font-size:11px;color:var(--text-3);margin-bottom:6px">${esc(tpl.industry)} ${t('行业')}</div>
+        <div style="font-size:12px;color:var(--text-2);line-height:1.6">${esc((tpl.description || '').slice(0, 46))}…</div>
       </div>`).join('');
     el.querySelectorAll('[data-tpl]').forEach(d => d.onclick = () => location.hash = '#/admin/agents');
   }

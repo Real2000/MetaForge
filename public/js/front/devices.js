@@ -71,16 +71,16 @@ export async function render(box) {
 
   // 安装引导
   box.querySelector('#installGuideBtn').onclick = () => modal({
-    title: '📖 安装引导（macOS）',
+    title: `📖 ${t('安装引导（macOS）')}`,
     body: `<div style="font-size:13px;line-height:2;color:var(--text)">
-      1️⃣ 点击「下载安装包（Mac .dmg）」，得到 <b>TeleAgent助手.dmg</b><br>
-      2️⃣ 双击打开 dmg → 把 <b>TeleAgent助手.app</b> 拖入旁边的 <b>Applications</b> 文件夹<br>
-      3️⃣ 到「应用程序」打开 TeleAgent助手（首次：右键 → 「打开」绕过未签名提示，仅需一次）<br>
-      4️⃣ 助手将自动安装开机自启（launchd），并弹出配对窗口<br>
-      5️⃣ 回到本页点「生成配对码」，把 6 位数字输入客户端弹窗<br>
-      6️⃣ 完成 ✅ 之后在对话里对 AI 说「帮我在桌面建个文件夹」试试<br><br>
-      <span style="color:var(--text-3);font-size:12px">权限边界：客户端仅执行白名单操作（建文件夹/开应用/列目录/发通知），每次高危操作都会在对话中弹确认卡。卸载：双击 dmg 里的「卸载.command」再把 .app 拖入废纸篓。<br>架构说明：当前包为 Intel（x64）；Apple Silicon（M 系列）需在对应机器上运行 local-bridge/build-installer.sh 构建。</span></div>`,
-    foot: `<button class="btn primary" data-close>知道了</button>`,
+      ${t('1️⃣ 点击「下载安装包（Mac .dmg）」，得到 TeleAgent助手.dmg')}<br>
+      ${t('2️⃣ 双击打开 dmg → 把 TeleAgent助手.app 拖入旁边的 Applications 文件夹')}<br>
+      ${t('3️⃣ 到「应用程序」打开 TeleAgent助手（首次：右键 → 「打开」绕过未签名提示，仅需一次）')}<br>
+      ${t('4️⃣ 助手将自动安装开机自启（launchd），并弹出配对窗口')}<br>
+      ${t('5️⃣ 回到本页点「生成配对码」，把 6 位数字输入客户端弹窗')}<br>
+      ${t('6️⃣ 完成 ✅ 之后在对话里对 AI 说「帮我在桌面建个文件夹」试试')}<br><br>
+      <span style="color:var(--text-3);font-size:12px">${t('权限边界：客户端仅执行白名单操作（建文件夹/开应用/列目录/发通知），每次高危操作都会在对话中弹确认卡。卸载：双击 dmg 里的「卸载.command」再把 .app 拖入废纸篓。')}<br>${t('架构说明：当前包为 Intel（x64）；Apple Silicon（M 系列）需在对应机器上运行 local-bridge/build-installer.sh 构建。')}</span></div>`,
+    foot: `<button class="btn primary" data-close>${t('知道了')}</button>`,
     onMount(m, close) { m.querySelector('[data-close]').onclick = close; },
   });
 
@@ -118,11 +118,11 @@ export async function render(box) {
           const agent = await api('/agents', {
             method: 'POST',
             body: {
-              name: tpl.title + '（桌面场景）',
+              name: tpl.title + t('（桌面场景）'),
               description: tpl.description,
               prompt: tpl.prompt,
               tools: ['local_exec'],
-              opening: '我已就绪，请告诉我需要做什么。',
+              opening: t('我已就绪，请告诉我需要做什么。'),
               opening_questions: [],
             },
           });
@@ -171,10 +171,10 @@ export async function render(box) {
         <th>${t('设备')}</th><th>${t('系统')}</th><th>${t('状态')}</th><th>${t('默认')}</th><th>${t('最近心跳')}</th><th></th>
       </tr></thead><tbody>${rows.map(d => `
         <tr>
-          <td><b>${esc(d.device_name || '未命名')}</b></td>
+          <td><b>${esc(d.device_name || t('未命名'))}</b></td>
           <td style="font-size:12px;color:var(--text-3)">${esc(d.platform || '—')}</td>
-          <td>${d.online ? '<span class="tag green">● 在线</span>' : '<span class="tag gray">○ 离线</span>'}</td>
-          <td>${d.is_default ? '<span class="tag blue">默认</span>' : ''}</td>
+          <td>${d.online ? `<span class="tag green">● ${t('在线')}</span>` : `<span class="tag gray">○ ${t('离线')}</span>`}</td>
+          <td>${d.is_default ? `<span class="tag blue">${t('默认')}</span>` : ''}</td>
           <td style="font-size:12px;color:var(--text-3)">${esc(d.last_seen || '—')}</td>
           <td style="white-space:nowrap">
             ${d.is_default ? '' : `<button class="btn sm" data-def="${d.id}">${t('设默认')}</button> `}
