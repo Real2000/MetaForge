@@ -9,7 +9,7 @@ import { t } from '../i18n.js';
 
 export async function render(el) {
   const me = getUser() || {};
-  if (me.role !== 'admin') { el.innerHTML = '<div class="empty-box">仅管理员可访问</div>'; return; }
+  if (me.role !== 'admin') { el.innerHTML = `<div class="empty-box">${t('仅管理员可访问')}</div>`; return; }
   el.innerHTML = `
   <style>
     .sec-page{padding:18px 22px;max-width:960px;margin:0 auto}
@@ -53,9 +53,9 @@ export async function render(el) {
         </div>`).join('');
       host.querySelectorAll('[data-edit]').forEach(b => b.onclick = () => openForm(b.dataset.edit, b.dataset.remark));
       host.querySelectorAll('[data-del]').forEach(b => b.onclick = async () => {
-        if (!(await confirmBox(`确认删除 {{env.${b.dataset.del}}} ？引用它的画布运行时将保留占位符原样`))) return;
+        if (!(await confirmBox(t('确认删除 {{env.{name}}} ？引用它的画布运行时将保留占位符原样').replace('{name}', b.dataset.del)))) return;
         const j2 = await api('/secrets', { method: 'POST', body: { name: b.dataset.del, value: '' } });
-        toast(j2.msg || '已删除');
+        toast(j2.msg || t('已删除'));
         load();
       });
     } catch (e) { el.querySelector('#secList').innerHTML = `<div style="color:#dc2626">❌ ${esc(e.message)}</div>`; }
@@ -65,11 +65,11 @@ export async function render(el) {
     modal({
       title: (name ? '✏️ ' + t('更新密钥') : '＋ ' + t('新增密钥')),
       body: `<div style="font-size:12.5px;line-height:1.9">
-        <div style="margin-bottom:10px"><label style="font-size:11.5px;color:var(--text-3)">名称（大写字母/数字/下划线）</label>
+        <div style="margin-bottom:10px"><label style="font-size:11.5px;color:var(--text-3)">${t('名称（大写字母/数字/下划线）')}</label>
           <input class="input" id="secName" value="${esc(name)}" ${name ? 'readonly' : ''} placeholder="如 SEARCH_API_KEY"></div>
-        <div style="margin-bottom:10px"><label style="font-size:11.5px;color:var(--text-3)">值（留空提交 = 删除${name ? '' : '（必填）'}）</label>
-          <input class="input" id="secValue" type="password" placeholder="${name ? '••••••（不变可留空？）留空提交将删除！' : '密钥值'}"></div>
-        <div><label style="font-size:11.5px;color:var(--text-3)">备注</label>
+        <div style="margin-bottom:10px"><label style="font-size:11.5px;color:var(--text-3)">${t('值（留空提交 = 删除')}${name ? '' : t('（必填）')}）</label>
+          <input class="input" id="secValue" type="password" placeholder="${name ? t('（不变可留空？留空提交将删除！）') : t('密钥值')}"></div>
+        <div><label style="font-size:11.5px;color:var(--text-3)">${t('备注')}</label>
           <input class="input" id="secRemark" value="${esc(remark)}" placeholder="${t('用途说明，如 联网搜索 API Key')}"></div>
       </div>`,
       foot: `<button class="btn primary" id="secSave">${t('保存')}</button>`,
@@ -78,13 +78,13 @@ export async function render(el) {
           const name = mask.querySelector('#secName').value.trim();
           const value = mask.querySelector('#secValue').value;
           const remark = mask.querySelector('#secRemark').value.trim();
-          if (!name) return toast('名称不能为空', 'err');
+          if (!name) return toast(t('名称不能为空'), 'err');
           if (!name && !value) return;
           try {
             const j = await api('/secrets', { method: 'POST', body: { name, value, remark } });
-            toast(j.msg || '已保存');
+            toast(j.msg || t('已保存'));
             close(); load();
-          } catch (e) { toast('保存失败：' + e.message, 'err'); }
+          } catch (e) { toast(t('保存失败：') + e.message, 'err'); }
         };
       },
     });
