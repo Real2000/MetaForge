@@ -12,62 +12,62 @@ import { t } from '../i18n.js';
 
 // 节点类型注册表（V2 type 名：start/llm/tool/agent/if-else/end + P5.2：code/iteration/assign）
 export const NODE_TYPES = {
-  start:   { icon: '🟦', color: '#1d4ed8', label: '开始（输入）', def: { title: '开始（输入）', variables: [], session_vars: [] } },
-  llm:     { icon: '🟣', color: '#7c3aed', label: '大模型', def: { title: '大模型', model: '', system_prompt: '', prompt: '', max_tokens: 1024, temperature: 0.7, output_schema: '', context: { use_history: false, rounds: 3 } } },
-  tool:    { icon: '🟠', color: '#ea580c', label: '工具', def: { title: '工具', toolId: 'web_search', args: '{}' } },
-  agent:   { icon: '🧠', color: '#0284c7', label: '子智能体', def: { title: '子智能体', agentId: '', input: '{{#start.input#}}' } },
-  code:    { icon: '⌨️', color: '#0891b2', label: '代码', def: { title: '代码', code: 'return input;', inputs: '{"input":"{{#start.input#}}"}', timeout: 3000 } },
-  iteration: { icon: '🔁', color: '#16a34a', label: '列表迭代', def: { title: '列表迭代', input: '[]', subflow: null } },
-  assign:  { icon: '💱', color: '#9333ea', label: '变量赋值', def: { title: '变量赋值', assignments: [{ variable: '', value: '', operator: 'set' }] } },
-  'if-else': { icon: '🟡', color: '#d97706', label: '判断分支', def: { title: '判断分支', cases: [
+  start:   { icon: '🟦', color: '#1d4ed8', label: t('开始（输入）'), def: { title: t('开始（输入）'), variables: [], session_vars: [] } },
+  llm:     { icon: '🟣', color: '#7c3aed', label: t('大模型'), def: { title: t('大模型'), model: '', system_prompt: '', prompt: '', max_tokens: 1024, temperature: 0.7, output_schema: '', context: { use_history: false, rounds: 3 } } },
+  tool:    { icon: '🟠', color: '#ea580c', label: t('工具'), def: { title: t('工具'), toolId: 'web_search', args: '{}' } },
+  agent:   { icon: '🧠', color: '#0284c7', label: t('子智能体'), def: { title: t('子智能体'), agentId: '', input: '{{#start.input#}}' } },
+  code:    { icon: '⌨️', color: '#0891b2', label: t('代码'), def: { title: t('代码'), code: 'return input;', inputs: '{"input":"{{#start.input#}}"}', timeout: 3000 } },
+  iteration: { icon: '🔁', color: '#16a34a', label: t('列表迭代'), def: { title: t('列表迭代'), input: '[]', subflow: null } },
+  assign:  { icon: '💱', color: '#9333ea', label: t('变量赋值'), def: { title: t('变量赋值'), assignments: [{ variable: '', value: '', operator: 'set' }] } },
+  'if-else': { icon: '🟡', color: '#d97706', label: t('判断分支'), def: { title: t('判断分支'), cases: [
     { label: 'IF', conditions: [{ variable: 'start.input', type: 'contains', value: '' }], logical: 'AND' },
     { label: 'ELSE', isFallback: true, conditions: [] },
   ] } },
   // P5.6 体验进阶三节点
-  answer:  { icon: '💬', color: '#2563eb', label: '直接回复', def: { title: '直接回复', text: '{{#start.input#}}' } },
-  classifier: { icon: '🎯', color: '#c026d3', label: '问题分类器', def: { title: '问题分类器', categories: [{ name: '闲聊' }, { name: '业务咨询' }], instruction: '', model: '' } },
-  aggregator: { icon: '🔀', color: '#0d9488', label: '变量聚合器', def: { title: '变量聚合器', sources: [{ variable: '' }], mode: 'first' } },
-  end:     { icon: '🟥', color: '#dc2626', label: '输出（结束）', def: { title: '输出（结束）', outputs: [{ variable: 'result', value: '{{#start.input#}}' }] } },
+  answer:  { icon: '💬', color: '#2563eb', label: t('直接回复'), def: { title: t('直接回复'), text: '{{#start.input#}}' } },
+  classifier: { icon: '🎯', color: '#c026d3', label: t('问题分类器'), def: { title: t('问题分类器'), categories: [{ name: t('闲聊') }, { name: t('业务咨询') }], instruction: '', model: '' } },
+  aggregator: { icon: '🔀', color: '#0d9488', label: t('变量聚合器'), def: { title: t('变量聚合器'), sources: [{ variable: '' }], mode: 'first' } },
+  end:     { icon: '🟥', color: '#dc2626', label: t('输出（结束）'), def: { title: t('输出（结束）'), outputs: [{ variable: 'result', value: '{{#start.input#}}' }] } },
 };
 
 // 各节点类型的静态输出变量（动态部分由 allVars 计算）；与后端 NODE_OUTPUT_SCHEMA 对齐
 export const NODE_OUTPUTS = {
-  start: [{ name: 'input', label: '用户消息' }],
-  llm: [{ name: 'text', label: '模型回复' }],
-  tool: [{ name: 'result', label: '工具结果' }],
-  agent: [{ name: 'reply', label: '子智能体回复' }],
-  code: [{ name: 'output', label: '代码返回值' }],
-  iteration: [{ name: 'results', label: '逐条结果数组' }, { name: 'count', label: '条目数' }],
+  start: [{ name: 'input', label: t('用户消息') }],
+  llm: [{ name: 'text', label: t('模型回复') }],
+  tool: [{ name: 'result', label: t('工具结果') }],
+  agent: [{ name: 'reply', label: t('子智能体回复') }],
+  code: [{ name: 'output', label: t('代码返回值') }],
+  iteration: [{ name: 'results', label: t('逐条结果数组') }, { name: 'count', label: t('条目数') }],
   assign: [],
-  'if-else': [{ name: 'branch', label: '命中分支名' }],
-  answer: [{ name: 'text', label: '直接回复内容' }],
-  classifier: [{ name: 'class_name', label: '命中类别名' }, { name: 'branch', label: '命中分支名' }],
-  aggregator: [{ name: 'output', label: '聚合值（首个非空）' }, { name: 'array', label: '数组拼接结果' }],
+  'if-else': [{ name: 'branch', label: t('命中分支名') }],
+  answer: [{ name: 'text', label: t('直接回复内容') }],
+  classifier: [{ name: 'class_name', label: t('命中类别名') }, { name: 'branch', label: t('命中分支名') }],
+  aggregator: [{ name: 'output', label: t('聚合值（首个非空）') }, { name: 'array', label: t('数组拼接结果') }],
   end: [],
 };
 
 // 分支操作符（P1：与后端 OPERATORS 对齐）
 export const OPERATORS = [
-  ['equals', '等于'], ['not_equals', '不等于'], ['contains', '包含'], ['not_contains', '不包含'],
-  ['starts_with', '以…开头'], ['gt', '大于'], ['gte', '大于等于'], ['lt', '小于'], ['lte', '小于等于'],
-  ['is_empty', '为空'], ['not_empty', '不为空'], ['regex', '正则匹配'],
+  ['equals', t('等于')], ['not_equals', t('不等于')], ['contains', t('包含')], ['not_contains', t('不包含')],
+  ['starts_with', t('以…开头')], ['gt', t('大于')], ['gte', t('大于等于')], ['lt', t('小于')], ['lte', t('小于等于')],
+  ['is_empty', t('为空')], ['not_empty', t('不为空')], ['regex', t('正则匹配')],
 ];
 const NO_VALUE_OPS = new Set(['is_empty', 'not_empty']); // 无需值输入的操作符
 
 // 平台工具节点清单（与 TOOL_META 对齐；tool 节点下拉用）
 export const TOOL_OPTIONS = [
-  ['web_search', '🌐', '联网搜索'], ['web_fetch', '🔗', '网页抓取'], ['get_datetime', '🕐', '时间查询'],
-  ['calculator', '🧮', '精确计算'], ['image_gen', '🎨', '文生图'], ['tts', '🔊', '语音合成'],
-  ['kb_search', '📚', '知识库检索'], ['db_query', '🗃️', 'Text2SQL'], ['db_chart', '📊', '数据图表'],
-  ['stock_quote', '💵', '股票行情'], ['export_word', '📄', 'Word 导出'], ['doc_review', '🔍', '文档评审'],
+  ['web_search', '🌐', t('联网搜索')], ['web_fetch', '🔗', t('网页抓取')], ['get_datetime', '🕐', t('时间查询')],
+  ['calculator', '🧮', t('精确计算')], ['image_gen', '🎨', t('文生图')], ['tts', '🔊', t('语音合成')],
+  ['kb_search', '📚', t('知识库检索')], ['db_query', '🗃️', t('Text2SQL')], ['db_chart', '📊', t('数据图表')],
+  ['stock_quote', '💵', t('股票行情')], ['export_word', '📄', t('Word 导出')], ['doc_review', '🔍', t('文档评审')],
 ];
 
 export function createCanvas(root, opts = {}) {
   // P5.18 模型透明化：兼容两种传参（旧：字符串数组 / 新：{name,type} 对象数组）——
   // LLM 节点仅对话模型可选，但全部模型分组可见（生图/视频/语音标注用途去向，不再"凭空消失"）
   let models = (opts.models || []).map(m => (typeof m === 'string' ? { name: m, type: 'chat' } : m));
-  const TYPE_TAG = { image: '🎨 生图', video: '🎬 视频', tts: '🎙️ 语音', embedding: '🧠 嵌入' };
-  const TYPE_GUIDE = { image: '用「文生图」工具节点', video: '画布暂无视频节点——用前台视频创作模式', tts: '用「语音合成」工具节点', embedding: '知识库检索用（不出现在对话下拉）' };
+  const TYPE_TAG = { image: t('🎨 生图'), video: t('🎬 视频'), tts: t('🎙️ 语音'), embedding: t('🧠 嵌入') };
+  const TYPE_GUIDE = { image: t('用「文生图」工具节点'), video: t('画布暂无视频节点——用前台视频创作模式'), tts: t('用「语音合成」工具节点'), embedding: t('知识库检索用（不出现在对话下拉）') };
   function modelOptions(sel) {
     const chats = models.filter(m => (m.type || 'chat') === 'chat');
     const others = models.filter(m => (m.type || 'chat') !== 'chat');
@@ -258,11 +258,11 @@ export function createCanvas(root, opts = {}) {
       </div>
       <div class="cv-empty" id="cvEmpty">🎨 ${t('画布为空——从左侧拖入节点开始编排')}<br>${t('从节点右侧圆点拖出连线，接到下一节点左侧圆点')}<br>${t('滚轮缩放 · 空白处拖动平移 · 双击空白加便签 · Shift 拖框多选 · 右键节点更多操作')}</div>
       <div class="cv-tools">
-        <button id="cvUndo" title="撤销 (Ctrl+Z)">↶</button>
-        <button id="cvRedo" title="重做 (Ctrl+Y / Ctrl+Shift+Z)">↷</button>
-        <button id="cvZoomOut" title="缩小">−</button>
-        <button id="cvZoomIn" title="放大">＋</button>
-        <button id="cvFit" title="适应画布">⊡</button>
+        <button id="cvUndo" title="${t('撤销 (Ctrl+Z)')}">↶</button>
+        <button id="cvRedo" title="${t('重做 (Ctrl+Y / Ctrl+Shift+Z)')}">↷</button>
+        <button id="cvZoomOut" title="${t('缩小')}">−</button>
+        <button id="cvZoomIn" title="${t('放大')}">＋</button>
+        <button id="cvFit" title="${t('适应画布')}">⊡</button>
       </div>
       <div class="cv-minimap" id="cvMini" style="display:none"><div id="cvMiniHost" style="position:absolute;inset:0"></div></div>
       <div class="cv-zoomlab" id="cvZoomLab">100%</div>
@@ -357,7 +357,7 @@ export function createCanvas(root, opts = {}) {
     if (rs.status === 'running') {
       // P5.10 流式调试：LLM 生成中逐字显示（尾部滚动态预览）
       if (rs.streamText) return `<span class="cv-spin"></span><span class="cv-stream">${esc(rs.streamText)}</span>`;
-      return `<span class="cv-spin"></span><span style="color:#2563eb">执行中…</span>`;
+      return `<span class="cv-spin"></span><span style="color:#2563eb">${t('执行中…')}</span>`;
     }
     // P5.13 成本可视化：成功徽标附 tokens 与费用（比 Dify 更直接——直接在节点卡片上显示）
     if (rs.status === 'success') {
@@ -369,8 +369,8 @@ export function createCanvas(root, opts = {}) {
       if (rs.viaError) return `<span style="color:#d97706">⚡</span><span class="err" title="${esc(rs.error || '')}">${esc((rs.error || '').slice(0, 40))}</span><span style="color:#d97706">${t('→已走异常分支')}</span>`;
       return `<span style="color:#dc2626">❌</span><span class="err" title="${esc(rs.error || '')}">${esc((rs.error || '').slice(0, 60))}</span>`;
     }
-    if (rs.status === 'skipped') return `<span>⏭️ 跳过（分支未命中）</span>`;
-    if (rs.status === 'preset') return `<span>↺ 沿用上次结果</span>`;
+    if (rs.status === 'skipped') return `<span>⏭️ ${t('跳过（分支未命中）')}</span>`;
+    if (rs.status === 'preset') return `<span>↺ ${t('沿用上次结果')}</span>`;
     return '';
   }
   // P5.11：节点卡高度估算（分支行数×24 + 头部/体部；异常分支锚点定位用）
@@ -392,16 +392,16 @@ export function createCanvas(root, opts = {}) {
       if (parts.length) return parts.join(' · ');
       return t('输入变量：{{#start.input#}}（用户消息）');
     }
-    if (n.type === 'llm') return `🤖 ${esc(d.model || '默认模型')}${(d.fallback_models || []).length ? ` · 🛡️+${d.fallback_models.length}` : ''}${d.output_schema ? ' · 📋结构化' : ''}${d.context?.use_history ? ' · 💬带历史' : ''} · ${esc((d.prompt || '').replace(/\s+/g, ' ').slice(0, 26) || '待填')}`;
+    if (n.type === 'llm') return `🤖 ${esc(d.model || t('默认模型'))}${(d.fallback_models || []).length ? ` · 🛡️+${d.fallback_models.length}` : ''}${d.output_schema ? ` · 📋${t('结构化')}` : ''}${d.context?.use_history ? ` · 💬${t('带历史')}` : ''} · ${esc((d.prompt || '').replace(/\s+/g, ' ').slice(0, 26) || t('待填'))}`;
     if (n.type === 'tool') { const f = TOOL_OPTIONS.find(x => x[0] === d.toolId); return `${f ? f[1] + ' ' : '🔧 '}${esc(d.toolId || '?')}`; }
-    if (n.type === 'agent') { const a = agents.find(x => String(x.id) === String(d.agentId)); return a ? `🧠 ${esc(a.name)}` : '⚠️ 未选择智能体'; }
+    if (n.type === 'agent') { const a = agents.find(x => String(x.id) === String(d.agentId)); return a ? `🧠 ${esc(a.name)}` : `⚠️ ${t('未选择智能体')}`; }
     if (n.type === 'code') return `⌨️ ${esc(String(d.code || '').replace(/\s+/g, ' ').slice(0, 40) || 'return …')}`;
-    if (n.type === 'iteration') return `🔁 ${d.subflow?.nodes?.length ? (d.subflow.nodes.length + ' 步子流程') : '⚠️ 未配置子流程'} · 输入数组`;
+    if (n.type === 'iteration') return `🔁 ${d.subflow?.nodes?.length ? t('{n} 步子流程').replace('{n}', d.subflow.nodes.length) : `⚠️ ${t('未配置子流程')}`} · ${t('输入数组')}`;
     if (n.type === 'assign') return (d.assignments || []).map(a => `💱 ${esc(a.variable || '?')} ${esc(a.operator || 'set')}${a.operator === 'clear' ? '' : ' ' + esc(String(a.value || '').slice(0, 10))}`).slice(0, 2).join(' · ') + ((d.assignments || []).length > 2 ? ' …' : '');
-    if (n.type === 'if-else') return (d.cases || []).map(c => `⇢ ${esc(c.label || '?')}${c.isFallback ? '（兜底）' : esc((c.conditions || []).map(cd => `${OPERATORS.find(o => o[0] === cd.type)?.[1] || cd.type}${cd.value ? ' ' + String(cd.value).slice(0, 6) : ''}`).join(c.logical === 'OR' ? ' 或 ' : ' 且 '))}`).join(' · ');
-    if (n.type === 'answer') return `💬 ${esc(String(d.text || '').replace(/\s+/g, ' ').slice(0, 34) || '待配置')}`;
+    if (n.type === 'if-else') return (d.cases || []).map(c => `⇢ ${esc(c.label || '?')}${c.isFallback ? t('（兜底）') : esc((c.conditions || []).map(cd => `${OPERATORS.find(o => o[0] === cd.type)?.[1] || cd.type}${cd.value ? ' ' + String(cd.value).slice(0, 6) : ''}`).join(c.logical === 'OR' ? t(' 或 ') : t(' 且 ')))}`).join(' · ');
+    if (n.type === 'answer') return `💬 ${esc(String(d.text || '').replace(/\s+/g, ' ').slice(0, 34) || t('待配置'))}`;
     if (n.type === 'classifier') return (d.categories || []).map(c => `⇢ ${esc(c.name || '?')}`).join(' · ') + ' · ⇢ default';
-    if (n.type === 'aggregator') return `🔀 ${d.mode === 'array' ? '数组拼接' : '首个非空'} × ${(d.sources || []).length}`;
+    if (n.type === 'aggregator') return `🔀 ${d.mode === 'array' ? t('数组拼接') : t('首个非空')} × ${(d.sources || []).length}`;
     if (n.type === 'end') return `📤 ${esc(String(d.outputs?.[0]?.value || '').replace(/\s+/g, ' ').slice(0, 34) || '待配置')}`;
     return '';
   }
@@ -759,7 +759,7 @@ export function createCanvas(root, opts = {}) {
     refreshRefWarnings();
     for (const [nid, refs] of Object.entries(refWarnings)) {
       for (const ref of refs) {
-        problems.push({ level: 'error', nodeId: nid, type: 'ref', msg: `引用了不存在的变量 {{#${ref}#}}` });
+        problems.push({ level: 'error', nodeId: nid, type: 'ref', msg: t('引用了不存在的变量 {{#{ref}#}}').replace('{ref}', ref) });
       }
     }
     // ② 孤立节点：未连入主流程（从 start 可达之外的节点）
@@ -773,43 +773,43 @@ export function createCanvas(root, opts = {}) {
     }
     for (const n of wf.nodes) {
       if (n.type === 'start') continue;
-      if (!reachable.has(n.id)) problems.push({ level: 'warn', nodeId: n.id, type: 'orphan', msg: '未连接到主流程（不会执行）' });
+      if (!reachable.has(n.id)) problems.push({ level: 'warn', nodeId: n.id, type: 'orphan', msg: t('未连接到主流程（不会执行）') });
     }
     // ③ 必填项缺失
     for (const n of wf.nodes) {
       const d = n.data || {};
       if (n.type === 'llm') {
-        if (!(String(d.prompt || '').trim())) problems.push({ level: 'error', nodeId: n.id, type: 'required', msg: '提示词为空' });
+        if (!(String(d.prompt || '').trim())) problems.push({ level: 'error', nodeId: n.id, type: 'required', msg: t('提示词为空') });
         if (!d.model && !models.length) { /* 跟随智能体默认模型——平台无模型时才无默认可跟，不报 */ }
-        if (d.output_schema) { try { JSON.parse(typeof d.output_schema === 'string' ? d.output_schema : JSON.stringify(d.output_schema)); } catch { problems.push({ level: 'error', nodeId: n.id, type: 'required', msg: '结构化输出 Schema 不是合法 JSON' }); } }
+        if (d.output_schema) { try { JSON.parse(typeof d.output_schema === 'string' ? d.output_schema : JSON.stringify(d.output_schema)); } catch { problems.push({ level: 'error', nodeId: n.id, type: 'required', msg: t('结构化输出 Schema 不是合法 JSON') }); } }
       }
-      if (n.type === 'tool' && !d.toolId) problems.push({ level: 'error', nodeId: n.id, type: 'required', msg: '未选择工具' });
-      if (n.type === 'agent' && !d.agentId) problems.push({ level: 'error', nodeId: n.id, type: 'required', msg: '未选择子智能体' });
+      if (n.type === 'tool' && !d.toolId) problems.push({ level: 'error', nodeId: n.id, type: 'required', msg: t('未选择工具') });
+      if (n.type === 'agent' && !d.agentId) problems.push({ level: 'error', nodeId: n.id, type: 'required', msg: t('未选择子智能体') });
       if (n.type === 'code') {
-        if (!(String(d.code || '').trim())) problems.push({ level: 'error', nodeId: n.id, type: 'required', msg: '代码为空' });
-        try { const m = typeof d.inputs === 'string' ? JSON.parse(d.inputs || '{}') : (d.inputs || {}); if (typeof m !== 'object' || Array.isArray(m)) throw new Error(); } catch { problems.push({ level: 'error', nodeId: n.id, type: 'required', msg: '输入变量 JSON 不合法' }); }
+        if (!(String(d.code || '').trim())) problems.push({ level: 'error', nodeId: n.id, type: 'required', msg: t('代码为空') });
+        try { const m = typeof d.inputs === 'string' ? JSON.parse(d.inputs || '{}') : (d.inputs || {}); if (typeof m !== 'object' || Array.isArray(m)) throw new Error(); } catch { problems.push({ level: 'error', nodeId: n.id, type: 'required', msg: t('输入变量 JSON 不合法') }); }
       }
       if (n.type === 'iteration') {
-        if (!d.subflow?.nodes?.length) problems.push({ level: 'error', nodeId: n.id, type: 'required', msg: '未搭建子流程' });
+        if (!d.subflow?.nodes?.length) problems.push({ level: 'error', nodeId: n.id, type: 'required', msg: t('未搭建子流程') });
         const raw = String(d.input || '[]').replace(/\{\{[^}]*\}\}/g, 'x'); // 模板替换后试探
-        try { const arr = JSON.parse(raw); if (!Array.isArray(arr)) { /* 换行分隔文本也合法 */ } } catch { if (!raw.trim()) problems.push({ level: 'warn', nodeId: n.id, type: 'required', msg: '输入数组为空（运行时将为空迭代）' }); }
+        try { const arr = JSON.parse(raw); if (!Array.isArray(arr)) { /* 换行分隔文本也合法 */ } } catch { if (!raw.trim()) problems.push({ level: 'warn', nodeId: n.id, type: 'required', msg: t('输入数组为空（运行时将为空迭代）') }); }
       }
       if (n.type === 'if-else') {
         const cases = d.cases || [];
-        if (!cases.some(c => !c.isFallback && (c.conditions || []).some(cd => cd.variable))) problems.push({ level: 'error', nodeId: n.id, type: 'required', msg: 'IF 分支未配置条件' });
-        if (!cases.some(c => c.isFallback)) problems.push({ level: 'warn', nodeId: n.id, type: 'required', msg: '无 ELSE 兜底分支（全不命中时流程断头）' });
+        if (!cases.some(c => !c.isFallback && (c.conditions || []).some(cd => cd.variable))) problems.push({ level: 'error', nodeId: n.id, type: 'required', msg: t('IF 分支未配置条件') });
+        if (!cases.some(c => c.isFallback)) problems.push({ level: 'warn', nodeId: n.id, type: 'required', msg: t('无 ELSE 兜底分支（全不命中时流程断头）') });
       }
       if (n.type === 'classifier') {
-        if (!(d.categories || []).some(c => (c.name || '').trim())) problems.push({ level: 'error', nodeId: n.id, type: 'required', msg: '未配置类别' });
+        if (!(d.categories || []).some(c => (c.name || '').trim())) problems.push({ level: 'error', nodeId: n.id, type: 'required', msg: t('未配置类别') });
       }
       if (n.type === 'assign') {
-        (d.assignments || []).forEach((a, i) => { if (!a.variable && a.operator !== 'clear') problems.push({ level: 'error', nodeId: n.id, type: 'required', msg: `赋值 ${i + 1} 未填变量名` }); });
+        (d.assignments || []).forEach((a, i) => { if (!a.variable && a.operator !== 'clear') problems.push({ level: 'error', nodeId: n.id, type: 'required', msg: t('赋值 {n} 未填变量名').replace('{n}', i + 1) }); });
       }
       if (n.type === 'aggregator') {
-        if (!(d.sources || []).some(s => (s.variable || '').trim())) problems.push({ level: 'error', nodeId: n.id, type: 'required', msg: '未配置聚合来源' });
+        if (!(d.sources || []).some(s => (s.variable || '').trim())) problems.push({ level: 'error', nodeId: n.id, type: 'required', msg: t('未配置聚合来源') });
       }
-      if (n.type === 'answer' && !(String(d.text || '').trim())) problems.push({ level: 'warn', nodeId: n.id, type: 'required', msg: '回复内容为空' });
-      if (n.type === 'end' && !((d.outputs || [])[0]?.value ?? '').trim()) problems.push({ level: 'warn', nodeId: n.id, type: 'required', msg: '输出模板为空' });
+      if (n.type === 'answer' && !(String(d.text || '').trim())) problems.push({ level: 'warn', nodeId: n.id, type: 'required', msg: t('回复内容为空') });
+      if (n.type === 'end' && !((d.outputs || [])[0]?.value ?? '').trim()) problems.push({ level: 'warn', nodeId: n.id, type: 'required', msg: t('输出模板为空') });
     }
     return { ok: !problems.some(p => p.level === 'error'), problems };
   }
@@ -939,35 +939,35 @@ export function createCanvas(root, opts = {}) {
     const out = [];
     for (const n of wf.nodes) {
       if (n.type === 'start') {
-        out.push({ ref: `start.input`, label: `开始·用户消息` });
+        out.push({ ref: `start.input`, label: t('开始·用户消息') });
         // P5.11 异常分支：画了 __error__ 出边的节点暴露 {{#节点.__error__#}}（失败原因，补救节点可引用）
         for (const n2 of wf.nodes) {
           if (n2.type === 'start' || !wf.edges.some(e => e.source === n2.id && (e.sourceHandle || 'out') === '__error__')) continue;
-          out.push({ ref: `${n2.id}.__error__`, label: `${n2.data?.title || n2.id}·失败原因（⚡异常分支）` });
+          out.push({ ref: `${n2.id}.__error__`, label: t('{n}·失败原因（⚡异常分支）').replace('{n}', n2.data?.title || n2.id) });
         }
-        for (const v of n.data?.variables || []) if (v.name) out.push({ ref: `start.${v.name}`, label: `开始·${v.name}` });
+        for (const v of n.data?.variables || []) if (v.name) out.push({ ref: `start.${v.name}`, label: t('开始·{n}').replace('{n}', v.name) });
         // P5.7 会话变量（跨轮次持久）：{{#start.名称#}} 引用，assign 写 session.名称
-        for (const v of n.data?.session_vars || []) if (v.name) out.push({ ref: `start.${v.name}`, label: `开始·${v.name}（💾会话变量）` });
+        for (const v of n.data?.session_vars || []) if (v.name) out.push({ ref: `start.${v.name}`, label: t('开始·{n}（💾会话变量）').replace('{n}', v.name) });
       } else if (n.type === 'llm') {
-        out.push({ ref: `${n.id}.text`, label: `${n.data?.title || n.id}·模型回复` });
+        out.push({ ref: `${n.id}.text`, label: t('{n}·模型回复').replace('{n}', n.data?.title || n.id) });
         // 结构化输出字段
         if (n.data?.output_schema) {
           try {
             const sc = JSON.parse(typeof n.data.output_schema === 'string' ? n.data.output_schema : JSON.stringify(n.data.output_schema));
             const props = sc?.properties || (sc && typeof sc === 'object' ? sc : null);
-            if (props && typeof props === 'object') for (const k of Object.keys(props)) out.push({ ref: `${n.id}.${k}`, label: `${n.data?.title || n.id}·${k}（结构化）` });
+            if (props && typeof props === 'object') for (const k of Object.keys(props)) out.push({ ref: `${n.id}.${k}`, label: t('{n}·{k}（结构化）').replace('{n}', n.data?.title || n.id).replace('{k}', k) });
           } catch { }
         }
       } else if (n.type === 'assign') {
-        for (const a of n.data?.assignments || []) if (a.variable) out.push({ ref: `${n.id}.${a.variable}`, label: `${n.data?.title || n.id}·${a.variable}（赋值）` });
+        for (const a of n.data?.assignments || []) if (a.variable) out.push({ ref: `${n.id}.${a.variable}`, label: t('{n}·{k}（赋值）').replace('{n}', n.data?.title || n.id).replace('{k}', a.variable) });
       } else {
-        for (const o of NODE_OUTPUTS[n.type] || []) out.push({ ref: `${n.id}.${o.name}`, label: `${n.data?.title || n.id}·${o.label}` });
+        for (const o of NODE_OUTPUTS[n.type] || []) out.push({ ref: `${n.id}.${o.name}`, label: t('{n}·{k}').replace('{n}', n.data?.title || n.id).replace('{k}', o.label) });
         if (n.type === 'code' && Array.isArray(n.data?.outputs)) {
-          for (const k of n.data.outputs) out.push({ ref: `${n.id}.${k}`, label: `${n.data?.title || n.id}·${k}（代码字段）` });
+          for (const k of n.data.outputs) out.push({ ref: `${n.id}.${k}`, label: t('{n}·{k}（代码字段）').replace('{n}', n.data?.title || n.id).replace('{k}', k) });
         }
         // P5.6 工具试运行发现的字段（data._fields）成可引用变量
         if (n.type === 'tool' && Array.isArray(n.data?._fields)) {
-          for (const k of n.data._fields) out.push({ ref: `${n.id}.${k}`, label: `${n.data?.title || n.id}·${k}（工具字段）` });
+          for (const k of n.data._fields) out.push({ ref: `${n.id}.${k}`, label: t('{n}·{k}（工具字段）').replace('{n}', n.data?.title || n.id).replace('{k}', k) });
         }
       }
     }
@@ -1189,7 +1189,7 @@ export function createCanvas(root, opts = {}) {
         (c.session_vars || []).map((v, i) => `
         <div class="fd" style="border:1px dashed #93c5fd;border-radius:8px;padding:8px;background:rgba(37,99,235,.03)"><label>💾 ${t('会话变量')} ${i + 1}</label>
           <div style="display:flex;gap:6px">
-            <input class="input" data-k="svars.name" data-i="${i}" value="${esc(v.name || '')}" placeholder="变量名（如 user_name）">
+            <input class="input" data-k="svars.name" data-i="${i}" value="${esc(v.name || '')}" placeholder="${t('变量名（如 user_name）')}">
             <input class="input" data-k="svars.default" data-i="${i}" value="${esc(v.default || '')}" placeholder="${t('默认值（如 游客）')}">
             <button class="btn" data-delsvar="${i}">✕</button>
           </div>
@@ -1305,7 +1305,7 @@ export function createCanvas(root, opts = {}) {
         </div>`).join('') +
         `<button class="btn" id="cvAddAssign" style="width:100%">＋ ${t('添加赋值')}</button>`;
     } else if (n.type === 'if-else') {
-      body = `<div class="hint">IF/ELIF/ELSE：按顺序判定，第一条命中即走对应出边；ELSE 兜底。多条件用 AND/OR 组合；每个分支从节点右侧对应行圆点拖出连线。</div>` +
+      body = `<div class="hint">${t('IF/ELIF/ELSE：按顺序判定，第一条命中即走对应出边；ELSE 兜底。多条件用 AND/OR 组合；每个分支从节点右侧对应行圆点拖出连线。')}</div>` +
         (c.cases || []).map((cs, i) => `
         <div class="fd" style="border:1px solid var(--border,#eef0f3);border-radius:8px;padding:8px">
           <label>${cs.isFallback ? 'ELSE ' : (i === 0 ? 'IF ' : 'ELIF ')}${t('分支')}</label>
@@ -1533,9 +1533,9 @@ export function createCanvas(root, opts = {}) {
     prop.querySelector('#cvEditSub')?.addEventListener('click', () => {
       const defaultSub = () => ({
         nodes: [
-          { id: 'start', type: 'start', position: { x: 60, y: 120 }, data: { title: '迭代开始', variables: [{ name: 'item', type: 'string', label: '当前条目' }, { name: 'index', type: 'string', label: '序号' }] } },
-          { id: 'node_1', type: 'code', position: { x: 380, y: 120 }, data: { title: '处理', code: 'return { out: item };', inputs: '{"item":"{{item}}","index":"{{index}}"}', timeout: 3000 } },
-          { id: 'node_2', type: 'end', position: { x: 700, y: 120 }, data: { title: '迭代输出', outputs: [{ variable: 'r', value: '{{#node_1.out#}}' }] } },
+          { id: 'start', type: 'start', position: { x: 60, y: 120 }, data: { title: t('迭代开始'), variables: [{ name: 'item', type: 'string', label: t('当前条目') }, { name: 'index', type: 'string', label: t('序号') }] } },
+          { id: 'node_1', type: 'code', position: { x: 380, y: 120 }, data: { title: t('处理'), code: 'return { out: item };', inputs: '{"item":"{{item}}","index":"{{index}}"}', timeout: 3000 } },
+          { id: 'node_2', type: 'end', position: { x: 700, y: 120 }, data: { title: t('迭代输出'), outputs: [{ variable: 'r', value: '{{#node_1.out#}}' }] } },
         ],
         edges: [{ id: 'e_1', source: 'start', target: 'node_1', sourceHandle: 'out' }, { id: 'e_2', source: 'node_1', target: 'node_2', sourceHandle: 'out' }],
         viewport: { x: 40, y: 30, zoom: 1 },
@@ -2045,7 +2045,7 @@ export function createCanvas(root, opts = {}) {
               headers: { 'Content-Type': 'application/json' }, // P2-3：Cookie 化后同源自动鉴权
               body: JSON.stringify(body),
             });
-            if (!res.ok || !res.body) throw new Error('SSE 连接失败（' + res.status + '）');
+            if (!res.ok || !res.body) throw new Error(t('SSE 连接失败（{n}）').replace('{n}', res.status));
             const reader = res.body.getReader();
             const decoder = new TextDecoder();
             let buf = '';
@@ -2292,8 +2292,8 @@ export function createCanvas(root, opts = {}) {
     wf.flow_type = wf.flow_type === 'chatflow' ? 'workflow' : 'chatflow';
     markDirty(); updateModeBtn(); pushHistory();
     toast(wf.flow_type === 'chatflow'
-      ? '💬 已切换 Chatflow：对话触发整图执行，llm 默认携带历史，直接回复节点流式输出'
-      : '⚙️ 已切换 Workflow：一次性执行，不带历史（llm 仍可单独勾选携带）');
+      ? t('💬 已切换 Chatflow：对话触发整图执行，llm 默认携带历史，直接回复节点流式输出')
+      : t('⚙️ 已切换 Workflow：一次性执行，不带历史（llm 仍可单独勾选携带）'));
     renderProp();
   };
   updateModeBtn();
