@@ -47,7 +47,7 @@ export async function render(box) {
         <div style="text-align:center;padding:16px;border:2px dashed var(--brand,#2563eb);border-radius:12px">
           <div style="font-size:13px;color:var(--text-3)">${t('在客户端安装后的配对窗口输入')}</div>
           <div style="font-size:44px;font-weight:700;letter-spacing:14px;color:var(--brand,#2563eb);margin:10px 0;font-family:ui-monospace,monospace">${esc(String(code))}</div>
-          <div style="font-size:12px;color:var(--text-3)">${expires_in}s ${t('内有效')} · <a href="javascript:;" id="regen">${t('重新生成')}</a></div>
+          <div style="font-size:12px;color:var(--text-3)">${t('{n}s 内有效').replace('{n}', expires_in)} · <a href="javascript:;" id="regen">${t('重新生成')}</a></div>
         </div>`;
       const tick = setInterval(() => {
         const el = box.querySelector('#pairArea [style*="12px"]');
@@ -96,58 +96,58 @@ export async function render(box) {
         el.innerHTML = `<div style="grid-column:1/-1;padding:18px;text-align:center;color:var(--text-3);font-size:13px">${t('暂无桌面场景模板——请先安装客户端并完成配对。')}</div>`;
         return;
       }
-      el.innerHTML = templates.map(t => `
+      el.innerHTML = templates.map(tpl => `
         <div class="card" style="padding:16px;display:flex;flex-direction:column;gap:10px;cursor:default">
           <div style="display:flex;align-items:center;gap:8px">
-            <span style="font-size:28px">${esc(t.icon || '🚀')}</span>
-            <div><b>${esc(t.title)}</b><br><span class="tag gray" style="font-size:11px">${esc(t.category || '通用')}</span></div>
+            <span style="font-size:28px">${esc(tpl.icon || '🚀')}</span>
+            <div><b>${esc(tpl.title)}</b><br><span class="tag gray" style="font-size:11px">${esc(t(tpl.category || '通用'))}</span></div>
           </div>
-          <p style="font-size:12px;color:var(--text-3);line-height:1.6;flex:1">${esc(t.description || '')}</p>
+          <p style="font-size:12px;color:var(--text-3);line-height:1.6;flex:1">${esc(tpl.description || '')}</p>
           <div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:4px">
-            ${(t.operations || []).map(op => `<span class="tag gray" style="font-size:10px">${esc(op)}</span>`).join('')}
+            ${(tpl.operations || []).map(op => `<span class="tag gray" style="font-size:10px">${esc(op)}</span>`).join('')}
           </div>
-          <button class="btn primary sm" data-create-template="${t.id}" style="margin-top:auto">${t('一键创建')}</button>
+          <button class="btn primary sm" data-create-template="${tpl.id}" style="margin-top:auto">${t('一键创建')}</button>
         </div>`).join('');
 
       el.querySelectorAll('[data-create-template]').forEach(b => b.onclick = async () => {
-        const t = templates.find(x => x.id === b.dataset.createTemplate);
-        if (!t) return;
-        if (!(await confirmBox(`确定创建「${t.title}」桌面场景智能体？\n\n创建后将自动完成：智能体创建 + 开场白配置 + 定时任务设置（${t.default_cron || '手动触发'}）。\n\n后续可在「智能体」页编辑或调整。`))) return;
+        const tpl = templates.find(x => x.id === b.dataset.createTemplate);
+        if (!tpl) return;
+        if (!(await confirmBox(t('确定创建「{name}」桌面场景智能体？创建后将自动完成：智能体创建 + 开场白配置 + 定时任务设置。后续可在「智能体」页编辑或调整。').replace('{name}', tpl.title)))) return;
         try {
           // 创建智能体（使用模板中的 prompt/工具/开场白）
           const agent = await api('/agents', {
             method: 'POST',
             body: {
-              name: t.title + '（桌面场景）',
-              description: t.description,
-              prompt: t.prompt,
+              name: tpl.title + '（桌面场景）',
+              description: tpl.description,
+              prompt: tpl.prompt,
               tools: ['local_exec'],
               opening: '我已就绪，请告诉我需要做什么。',
               opening_questions: [],
             },
           });
-          if (agent.code !== 0) { toast('创建智能体失败：' + (agent.msg || '未知错误'), 'err'); return; }
+          if (agent.code !== 0) { toast(t('创建智能体失败：') + (agent.msg || t('未知错误')), 'err'); return; }
           const agentId = agent.data.id;
 
           // 如果模板有定时任务 cron 表达式，创建定时任务
-          if (t.default_cron) {
+          if (tpl.default_cron) {
             const task = await api('/tasks', {
               method: 'POST',
               body: {
-                name: t.title + '（定时）',
+                name: tpl.title + '（定时）',
                 target_id: agentId,
                 exec_type: 'cron',
-                cron: t.default_cron,
+                cron: tpl.default_cron,
                 params: JSON.stringify({ agent_id: agentId }),
               },
             });
             if (task.code !== 0) {
-              toast('已创建智能体，定时任务创建失败：' + (task.msg || '未知错误'), 'err');
+              toast(t('已创建智能体，定时任务创建失败：') + (task.msg || t('未知错误')), 'err');
             } else {
-              toast(`🎉 已创建「${t.title}」智能体，并设置了定时任务（${t.default_cron}）`, 'ok');
+              toast(t('🎉 已创建「{name}」智能体，并设置了定时任务').replace('{name}', tpl.title) + `（${tpl.default_cron}）`, 'ok');
             }
           } else {
-            toast(`🎉 已创建「${t.title}」智能体。在对话中召唤即可使用！`, 'ok');
+            toast(t('🎉 已创建「{name}」智能体。在对话中召唤即可使用！').replace('{name}', tpl.title), 'ok');
           }
         } catch (e) {
           toast('创建失败：' + e.message, 'err');
