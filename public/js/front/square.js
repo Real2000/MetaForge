@@ -3,12 +3,13 @@
  */
 import { api } from '../api.js'; // P2-3：移除未使用的 getToken 导入（token 已 Cookie 化）
 import { esc, toast, modal, confirmBox } from '../ui.js';
+import { t } from '../i18n.js';
 
 const AVA = [
   ['#2563eb', '#7c3aed'], ['#059669', '#0d9488'], ['#d97706', '#dc2626'], ['#db2777', '#7c3aed'],
   ['#0891b2', '#2563eb'], ['#65a30d', '#059669'], ['#ea580c', '#d97706'], ['#4f46e5', '#db2777'],
 ];
-const TYPE_TAG = { enterprise: '<span class="tag blue">企业</span>', digital: '<span class="tag green">数字员工</span>', dept: '<span class="tag purple">部门助理</span>', other: '<span class="tag gray">其他</span>' };
+const TYPE_TAG = { enterprise: `<span class="tag blue">${t('企业')}</span>`, digital: `<span class="tag green">${t('数字员工')}</span>`, dept: `<span class="tag purple">${t('部门助理')}</span>`, other: `<span class="tag gray">${t('其他')}</span>` };
 
 export async function render(el) {
   let list = [], categories = [];
@@ -42,19 +43,19 @@ export async function render(el) {
     .wf-builtin{position:absolute;top:10px;right:12px;font-size:10px;background:linear-gradient(135deg,#2563eb,#7c3aed);color:#fff;padding:2px 8px;border-radius:999px}
   </style>
   <div class="page-head">
-    <h2>智能体广场</h2>
-    <div class="desc">已发布的智能体在此集中展示——分类浏览、搜索、收藏、一键复制创建，开启你的探索之旅。</div>
+    <h2>${t('智能体广场')}</h2>
+    <div class="desc">${t('已发布的智能体在此集中展示——分类浏览、搜索、收藏、一键复制创建，开启你的探索之旅。')}</div>
   </div>
   <div class="card" style="padding:14px 18px">
     <div class="sq-head">
       <div class="sq-chips" id="chips"></div>
       <div style="display:flex;gap:10px;align-items:center">
-        <input class="input" id="kw" placeholder="🔍 搜索智能体名称或描述" style="width:220px">
+        <input class="input" id="kw" placeholder="${t('🔍 搜索智能体名称或描述')}" style="width:220px">
       </div>
     </div>
   </div>
   <div class="sq-grid" id="grid"></div>
-  <div class="wf-sec"><h3>📐 工作流模板</h3><span style="font-size:12px;color:var(--text-3)">预配置画布流程一键复用——复制后改提示词/知识库即可，比从零画快 10 倍</span></div>
+  <div class="wf-sec"><h3>📐 ${t('工作流模板')}</h3><span style="font-size:12px;color:var(--text-3)">${t('预配置画布流程一键复用——复制后改提示词/知识库即可，比从零画快 10 倍')}</span></div>
   <div class="wf-grid" id="wfGrid"></div>`;
 
   const grid = el.querySelector('#grid');
@@ -68,14 +69,14 @@ export async function render(el) {
 
   function renderChips() {
     const chipDefs = [
-      { key: '全部', label: '全部' },
-      ...categories.map(c => ({ key: c.category, label: `${c.category} ${c.c}` })),
+      { key: '全部', label: t('全部') },
+      ...categories.map(c => ({ key: c.category, label: `${esc(c.category)} ${c.c}` })),
     ];
     chipsBox.innerHTML = `
       ${chipDefs.map(c => `<span class="sq-chip ${cat === c.key ? 'on' : ''}" data-c="${esc(c.key)}">${esc(c.label)}</span>`).join('')}
       <span style="width:1px;height:18px;background:#e5e7eb;margin:0 2px"></span>
-      <span class="sq-chip ${officialOnly ? 'on' : ''}" data-off="1">🏛️ 仅官方</span>
-      <span class="sq-chip ${mineOnly ? 'on' : ''}" data-mine="1">⭐ 我的收藏</span>`;
+      <span class="sq-chip ${officialOnly ? 'on' : ''}" data-off="1">🏛️ ${t('仅官方')}</span>
+      <span class="sq-chip ${mineOnly ? 'on' : ''}" data-mine="1">⭐ ${t('我的收藏')}</span>`;
     chipsBox.querySelectorAll('[data-c]').forEach(c => c.onclick = () => { cat = c.dataset.c; reload(); });
     const off = chipsBox.querySelector('[data-off]');
     off.onclick = () => { officialOnly = !officialOnly; reload(); };
@@ -89,29 +90,29 @@ export async function render(el) {
       (cat === '全部' || a.category === cat) &&
       (!keyword || a.name.includes(keyword) || (a.description || '').includes(keyword)));
     if (!shown.length) {
-      grid.innerHTML = `<div class="empty-box" style="grid-column:1/-1"><div class="big">🛍️</div>${mineOnly ? '还没有收藏的智能体，去逛逛吧～' : '该分类下暂无智能体'}</div>`;
+      grid.innerHTML = `<div class="empty-box" style="grid-column:1/-1"><div class="big">🛍️</div>${mineOnly ? t('还没有收藏的智能体，去逛逛吧～') : t('该分类下暂无智能体')}</div>`;
       return;
     }
     grid.innerHTML = shown.map(a => `
       <div class="sq-card" data-id="${a.id}">
-        ${a.is_official ? '<span class="sq-official">官方</span>' : ''}
+        ${a.is_official ? `<span class="sq-official">${t('官方')}</span>` : ''}
         <div class="sq-titrow">
           <div class="sq-ava" style="${avaStyle(a.id)}">${esc(a.icon || '🤖')}</div>
           <div style="min-width:0">
-            <div class="sq-name">${esc(a.name)} ${TYPE_TAG[a.type] || ''}${a.source !== 'self' ? '<span class="tag orange">外部</span>' : ''}</div>
-            <div style="font-size:11px;color:#9ca3af;margin-top:2px">来自 ${esc(a.space_name || a.source_name || '平台')}</div>
+            <div class="sq-name">${esc(a.name)} ${TYPE_TAG[a.type] || ''}${a.source !== 'self' ? `<span class="tag orange">${t('外部')}</span>` : ''}</div>
+            <div style="font-size:11px;color:#9ca3af;margin-top:2px">${t('来自')} ${esc(a.space_name || a.source_name || t('平台'))}</div>
           </div>
         </div>
-        <div class="sq-desc">${esc(a.description || '暂无简介')}</div>
+        <div class="sq-desc">${esc(a.description || t('暂无简介'))}</div>
         <div class="sq-stats">
-          <span>👥 ${a.user_count || 0} 用户</span><span>💬 ${a.session_count || 0} 会话</span><span>⭐ ${a.fav_count || 0}</span>
+          <span>👥 ${a.user_count || 0} ${t('用户')}</span><span>💬 ${a.session_count || 0} ${t('会话')}</span><span>⭐ ${a.fav_count || 0}</span>
           <span class="tag gray" style="margin-left:auto">${esc(a.category)}</span>
         </div>
         <div class="sq-foot">
-          <span class="sq-star" data-fav="${a.id}" title="${a.favorited ? '取消收藏' : '收藏'}">${a.favorited ? '⭐' : '☆'}</span>
+          <span class="sq-star" data-fav="${a.id}" title="${a.favorited ? t('取消收藏') : t('收藏')}">${a.favorited ? '⭐' : '☆'}</span>
           <div style="display:flex;gap:8px">
-            ${a.allow_copy ? `<button class="btn sm" data-copy="${a.id}">⧉ 复制</button>` : ''}
-            <button class="btn sm primary" data-use="${a.id}">开始使用 →</button>
+            ${a.allow_copy ? `<button class="btn sm" data-copy="${a.id}">${t('⧉ 复制')}</button>` : ''}
+            <button class="btn sm primary" data-use="${a.id}">${t('开始使用 →')}</button>
           </div>
         </div>
       </div>`).join('');
@@ -131,11 +132,11 @@ export async function render(el) {
         if (a.favorited) {
           await api(`/agents/${id}/favorite`, { method: 'DELETE' });
           a.favorited = false; a.fav_count = Math.max((a.fav_count || 0) - 1, 0);
-          toast('已取消收藏');
+          toast(t('已取消收藏'));
         } else {
           await api(`/agents/${id}/favorite`, { method: 'POST' });
           a.favorited = true; a.fav_count = (a.fav_count || 0) + 1;
-          toast('已收藏，可在「我的收藏」中查看');
+          toast(t('已收藏，可在「我的收藏」中查看'));
         }
         renderGrid();
       } catch (err) { toast(err.message, 'err'); }
@@ -145,8 +146,8 @@ export async function render(el) {
       const id = +b.dataset.copy;
       try {
         const j = await api(`/agents/${id}/copy`, { method: 'POST' });
-        toast(j.msg || '已复制为草稿');
-        if (await confirmBox('已复制为你的草稿智能体，是否前往编排页继续完善？')) {
+        toast(j.msg || t('已复制为草稿'));
+        if (await confirmBox(t('已复制为你的草稿智能体，是否前往编排页继续完善？'))) {
           location.hash = '#/admin/studio/' + j.data.id;
         }
       } catch (err) { toast(err.message, 'err'); }
@@ -160,27 +161,27 @@ export async function render(el) {
     let questions = [];
     try { questions = JSON.parse(a.opening_questions || '[]'); } catch { }
     modal({
-      title: '智能体详情',
+      title: t('智能体详情'),
       body: `
         <div style="display:flex;gap:14px;align-items:center">
           <div class="sq-ava" style="${avaStyle(a.id)};width:56px;height:56px;font-size:28px">${esc(a.icon || '🤖')}</div>
           <div>
-            <div style="font-size:17px;font-weight:700">${esc(a.name)} ${TYPE_TAG[a.type] || ''} ${a.is_official ? '<span class="sq-official" style="position:static">官方</span>' : ''}</div>
-            <div style="font-size:12px;color:#9ca3af;margin-top:4px">来自 ${esc(a.space_name || a.source_name || '平台')} · ${esc(a.category)} · 模型 ${esc(a.model || '默认')}</div>
+            <div style="font-size:17px;font-weight:700">${esc(a.name)} ${TYPE_TAG[a.type] || ''} ${a.is_official ? `<span class="sq-official" style="position:static">${t('官方')}</span>` : ''}</div>
+            <div style="font-size:12px;color:#9ca3af;margin-top:4px">${t('来自')} ${esc(a.space_name || a.source_name || t('平台'))} · ${esc(a.category)} · ${t('模型')} ${esc(a.model || t('默认'))}</div>
           </div>
         </div>
-        <div style="font-size:13px;line-height:1.8;color:var(--text);margin:16px 0;padding:12px;background:#f8faff;border-radius:10px">${esc(a.description || '暂无简介')}</div>
+        <div style="font-size:13px;line-height:1.8;color:var(--text);margin:16px 0;padding:12px;background:#f8faff;border-radius:10px">${esc(a.description || t('暂无简介'))}</div>
         <div style="display:flex;gap:18px;font-size:12px;color:var(--text-3)">
-          <span>👥 ${a.user_count || 0} 位用户使用</span>
-          <span>💬 ${a.session_count || 0} 次会话</span>
-          <span>⭐ ${a.fav_count || 0} 人收藏</span>
+          <span>👥 ${a.user_count || 0} ${t('位用户使用')}</span>
+          <span>💬 ${a.session_count || 0} ${t('次会话')}</span>
+          <span>⭐ ${a.fav_count || 0} ${t('人收藏')}</span>
         </div>
-        ${a.publish_record ? `<div style="margin-top:12px;font-size:12px;color:var(--text-3)">📝 发布记录：${esc(a.publish_record)}</div>` : ''}
-        ${questions.length ? `<div style="margin-top:14px"><div style="font-size:12px;color:var(--text-3);margin-bottom:8px">💡 大家都在问：</div>${questions.map(q => `<span class="tag gray" style="margin:0 6px 6px 0;display:inline-block;padding:4px 10px">${esc(q)}</span>`).join('')}</div>` : ''}`,
+        ${a.publish_record ? `<div style="margin-top:12px;font-size:12px;color:var(--text-3)">📝 ${t('发布记录：')}${esc(a.publish_record)}</div>` : ''}
+        ${questions.length ? `<div style="margin-top:14px"><div style="font-size:12px;color:var(--text-3);margin-bottom:8px">💡 ${t('大家都在问：')}</div>${questions.map(q => `<span class="tag gray" style="margin:0 6px 6px 0;display:inline-block;padding:4px 10px">${esc(q)}</span>`).join('')}</div>` : ''}`,
       foot: `
-        <button class="btn" data-fav>${a.favorited ? '⭐ 取消收藏' : '☆ 收藏'}</button>
-        ${a.allow_copy ? '<button class="btn" data-copy>⧉ 复制创建</button>' : ''}
-        <button class="btn primary" data-use>开始使用 →</button>`,
+        <button class="btn" data-fav>${a.favorited ? `⭐ ${t('取消收藏')}` : `☆ ${t('收藏')}`}</button>
+        ${a.allow_copy ? `<button class="btn" data-copy>${t('⧉ 复制创建')}</button>` : ''}
+        <button class="btn primary" data-use>${t('开始使用 →')}</button>`,
       onMount(mask, close) {
         mask.querySelector('[data-use]').onclick = () => { close(); location.hash = '#/chat/' + a.id; };
         mask.querySelector('[data-fav]').onclick = async () => {
@@ -199,8 +200,8 @@ export async function render(el) {
         if (cp) cp.onclick = async () => {
           try {
             const j = await api(`/agents/${a.id}/copy`, { method: 'POST' });
-            close(); toast(j.msg || '已复制为草稿');
-            if (await confirmBox('已复制为你的草稿，前往编排页完善？')) location.hash = '#/admin/studio/' + j.data.id;
+            close(); toast(j.msg || t('已复制为草稿'));
+            if (await confirmBox(t('已复制为你的草稿，前往编排页完善？'))) location.hash = '#/admin/studio/' + j.data.id;
           } catch (e) { toast(e.message, 'err'); }
         };
       },
@@ -220,64 +221,64 @@ export async function render(el) {
     if (!wfGrid) return;
     let tpls = [];
     try { tpls = (await api('/wf-templates')).data || []; } catch { wfGrid.innerHTML = ''; return; }
-    if (keyword) tpls = tpls.filter(t => (t.name + (t.description || '') + (t.category || '')).includes(keyword));
+    if (keyword) tpls = tpls.filter(tpl => (tpl.name + (tpl.description || '') + (tpl.category || '')).includes(keyword));
     if (!tpls.length) {
-      wfGrid.innerHTML = `<div class="empty-box" style="grid-column:1/-1"><div class="big">📐</div>暂无工作流模板${keyword ? '（搜索不匹配）' : '——在编排页画布上「💾 存为模板」沉淀你的高频流程'}</div>`;
+      wfGrid.innerHTML = `<div class="empty-box" style="grid-column:1/-1"><div class="big">📐</div>${t('暂无工作流模板')}${keyword ? t('（搜索不匹配）') : t('——在编排页画布上「💾 存为模板」沉淀你的高频流程')}</div>`;
       return;
     }
-    wfGrid.innerHTML = tpls.map(t => `
+    wfGrid.innerHTML = tpls.map(tpl => `
       <div class="wf-card">
-        ${t.builtin ? '<span class="wf-builtin">官方模板</span>' : ''}
+        ${tpl.builtin ? `<span class="wf-builtin">${t('官方模板')}</span>` : ''}
         <div class="sq-titrow">
-          <div class="sq-ava" style="background:linear-gradient(135deg,#2563eb,#7c3aed)">${esc(t.icon || '🎨')}</div>
+          <div class="sq-ava" style="background:linear-gradient(135deg,#2563eb,#7c3aed)">${esc(tpl.icon || '🎨')}</div>
           <div style="min-width:0">
-            <div class="sq-name">${esc(t.name)}</div>
-            <div style="font-size:11px;color:#9ca3af;margin-top:2px">${esc(t.category || '通用')} · ${t.nodes_count || 0} 节点 · 用过 ${t.use_count || 0} 次</div>
+            <div class="sq-name">${esc(tpl.name)}</div>
+            <div style="font-size:11px;color:#9ca3af;margin-top:2px">${esc(tpl.category || t('通用'))} · ${tpl.nodes_count || 0} ${t('节点')} · ${t('用过')} ${tpl.use_count || 0} ${t('次')}</div>
           </div>
         </div>
-        <div class="sq-desc">${esc(t.description || '预配置工作流模板')}</div>
-        <div class="wf-scene" title="${esc(t.scene || '')}">💡 ${esc(t.scene || '复制后按需调整节点参数')}</div>
+        <div class="sq-desc">${esc(tpl.description || t('预配置工作流模板'))}</div>
+        <div class="wf-scene" title="${esc(tpl.scene || '')}">💡 ${esc(tpl.scene || t('复制后按需调整节点参数'))}</div>
         <div class="sq-foot">
-          <span style="font-size:11px;color:#9ca3af">${esc(t.builtin ? '平台内置' : (t.created_by || ''))}</span>
+          <span style="font-size:11px;color:#9ca3af">${esc(tpl.builtin ? t('平台内置') : (tpl.created_by || ''))}</span>
           <div style="display:flex;gap:8px">
-            <button class="btn sm" data-wfdetail="${t.id}">🔍 预览</button>
-            <button class="btn sm primary" data-wfuse="${t.id}">⧉ 一键复用</button>
+            <button class="btn sm" data-wfdetail="${tpl.id}">🔍 ${t('预览')}</button>
+            <button class="btn sm primary" data-wfuse="${tpl.id}">⧉ ${t('一键复用')}</button>
           </div>
         </div>
       </div>`).join('');
 
     wfGrid.querySelectorAll('[data-wfuse]').forEach(b => b.onclick = async () => {
-      const t = tpls.find(x => x.id === +b.dataset.wfuse);
+      const tpl = tpls.find(x => x.id === +b.dataset.wfuse);
       b.disabled = true;
       try {
         const j = await api(`/wf-templates/${b.dataset.wfuse}/create`, { method: 'POST', body: {} });
-        toast(j.msg || '已创建草稿');
-        if (await confirmBox(`已从「${t.name}」创建草稿，前往编排页调整？\n\n使用提示：${t.scene || ''}`)) location.hash = '#/admin/studio/' + j.data.id;
+        toast(j.msg || t('已创建草稿'));
+        if (await confirmBox(t('已从「{name}」创建草稿，前往编排页调整？\n\n使用提示：{scene}').replace('{name}', tpl.name).replace('{scene}', tpl.scene || ''))) location.hash = '#/admin/studio/' + j.data.id;
         renderWfTemplates();
       } catch (e) { toast(e.message, 'err'); b.disabled = false; }
     });
     wfGrid.querySelectorAll('[data-wfdetail]').forEach(b => b.onclick = async () => {
-      const t = tpls.find(x => x.id === +b.dataset.wfdetail);
+      const tpl = tpls.find(x => x.id === +b.dataset.wfdetail);
       const j = await api(`/wf-templates/${b.dataset.wfdetail}/detail`);
       const wf = j.data.workflow || {};
       const nodes = wf.nodes || [];
       const NODE_ICON = { start: '🟦', llm: '🟣', tool: '🟠', agent: '🧠', code: '⌨️', iteration: '🔁', assign: '💱', 'if-else': '🟡', end: '🟥', answer: '💬', classifier: '🎯', aggregator: '🔀' };
       modal({
-        title: `${t.icon || '🎨'} ${t.name}`, wide: true,
+        title: `${tpl.icon || '🎨'} ${tpl.name}`, wide: true,
         body: `<div style="font-size:12.5px;line-height:1.7">
-          <div style="color:var(--text-2)">${esc(t.description || '')}</div>
-          <div style="margin-top:10px;padding:10px 12px;background:#fffbeb;border-radius:8px;font-size:12px;color:#92400e">💡 <b>使用说明：</b>${esc(t.scene || '复制后按需调整节点参数')}</div>
+          <div style="color:var(--text-2)">${esc(tpl.description || '')}</div>
+          <div style="margin-top:10px;padding:10px 12px;background:#fffbeb;border-radius:8px;font-size:12px;color:#92400e">💡 <b>${t('使用说明：')}</b>${esc(tpl.scene || t('复制后按需调整节点参数'))}</div>
           <div style="margin-top:12px;padding:8px 12px;font-size:11.5px;color:#2563eb;background:#eff6ff;border-radius:8px;line-height:1.9;font-family:ui-monospace,monospace">${nodes.map(n => `${NODE_ICON[n.type] || '⚪'} ${esc((n.data && n.data.title) || n.type)}`).join('　→　')}</div>
-          <div style="margin-top:8px;font-size:11px;color:var(--text-3)">${nodes.length} 个节点 · ${(wf.edges || []).length} 条连线${(wf.notes || []).length ? ' · ' + wf.notes.length + ' 张便签' : ''}${wf.flow_type === 'chatflow' ? ' · Chatflow' : ''}</div>
+          <div style="margin-top:8px;font-size:11px;color:var(--text-3)">${nodes.length} ${t('个节点')} · ${(wf.edges || []).length} ${t('条连线')}${(wf.notes || []).length ? ' · ' + wf.notes.length + ` ${t('张便签')}` : ''}${wf.flow_type === 'chatflow' ? ' · Chatflow' : ''}</div>
         </div>`,
-        foot: `<button class="btn" data-close>关闭</button><button class="btn primary" data-use>⧉ 从此模板创建</button>`,
+        foot: `<button class="btn" data-close>${t('关闭')}</button><button class="btn primary" data-use>${t('⧉ 从此模板创建')}</button>`,
         onMount(mask, close) {
           mask.querySelector('[data-close]').onclick = close;
           mask.querySelector('[data-use]').onclick = async () => {
             try {
-              const j2 = await api(`/wf-templates/${t.id}/create`, { method: 'POST', body: {} });
-              close(); toast(j2.msg || '已创建草稿');
-              if (await confirmBox('已创建草稿，前往编排页调整？')) location.hash = '#/admin/studio/' + j2.data.id;
+              const j2 = await api(`/wf-templates/${tpl.id}/create`, { method: 'POST', body: {} });
+              close(); toast(j2.msg || t('已创建草稿'));
+              if (await confirmBox(t('已创建草稿，前往编排页调整？'))) location.hash = '#/admin/studio/' + j2.data.id;
               renderWfTemplates();
             } catch (e) { toast(e.message, 'err'); }
           };
