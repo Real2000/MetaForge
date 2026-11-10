@@ -1165,8 +1165,9 @@ export async function render(el, params) {
             const rows = j.data || [];
             if (!rows.length) { host.innerHTML = `<div class="hint" style="padding:14px">${t('暂无发布版本——发布一次画布智能体即存快照（表单模式无版本）')}</div>`; return; }
             host.innerHTML = `<div class="hint" style="margin-bottom:8px">💾 ${t('每次发布存一份画布快照；运行时走已发布快照（编辑草稿不影响线上）。回滚 = 把该版本写回草稿并同步线上（即刻生效）')}。</div>` +
+              `<div style="display:flex;justify-content:flex-end;margin-bottom:8px"><button class="btn sm" id="stCmpMode">⇆ ${t('两版对比')}</button></div>` +
               rows.map((r, i) => `
-              <div style="display:flex;gap:10px;align-items:center;padding:9px 12px;border:1px solid var(--border,#eef0f3);border-radius:8px;margin-bottom:6px">
+              <div data-cmprow="${r.version}" style="display:flex;gap:10px;align-items:center;padding:9px 12px;border:1px solid var(--border,#eef0f3);border-radius:8px;margin-bottom:6px;transition:outline .1s">
                 <b style="min-width:46px;color:#2563eb">v${r.version}</b>
                 <span style="color:var(--text-2);font-size:12px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(r.note || '')}">${esc(r.note || t('（无发布说明）'))}</span>
                 <span style="font-size:11px;color:var(--text-3)">${r.nodes} ${t('节点')}</span>
@@ -1177,17 +1178,56 @@ export async function render(el, params) {
               </div>`).join('');
             host.querySelectorAll('[data-rb]').forEach(b => b.onclick = async () => {
               const v = b.dataset.rb;
-              if (!await confirmBox(t('回滚到 v{v}：该版本快照将写回草稿并同步线上（即刻生效，当前草稿改动会被覆盖）。确定回滚？').replace('{v}', v), t('回滚确认'))) return;
-              try {
-                const rj = await api(`/agents/${id}/publish-history/${v}/rollback`, { method: 'POST', body: {} });
-                toast(rj.msg || t('已回滚'));
-                close();
-                location.reload(); // 草稿已变——整页重载加载新图
-              } catch (e) { toast(e.message, 'err'); }
+              const doRollback = async () => {
+                try {
+                  const rj = await api(`/agents/${id}/publish-history/${v}/rollback`, { method: 'POST', body: {} });
+                  toast(rj.msg || t('已回滚'));
+                  close();
+                  location.reload(); // 草稿已变——整页重载加载新图
+                } catch (e) { toast(e.message, 'err'); }
+              };
+              // C2 验收项：回滚前 diff 预览确认——先看「目标版本相对当前草稿」的变更再决定；
+              // diff 不可用（如无草稿/快照损坏）时回退纯确认框，不让回滚能力被 diff 依赖卡死
+              const ok = await showCanvasDiff('draft', v, {
+                note: t('回滚预览：目标 v{v} 相对当前草稿的变更。确认后该版本快照将写回草稿并同步线上（即刻生效，当前草稿改动会被覆盖）。').replace('{v}', v),
+                confirmText: t('确认回滚到 v{v}').replace('{v}', v),
+                onConfirm: doRollback,
+              });
+              if (!ok && await confirmBox(t('回滚到 v{v}：该版本快照将写回草稿并同步线上（即刻生效，当前草稿改动会被覆盖）。确定回滚？').replace('{v}', v), t('回滚确认'))) doRollback();
             });
             // C2：画布版本对比入口（基准=上一版/当前版本 → 目标=本版本/草稿；diff 语义恒为「目标相对基准的变化」）
             host.querySelectorAll('[data-cmp]').forEach(b => b.onclick = () => showCanvasDiff(b.dataset.prev, b.dataset.cmp));
             host.querySelectorAll('[data-cmpd]').forEach(b => b.onclick = () => showCanvasDiff(b.dataset.cmpd, 'draft'));
+            // C2 验收项：任意两版对比——开启对比模式后点选两个版本（新者为目标，旧者为基准，与「上一版」语义一致）
+            {
+              let cmpMode = false, cmpPick = null, pickEl = null;
+              const cmpBtn = host.querySelector('#stCmpMode');
+              const resetRows = () => host.querySelectorAll('[data-cmprow]').forEach(rEl => {
+                rEl.style.cursor = ''; rEl.style.outline = '';
+              });
+              if (cmpBtn) cmpBtn.onclick = () => {
+                cmpMode = !cmpMode; cmpPick = null; pickEl = null;
+                cmpBtn.classList.toggle('primary', cmpMode);
+                resetRows();
+                if (cmpMode) toast(t('已开启两版对比：先点一个版本，再点另一个版本'));
+              };
+              host.querySelectorAll('[data-cmprow]').forEach(rEl => rEl.onclick = (e) => {
+                if (!cmpMode) return;
+                if (e.target.closest('button')) return; // 行内按钮（对比/回滚）不参与选版
+                const v = String(rEl.dataset.cmprow);
+                if (cmpPick === null) {
+                  cmpPick = v; pickEl = rEl;
+                  rEl.style.outline = '2px solid #2563eb';
+                  toast(t('已选 v{v}，再点一个版本').replace('{v}', v));
+                } else if (cmpPick === v) { // 再点同一版 = 取消选择
+                  cmpPick = null; pickEl = null; rEl.style.outline = '';
+                } else {
+                  const base = Math.min(+cmpPick, +v), target = Math.max(+cmpPick, +v);
+                  showCanvasDiff(String(base), String(target));
+                  if (cmpBtn) cmpBtn.onclick(); // 对比完成退出模式并复位 UI
+                }
+              });
+            }
           } catch (e) { host.innerHTML = `<div style="color:#dc2626;padding:12px">❌ ${esc(e.message)}</div>`; }
         })();
       },
@@ -1203,13 +1243,15 @@ export async function render(el, params) {
     return s;
   }
 
-  async function showCanvasDiff(aV, bV) {
+  /** 画布版本对比弹窗（C2）。
+   *  opts.note：顶部警示横幅（回滚预览场景）；opts.confirmText/onConfirm：确认型弹窗（回滚前 diff 预览确认）；返回 false = diff 加载失败（调用方可回退）*/
+  async function showCanvasDiff(aV, bV, opts = {}) {
     let j;
     try {
       j = await api(`/agents/${id}/publish-history/diff?a=${encodeURIComponent(aV)}&b=${encodeURIComponent(bV)}`);
-    } catch (e) { toast(e.message || t('加载对比失败'), 'err'); return; }
+    } catch (e) { toast(e.message || t('加载对比失败'), 'err'); return false; }
     const { a, b, diff, nodeMap } = j.data || {};
-    if (!diff) { toast(t('对比数据为空'), 'err'); return; }
+    if (!diff) { toast(t('对比数据为空'), 'err'); return false; }
     const typeHtml = (ty) => {
       const nt = NODE_TYPES[ty];
       return nt ? `${nt.icon} ${esc(nt.label)}` : `<span class="tag gray">${esc(ty || '?')}</span>`;
@@ -1252,6 +1294,7 @@ export async function render(el, params) {
       title: t('🔍 画布版本对比：{a} ↔ {b}').replace('{a}', a.label).replace('{b}', b.label),
       wide: true,
       body: `
+        ${opts.note ? `<div style="margin-bottom:12px;padding:8px 12px;border:1px solid #f59e0b;background:#fffbeb;color:#92400e;font-size:12px;border-radius:8px;line-height:1.6">⚠️ ${esc(opts.note)}</div>` : ''}
         <div style="margin-bottom:10px;font-size:12px;color:var(--text-3)">${aInfo} ↔ ${bInfo}</div>
         <div style="margin-bottom:14px">${badges}</div>
         ${section(t('新增节点'), 'green', diff.nodes.added, n => `<div style="padding:7px 10px;border-bottom:1px solid rgba(0,0,0,.04)">${nodeName(n)}</div>`)}
@@ -1269,9 +1312,16 @@ export async function render(el, params) {
             ${fieldTable(e.fields)}
           </div>`)}
       `,
-      foot: `<button class="btn" data-close>${t('关闭')}</button>`,
-      onMount(mask, close) { mask.querySelector('[data-close]').onclick = close; },
+      foot: opts.confirmText
+        ? `<button class="btn" data-close>${t('取消')}</button><button class="btn danger" data-confirm>${opts.confirmText}</button>`
+        : `<button class="btn" data-close>${t('关闭')}</button>`,
+      onMount(mask, close) {
+        mask.querySelector('[data-close]').onclick = close;
+        const cf = mask.querySelector('[data-confirm]');
+        if (cf && opts.onConfirm) cf.onclick = () => { close(); opts.onConfirm(); };
+      },
     });
+    return true;
   }
 
   function openPublishDlg() {
