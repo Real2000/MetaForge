@@ -9,6 +9,8 @@
  *    权限真正的边界在服务端 adminOnly，此处仅做展示层。
  *  - 模块加载时清理历史版本遗留的存量 token（旧 token 在 TTL 内仍有效，不清理则 XSS 依旧可读——
  *    迁移安全的关键一步）。 */
+import { t } from './i18n.js';
+
 const TOKEN_KEY = 'ap_token';
 const USER_KEY = 'ap_user';
 
@@ -80,7 +82,7 @@ export async function sseChat(body, handlers) {
     });
   } catch (e) {
     if (e?.name === 'AbortError') { handlers.onAborted?.(); return; }
-    handlers.onError?.(new Error('连接失败：' + (e.message || '网络异常')));
+    handlers.onError?.(new Error(t('连接失败：') + (e.message || t('网络异常'))));
     return;
   }
   if (!res.ok || !res.body) { handlers.onError?.(new Error('HTTP ' + res.status)); return; }
@@ -117,6 +119,6 @@ export async function sseChat(body, handlers) {
   } catch (e) {
     // P5.29：用户停止（abort）→ onAborted；网络断开 → onError（此前未捕获直接炸到调用方，按钮永久卡死）
     if (e?.name === 'AbortError') { handlers.onAborted?.(); return; }
-    handlers.onError?.(new Error('流中断：' + (e.message || '网络异常')));
+    handlers.onError?.(new Error(t('流中断：') + (e.message || t('网络异常'))));
   }
 }

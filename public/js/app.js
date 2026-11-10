@@ -79,8 +79,8 @@ function renderNav(list, currentPath) {
 }
 
 /** 主题/语言切换按钮组（顶栏与对话页侧栏共用；P3 暗色 + P5.23 三态：跟随系统/亮/暗循环） */
-const THEME_BTN = { auto: { icon: '🖥️', title: '主题：跟随系统（点击切换日间）' }, light: { icon: '☀️', title: '主题：日间（点击切换夜间）' }, dark: { icon: '🌙', title: '主题：夜间（点击切换跟随系统）' } };
-function themeBtnHTML() { const p = getThemePref(); return `<button class="btn sm" id="themeBtn" title="${THEME_BTN[p].title}">${THEME_BTN[p].icon}</button>`; }
+const THEME_BTN = { auto: { icon: '🖥️', title: () => t('主题：跟随系统（点击切换日间）') }, light: { icon: '☀️', title: () => t('主题：日间（点击切换夜间）') }, dark: { icon: '🌙', title: () => t('主题：夜间（点击切换跟随系统）') } };
+function themeBtnHTML() { const p = getThemePref(); return `<button class="btn sm" id="themeBtn" title="${THEME_BTN[p].title()}">${THEME_BTN[p].icon}</button>`; }
 function prefToggleHTML() {
   return `${themeBtnHTML()}
   <button class="btn sm" id="langBtn" title="切换中英文 / Switch language">${getLang() === 'en' ? 'EN' : '中'}</button>`;
@@ -126,7 +126,7 @@ function layoutShell(kind, currentPath, title, contentHTML) {
           ${isAdmin ? `<a class="nav-item" href="#/admin/dashboard"><i class="ic">⚙️</i>${t('进入后台')}</a>` : ''}
         </div>
       </aside>
-      <button class="mobile-menu-btn" id="chatSessBtn" title="历史会话" aria-label="打开历史会话列表" style="position:fixed;top:58px;left:12px;z-index:45">☰</button>
+      <button class="mobile-menu-btn" id="chatSessBtn" title="${t('历史会话')}" aria-label="${t('打开历史会话列表')}" style="position:fixed;top:58px;left:12px;z-index:45">☰</button>
       <div class="main">${contentHTML}</div>
     </div>`;
   }
@@ -192,7 +192,7 @@ function mountOfflineBar() {
   const bar = document.createElement('div');
   bar.id = 'offlineBar';
   bar.className = 'offline-bar';
-  bar.textContent = '⚠️ 网络已断开——当前展示离线缓存内容，操作将无法保存';
+  bar.textContent = t('⚠️ 网络已断开——当前展示离线缓存内容，操作将无法保存');
   document.body.appendChild(bar);
   const sync = () => bar.classList.toggle('show', !navigator.onLine);
   sync();
@@ -241,7 +241,7 @@ async function route() {  const hash = location.hash || '#/home';
     if (isEmbedMode()) postEmbedHeight();
     const lb = document.getElementById('logoutBtn');
     if (lb) lb.onclick = async () => {
-      if (await confirmBox('确定退出登录？')) {
+      if (await confirmBox(t('确定退出登录？'))) {
         // P2-3 连带修复（2026-11-09）：必须先调后端 /auth/logout（吊销当前 token + 清 HttpOnly Cookie）
         // 再清本地态——否则 Cookie 在"退出"后仍有效至 TTL（7 天），共享电脑上属假登出；
         // 此前该端点从未被前端接线（孤儿接口），Node 级测试只验了端点本身没验 UI 集成。
@@ -267,7 +267,7 @@ async function route() {  const hash = location.hash || '#/home';
       if (typeof ret?.destroy === 'function') currentDestroy = ret.destroy;
     } catch (e) {
       console.error(e);
-      box.innerHTML = `<div class="empty-box"><div class="big">⚠️</div>页面加载失败：${esc(e.message)}</div>`;
+      box.innerHTML = `<div class="empty-box"><div class="big">⚠️</div>${t('页面加载失败：')}${esc(e.message)}</div>`;
     }
     // 移动端汉堡菜单：页面渲染后挂载（chat 布局的 .chat-side 此时才存在）
     mountMobileMenu();

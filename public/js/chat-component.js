@@ -9,14 +9,14 @@ import { t, getLang } from './i18n.js';
 function friendlyError(msg) {
   const s = String(msg || '');
   const MAP = [
-    [/timeout|timed? ?out|ETIMEDOUT/i, '模型服务响应超时'],
-    [/rate ?limit|429/i, '请求过于频繁，触发限流'],
-    [/401|unauthorized|invalid.*key|api ?key/i, '鉴权失败（API Key 无效或已过期）'],
-    [/404|not ?found/i, '请求的模型或接口不存在'],
-    [/50[0234]|upstream|bad ?gateway|service unavailable/i, '模型服务暂时繁忙'],
-    [/fetch failed|network|econn|dns|ENOTFOUND|EAI_AGAIN/i, '网络连接异常'],
-    [/JSON|parse|unexpected token/i, '响应数据解析失败'],
-    [/quota|配额/i, 'Token 配额不足'],
+    [/timeout|timed? ?out|ETIMEDOUT/i, t('模型服务响应超时')],
+    [/rate ?limit|429/i, t('请求过于频繁，触发限流')],
+    [/401|unauthorized|invalid.*key|api ?key/i, t('鉴权失败（API Key 无效或已过期）')],
+    [/404|not ?found/i, t('请求的模型或接口不存在')],
+    [/50[0234]|upstream|bad ?gateway|service unavailable/i, t('模型服务暂时繁忙')],
+    [/fetch failed|network|econn|dns|ENOTFOUND|EAI_AGAIN/i, t('网络连接异常')],
+    [/JSON|parse|unexpected token/i, t('响应数据解析失败')],
+    [/quota|配额/i, t('Token 配额不足')],
   ];
   for (const [re, zh] of MAP) if (re.test(s)) return zh;
   return s;
@@ -63,7 +63,7 @@ export function mountChat(el, opts) {
     const badge = document.createElement('span');
     badge.id = 'attachBadge';
     badge.style.cssText = 'font-size:11.5px;color:#2563eb;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer';
-    badge.title = '点击清空附件';
+    badge.title = t('点击清空附件');
     badge.onclick = () => { pendingAttach = []; renderAttachBadge(); };
     btn.parentElement.appendChild(badge);
     const renderAttachBadge = () => {
@@ -541,7 +541,7 @@ export function mountChat(el, opts) {
           <div class="kb-ref-content">${esc((h.content || '').slice(0, 200))}${(h.content || '').length > 200 ? '…' : ''}</div></div>`).join('')}</div></div>`;
     }
     if (m.toolCalls?.length) {
-      html += `<div class="tool-ref">🔧 已调用工具：${m.toolCalls.map(t => `<span class="tag purple" style="font-size:10px;margin-right:4px">${esc(t.name)}</span>`).join('')}</div>`;
+      html += `<div class="tool-ref">🔧 ${t('已调用工具：')}${m.toolCalls.map(tc => `<span class="tag purple" style="font-size:10px;margin-right:4px">${esc(tc.name)}</span>`).join('')}</div>`;
     }
     // 追问建议条（借鉴 SinguX「用户问题建议」）；挂在消息数据上，历史回看同样可见
     if (m.suggestions?.length) {
@@ -580,7 +580,7 @@ export function mountChat(el, opts) {
         if (st) {
           const p = Math.min(95, d.progress || 5);
           const eta = Math.max(1, Math.round(120 * (100 - p) / 100));
-          st.textContent = `生成中… ${p}%（预计还需 ${eta < 60 ? eta + ' 秒' : Math.round(eta / 60) + ' 分钟'}）`;
+          st.textContent = t('生成中… {p}%（预计还需 {eta}）').replace('{p}', p).replace('{eta}', eta < 60 ? eta + ` ${t('秒')}` : Math.round(eta / 60) + ` ${t('分钟')}`);
         }
       }
     } catch { /* 网络抖动继续轮询 */ }
@@ -639,8 +639,8 @@ export function mountChat(el, opts) {
   }
 
   async function newSession() {
-    const j = await api('/chat/sessions', { method: 'POST', body: { agent_id: opts.getAgentId?.() ?? null, title: '新会话' } });
-    currentSession = { id: j.data.id, title: '新会话' };
+    const j = await api('/chat/sessions', { method: 'POST', body: { agent_id: opts.getAgentId?.() ?? null, title: t('新会话') } });
+    currentSession = { id: j.data.id, title: t('新会话') };
     messages = [];
     loadSessions(); renderMessages();
     fillUserPrompt(); // 新会话预填用户提示词
@@ -661,8 +661,8 @@ export function mountChat(el, opts) {
     sel.style.display = allow ? '' : 'none';
     if (!allow) return;
     const need = SKILL_MODEL_TYPE[currentSkill] || 'chat';
-    const TYPE_TAG = { chat: '💬 对话', image: '🎨 生图', video: '🎬 视频', tts: '🎙️ 语音', embedding: '🧠 嵌入' };
-    const TYPE_MODE = { chat: '对话模式', image: '🎨 图片生成模式', video: '🎬 视频生成模式', tts: '🎙️ 语音生成模式' };
+    const TYPE_TAG = { chat: `💬 ${t('对话')}`, image: `🎨 ${t('生图')}`, video: `🎬 ${t('视频')}`, tts: `🎙️ ${t('语音')}`, embedding: `🧠 ${t('嵌入')}` };
+    const TYPE_MODE = { chat: t('对话模式'), image: `🎨 ${t('图片生成模式')}`, video: `🎬 ${t('视频生成模式')}`, tts: `🎙️ ${t('语音生成模式')}` };
     const pool = models.filter(m => (m.type || 'chat') === need);
     const others = models.filter(m => (m.type || 'chat') !== need && (m.type || 'chat') !== 'embedding');
     sel.innerHTML =
@@ -885,8 +885,8 @@ export function mountChat(el, opts) {
       onAborter(abortFn) { currentAbort = abortFn; },
       onAborted() {
         botMsg.content = botMsg.content
-          ? botMsg.content + '\n\n---\n⏹ 已停止生成，以上为部分内容。'
-          : '⏹ 已停止生成（尚未输出内容）。';
+          ? botMsg.content + `\n\n---\n⏹ ${t('已停止生成，以上为部分内容。')}`
+          : `⏹ ${t('已停止生成（尚未输出内容）。')}`;
         renderMessages();
         $('#chatStatus').textContent = '';
         toast(t('已停止生成'), 'info');
@@ -943,8 +943,8 @@ export function mountChat(el, opts) {
           <span style="font-size:22px">${esc(s.icon || '✨')}</span>
           <div style="flex:1;min-width:0">
             <div style="font-size:13px;font-weight:600;color:var(--text)">${esc(s.name)}
-              ${s.mine ? '<span class="tag blue" style="font-size:10px">我的</span>' : `<span class="tag gray" style="font-size:10px">${esc(s.owner)}</span>`}
-              ${s.tools?.length ? `<span class="tag purple" style="font-size:10px">工具×${s.tools.length}</span>` : ''}
+              ${s.mine ? `<span class="tag blue" style="font-size:10px">${t('我的')}</span>` : `<span class="tag gray" style="font-size:10px">${esc(s.owner)}</span>`}
+              ${s.tools?.length ? `<span class="tag purple" style="font-size:10px">${t('工具')}×${s.tools.length}</span>` : ''}
             </div>
             <div style="font-size:12px;color:var(--text-3);margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(s.description || (s.prompt || '').slice(0, 60) || '')}</div>
           </div>
@@ -1030,7 +1030,7 @@ export function mountChat(el, opts) {
           <div style="flex:1;min-width:0">
             <div style="font-size:13px;font-weight:600;color:var(--text)">${esc(a.name)}
               <span class="tag blue" style="font-size:10px">${t(TYPE_TAG[a.type] || '智能体')}</span>
-              ${a.is_official ? '<span class="tag purple" style="font-size:10px">官方</span>' : ''}
+              ${a.is_official ? `<span class="tag purple" style="font-size:10px">${t('官方')}</span>` : ''}
             </div>
             <div style="font-size:12px;color:var(--text-3);margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(a.description || '')}</div>
           </div>
