@@ -1,12 +1,13 @@
-version: '3.8'
-
 # ================================================================
 #  智能体开发平台 · Docker 全栈编排
-#  一条命令启动：docker compose up -d
+#
+#  默认只启动平台主服务（OCR 可选，避免首次拉取 ~2GB 镜像）：
+#    docker compose up -d                    # 仅 platform（推荐起步）
+#    docker compose --profile ocr up -d      # platform + PaddleOCR（扫描件识别增强）
 #
 #  服务组成：
 #    · platform —— 智能体平台主服务（端口 3210）
-#    · paddleocr —— OCR 识别服务（扫描版 PDF 自动识别）[可选]
+#    · paddleocr —— OCR 识别服务（扫描版 PDF 自动识别）[可选，profile=ocr]
 # ================================================================
 
 services:
@@ -22,8 +23,15 @@ services:
       # 数据库与数据目录（不要修改，除非你有明确的 Docker 卷映射需求）
       - AGENT_DATA_DIR=/app/data
 
-      # PaddleOCR 服务地址（可选；无此服务时平台功能完全不受影响，扫描版 PDF 解析会较粗略）
-      - PADDLEOCR_URL=http://paddleocr:9300
+      # PaddleOCR 服务地址：启用 --profile ocr 时取消注释（平台与 OCR 同网络，容器名互访）
+      # 不设置时扫描版 PDF 解析自动降级（粗略分块），平台核心功能不受影响
+      # - PADDLEOCR_URL=http://paddleocr:9300
+
+      # 安全密钥（生产建议显式注入，值用 openssl rand -hex 32 生成；不设置时自动生成并落盘 data/secrets.json）
+      # - AGENT_JWT_SECRET=
+
+      # 登录 Token 有效期（小时，默认 168 = 7 天）
+      # - AGENT_TOKEN_TTL_HOURS=168
 
       # 日志级别与文件大小控制
       - LOG_LEVEL=info
@@ -43,9 +51,6 @@ services:
       - platform-uploads:/app/public/uploads
       - platform-downloads:/app/public/downloads
 
-    depends_on:
-      paddleocr:
-        condition: service_started
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:3210/api/health"]
       interval: 30s
@@ -53,8 +58,10 @@ services:
       retries: 3
       start_period: 15s
 
-  # ---- PaddleOCR 服务（可选；不启动不影响平台核心功能）----
+  # ---- PaddleOCR 服务（可选，默认不启动；启用：docker compose --profile ocr up -d）----
+  # 不启动不影响平台核心功能：扫描件解析文本过短时静默降级
   paddleocr:
+    profiles: ["ocr"]
     image: paddlecloud/paddleocr:2.7
     container_name: paddleocr
     restart: unless-stopped
