@@ -25,5 +25,8 @@
     "pdf-parse": "^2.4.5",
     "pptxgenjs": "^4.0.1",
     "vectordb": "^0.21.2"
+  },
+  "devDependencies": {
+    "autocannon": "^9.0.0"
   }
 }
