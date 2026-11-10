@@ -69,16 +69,18 @@ export async function render(el) {
           </div>
         </div>
       </div>`).join('') + `
-      ${tab === 'digital' || tab === 'all' ? `<div class="agent-card new-agent-card" id="newAgent">＋ ${t('新增智能体')}</div>` : ''}`;
+      <!-- A3（2026-11-10）：每个分类下都新增智能体占位卡片（而非仅 digital/all），点击时自动携带当前分类的 type -->
+      <div class="agent-card new-agent-card" data-type="${tab === 'all' ? 'digital' : tab}">＋ ${t('新增智能体')}</div>`;
 
     grid.querySelectorAll('.agent-card[data-id]').forEach(card => {
       card.onclick = () => { location.hash = '#/chat/' + card.dataset.id; };
     });
-    const n = grid.querySelector('#newAgent');
-    if (n) n.onclick = () => openCreate();
+    const n = grid.querySelector('.new-agent-card');
+    if (n) n.onclick = () => openCreate(n.dataset.type || 'digital');
   }
 
-  async function openCreate() {
+  async function openCreate(type = 'digital') {
+    const createType = type; // 创建类型：enterprise / digital / dept / other
     const body = document.createElement('div');
     body.innerHTML = `
       <div class="tabs" id="cfgTabs" style="margin-bottom:16px">
@@ -124,8 +126,9 @@ export async function render(el) {
         </div>
       </div>`;
 
+    const typeName = { enterprise: '企业智能体', digital: '数字员工', dept: '部门AI助理', other: '其他' };
     const m = modal({
-      title: '新增智能体（数字员工）',
+      title: `新增智能体（${typeName[createType] || '数字员工'}）`,
       body, wide: true,
       foot: '<button class="btn" data-cancel>取消</button><button class="btn primary" data-save>创建</button>',
       onMount(mask, close) {
@@ -171,7 +174,7 @@ export async function render(el) {
           const payload = {
             name: mask.querySelector('#f_name').value.trim(),
             description: mask.querySelector('#f_desc').value.trim(),
-            type: 'digital',
+            type: createType,
             category: mask.querySelector('#f_cat').value.trim() || '未分类',
             prompt: mask.querySelector('#f_prompt').value.trim(),
             kb_id: +mask.querySelector('#f_kb').value || null,
