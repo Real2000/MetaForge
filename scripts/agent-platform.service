@@ -1,0 +1,40 @@
+[Unit]
+Description=智能体开发平台（Agent Platform）
+Documentation=https://github.com/agent-platform
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# 用户与工作目录
+User=agent
+Group=agent
+WorkingDirectory=/opt/agent-platform
+
+# 环境变量
+EnvironmentFile=/etc/agent-platform/.env
+Environment=NODE_ENV=production
+Environment=AGENT_DATA_DIR=/opt/agent-platform/data
+
+# 启动命令
+ExecStart=/usr/bin/node /opt/agent-platform/server.js
+
+# 优雅停机（Express 内置了 SIGTERM 处理：停止接新连接 → 等待存量请求 → 关闭数据库 → exit 0）
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+# 自恢复
+Restart=on-failure
+RestartSec=10
+
+# 日志
+StandardOutput=journal
+StandardError=journal
+
+# 安全加固（可选，开箱即用）
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

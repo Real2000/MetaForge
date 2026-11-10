@@ -66,6 +66,10 @@ echo ""
 echo "启动后将自动打开浏览器访问 http://localhost:3210"
 echo "（关闭本窗口或按 Ctrl+C 即停止服务）"
 echo ""
+echo "  Docker 部署：docker compose up -d                 详见 docs/ 与根目录 Dockerfile"
+echo "  Linux 部署：systemd 单元文件在 scripts/          详见 scripts/agent-platform.service"
+echo ""./scripts/agent-platform.service"
+echo ""
 node server.js &
 SERVER_PID=$!
 sleep 2

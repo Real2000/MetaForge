@@ -1,0 +1,70 @@
+version: '3.8'
+
+# ================================================================
+#  智能体开发平台 · Docker 全栈编排
+#  一条命令启动：docker compose up -d
+#
+#  服务组成：
+#    · platform —— 智能体平台主服务（端口 3210）
+#    · paddleocr —— OCR 识别服务（扫描版 PDF 自动识别）[可选]
+# ================================================================
+
+services:
+
+  platform:
+    build: .
+    image: agent-platform:latest
+    container_name: agent-platform
+    restart: unless-stopped
+    ports:
+      - "3210:3210"
+    environment:
+      # 数据库与数据目录（不要修改，除非你有明确的 Docker 卷映射需求）
+      - AGENT_DATA_DIR=/app/data
+
+      # PaddleOCR 服务地址（可选；无此服务时平台功能完全不受影响，扫描版 PDF 解析会较粗略）
+      - PADDLEOCR_URL=http://paddleocr:9300
+
+      # 日志级别与文件大小控制
+      - LOG_LEVEL=info
+
+      # 定时备份与轮转配置（默认值：备份 30 份、产物保留 30 天、日志保留 90 天）
+      # - BACKUP_RETENTION=30
+      # - ARTIFACT_RETENTION_DAYS=30
+      # - LOG_RETENTION_DAYS=90
+
+      # TZ 时区
+      - TZ=Asia/Shanghai
+    volumes:
+      # 数据持久化（生产库、加密密钥、向量库等）
+      - platform-data:/app/data
+
+      # 用户上传的文件（uploads/downloads）
+      - platform-uploads:/app/public/uploads
+      - platform-downloads:/app/public/downloads
+
+    depends_on:
+      paddleocr:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:3210/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # ---- PaddleOCR 服务（可选；不启动不影响平台核心功能）----
+  paddleocr:
+    image: paddlecloud/paddleocr:2.7
+    container_name: paddleocr
+    restart: unless-stopped
+    ports:
+      - "9300:9300"
+    volumes:
+      - ocr-models:/root/.paddleocr/
+
+volumes:
+  platform-data:
+  platform-uploads:
+  platform-downloads:
+  ocr-models:
