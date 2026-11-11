@@ -48,7 +48,12 @@ export async function render(el) {
   function visTag(a) {
     // P3 可见范围徽标：restricted = 🔒 受限（仅指定范围可见）
     if (a.visibility !== 'restricted') return '';
-    const tip = [a.visible_depts?.length ? a.visible_depts.join('/') : '', a.visible_members?.length ? `+${a.visible_members.length}${t('名成员')}` : ''].filter(Boolean).join(' ');
+    // P0 修复（2026-11-11）：列表接口按既定约定透传 DB TEXT 字段（JSON 字符串，与 studio.js 自行 parse 一致），
+    // 须先数组化再取数——字符串 '[]'?.length 为真值直接 .join 会崩（生产实测报
+    // a.visible_depts.join is not a function）；兼容存量数据三种形态：数组/JSON 字符串/null 与非法 JSON
+    const toArr = v => Array.isArray(v) ? v : (() => { try { const p = JSON.parse(v || '[]'); return Array.isArray(p) ? p : []; } catch { return []; } })();
+    const depts = toArr(a.visible_depts), members = toArr(a.visible_members);
+    const tip = [depts.length ? depts.join('/') : '', members.length ? `+${members.length}${t('名成员')}` : ''].filter(Boolean).join(' ');
     return `<span class="tag orange" title="${t('受限可见')}：${esc(tip || t('指定范围'))}">🔒 ${t('受限')}</span>`;
   }
 
