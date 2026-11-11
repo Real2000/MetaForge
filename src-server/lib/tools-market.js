@@ -84,11 +84,18 @@ const uuid_gen = {
     for (let i = 0; i < count; i++) {
       if (kind === 'uuid') out.push(crypto.randomUUID());
       else if (kind === 'password') {
-        const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()-_=+';
-        const buf = crypto.randomBytes(len);
-        let s = '';
-        for (let j = 0; j < len; j++) s += chars[buf[j] % chars.length];
-        out.push(s);
+        // 加固（2026-11-11）：纯均匀随机在 12 位下约 16% 概率缺某一类字符（实测冒烟 flaky：
+        // 生成 J*#HreBs)M$y 缺数字），且作为密码生成器缺类属弱密码缺陷——改为四类各保底 1 个，
+        // 其余随机填充后 Fisher-Yates 洗牌，保证「长度达标 + 四类必含」且无位置规律
+        const sets = ['ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz', '0123456789', '!@#$%^&*()-_=+'];
+        const all = sets.join('');
+        const buf = crypto.randomBytes(256);
+        let pick = 0;
+        const next = mod => buf[pick++ % buf.length] % mod;
+        const arr = sets.map(set => set[next(set.length)]);
+        while (arr.length < len) arr.push(all[next(all.length)]);
+        for (let j = arr.length - 1; j > 0; j--) { const k = next(j + 1); [arr[j], arr[k]] = [arr[k], arr[j]]; }
+        out.push(arr.join(''));
       } else {
         const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
         const buf = crypto.randomBytes(len);
