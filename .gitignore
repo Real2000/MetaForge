@@ -6,6 +6,7 @@ server.log
 
 # 业务数据与密钥（严禁入库）
 data/
+license-signing/
 
 # 数据库与密钥文件通用模式（#13 开源加固 2026-11-03：防 data/ 之外的散落库文件/密钥误提交）
 *.db
@@ -13,6 +14,8 @@ data/
 *.db-shm
 *.sqlite
 *.sqlite3
+*.key
+*.pem
 .env
 .env.*
 !.env.example

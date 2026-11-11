@@ -40,6 +40,12 @@ const days = Number(args.days);
 if (!Number.isFinite(days)) fail('--days 需为数字（有效期天数；测试过期场景可用负数）');
 const keyPath = path.resolve(args['private-key'] || path.join(process.cwd(), 'license-private.key'));
 
+// 护栏：阻止在仓库目录内签发（私钥绝不进仓库）
+const repoGit = path.join(process.cwd(), '.git');
+if (fs.existsSync(repoGit) && keyPath.startsWith(process.cwd() + path.sep)) {
+  fail(`私钥路径（${keyPath}）在当前仓库内！请将签发工具和私钥移到仓库外的独立签发机目录。`);
+}
+
 // ---- 私钥加载 / 首次自动生成 ----
 let privateKey;
 if (fs.existsSync(keyPath)) {
