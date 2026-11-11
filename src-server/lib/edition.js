@@ -46,11 +46,11 @@ const EDITIONS = {
   },
   professional: {
     name: '专业版',
-    features: ['agents', 'kb', 'workflow', 'mcp', 'openapi', 'dingtalk', 'ldap', 'unlimited'],
+    features: ['agents', 'kb', 'workflow', 'mcp', 'openapi', 'dingtalk', 'unlimited'],
   },
   enterprise: {
     name: '企业版',
-    features: ['agents', 'kb', 'workflow', 'mcp', 'openapi', 'dingtalk', 'ldap', 'unlimited', 'tenant', 'audit_flow', 'priority_support'],
+    features: ['agents', 'kb', 'workflow', 'mcp', 'openapi', 'dingtalk', 'audit_flow', 'unlimited', 'priority_support'],
   },
 };
 
@@ -180,7 +180,8 @@ function hasFeature(feature) {
 }
 
 /** Express 中间件：无权返回 body code=403（HTTP 200，与 plans.js 402 软约束同风格，前端统一按 code 分支处理）；
- *  后续钉钉/租户/审核流上线时在对应路由挂 requireFeature('dingtalk')/requireFeature('tenant') 即生效 */
+ *  确定特性实现后在该路由挂 requireFeature('xxx') 即生效——已从部署级特性表移除未实现的 ldap 与 tenant 声明（P0-4，2026-11-11）；
+ *  audit_flow 保留（审核流已有完整实现） */
 function requireFeature(feature) {
   return (req, res, next) => {
     if (hasFeature(feature)) return next();

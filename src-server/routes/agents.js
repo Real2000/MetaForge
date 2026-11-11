@@ -173,7 +173,7 @@ function parseBody(b) {
 
   // V2.2 #8 2026-10-31 License 功能闸门（接线示范）：community 即含 agents 特性，当前实际不拦——
   // 机制先行、付费墙后置（避免误伤存量用户）；后续钉钉/租户/审核流上线时在对应路由挂
-  // requireFeature('dingtalk') / requireFeature('tenant') / requireFeature('audit_flow') 即生效
+  // requireFeature('agents') / requireFeature('dingtalk') 即生效（ldap/tenant 已随 P0-4 2026-11-11 从特性表移除；audit_flow 保留）
   router.post('/', requireFeature('agents'), (req, res) => {
   // V2.4 #8 收尾：叠加 edition 限制——社区版用户最多创建 3 个智能体
   const softLimit = getSoftLimit('agents', req.user.username);
