@@ -1,6 +1,6 @@
 /** License 命令行签发工具（V2.2 #8 2026-10-31）——只在签发机运行，私钥绝不进仓库/不部署到服务器
- *  用法：node scripts/issue-license.js --private-key ./license-private.key --customer "客户公司" --edition professional --days 365
- *    --private-key  私钥路径（默认 ./license-private.key）；文件不存在时自动生成 Ed25519 密钥对：
+ *  用法：node scripts/issue-license.js --private-key ~/license-signing/prod.key --customer "客户公司" --edition professional --days 365
+ *    --private-key  私钥路径（默认 ~/license-signing/license-private.key）；文件不存在时自动生成 Ed25519 密钥对：
  *                   私钥写入该路径（chmod 600），公钥 hex 打印到 stderr——请更新到
  *                   src-server/lib/edition.js 的 PUBLIC_KEY_HEX（或部署机设环境变量 LICENSE_PUBKEY_HEX）
  *    --customer     客户标识（必填，展示与防串货）
@@ -38,12 +38,16 @@ const customer = String(args.customer || '').trim();
 if (!customer) fail('--customer 不能为空（License 客户标识，用于展示与防串货）');
 const days = Number(args.days);
 if (!Number.isFinite(days)) fail('--days 需为数字（有效期天数；测试过期场景可用负数）');
-const keyPath = path.resolve(args['private-key'] || path.join(process.cwd(), 'license-private.key'));
+const keyPath = path.resolve(args['private-key'] || path.join(process.env.HOME || process.cwd(), 'license-signing', 'license-private.key'));
 
 // 护栏：阻止在仓库目录内签发（私钥绝不进仓库）
 const repoGit = path.join(process.cwd(), '.git');
-if (fs.existsSync(repoGit) && keyPath.startsWith(process.cwd() + path.sep)) {
-  fail(`私钥路径（${keyPath}）在当前仓库内！请将签发工具和私钥移到仓库外的独立签发机目录。`);
+const cwd = process.cwd();
+if (fs.existsSync(repoGit) && keyPath.startsWith(cwd + path.sep)) {
+  // 若用户指定了仓库内的路径才阻止；HOME 路径下自动生成的密钥在仓库外则放行
+  if (!keyPath.startsWith(path.join(process.env.HOME || '~', 'license-signing'))) {
+    fail(`私钥路径（${keyPath}）在当前仓库内！请将签发工具和私钥移到仓库外的独立签发机目录（如 ~/license-signing/）。`);
+  }
 }
 
 // ---- 私钥加载 / 首次自动生成 ----
