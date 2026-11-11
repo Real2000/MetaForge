@@ -1,10 +1,9 @@
 /**
  * 认证：HMAC 无状态 token
- * 密钥管理（2026-10-20 P0 安全加固）：
+ * 密钥管理（P0 安全加固，2026-11-11 移除硬编码兜底）：
  * - 优先读环境变量 AGENT_JWT_SECRET；
  * - 其次读 data/secrets.json（首次启动自动生成 64 字节随机密钥落盘，权限 600）；
- * - 兜底旧版硬编码密钥（保证升级后存量 Token 不失效）。
- * 秘钥文件缺失时自动生成，任何人拿到源码也伪造不了 Token。
+ * - 两路均失败时服务器拒绝启动，不再使用旧版硬编码兜底密钥。
  */
 const crypto = require('crypto');
 const fs = require('fs');
@@ -12,7 +11,6 @@ const path = require('path');
 const { db } = require('../db');
 
 const SECRET_FILE = path.join(__dirname, '..', '..', 'data', 'secrets.json');
-const LEGACY_SECRET = 'agent-platform-jwt-secret-v1';
 
 function loadSecret() {
   // 1) 环境变量优先（生产部署推荐）
@@ -33,14 +31,12 @@ function loadSecret() {
     fs.writeFileSync(SECRET_FILE, JSON.stringify(j, null, 2), { mode: 0o600 });
     return j.jwt_secret;
   } catch { }
-  // 4) 兜底：旧版硬编码（极端环境写不了文件时仍可用，保证不崩）
-  return LEGACY_SECRET;
+  // 4) 两路均失败：拒绝启动，禁止使用弱钥（2026-11-11 移除旧版 LEGACY_SECRET 兜底）
+  console.error('[auth] 致命错误：无法读取/生成 JWT 密钥。请设置环境变量 AGENT_JWT_SECRET（≥16 位），或确保 data/ 目录可写。');
+  process.exit(1);
 }
 
 const SECRET = loadSecret();
-if (SECRET === LEGACY_SECRET && !process.env.AGENT_JWT_SECRET) {
-  console.warn('[auth] 警告：未能生成/读取密钥文件，正在使用内置兜底密钥（不安全，请检查 data 目录写权限）');
-}
 
 // Token 有效期：默认 7 天，可用环境变量调整（小时）
 const TOKEN_TTL_MS = (+(process.env.AGENT_TOKEN_TTL_HOURS || 0) > 0 ? +process.env.AGENT_TOKEN_TTL_HOURS : 168) * 3600000;
