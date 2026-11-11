@@ -1,51 +1,14 @@
-/** 通用 UI 组件：toast / modal / confirm / charts / 分页 / 转义 + 主题（P3 暗色模式） */
+/** 通用 UI 组件：toast / modal / confirm / charts / 分页 / 转义 */
 import { t } from './i18n.js';
 
 export function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
-/* ---------------- 主题（P3 暗色模式；P5.23 三态：跟随系统/亮/暗） ----------------
- * getTheme 返回「实际生效」主题（auto 时按系统），chartColors 等依赖此语义；
- * getThemePref 返回用户偏好（auto/light/dark），持久化 localStorage；
- * auto 模式下监听系统深浅变化即时联动（回调通知图表重绘）；主题回调参数始终为实际生效值 */
-const THEME_KEY = 'ap_theme';
-const themeCbs = [];
-const sysDark = () => window.matchMedia?.('(prefers-color-scheme: dark)').matches;
-/** 用户偏好：auto（默认，跟随系统）/ light / dark。旧存量值 dark/light 直接兼容 */
-export function getThemePref() {
-  try { const v = localStorage.getItem(THEME_KEY); return v === 'light' || v === 'dark' ? v : 'auto'; } catch { return 'auto'; }
-}
-/** 实际生效主题（resolve auto → 系统） */
-export function getTheme() { return getThemePref() === 'auto' ? (sysDark() ? 'dark' : 'light') : getThemePref(); }
-function applyTheme() {
-  const th = getTheme();
-  if (th === 'dark') document.documentElement.setAttribute('data-theme', 'dark');
-  else document.documentElement.removeAttribute('data-theme');
-  return th;
-}
-export function setTheme(pref) {
-  const p = pref === 'light' || pref === 'dark' ? pref : 'auto';
-  try { localStorage.setItem(THEME_KEY, p); } catch { }
-  const th = applyTheme();
-  themeCbs.forEach(cb => { try { cb(th); } catch { } });
-}
-// auto 模式下系统深浅切换 → 实时联动（用户偏好非 auto 时忽略）
-if (window.matchMedia) {
-  try {
-    window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
-      if (getThemePref() !== 'auto') return;
-      const th = applyTheme();
-      themeCbs.forEach(cb => { try { cb(th); } catch { } });
-    });
-  } catch { }
-}
-/** 注册主题变化回调（图表等 Canvas 内容需重绘时使用），返回注销函数 */
-export function onThemeChange(cb) { themeCbs.push(cb); return () => { const i = themeCbs.indexOf(cb); if (i > -1) themeCbs.splice(i, 1); }; }
-/** 图表主题色（Canvas 手绘图表无法吃 CSS 变量，统一在此取色） */
+/* ---------------- 图表主题色（全站浅色唯一外观，P5.23 三态机制已随暗色模式退役） ----------------
+ * Canvas 手绘图表无法吃 CSS 变量，统一在此取色 */
 export function chartColors() {
-  const dark = getTheme() === 'dark';
-  return { grid: dark ? '#243252' : '#eef1f6', text: dark ? '#7c8aa5' : '#9ca3af', dot: dark ? '#111a2e' : '#ffffff' };
+  return { grid: '#eef1f6', text: '#9ca3af', dot: '#ffffff' };
 }
 
 export function toast(msg, type = 'ok') {

@@ -1,6 +1,6 @@
-/** Hash 路由 + 双布局（前台/后台）+ 主题/语言切换（P3） */
+/** Hash 路由 + 双布局（前台/后台）+ 语言切换 */
 import { api, getToken, getUser, logout, setLogin } from './api.js';
-import { esc, toast, modal, confirmBox, getTheme, getThemePref, setTheme } from './ui.js';
+import { esc, toast, modal, confirmBox } from './ui.js';
 import { t, getLang, setLang } from './i18n.js';
 
 // <html lang> 跟随界面语言（P3 多语言）
@@ -78,27 +78,11 @@ function renderNav(list, currentPath) {
   return list.map(n => `<a class="nav-item ${currentPath.startsWith(n.href.slice(1)) ? 'active' : ''}" href="${n.href}"><i class="ic">${n.ic}</i>${t(n.label)}</a>`).join('');
 }
 
-/** 主题/语言切换按钮组（顶栏与对话页侧栏共用；P3 暗色 + P5.23 三态：跟随系统/亮/暗循环） */
-const THEME_BTN = { auto: { icon: '🖥️', title: () => t('主题：跟随系统（点击切换日间）') }, light: { icon: '☀️', title: () => t('主题：日间（点击切换夜间）') }, dark: { icon: '🌙', title: () => t('主题：夜间（点击切换跟随系统）') } };
-function themeBtnHTML() { const p = getThemePref(); return `<button class="btn sm" id="themeBtn" title="${THEME_BTN[p].title()}">${THEME_BTN[p].icon}</button>`; }
+/** 语言切换按钮（顶栏与对话页侧栏共用） */
 function prefToggleHTML() {
-  return `${themeBtnHTML()}
-  <button class="btn sm" id="langBtn" title="${t('切换中英文 / Switch language')}">${getLang() === 'en' ? 'EN' : '中'}</button>`;
+  return `<button class="btn sm" id="langBtn" title="${t('切换中英文 / Switch language')}">${getLang() === 'en' ? 'EN' : '中'}</button>`;
 }
 function mountPrefToggles() {
-  const tb = document.getElementById('themeBtn');
-  if (tb) tb.onclick = () => {
-    // 三态循环：跟随系统 → 日间 → 夜间 → 跟随系统（旧二态用户习惯保留：亮暗切换仍在环内）
-    const order = ['auto', 'light', 'dark'];
-    const next = order[(order.indexOf(getThemePref()) + 1) % 3];
-    setTheme(next);
-    tb.outerHTML = themeBtnHTML();
-    mountPrefToggles();
-    // 含 Canvas 图表的页面重渲染以刷新图表；其余页面 CSS 变量即时变色无需刷新
-    const h = location.hash;
-    const chartPage = /^#\/admin\/(dashboard|monitor|operation|quota)/.test(h) || h === '#/billing' || h === '#/insights';
-    if (chartPage && typeof route === 'function') route();
-  };
   const lb = document.getElementById('langBtn');
   if (lb) lb.onclick = () => { setLang(getLang() === 'en' ? 'zh' : 'en'); location.reload(); };
 }

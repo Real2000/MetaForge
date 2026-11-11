@@ -2,7 +2,7 @@
  * mount(el, opts) opts: { getAgentId(), getAgentBanner() -> {name, desc, icon, opening, openingQuestions} | null, defaultModel, skills?: true }
  */
 import { api, sseChat, getToken } from './api.js';
-import { esc, toast, modal, getTheme } from './ui.js';
+import { esc, toast, modal } from './ui.js';
 import { t, getLang } from './i18n.js';
 
 /** 错误文案兜底翻译（服务端已尽量给中文，仍可能透出英文原文——最后一道防线） */
@@ -699,13 +699,12 @@ export function mountChat(el, opts) {
       <span style="display:inline-block;width:64px;height:5px;background:var(--border,#f1f3f7);border-radius:6px;overflow:hidden"><span style="display:block;width:${pct}%;height:100%;background:${color}"></span></span>
       <b style="color:${color}">${pct}%</b>`;
     strip.title = `${t('剩余')} ${fmt(q.remaining)} tokens`;
-    // 预警横幅：80% 黄色 / 90% 红色（站内信已同步发送，见通知中心）；暗色模式用半透明底色
+    // 预警横幅：80% 黄色 / 90% 红色（站内信已同步发送，见通知中心）
     if (pct >= 80) {
       const red = pct >= 90;
-      const dark = getTheme() === 'dark';
-      const bg = dark ? (red ? 'rgba(239,68,68,.12)' : 'rgba(245,158,11,.12)') : (red ? '#fef2f2' : '#fffbeb');
-      const bd = dark ? (red ? 'rgba(239,68,68,.4)' : 'rgba(245,158,11,.4)') : (red ? '#fecaca' : '#fde68a');
-      const tx = dark ? (red ? '#fca5a5' : '#fcd34d') : (red ? '#991b1b' : '#92400e');
+      const bg = red ? '#fef2f2' : '#fffbeb';
+      const bd = red ? '#fecaca' : '#fde68a';
+      const tx = red ? '#991b1b' : '#92400e';
       banner.innerHTML = `
       <div style="display:flex;gap:10px;align-items:center;padding:9px 14px;border-radius:10px;margin-bottom:10px;font-size:12.5px;
         background:${bg};border:1px solid ${bd};color:${tx}">

@@ -8,27 +8,15 @@
   <title>智能体平台</title>
   <!-- PWA：安卓 Chrome「安装应用」/ iOS Safari「添加到主屏幕」/ 鸿蒙浏览器「添加到桌面」通用 -->
   <link rel="manifest" href="/manifest.json">
-  <meta name="theme-color" content="#2563eb">
-  <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#0b111f">
+  <meta name="theme-color" content="#f9fafb">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="mobile-web-app-capable" content="yes">
-  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
   <meta name="apple-mobile-web-app-title" content="智能体平台">
   <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
   <!-- P5.23 高 DPI：SVG favicon 优先（矢量，Retina/2K/4K 不糊），PNG 兜底旧浏览器 -->
   <link rel="icon" type="image/svg+xml" href="/favicon.svg">
   <link rel="icon" type="image/png" sizes="192x192" href="/icons/icon-192.png">
-  <script>
-    /* 主题预读（P3 暗色 + P5.23 三态）：CSS 加载前设置 data-theme，避免刷新闪白。
-       阻塞内联于 head：暗色用户首屏即正确着色（auto = 跟随系统，与 ui.js 解析逻辑一致） */
-    (function () {
-      try {
-        var p = localStorage.getItem('ap_theme');
-        var dark = p === 'dark' || ((p === 'auto' || !p) && window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
-        if (dark) document.documentElement.setAttribute('data-theme', 'dark');
-      } catch (e) { }
-    })();
-  </script>
   <link rel="stylesheet" href="/css/app.css">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%232563eb'/><text x='50' y='68' font-size='52' text-anchor='middle' fill='white' font-family='sans-serif' font-weight='bold'>A</text></svg>">
 </head>

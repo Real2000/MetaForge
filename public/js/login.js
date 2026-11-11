@@ -1,5 +1,5 @@
 import { api, setLogin } from './api.js';
-import { esc, toast, modal, getTheme, getThemePref, setTheme } from './ui.js';
+import { esc, toast, modal } from './ui.js';
 import { t, getLang, setLang } from './i18n.js';
 
 /** 弱口令强制改密（P0 安全）：登录后检测 must_change_pwd 弹窗改密，不可跳过 */
@@ -66,7 +66,7 @@ export function render(root) {
 
   root.innerHTML = `
   <div class="login-wrap">
-    <div class="pref-float"><span class="pref-theme">${getTheme() === 'dark' ? '☀️' : '🌙'}</span><span style="width:6px"></span><span class="pref-lang">${getLang() === 'en' ? 'EN' : '中'}</span></div>
+    <div class="pref-float"><span class="pref-lang">${getLang() === 'en' ? 'EN' : '中'}</span></div>
     <div class="login-left">
       <div class="logo-row"><span class="mark">A</span>${t('智能体平台')}</div>
       <h1>${t('一站式企业 AI 办公入口')}</h1>
@@ -102,20 +102,13 @@ export function render(root) {
     .pref-float button:hover{background:rgba(255,255,255,.24)}
   </style>`;
 
-  // 主题/语言切换（登录页右上角悬浮按钮组；两个 span 占位替换为按钮；P5.23 三态循环）
+  // 语言切换（登录页右上角悬浮按钮；span 占位替换为按钮）
   const float = root.querySelector('.pref-float');
   const mkBtn = (span, label) => {
     const b = document.createElement('button');
     b.textContent = label;
     span.replaceWith(b);
     return b;
-  };
-  const THEME_ICON = { auto: '🖥️', light: '☀️', dark: '🌙' };
-  const themeBtn = mkBtn(float.querySelector('.pref-theme'), THEME_ICON[getThemePref()]);
-  themeBtn.onclick = () => {
-    const order = ['auto', 'light', 'dark'];
-    setTheme(order[(order.indexOf(getThemePref()) + 1) % 3]);
-    themeBtn.textContent = THEME_ICON[getThemePref()];
   };
   mkBtn(float.querySelector('.pref-lang'), getLang() === 'en' ? 'EN' : '中').onclick = () => { setLang(getLang() === 'en' ? 'zh' : 'en'); location.reload(); };
 
