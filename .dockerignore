@@ -1,0 +1,28 @@
+# 运行时数据与密钥（Docker 构建上下文排除，防误带入镜像）
+.git/
+.gitignore
+data/
+backups/
+*.key
+*.pem
+*.db
+*.db-wal
+*.db-shm
+
+# 依赖（多阶段构建中在 builder 阶段处理）
+node_modules/
+
+# 开发与临时文件
+.temp/
+*.log
+.DS_Store
+
+# 用户生成产物（运行时挂载卷持久化，不入镜像）
+public/uploads/
+public/downloads/
+
+# 文档与测试（无需进入生产镜像）
+test/
+docs/
+NOTICE
+LICENSE
