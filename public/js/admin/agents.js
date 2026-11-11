@@ -139,12 +139,12 @@ export async function render(el) {
             <div style="font-size:11.5px;color:var(--text-3);margin-bottom:6px">✅ ${t('已允许域名：')}${d.domains.map(esc).join('、')}${t('（CSP 即刻生效，域名变更后需重新保存）')}</div>
             <label style="font-size:12px;font-weight:600">${t('方式一：iframe 直嵌（推荐，简单可控）')}</label>
             <div style="display:flex;gap:6px;align-items:flex-start;margin:4px 0 10px">
-              <pre class="mono" style="flex:1;font-size:11px;background:var(--surface-2,#f8fafc);border:1px solid var(--border,#eef0f4);border-radius:8px;padding:8px 10px;white-space:pre-wrap;word-break:break-all;max-height:110px;overflow:auto;margin:0">${esc(d.iframe)}</pre>
+              <pre class="mono" style="flex:1;font-size:11px;background:var(--surface-2,#f3f4f6);border:1px solid var(--border,#e5e7eb);border-radius:8px;padding:8px 10px;white-space:pre-wrap;word-break:break-all;max-height:110px;overflow:auto;margin:0">${esc(d.iframe)}</pre>
               <button class="btn" id="cpIframe">${t('复制')}</button>
             </div>
             <label style="font-size:12px;font-weight:600">${t('方式二：JS 浮窗（右下角对话球，点击展开）')}</label>
             <div style="display:flex;gap:6px;align-items:flex-start;margin:4px 0 2px">
-              <pre class="mono" style="flex:1;font-size:11px;background:var(--surface-2,#f8fafc);border:1px solid var(--border,#eef0f4);border-radius:8px;padding:8px 10px;white-space:pre-wrap;word-break:break-all;max-height:150px;overflow:auto;margin:0">${esc(d.script)}</pre>
+              <pre class="mono" style="flex:1;font-size:11px;background:var(--surface-2,#f3f4f6);border:1px solid var(--border,#e5e7eb);border-radius:8px;padding:8px 10px;white-space:pre-wrap;word-break:break-all;max-height:150px;overflow:auto;margin:0">${esc(d.script)}</pre>
               <button class="btn" id="cpScript">${t('复制')}</button>
             </div>
             <div style="font-size:11px;color:var(--text-3)">${esc(d.note || '')}</div>`;

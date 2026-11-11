@@ -109,7 +109,7 @@ export function createCanvas(root, opts = {}) {
     .cv-lib .card .ic{width:26px;height:26px;border-radius:7px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:13px;flex-shrink:0}
     .cv-lib .card .nm{font-size:12.5px;color:var(--text,#374151);line-height:1.25}
     .cv-lib .card .nm small{display:block;font-size:10.5px;color:var(--text-3,#9ca3af)}
-    .cv-stage{flex:1;position:relative;overflow:hidden;background:var(--bg,#f8fafc);cursor:default}
+    .cv-stage{flex:1;position:relative;overflow:hidden;background:var(--bg,#f9fafb);cursor:default}
     .cv-stage.panning{cursor:grabbing}
     .cv-world{position:absolute;left:0;top:0;transform-origin:0 0;will-change:transform}
     .cv-dots{position:absolute;inset:-2000px;background-image:radial-gradient(var(--border,#d7dce3) 1px,transparent 1px);background-size:22px 22px;pointer-events:none}
@@ -142,7 +142,7 @@ export function createCanvas(root, opts = {}) {
     .cv-node .nh .del{border:none;background:none;color:var(--text-3,#9ca3af);cursor:pointer;font-size:13px;padding:2px 4px;border-radius:4px}
     .cv-node .nh .del:hover{color:#dc2626;background:#fee2e2}
     .cv-node .nb{padding:7px 10px;font-size:11px;color:var(--text-2,#6b7280);line-height:1.5;min-height:20px;max-height:52px;overflow:hidden}
-    .cv-anchor-in{position:absolute;left:-7px;top:26px;width:12px;height:12px;border-radius:50%;background:#fff;border:2.5px solid #94a3b8;cursor:crosshair;z-index:2}
+    .cv-anchor-in{position:absolute;left:-7px;top:26px;width:12px;height:12px;border-radius:50%;background:#fff;border:2.5px solid var(--text-3,#9ca3af);cursor:crosshair;z-index:2}
     .cv-anchor-out{position:absolute;right:-7px;width:12px;height:12px;border-radius:50%;background:#fff;border:2.5px solid var(--brand,#2563eb);cursor:crossbar;z-index:2}
     /* P5.11 异常分支出口：红色小端口（节点底部中央；仅失败时激活） */
     .cv-anchor-err{position:absolute;bottom:-7px;left:50%;transform:translateX(-50%);width:12px;height:12px;border-radius:50%;background:#fff;border:2.5px solid #dc2626;cursor:crosshair;z-index:3}

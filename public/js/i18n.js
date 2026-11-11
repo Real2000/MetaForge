@@ -821,9 +821,7 @@ const EN = {
   '专属客户成功经理': 'Dedicated customer success manager',
   'SLA 99.9% 保障': '99.9% SLA guarantee',
   // ---------- C1：框架 app/api/chat-component（2026-11-10） ----------
-  '主题：跟随系统（点击切换日间）': 'Theme: follow system (click for light)',
-  '主题：日间（点击切换夜间）': 'Theme: light (click for dark)',
-  '主题：夜间（点击切换跟随系统）': 'Theme: dark (click to follow system)',
+  // 主题切换三键已随暗色模式退役（浅色唯一外观，2026-11-11 移除）
   '打开历史会话列表': 'Open session history',
   '⚠️ 网络已断开——当前展示离线缓存内容，操作将无法保存': '⚠️ Offline — showing cached content; changes cannot be saved',
   '确定退出登录？': 'Sign out?',

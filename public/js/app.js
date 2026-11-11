@@ -6,6 +6,9 @@ import { t, getLang, setLang } from './i18n.js';
 // <html lang> 跟随界面语言（P3 多语言）
 document.documentElement.lang = getLang() === 'en' ? 'en' : 'zh-CN';
 
+// 主题机制退役后清理旧存量偏好（浅色唯一外观，2026-11-11；一次性移除，幂等无副作用）
+try { localStorage.removeItem('ap_theme'); } catch { }
+
 // 路由层 destroy 生命周期：页面模块 render() 可返回 { destroy }，切页时统一清理（防 monitor 轮询/canvas 监听器泄漏）
 let currentDestroy = null;
 
