@@ -2646,7 +2646,10 @@ const EN = {
   '已开启两版对比：先点一个版本，再点另一个版本': 'Two-version compare on: click one version, then another',
   '已选 v{v}，再点一个版本': 'Selected v{v} — click another version',
   '回滚预览：目标 v{v} 相对当前草稿的变更。确认后该版本快照将写回草稿并同步线上（即刻生效，当前草稿改动会被覆盖）。': 'Rollback preview: changes of target v{v} relative to the current draft. Confirm to write this snapshot back to the draft and sync it live (effective immediately; current draft changes will be overwritten).',
-  '确认回滚到 v{v}': 'Confirm rollback to v{v}',
+   '确认回滚到 v{v}': 'Confirm rollback to v{v}',
+  // ---------- C1 第十八批：P1-1 SSO 企业登录（2026-11-12） ----------
+  '或': 'or',
+  '企业登录': 'Enterprise Login',
 };
 
 /** 翻译：中文即 key；英文查词典，缺失回退中文 */

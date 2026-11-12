@@ -90,6 +90,7 @@ export function render(root) {
         <button class="btn primary" type="submit" style="width:100%;justify-content:center;padding:11px;font-size:14px;margin-top:6px" id="loginBtn">${t('登 录')}</button>
       </form>
       <button class="btn" id="dtH5Btn" style="width:100%;justify-content:center;padding:10px;font-size:13px;margin-top:10px;display:none">📱 ${t('钉钉免登（演示）')}</button>
+      <div id="ssoBtnArea" style="display:none;margin-top:12px"><div style="display:flex;align-items:center;gap:10px;margin-bottom:10px"><span style="flex:1;height:1px;background:rgba(255,255,255,.2)"></span><span style="font-size:11px;color:var(--text-3,#9ca3af)">${t('或')}</span><span style="flex:1;height:1px;background:rgba(255,255,255,.2)"></span></div><button class="btn" id="ssoBtn" style="width:100%;justify-content:center;padding:10px;font-size:13px">🏢 ${t('企业登录')}</button></div>
       <div class="demo-tip">
         ${t('演示账号')}：<b>admin</b>（${t('管理员')}）/ <b>demo</b>（${t('普通用户')}）<br>
         ${t('初始密码由管理员在后台「用户管理」中设置与重置')}
@@ -161,5 +162,24 @@ export function render(root) {
         }
       };
     } catch { /* config 不可达时静默（登录页核心是密码登录） */ }
+  })();
+
+  // P1-1 SSO/OIDC 企业登录：查询已启用的 SSO 提供方，有则显示按钮
+  (async () => {
+    try {
+      const j = await api('/auth/sso/providers', { rawResponse: true });
+      if (j.code !== 0 || !Array.isArray(j.data) || !j.data.length) return;
+      const area = root.querySelector('#ssoBtnArea');
+      if (!area) return;
+      area.style.display = 'block';
+      const btn = root.querySelector('#ssoBtn');
+      if (!btn) return;
+      const name = j.data[0].display_name || j.data[0].name;
+      btn.textContent = `🏢 ${t('企业登录')}（${name}）`;
+      btn.onclick = () => {
+        // 跳转到 SSO 授权页（OAuth2 authorize 端点）
+        window.location.href = `/api/auth/sso/authorize?provider_id=${j.data[0].id}&redirect=${encodeURIComponent(location.href)}`;
+      };
+    } catch { /* SSO 服务不可用时静默 */ }
   })();
 }

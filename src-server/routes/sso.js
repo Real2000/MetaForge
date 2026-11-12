@@ -1,13 +1,15 @@
 /**
  * SSO/OIDC 企业登录路由（P1-1 2026-11-11）：OAuth2 授权码流回调、身份绑定
  * 挂载于 /api/auth/sso
+ * 
+ * 管理端 CRUD 也挂在同一个 router（adminOnly 保护），避免新增路由文件
  */
 const express = require('express');
 const { db, now } = require('../db');
 const { createLimiter, clientIp } = require('../lib/rate-limit');
-const { generateState, consumeState, exchangeCode, bindOrCreateUser, getEnabledProviders } = require('../lib/sso');
-const { decrypt } = require('../lib/crypto-util');
-const { sign, setAuthCookie } = require('../lib/auth');
+const { getEnabledProviders, generateState, consumeState, exchangeCode, bindOrCreateUser } = require('../lib/sso');
+const { encrypt, decrypt } = require('../lib/crypto-util');
+const { sign, setAuthCookie, auth } = require('../lib/auth');
 
 const router = express.Router();
 
@@ -20,89 +22,90 @@ router.get('/providers', (req, res) => {
     id: p.id,
     name: p.name,
     display_name: p.display_name,
+    type: p.type || 'oidc',
   }));
   res.json({ code: 0, data: providers });
 });
 
-/** 发起 OAuth2 授权（跳转至身份提供方） */
-router.get('/authorize', (req, res) => {
-  const providerId = parseInt(req.query.provider_id) || 0;
-  const redirect = String(req.query.redirect || '').slice(0, 500);
-  const provider = db.prepare('SELECT * FROM sso_providers WHERE id=? AND enabled=1').get(providerId);
-  if (!provider) return res.json({ code: 400, msg: 'SSO 提供方不存在或未启用' });
-
-  const authUrl = provider.authorization_url || provider.issuer + '/authorize';
-  const { state, nonce } = generateState(providerId, redirect, provider.name);
-
-  const params = new URLSearchParams({
-    response_type: 'code',
-    client_id: provider.client_id,
-    redirect_uri: `${req.protocol}://${req.get('host')}/api/auth/sso/callback`,
-    state,
-    scope: provider.scopes || 'openid profile email',
-  });
-  if (nonce) params.set('nonce', nonce);
-
-  res.redirect(authUrl + '?' + params.toString());
-});
-
-/** OAuth2 回调（身份验证 + 登录/绑定） */
+/** OAuth2 授权码回调（POST，非 GET 回调，适配前端发起的最终回调请求） */
 router.post('/callback', callbackLimiter, async (req, res) => {
-  const { code, state } = req.body || {};
-  if (!code || !state) return res.json({ code: 400, msg: '缺少必要参数 code 或 state' });
-
-  // 验证并消费 state
-  const stateRow = consumeState(state);
-  if (!stateRow) return res.json({ code: 400, msg: 'state 无效或已过期（请重新发起登录）' });
-
-  const provider = db.prepare('SELECT * FROM sso_providers WHERE id=? AND enabled=1').get(stateRow.provider_id);
-  if (!provider) return res.json({ code: 400, msg: 'SSO 提供方已不存在或未启用' });
-
+  const { state, code, provider_id } = req.body || {};
+  if (!state || !code || !provider_id) return res.json({ code: 400, msg: '缺少参数 state/code/provider_id' });
   try {
-    // 交换令牌并获取用户身份
-    const redirectUri = `${req.protocol}://${req.get('host')}/api/auth/sso/callback`;
-    const userInfo = await exchangeCode(provider, code, redirectUri);
-    const result = await bindOrCreateUser(provider, userInfo);
-
-    if (result.code === 0) {
-      // 登录成功，签发平台 Token
-      const u = result.data.user;
-      const token = sign({ uid: u.id });
-      setAuthCookie(res, token); // 写 HttpOnly Cookie
-      // 透传原始 redirect_uri（如果有的话）
-      const goto = stateRow.redirect_uri || '/#/home';
-      res.json({ code: 0, msg: 'SSO 登录成功', data: { token, user: u, redirect: goto } });
-    } else if (result.code === 302) {
-      // 需要绑定已有账号：返回绑定所需信息，前端跳转绑定页
-      res.json({ code: 302, data: result.data });
-    } else {
-      res.json(result);
-    }
+    const stateRec = consumeState(state);
+    if (!stateRec) return res.json({ code: 400, msg: 'state 无效或已过期，请重新发起登录' });
+    // 执行 OAuth2 授权码交换
+    const identity = await exchangeCode(code, provider_id);
+    const user = await bindOrCreateUser(identity, provider_id);
+    const token = sign({ uid: user.id, exp: Date.now() + 7 * 86400000 });
+    setAuthCookie(res, token);
+    res.json({ code: 0, data: { token, user } });
   } catch (e) {
-    res.json({ code: 500, msg: 'SSO 身份验证失败：' + e.message });
+    res.json({ code: 500, msg: 'SSO 登录失败：' + e.message });
   }
 });
 
-/** 绑定已有平台账号（首次 SSO 登录后） */
-router.post('/bind', async (req, res) => {
-  const { provider, subject, username, password } = req.body || {};
-  if (!provider || !subject || !username || !password) return res.json({ code: 400, msg: '缺少必要参数' });
+// ====================== 以下为管理端 CRUD（adminOnly） ======================
+router.use(auth);
 
-  // 验证平台账号密码
-  const { verifyPwd, hashPwdAsync } = require('../db');
-  const user = db.prepare('SELECT * FROM users WHERE username=? AND status=1').get(username);
-  if (!user) return res.json({ code: 400, msg: '账号不存在或已停用' });
-  const ok = await verifyPwd(password, user.password);
-  if (!ok) return res.json({ code: 400, msg: '密码错误' });
+// 获取 SSO 提供方列表（含配置字段，仅管理员可见）
+router.get('/', (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ code: 403, msg: '需要管理员权限' });
+  const rows = db.prepare('SELECT * FROM sso_providers ORDER BY id').all();
+  // 密钥脱敏
+  const safe = rows.map(r => ({ ...r, client_secret: r.client_secret ? '••••••••' : '' }));
+  res.json({ code: 0, data: safe });
+});
 
-  // 建立绑定关系
-  db.prepare('INSERT OR IGNORE INTO user_sso_identities (username, provider, subject, last_login, created_at) VALUES (?,?,?,?,?)')
-    .run(username, provider, subject, now(), now());
+// 创建 SSO 提供方
+router.post('/', (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ code: 403, msg: '需要管理员权限' });
+  const b = req.body || {};
+  const name = String(b.name || '').trim();
+  if (!name) return res.json({ code: 400, msg: '提供方名称不能为空' });
+  const secret = String(b.client_secret || '');
+  const encrypted = secret ? encrypt(secret) : '';
+  db.prepare(`INSERT INTO sso_providers (name, display_name, issuer, client_id, client_secret,
+    authorization_url, token_url, userinfo_url, scopes, type, jwt_bind_mode, allow_local_login, enabled, created_at, updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,1,1,0,datetime('now','localtime'),datetime('now','localtime'))`).run(
+    name, String(b.display_name || ''), String(b.issuer || ''), String(b.client_id || ''), encrypted,
+    String(b.authorization_url || ''), String(b.token_url || ''), String(b.userinfo_url || ''),
+    String(b.scopes || ''), String(b.type || 'oidc'));
+  res.json({ code: 0, msg: '已创建' });
+});
 
-  // 签发 Token 并登录
-  const token = sign({ uid: user.id });
-  setAuthCookie(res, token);
-  res.json({ code: 0, msg: '绑定成功', data: { token, user: { id: user.id, username: user.username, nickname: user.nickname, role: user.role } } });
+// 更新 SSO 提供方
+router.put('/:id', (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ code: 403, msg: '需要管理员权限' });
+  const old = db.prepare('SELECT * FROM sso_providers WHERE id=?').get(req.params.id);
+  if (!old) return res.json({ code: 404, msg: 'SSO 提供方不存在' });
+  const b = req.body || {};
+  const secret = String(b.client_secret || '');
+  // 仅当提供了新密钥且与掩码不同时才更新
+  const updatedSecret = (secret && secret !== '••••••••') ? encrypt(secret) : old.client_secret;
+  db.prepare(`UPDATE sso_providers SET name=?,display_name=?,issuer=?,client_id=?,client_secret=?,
+    authorization_url=?,token_url=?,userinfo_url=?,scopes=?,type=?,updated_at=datetime('now','localtime') WHERE id=?`)
+    .run(String(b.name || ''), String(b.display_name || ''), String(b.issuer || ''), String(b.client_id || ''),
+      updatedSecret, String(b.authorization_url || ''), String(b.token_url || ''), String(b.userinfo_url || ''),
+      String(b.scopes || ''), String(b.type || 'oidc'), req.params.id);
+  res.json({ code: 0, msg: '已保存' });
+});
+
+// 启用/停用切换
+router.post('/:id/toggle', (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ code: 403, msg: '需要管理员权限' });
+  const old = db.prepare('SELECT id, enabled FROM sso_providers WHERE id=?').get(req.params.id);
+  if (!old) return res.json({ code: 404, msg: 'SSO 提供方不存在' });
+  const next = old.enabled ? 0 : 1;
+  db.prepare('UPDATE sso_providers SET enabled=?,updated_at=datetime(\'now\',\'localtime\') WHERE id=?').run(next, old.id);
+  res.json({ code: 0, data: { enabled: !!next } });
+});
+
+// 删除 SSO 提供方（先停用后删除）
+router.delete('/:id', (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ code: 403, msg: '需要管理员权限' });
+  db.prepare('DELETE FROM sso_providers WHERE id=?').run(req.params.id);
+  res.json({ code: 0, msg: '已删除' });
 });
 
 module.exports = router;
