@@ -2,7 +2,7 @@
  * mount(el, opts) opts: { getAgentId(), getAgentBanner() -> {name, desc, icon, opening, openingQuestions} | null, defaultModel, skills?: true }
  */
 import { api, sseChat, getToken } from './api.js';
-import { esc, toast, modal } from './ui.js';
+import { esc, toast, modal, confirmBox } from './ui.js';
 import { t, getLang } from './i18n.js';
 
 /** 错误文案兜底翻译（服务端已尽量给中文，仍可能透出英文原文——最后一道防线） */
@@ -37,9 +37,12 @@ export function mountChat(el, opts) {
   let sessions = [];
   let currentSession = null;
   let messages = [];
+  let currentBranch = 'main'; // P1-6 分支回放：当前查看的分支（main=活跃线，br-*=归档线）
+  let branches = [];        // P1-6：归档分支列表
+  let pendingCk = null;     // P1-6：aborted 检查点（续跑卡片数据源）
+  let streaming = false;
   let models = [];
   let currentModel = '';
-  let streaming = false;
   let currentAbort = null; // P5.29 停止生成：当前流的中断句柄（生成中点击停止按钮调用，见 sseChat onAborter）
   let pendingKbHits = null;
   let pendingTools = [];
@@ -274,22 +277,54 @@ export function mountChat(el, opts) {
       });
       return;
     }
-    inner.innerHTML = messages.map(m => `
-      <div class="msg ${m.role === 'user' ? 'user' : 'bot'}" data-mid="${m.id || ''}">
+    inner.innerHTML = messages.map(m => {
+      const isArch = (m.branch || 'main') !== 'main';
+      const nameTag = (isArch ? ' <span class="tag gray" style="font-size:10px">' + t('归档') + '</span>' : '')
+        + (m.resumed ? ' <span class="tag green" style="font-size:10px">⏯ ' + t('续跑补全') + '</span>' : '');
+      return `
+      <div class="msg ${m.role === 'user' ? 'user' : 'bot'}${isArch ? ' arch-branch' : ''}" data-mid="${m.id || ''}" style="${isArch ? 'opacity:.75' : ''}">
         <div class="m-avatar">${m.role === 'user' ? '我' : 'AI'}</div>
         <div class="m-body">
-          <div class="m-name">${m.role === 'user' ? (getUserNick()) : (opts.getAgentBanner?.()?.name || t('AI 助手'))}</div>
+          <div class="m-name">${m.role === 'user' ? (getUserNick()) : (opts.getAgentBanner?.()?.name || t('AI 助手'))}${nameTag}</div>
           ${m.isError ? renderErrorCard(m) : `<div class="m-bubble">${renderBubble(m)}</div>`}
           ${m.role === 'assistant' && m.id && !m.isError ? renderFeedbackBar(m) : ''}
+          ${m.role === 'assistant' && m.id && !m.isError && currentBranch === 'main' && !streaming ? renderReplayBtn(m) : ''}
         </div>
-      </div>`).join('');
+      </div>`;
+    }).join('');
     bindBubbleEvents();
     bindFeedbackEvents();
     bindErrorEvents();
     bindMediaDynamic();
+    bindReplayEvents(); // P1-6：回放按钮事件
     scrollBottom();
   }
 
+  // P1-6 分支回放：AI 回复悬浮「从此回放」按钮（仅主线且非生成中可见）
+  function renderReplayBtn(m) {
+    return `<div class="replay-bar" style="margin-top:4px;display:flex;gap:6px;font-size:12px">
+      <button class="fb-btn" data-replay="${m.id}" title="${t('从这条回复处重新生成——其后对话归档保留，不丢失')}">🔄 ${t('从此回放')}</button>
+    </div>`;
+  }
+
+  function bindReplayEvents(scope) {
+    (scope || el).querySelectorAll('[data-replay]').forEach(b => b.onclick = async () => {
+      if (!await confirmBox(t('从这条回复处重新生成？其后对话将归档为只读分支，不会丢失。'))) return;
+      try {
+        const j = await api(`/chat/messages/${b.dataset.replay}/replay`, { method: 'POST' });
+        if (j.code !== 0) return toast(j.msg || t('回放失败'), 'err');
+        toast(t('已归档旧回复——主线已回到你的问题，请重新发送或稍候重新生成'));
+        // 重拉消息（main 已截断到锚点前）+ 刷新分支条
+        const qs2 = await api(`/chat/sessions/${currentSession.id}/messages`);
+        messages = (qs2.data && qs2.data.list) || [];
+        currentBranch = 'main';
+        renderMessages();
+        loadBranches(currentSession.id);
+        // P1-6 第二迭代：回放后自动把原问句填回输入框，用户可直接重发（或编辑后重发）
+        if (j.data && j.data.user_question) { $('#chatInput').value = j.data.user_question; $('#chatInput').focus(); }
+      } catch (e) { toast(e.message, 'err'); }
+    });
+  }
   // 错误卡片（体验优化）：图标 + 中文文案 + 重试按钮 + 联系反馈，不再裸抛英文堆栈
   function renderErrorCard(m) {
     return `
@@ -633,9 +668,111 @@ export function mountChat(el, opts) {
 
   async function openSession(id) {
     currentSession = sessions.find(s => s.id === id);
+    // P1-6：返回结构改为 {branch, list}；同时探测未完成检查点（aborted → 展示「继续生成」卡片）
     const j = await api(`/chat/sessions/${id}/messages`);
-    messages = j.data;
+    messages = (j.data && j.data.list) || [];
+    currentBranch = (j.data && j.data.branch) || 'main';
     renderSessions(); renderMessages();
+    checkPendingResume(id);
+    loadBranches(id);
+  }
+
+  // P1-6 断点续跑：打开会话时若有 aborted 检查点，在消息流末尾追加续跑卡片
+  async function checkPendingResume(id) {
+    try {
+      const j = await api(`/chat/sessions/${id}/checkpoint`);
+      pendingCk = j.data || null;
+    } catch { pendingCk = null; }
+    if (pendingCk && pendingCk.status === 'aborted') renderResumeCard();
+  }
+
+  function renderResumeCard() {
+    if (!pendingCk) return;
+    const inner = $('#chatInner');
+    if (!inner || document.getElementById('resumeCard')) return;
+    const partial = String(pendingCk.partial_content || '');
+    const div = document.createElement('div');
+    div.id = 'resumeCard';
+    div.className = 'msg bot';
+    div.innerHTML = `
+      <div class="m-avatar">AI</div>
+      <div class="m-body">
+        <div class="m-bubble" style="border:1px dashed #f59e0b;background:#fffbeb">
+          <div style="font-size:12px;color:#b45309;font-weight:600;margin-bottom:4px">⚠️ ${t('上次回复生成中断')}</div>
+          <div style="font-size:12px;color:var(--text-3)">${t('中断处内容：')}${esc(partial.slice(-80))}${partial.length > 80 ? '…' : ''}</div>
+          <div style="margin-top:8px;display:flex;gap:8px">
+            <button class="btn sm primary" id="resumeBtn">▶️ ${t('继续生成')}</button>
+            <button class="btn sm" id="resumeDismiss">${t('忽略')}</button>
+          </div>
+        </div>
+      </div>`;
+    inner.appendChild(div);
+    $('#resumeBtn').onclick = async () => { div.remove(); await doResume(); };
+    $('#resumeDismiss').onclick = () => { div.remove(); pendingCk = null; };
+    scrollBottom();
+  }
+
+  // P1-6 续跑 SSE：与 doSend 同构的流式渲染（每次 delta 后定位最后一个气泡重绘）
+  async function doResume() {
+    if (!pendingCk || !currentSession) return;
+    streaming = true;
+    setSendBtnMode('stop');
+    $('#chatStatus').textContent = t('续跑中…');
+    const botMsg = { role: 'assistant', content: pendingCk.partial_content || '', resumed: true };
+    messages.push(botMsg);
+    renderMessages();
+    const bubbles = $('#chatInner').querySelectorAll('.m-bubble');
+    streamingBubble(bubbles[bubbles.length - 1]);
+    await sseChat(null, {
+      url: `/api/chat/sessions/${currentSession.id}/resume`,
+      method: 'POST',
+      body: {},
+      onDelta(text) {
+        botMsg.content += text;
+        const bs = $('#chatInner').querySelectorAll('.m-bubble');
+        const live = bs[bs.length - 1];
+        if (live) live.innerHTML = renderMarkdown(botMsg.content);
+        scrollBottom();
+      },
+      onDone(j) { botMsg.content = j.content; botMsg.id = j.mid; pendingCk = null; streaming = false; setSendBtnMode('send'); $('#chatStatus').textContent = ''; renderMessages(); },
+      onError(e) { toast(e.message, 'err'); botMsg.content = botMsg.content || t('续跑失败'); streaming = false; setSendBtnMode('send'); renderMessages(); },
+      onAborted() { toast(t('已停止续跑'), 'info'); streaming = false; setSendBtnMode('send'); renderMessages(); },
+    });
+  }
+
+  // P1-6 分支列表：会话存在归档线时，顶部展示分支切换条
+  async function loadBranches(id) {
+    try {
+      const j = await api(`/chat/sessions/${id}/branches`);
+      branches = (j.data || []).filter(b => b.branch !== 'main');
+    } catch { branches = []; }
+    renderBranchBar();
+  }
+
+  function renderBranchBar() {
+    let bar = $('#branchBar');
+    if (!bar) {
+      bar = document.createElement('div');
+      bar.id = 'branchBar';
+      bar.style.cssText = 'display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:6px 10px;font-size:12px';
+      const inner = $('#chatInner');
+      if (inner) inner.parentElement.insertBefore(bar, inner);
+    }
+    if (!branches.length) { bar.innerHTML = ''; bar.style.display = 'none'; return; }
+    bar.style.display = 'flex';
+    bar.innerHTML = `<span style="color:var(--text-3)">🌿 ${t('回放分支：')}</span>` +
+      `<span class="mm-chip ${currentBranch === 'main' ? 'on' : ''}" data-br="main">${t('当前主线')}</span>` +
+      branches.map(b => `<span class="mm-chip ${currentBranch === b.branch ? 'on' : ''}" data-br="${b.branch}">${b.branch}（${b.msgs}）</span>`).join('');
+    bar.querySelectorAll('[data-br]').forEach(c => c.onclick = async () => {
+      const br = c.dataset.br;
+      if (br === currentBranch) return;
+      currentBranch = br;
+      const qs = br === 'main' ? '' : `?branch=${br}`;
+      const j = await api(`/chat/sessions/${currentSession.id}/messages${qs}`);
+      messages = (j.data && j.data.list) || [];
+      currentBranch = (j.data && j.data.branch) || br;
+      renderMessages(); renderBranchBar();
+    });
   }
 
   async function newSession() {

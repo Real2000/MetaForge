@@ -11,7 +11,7 @@
  *   （即任何会被 STATIC_CACHE 缓存的资源变更），发版前必须 bump SW_VERSION，否则用户端拿旧缓存。
  * 提交前自检：git diff --name-only HEAD~1 | grep -E '^public/(js|css|vendor|sw\.js|index\.html)' 命中则必须改本常量。
  */
-const SW_VERSION = 'p5.36-v1'; // 2026-11-12 bump：P1-4/P1-5/P1-1b/P0-3b 大量 public/js 变更（memories/sso/departments/studio/app/i18n），强制全体客户端弃旧缓存
+const SW_VERSION = 'p5.36-v2'; // 2026-11-12 bump：P1-6 会话检查点 v2 前端变更（chat-component/api）
 const STATIC_CACHE = `ap-static-${SW_VERSION}`;
 const NEVER_CACHE = [/^\/api\//, /\/sse/, /\/stream/, /\/files\/download/, /\?[^\s]*download/];
 

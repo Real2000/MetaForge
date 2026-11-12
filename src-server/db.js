@@ -265,7 +265,7 @@ CREATE TABLE IF NOT EXISTS messages (
 }
 db.exec(`CREATE TABLE IF NOT EXISTS checkpoints (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  session_id INTEGER,
+  session_id INTEGER NOT NULL UNIQUE,
   user_content TEXT DEFAULT '',
   partial_content TEXT DEFAULT '',
   status TEXT DEFAULT 'generating',
@@ -1492,7 +1492,25 @@ CREATE INDEX IF NOT EXISTS idx_entity_name_type ON entities(name, type);`);
 const tableEntities = 'entities';
 const tableEntityRelations = 'entity_relations';
 
-module.exports = { db, hashPwd, hashPwdAsync, verifyPwd, now, daysAgo, tableEntities, tableEntityRelations };
+// ---------------- P1-6 会话检查点 v2（2026-11-12）：checkpoint 读写辅助 ----------------
+// 语义：stream 生成中每 ~200 token 节流 UPSERT 当前快照；异常中断标记 aborted；
+// 正常完成删除。前端发现 status != 'done' 的检查点时提示「继续生成」。
+function upsertCheckpoint(sessionId, { userContent, partialContent, status, model }) {
+  db.prepare(`INSERT INTO checkpoints (session_id, user_content, partial_content, status, model, created_at, updated_at)
+    VALUES (?,?,?,?,?,?,datetime('now','localtime'))
+    ON CONFLICT(session_id) DO UPDATE SET
+      partial_content=excluded.partial_content, status=excluded.status,
+      model=excluded.model, updated_at=datetime('now','localtime')`)
+    .run(sessionId, userContent || '', partialContent || '', status || 'generating', model || '');
+}
+function getCheckpoint(sessionId) {
+  return db.prepare('SELECT * FROM checkpoints WHERE session_id=?').get(sessionId);
+}
+function deleteCheckpoint(sessionId) {
+  db.prepare('DELETE FROM checkpoints WHERE session_id=?').run(sessionId);
+}
+
+module.exports = { db, hashPwd, hashPwdAsync, verifyPwd, now, daysAgo, tableEntities, tableEntityRelations, upsertCheckpoint, getCheckpoint, deleteCheckpoint };
 
 // ---------- P1-4 修复 2026-11-09：ENCRYPTION_KEY 自动初始化（secrets 表建表后幂等注入） ----------
 // 若 secrets 表中尚无 ENCRYPTION_KEY，自动生成 32 字节（64 hex）随机密钥写入。

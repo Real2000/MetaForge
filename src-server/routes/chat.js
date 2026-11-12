@@ -2,7 +2,7 @@
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
-const { db, now } = require('../db');
+const { db, now, upsertCheckpoint, getCheckpoint, deleteCheckpoint } = require('../db');
 const { auth, adminOnly } = require('../lib/auth');
 const { chat, chatOnce } = require('../lib/llm');
 const { retrieve } = require('../lib/retriever');
@@ -109,7 +109,9 @@ router.get('/sessions/:id/messages', (req, res) => {
   const sess = db.prepare('SELECT username FROM sessions WHERE id=?').get(req.params.id);
   if (!sess) return res.json({ code: 404, msg: '会话不存在' });
   if (sess.username !== req.user.username) return res.json({ code: 403, msg: '无权访问该会话' });
-  const rows = db.prepare('SELECT * FROM messages WHERE session_id=? ORDER BY id').all(req.params.id);
+  // P1-6 分支回放：?branch=br-xxx 查看归档线；默认返回当前活跃线（sessions.active_branch，老数据 main）
+  const branch = String(req.query.branch || '').trim() || (db.prepare('SELECT active_branch FROM sessions WHERE id=?').get(req.params.id)?.active_branch || 'main');
+  const rows = db.prepare('SELECT * FROM messages WHERE session_id=? AND branch=? ORDER BY id').all(req.params.id, branch);
   const traceStmt = db.prepare('SELECT kb_hits, tool_calls, suggestions FROM chat_traces WHERE message_id=? ORDER BY id DESC LIMIT 1');
   const out = rows.map(m => {
     if (m.role !== 'assistant') return m;
@@ -119,7 +121,134 @@ router.get('/sessions/:id/messages', (req, res) => {
       return { ...m, kbHits: JSON.parse(t.kb_hits || '[]'), toolCalls: JSON.parse(t.tool_calls || '[]'), suggestions: JSON.parse(t.suggestions || '[]') };
     } catch { return m; }
   });
-  res.json({ code: 0, data: out });
+  res.json({ code: 0, data: { branch, list: out } });
+});
+
+// ---------------- P1-6 会话检查点 v2：断点续跑 + 分支回放（2026-11-12） ----------------
+// ① GET /chat/sessions/:id/checkpoint —— 查询未完成检查点（前端打开会话时探测「继续生成」卡片）
+router.get('/sessions/:id/checkpoint', (req, res) => {
+  const sess = db.prepare('SELECT username FROM sessions WHERE id=?').get(req.params.id);
+  if (!sess) return res.json({ code: 404, msg: '会话不存在' });
+  if (sess.username !== req.user.username) return res.json({ code: 403, msg: '无权访问该会话' });
+  const ck = getCheckpoint(req.params.id);
+  // done 态不该出现（完成即删）；generating 态视为进行中无需续跑；仅 aborted 可续
+  if (!ck || ck.status === 'done' || ck.status === 'generating') return res.json({ code: 0, data: null });
+  res.json({ code: 0, data: ck });
+});
+
+// ② POST /chat/sessions/:id/resume —— 续跑：把 partial 作为前情继续生成，产出一条完整 assistant 消息
+//    不重复写 user 消息；续写不带工具/检索（纯文本续写，避免重复副作用）
+router.post('/sessions/:id/resume', async (req, res) => {
+  const sess = db.prepare('SELECT * FROM sessions WHERE id=?').get(req.params.id);
+  if (!sess) return res.json({ code: 404, msg: '会话不存在' });
+  if (sess.username !== req.user.username) return res.json({ code: 403, msg: '无权访问该会话' });
+  const ck = getCheckpoint(req.params.id);
+  if (!ck || ck.status !== 'aborted') return res.json({ code: 400, msg: '该会话没有可续跑的检查点' });
+  if (ck.partial_content.length < 10) return res.json({ code: 400, msg: '中断内容过短，无续跑价值，请重新提问' });
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  let clientClosed = false;
+  res.on('close', () => { if (!res.writableEnded) clientClosed = true; });
+  const send = (event, data) => { if (!clientClosed && !res.writableEnded) res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); };
+  try {
+    // 续跑前情：历史 + partial 快照 + 续写指令（明确要求接续而非重答）
+    const history = db.prepare('SELECT role, content FROM messages WHERE session_id=? AND branch=IFNULL((SELECT active_branch FROM sessions WHERE id=?),"main") ORDER BY id').all(req.params.id, req.params.id)
+      .map(m => ({ role: m.role, content: m.content }));
+    const resumePrompt = [
+      `你之前的回复在生成中途意外中断，已生成内容如下（可能不完整，句子可能戛然而止）：`,
+      `"""\n${ck.partial_content}\n"""`,
+      `请从中断处自然续写，直接接续上文语义与格式（不要重复已生成内容，不要道歉，不要重新开头；若上文是 markdown 列表/代码块中断，则补完该结构）。`,
+    ].join('\n');
+    const messages = [...history, { role: 'user', content: resumePrompt }];
+
+    const gen = chat(messages, { model: ck.model || undefined, username: req.user.username, max_reply: undefined });
+    send('delta', { text: '' }); // 触发前端"生成中"态
+    let full = '';
+    let genMeta = null;
+    let ckLastLen = 0;
+    try {
+      while (true) {
+        const r = await gen.next();
+        if (r.done) { full = r.value.full; genMeta = r.value; break; }
+        if (r.value.delta) { full += r.value.delta; send('delta', { text: r.value.delta }); }
+        if (full.length - ckLastLen >= 200) {
+          ckLastLen = full.length;
+          try { upsertCheckpoint(req.params.id, { userContent: ck.user_content, partialContent: full, status: 'generating', model: ck.model }); } catch { }
+        }
+        if (clientClosed) break; // 客户端断开：保留 generating 态检查点（重开可再续）
+      }
+    } catch (e) {
+      if (clientClosed || e?.name === 'AbortError' || e?.aborted) { /* 断开：保留快照 */ }
+      else {
+        try { upsertCheckpoint(req.params.id, { userContent: ck.user_content, partialContent: full || ck.partial_content, status: 'aborted', model: ck.model }); } catch { }
+        throw e;
+      }
+    }
+    if (clientClosed) return res.end(); // 断开：partial 已在检查点，重开会话可再续跑
+
+    // 续跑完成：完整内容落库为一条 assistant 消息 + 清检查点
+    const tokens = Math.ceil(full.length * 0.6);
+    const msgInfo = db.prepare('INSERT INTO messages (session_id,role,content,tokens,created_at) VALUES (?,?,?,?,?)')
+      .run(req.params.id, 'assistant', full, tokens, now());
+    addUsage(req.user.username, tokens);
+    db.prepare('UPDATE sessions SET updated_at=? WHERE id=?').run(now(), req.params.id);
+    deleteCheckpoint(req.params.id);
+    db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
+      .run(req.user.username, '断点续跑', `会话 #${req.params.id} 从 ${ck.partial_content.length} 字符处续写至 ${full.length} 字符`, req.ip, now());
+    send('done', { content: full, tokens, model: genMeta?.model, provider: genMeta?.provider, mid: Number(msgInfo.lastInsertRowid), resumed: true });
+    res.end();
+  } catch (e) {
+    console.error('[chat] 续跑异常：', e);
+    db.prepare('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)').run('chat-service', '断点续跑异常：' + e.message, now());
+    send('error', { msg: '续跑失败：' + e.message });
+    res.end();
+  }
+});
+
+// ③ GET /chat/sessions/:id/branches —— 分支列表（回放产生的归档线）
+//    main = 当前活跃线；br-{ts} = 从某消息回放后归档的旧线（只读保留，防误删上下文）
+router.get('/sessions/:id/branches', (req, res) => {
+  const sess = db.prepare('SELECT username FROM sessions WHERE id=?').get(req.params.id);
+  if (!sess) return res.json({ code: 404, msg: '会话不存在' });
+  if (sess.username !== req.user.username) return res.json({ code: 403, msg: '无权访问该会话' });
+  const rows = db.prepare(`SELECT branch, COUNT(*) AS msgs, MIN(created_at) AS since, MAX(created_at) AS until
+    FROM messages WHERE session_id=? GROUP BY branch ORDER BY branch='main' DESC, since DESC`).all(req.params.id);
+  res.json({ code: 0, data: rows });
+});
+
+// ④ POST /chat/messages/:id/replay —— 分支回放：从该消息（锚点）后重新生成
+//    语义：锚点之后的所有消息从 main 归档到 br-{ts}（只读保留），main 截断至锚点，
+//    模型对锚点消息（user 问句）重新作答。原消息保留在归档线，不删除任何内容。
+router.post('/messages/:id/replay', async (req, res) => {
+  const m = db.prepare('SELECT m.*, s.username AS sess_owner FROM messages m JOIN sessions s ON s.id=m.session_id WHERE m.id=?').get(req.params.id);
+  if (!m) return res.json({ code: 404, msg: '消息不存在' });
+  if (m.sess_owner !== req.user.username) return res.json({ code: 403, msg: '无权回放该会话消息' });
+  if (m.role !== 'assistant') return res.json({ code: 400, msg: '只能从 AI 回复处回放' });
+  // 锚点必须仍在 main 分支上（归档线只读，不允许在归档线上再回放）
+  if ((m.branch || 'main') !== 'main') return res.json({ code: 400, msg: '归档分支为只读，请回到当前主线回放' });
+
+  // 锚点的问句：锚点本身是 assistant → 其前面最近的一条 user 消息（同 main 分支）
+  const anchorUser = db.prepare(`SELECT id, content FROM messages WHERE session_id=? AND role='user' AND branch='main' AND id<? ORDER BY id DESC LIMIT 1`)
+    .get(m.session_id, m.id);
+  if (!anchorUser) return res.json({ code: 400, msg: '未找到锚点对应的用户问句，无法回放' });
+
+  const branchName = `br-${Date.now()}`;
+  // 归档锚点及其后所有 main 分支消息 → br-{ts}；main 截断在锚点之前（事务保证原子）
+  const tx = db.transaction(() => {
+    db.prepare(`UPDATE messages SET branch=? WHERE session_id=? AND branch='main' AND id>=?`)
+      .run(branchName, m.session_id, m.id);
+    db.prepare('UPDATE sessions SET active_branch=?, updated_at=? WHERE id=?')
+      .run('main', now(), m.session_id);
+    db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
+      .run(req.user.username, '分支回放', `会话 #${m.session_id}：消息 #${m.id} 起归档为 ${branchName}，主线将重新生成`, req.ip, now());
+  });
+  tx();
+  res.json({ code: 0, data: { branch: branchName, anchor_msg_id: m.id, user_question_id: anchorUser.id, user_question: anchorUser.content }, msg: '已回放，正在重新生成' });
 });
 
 // ---------- 对话质量反馈（2026-10-20 体验优化） ----------
@@ -1002,6 +1131,20 @@ router.post('/stream', async (req, res) => {
     });
     let genMeta = null;
     let stopped = false; // P5.29：用户点了「停止生成」（客户端断连 → ac.abort 中断模型流，已生成部分照常落库）
+    // P1-6 会话检查点 v2：每 ~200 字符节流 UPSERT 生成快照——断网/崩溃后重新打开会话可「继续生成」；
+    // 仅本地模型链路（workflow/classifier 无逐字流，检查点意义小，靠 partial 落库兼容）
+    let ckLastLen = 0;
+    const ckThrottle = 200;
+    const ckSave = (status) => {
+      try {
+        upsertCheckpoint(session_id, {
+          userContent: input,
+          partialContent: full,
+          status,
+          model: genMeta?.model || model || agent?.model || '',
+        });
+      } catch { /* 检查点写失败不影响对话主链路 */ }
+    };
     try {
       while (true) {
         const r = await gen.next();
@@ -1011,6 +1154,8 @@ router.post('/stream', async (req, res) => {
           toolTrace.push(r.value.toolCall);
           send('tool', { name: r.value.toolCall.name, status: 'finished', result: r.value.toolCall.result });
         }
+        // P1-6：生成中节流写检查点（generating 态；resume 时不重复写——防覆盖续跑前的快照）
+        if (full.length - ckLastLen >= ckThrottle) { ckLastLen = full.length; ckSave('generating'); }
         if (clientClosed) { stopped = true; break; } // 非模型 fetch 链路（workflow 等）的断连兑底跳出
       }
     } catch (e) {
@@ -1064,6 +1209,9 @@ router.post('/stream', async (req, res) => {
 
     send('done', { content: outMasked, tokens, model: genMeta?.model, provider: genMeta?.provider, mid: Number(msgInfo.lastInsertRowid) });
 
+    // P1-6：正常完成（含用户主动停止但已落库）即清理检查点——续跑只对「中断未完成」的生成有意义
+    deleteCheckpoint(session_id);
+
     // 用户问题建议（借鉴 SinguX「用户问题建议」）：回复后推荐 3 条追问，done 后异步生成不阻塞主回复；
     // 生成后回写 chat_traces，历史会话回看时建议同样可见；智能体可经 suggest_enabled 关闭
     // P5.29：用户停止生成时不再异步生成建议/标题/记忆——已停止的对话不值得再烧一次模型调用，直接收尾
@@ -1096,6 +1244,14 @@ router.post('/stream', async (req, res) => {
   } catch (e) {
     console.error('[chat] 对话异常：', e);
     db.prepare('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)').run('chat-service', '对话链路异常：' + e.message, now());
+    // P1-6：异常中断——检查点标记 aborted（保留 partial 快照），用户重开会话可「继续生成」；
+    // 顺带把已流出的 partial 落一条 assistant 消息（带续跑标记），前端据此展示续跑卡片
+    try {
+      const ck = getCheckpoint(session_id);
+      if (ck && ck.status !== 'aborted') {
+        upsertCheckpoint(session_id, { userContent: ck.user_content, partialContent: ck.partial_content, status: 'aborted', model: ck.model });
+      }
+    } catch { /* 检查点维护失败不影响错误上报 */ }
     send('error', { msg: '对话服务异常：' + e.message });
   }
   res.end();

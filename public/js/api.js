@@ -70,14 +70,18 @@ export async function api(path, opts = {}) {
  *  P5.29 停止生成：onAborter(abortFn) 在请求发出前同步交出中断句柄（调用方存下，点击停止按钮时执行）；
  *  中断后 fetch/reader 抛 AbortError → 转为 onAborted 回调（不抛给调用方，组件清理逻辑照常走） */
 export async function sseChat(body, handlers) {
+  // P1-6：handlers 可携带 url/method/body 覆盖（断点续跑走 /chat/sessions/:id/resume）
+  const url = handlers?.url || '/api/chat/stream';
+  const method = handlers?.method || 'POST';
+  const payload = handlers?.body !== undefined ? handlers.body : body;
   const ctrl = new AbortController();
   handlers.onAborter?.(() => ctrl.abort());
   let res;
   try {
-    res = await fetch('/api/chat/stream', {
-      method: 'POST',
+    res = await fetch(url, {
+      method,
       headers: authHeaders(),
-      body: JSON.stringify(body),
+      body: JSON.stringify(payload),
       signal: ctrl.signal, // P5.29：停止生成——中断请求（后端 req 'close' 感知断连后中止模型流）
     });
   } catch (e) {

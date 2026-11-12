@@ -20,8 +20,12 @@ function countFailedLogin(username, ip) {
   const row = db.prepare('SELECT * FROM login_attempts WHERE username=?').get(username);
   if (!row) {
     const until = new Date(Date.now() + LOCKOUT_DURATION_MS).toISOString();
+    // 修复（2026-11-12 P1-2 bug）：INSERT 列序与实参错位——last_attempt 收到 until、
+    // locked_until 收到 now()（本地时间字符串），导致首次失败即被"永久锁定"
+    // （本地时间字符串被 new Date() 按 UTC 解析恒大于当前时刻）。
+    // 正确对位：attempts=1, last_attempt=now(), locked_until=null（未达 5 次不锁）
     db.prepare('INSERT INTO login_attempts (username, ip, attempts, last_attempt, locked_until, created_at) VALUES (?,?,1,?,?,?)')
-      .run(username, ip, now(), until, now());
+      .run(username, ip, now(), null, now());
     return;
   }
   const next_attempts = row.attempts + 1;
