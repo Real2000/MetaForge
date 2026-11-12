@@ -42,21 +42,23 @@ async function genSuggestions(userInput, assistantReply, agentName) {
 }
 
 /** 长期记忆提取（借鉴 SinguX「记忆-长期记忆」）：从本轮对话中提取值得跨会话记住的用户特征事实，
- *  去重后落库 agent_memories。失败静默，不影响对话主流程 */
+ *  去重后落库 agent_memories。P1-4 增加 type/confidence/source/summary 字段，支持事实/偏好/摘要三种类型 */
 async function extractMemory(agent, username, userInput, assistantReply) {
   try {
-    const existing = db.prepare('SELECT fact FROM agent_memories WHERE agent_id=? AND username=?').all(agent.id, username).map(r => r.fact);
+    const existing = db.prepare('SELECT fact, type FROM agent_memories WHERE agent_id=? AND username=?').all(agent.id, username).map(r => ({ fact: r.fact, type: r.type }));
+    const existingFacts = existing.map(r => r.fact);
     const r = await chatOnce([
       { role: 'system', content: `你是用户记忆提取器。根据对话内容提取值得长期记住的当前用户特征事实（如职业、偏好、称呼、业务背景），忽略一次性问题内容。
 规则：只输出 JSON 数组（如 ["用户是银行客户经理","用户偏好简洁回复"]），最多 3 条，每条不超过 25 字；没有值得记住的内容输出 []；不要其他任何文字。` },
-      { role: 'user', content: `已知记忆：${existing.join('；') || '（无）'}\n用户提问：${userInput.slice(0, 200)}\n智能体回答（节选）：${(assistantReply || '').slice(0, 300)}` },
+      { role: 'user', content: `已知记忆：${existingFacts.join('；') || '（无）'}\n用户提问：${userInput.slice(0, 200)}\n智能体回答（节选）：${(assistantReply || '').slice(0, 300)}` },
     ], { temperature: 0.3, max_reply: 150, agentName: '记忆提取' });
     const m = (r.full || '').match(/\[[\s\S]*\]/);
     if (!m) return;
     const facts = JSON.parse(m[0]).filter(x => typeof x === 'string' && x.trim()).slice(0, 3).map(x => x.trim().slice(0, 40));
     for (const f of facts) {
-      if (existing.some(e => e.includes(f) || f.includes(e))) continue; // 去重（含互为子串）
-      db.prepare('INSERT INTO agent_memories (agent_id,username,fact,created_at) VALUES (?,?,?,?)').run(agent.id, username, f, now());
+      if (existingFacts.some(e => e.includes(f) || f.includes(e))) continue; // 去重（含互为子串）
+      const type = /偏好|喜欢|不喜欢|希望|想要/.test(f) ? 'preference' : 'fact';
+      db.prepare('INSERT INTO agent_memories (agent_id,username,fact,type,confidence,source,created_at) VALUES (?,?,?,?,1.0,?,?)').run(agent.id, username, f, type, 'chat', now());
     }
   } catch { /* 静默 */ }
 }
@@ -781,7 +783,7 @@ router.post('/stream', async (req, res) => {
     }
     let memRows = [];
     if (agent?.long_memory) {
-      memRows = db.prepare('SELECT fact FROM agent_memories WHERE agent_id=? AND username=? ORDER BY id DESC LIMIT 20').all(agent.id, req.user.username);
+      memRows = db.prepare('SELECT fact, type, confidence FROM agent_memories WHERE agent_id=? AND username=? ORDER BY type ASC, confidence DESC LIMIT 20').all(agent.id, req.user.username);
       if (memRows.length) {
         system += `\n\n【长期记忆】已记住的当前用户特征（回复时自然利用，无需重复询问）：\n${memRows.map(m => '- ' + m.fact).join('\n')}`;
       }

@@ -255,8 +255,15 @@ router.get('/:id/memories', (req, res) => {
   // V2.4 #9 收尾：记忆归属校验——非管理员只返回自己创建的记忆（防越权查看其他用户在同一智能体上的聊天记忆）
   const whereClause = req.user.role !== 'admin' ? ' AND username=?' : '';
   const args = req.user.role !== 'admin' ? [req.user.username] : [];
-  const rows = db.prepare(`SELECT id, fact, created_at, username FROM agent_memories WHERE agent_id=? ${whereClause} ORDER BY id DESC LIMIT 200`).all(req.params.id, ...args);
-  res.json({ code: 0, data: rows });
+  const rows = db.prepare(`SELECT id, fact, type, confidence, source, summary, summary_source, created_at, username FROM agent_memories WHERE agent_id=? ${whereClause} ORDER BY id DESC LIMIT 200`).all(req.params.id, ...args);
+  // P1-4 聚合摘要：按智能体+用户聚合所有记忆，生成摘要统计
+  const stat = { fact: 0, preference: 0, summary: 0 };
+  const summaryIds = [];
+  for (const r of rows) {
+    if (r.type === 'summary') summaryIds.push(r.id);
+    if (stat.hasOwnProperty(r.type)) stat[r.type]++;
+  }
+  res.json({ code: 0, data: { list: rows, stat } });
 });
 router.delete('/:id/memories', (req, res) => {
   const old = db.prepare('SELECT * FROM agents WHERE id=?').get(req.params.id);

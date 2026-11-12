@@ -1534,6 +1534,16 @@ db.exec(`CREATE TABLE IF NOT EXISTS localbridge_tasks (
   updated_at TEXT
 );`);
 
+// ---------------- P1-4 分层记忆v1：agent_memories 增加 type/confidence/source/summary 字段（2026-11-11）----------------
+{
+  const cols = db.prepare('PRAGMA table_info(agent_memories)').all().map(r => r.name);
+  if (!cols.includes('type')) db.exec("ALTER TABLE agent_memories ADD COLUMN type TEXT DEFAULT 'fact'");
+  if (!cols.includes('confidence')) db.exec("ALTER TABLE agent_memories ADD COLUMN confidence REAL DEFAULT 1.0");
+  if (!cols.includes('source')) db.exec("ALTER TABLE agent_memories ADD COLUMN source TEXT DEFAULT 'chat'");
+  if (!cols.includes('summary')) db.exec("ALTER TABLE agent_memories ADD COLUMN summary TEXT DEFAULT ''");
+  if (!cols.includes('summary_source')) db.exec("ALTER TABLE agent_memories ADD COLUMN summary_source TEXT DEFAULT ''");
+}
+
 
 // ---------------- P1-1 SSO 单点登录表（2026-11-11）----------------
 db.exec(`CREATE TABLE IF NOT EXISTS sso_providers (
