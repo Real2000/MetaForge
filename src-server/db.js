@@ -1533,3 +1533,58 @@ db.exec(`CREATE TABLE IF NOT EXISTS localbridge_tasks (
   created_at TEXT,
   updated_at TEXT
 );`);
+
+
+// ---------------- P1-1 SSO 单点登录表（2026-11-11）----------------
+db.exec(`CREATE TABLE IF NOT EXISTS sso_providers (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  display_name TEXT DEFAULT '',
+  issuer TEXT DEFAULT '',
+  client_id TEXT DEFAULT '',
+  client_secret TEXT DEFAULT '',
+  authorization_url TEXT DEFAULT '',
+  token_url TEXT DEFAULT '',
+  userinfo_url TEXT DEFAULT '',
+  scopes TEXT DEFAULT '',
+  jwt_bind_mode INTEGER DEFAULT 1,
+  allow_local_login INTEGER DEFAULT 1,
+  enabled INTEGER DEFAULT 0,
+  created_at TEXT,
+  updated_at TEXT
+);`);
+db.exec(`CREATE TABLE IF NOT EXISTS sso_login_states (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  state TEXT NOT NULL UNIQUE,
+  nonce TEXT DEFAULT '',
+  type TEXT DEFAULT 'oidc',
+  provider_id INTEGER,
+  redirect_uri TEXT DEFAULT '',
+  created_at TEXT
+);`);
+db.exec(`CREATE TABLE IF NOT EXISTS user_sso_identities (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  username TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  external_username TEXT DEFAULT '',
+  access_token TEXT DEFAULT '',
+  refresh_token TEXT DEFAULT '',
+  expires_at TEXT DEFAULT '',
+  last_login TEXT,
+  created_at TEXT,
+  UNIQUE(provider, subject)
+);`);
+
+// ---------------- P1-2 登录失败计数与锁定（2026-11-11）----------------
+db.exec(`CREATE TABLE IF NOT EXISTS login_attempts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  username TEXT NOT NULL,
+  ip TEXT DEFAULT '',
+  attempts INTEGER DEFAULT 1,
+  last_attempt TEXT,
+  locked_until TEXT,
+  created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_login_attempts_username ON login_attempts(username);
+CREATE INDEX IF NOT EXISTS idx_login_attempts_locked ON login_attempts(locked_until);`);

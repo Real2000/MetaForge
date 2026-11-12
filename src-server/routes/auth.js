@@ -10,6 +10,46 @@ const { upsertDingtalkUser } = require('./dingtalk'); // 扫码登录用户映�
 
 const router = express.Router();
 
+// ---------- P1-2 登录失败锁定配置（2026-11-11） ----------
+const MAX_LOGIN_ATTEMPTS = 5;       // 最大失败次数
+const LOCKOUT_DURATION_MS = 15 * 60 * 1000; // 锁定 15 分钟（毫秒）
+const LOCKOUT_DURATION_MIN = 15;    // 锁定 15 分钟（用于显示）
+
+/** 记录登录失败（次数 + 时间戳 + 锁定时间）*/
+function countFailedLogin(username, ip) {
+  const row = db.prepare('SELECT * FROM login_attempts WHERE username=?').get(username);
+  if (!row) {
+    const until = new Date(Date.now() + LOCKOUT_DURATION_MS).toISOString();
+    db.prepare('INSERT INTO login_attempts (username, ip, attempts, last_attempt, locked_until, created_at) VALUES (?,?,1,?,?,?)')
+      .run(username, ip, now(), until, now());
+    return;
+  }
+  const next_attempts = row.attempts + 1;
+  const until = new Date(Date.now() + LOCKOUT_DURATION_MS).toISOString();
+  // 检查是否已被锁定
+  if (row.locked_until && new Date(row.locked_until) > new Date()) return; // 已锁定，不动递增计数
+  db.prepare('UPDATE login_attempts SET attempts=?, ip=?, last_attempt=?, locked_until=? WHERE id=?')
+    .run(next_attempts, ip, now(), next_attempts >= MAX_LOGIN_ATTEMPTS ? until : null, row.id);
+}
+
+/** 检查登录锁定状态：返回 { locked, remaining, msg } */
+function checkLoginLock(username) {
+  const row = db.prepare('SELECT * FROM login_attempts WHERE username=?').get(username);
+  if (!row) return { locked: false, remaining: MAX_LOGIN_ATTEMPTS, msg: '' };
+  // 检查锁定时间是否已过
+  if (row.locked_until && new Date(row.locked_until) > new Date()) {
+    const remainSec = Math.ceil((new Date(row.locked_until) - new Date()) / 1000);
+    return { locked: true, remaining: 0, msg: `账号已被锁定，请 ${Math.ceil(remainSec / 60)} 分钟后再试` };
+  }
+  const attempts = row.attempts || 0;
+  return { locked: false, remaining: Math.max(0, MAX_LOGIN_ATTEMPTS - attempts), msg: attempts >= 3 ? `登录失败 ${attempts} 次，还剩 ${MAX_LOGIN_ATTEMPTS - attempts} 次尝试机会` : '' };
+}
+
+/** 登录成功后清除失败计数 */
+function clearLoginAttempts(username) {
+  db.prepare('DELETE FROM login_attempts WHERE username=?').run(username);
+}
+
 // P5.30 安全止血：登录接口按 IP 限流（此前可无限暴力尝试；与 share/openapi 同一套滑动窗口实现，10 次/分钟/IP）
 const loginLimiter = createLimiter({ name: 'login', windowMs: 60000, max: 10, keyFn: clientIp, msg: '登录尝试过于频繁，请 1 分钟后再试' });
 
@@ -17,13 +57,28 @@ router.post('/login', loginLimiter, async (req, res) => {
   const { username, password } = req.body || {};
   const ip = req.ip;
   if (!username || !password) return res.json({ code: 400, msg: '请输入账号和密码' });
+
+  // P1-2 失败锁定检查
+  const lock = checkLoginLock(username);
+  if (lock.locked) {
+    db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
+      .run(username, '登录失败', lock.msg, ip, now());
+    return res.json({ code: 401, msg: lock.msg });
+  }
+
   const user = db.prepare('SELECT * FROM users WHERE username=? AND status=1').get(username);
   const v = user ? await verifyPwd(password, user.password) : { ok: false };
   if (!user || !v.ok) {
     db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
       .run(username, '登录失败', '账号或密码错误', ip, now());
-    return res.json({ code: 401, msg: '账号或密码错误' });
+    countFailedLogin(username, ip);
+    // 二次查询检查锁定状态更新后的剩余次数
+    const lockAfter = checkLoginLock(username);
+    if (lockAfter.locked) return res.json({ code: 401, msg: lockAfter.msg });
+    return res.json({ code: 401, msg: lock.remaining > 0 ? `账号或密码错误（还剩 ${lock.remaining - 1} 次尝试机会）` : '账号或密码错误' });
   }
+  // 登录成功：清除失败计数
+  clearLoginAttempts(username);
   // 旧 SALT 密码平滑迁移：登录成功即重写为新 SALT 哈希（一次性，用户无感）
   if (v.legacy) db.prepare('UPDATE users SET password=? WHERE id=?').run(await hashPwdAsync(password), user.id);
   const token = sign({ uid: user.id, exp: Date.now() + TOKEN_TTL_MS });
