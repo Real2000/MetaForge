@@ -395,30 +395,23 @@ router.post('/h5/jsapi-config', h5Limiter, async (req, res) => {
 router.post('/h5/send-msg', auth, async (req, res) => {
   const ip = clientIp(req);
   const b = req.body || {};
-  const s = loadSecrets();
   const userList = String(b.userid_list || '').split(',').map(x => x.trim()).filter(Boolean).slice(0, 20); // 单次至多 20 人
   const title = String(b.title || '').trim().slice(0, 60);
   const content = String(b.content || '').trim().slice(0, 500);
   if (!userList.length || !content) return res.json({ code: 400, msg: 'userid_list 与 content 必填（title 可选）' });
-  if (!h5Configured()) {
-    logOp('钉钉H5消息（mock）', `收件 ${userList.length} 人 [${title || content.slice(0, 20)}] ${content.slice(0, 80)}`, ip);
+  // P1-7 渠道适配层：出站统一走 lib/channel.send（钉钉未配置时自动降级站内信 + 审计）
+  const { send: channelSend } = require('../lib/channel');
+  const r = await channelSend({ channel: 'dingtalk', receivers: userList }, { title, content });
+  if (r.ok && r.mock) {
+    logOp('钉钉H5消息（降级）', `收件 ${userList.length} 人 [${title || content.slice(0, 20)}] ${content.slice(0, 80)}`, ip);
     return res.json({ code: 0, msg: '已发送（mock 模式：未配置钉钉凭证，消息仅审计留痕）', data: { mock: true, receivers: userList.length } });
   }
-  try {
-    const accessToken = await getAccessToken();
-    const r = await fetch('https://oapi.dingtalk.com/topapi/message/corpconversation/asyncsend_v2?' + new URLSearchParams({ access_token: accessToken }), {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ agent_id: s.DINGTALK_AGENT_ID || '', userid_list: userList.join(','), msg: { msgtype: 'text', text: { content: (title ? `【${title}】` : '') + content } } }),
-      signal: AbortSignal.timeout(8000),
-    });
-    const j = await r.json();
-    if (!j || j.errcode !== 0) return res.json({ code: 502, msg: '钉钉消息发送失败：' + (j && j.errmsg || '未知错误') });
-    logOp('钉钉H5消息', `收件 ${userList.length} 人 [${title || content.slice(0, 20)}] taskId=${j.task_id}`, ip);
-    res.json({ code: 0, msg: '已发送', data: { task_id: j.task_id } });
-  } catch (e) {
-    logOp('钉钉H5消息失败', String(e.message).slice(0, 120), ip);
-    res.json({ code: 502, msg: '钉钉服务暂不可达，请稍后重试' });
+  if (!r.ok) {
+    logOp('钉钉H5消息失败', String(r.error || '').slice(0, 120), ip);
+    return res.json({ code: 502, msg: '钉钉消息发送失败：' + (r.error || '未知错误') });
   }
+  logOp('钉钉H5消息', `收件 ${userList.length} 人 [${title || content.slice(0, 20)}] taskId=${r.taskId}`, ip);
+  res.json({ code: 0, msg: '已发送', data: { task_id: r.taskId } });
 });
 
 module.exports = router;

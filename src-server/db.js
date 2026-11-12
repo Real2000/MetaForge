@@ -273,6 +273,23 @@ db.exec(`CREATE TABLE IF NOT EXISTS checkpoints (
   created_at TEXT,
   updated_at TEXT
 );`);
+// ---------------- P1-7 渠道适配层（2026-11-12）：入站消息审计表 ----------------
+// 每条经渠道适配层归一化的入站消息落一行（含派发去向），渠道侧 eventId 幂等去重
+db.exec(`CREATE TABLE IF NOT EXISTS channel_messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id TEXT DEFAULT '',
+  channel TEXT DEFAULT '',
+  sender_id TEXT DEFAULT '',
+  chat_id TEXT DEFAULT '',
+  chat_type TEXT DEFAULT 'single',
+  text TEXT DEFAULT '',
+  attachments TEXT DEFAULT '[]',
+  dispatched_to TEXT DEFAULT '',
+  dispatch_result TEXT DEFAULT '',
+  raw TEXT DEFAULT '',
+  created_at TEXT
+);`);
+db.exec('CREATE INDEX IF NOT EXISTS idx_channel_messages_event ON channel_messages(event_id);');
 // checkpoints 补充：SSE 流式生成快照——generating(生成中)/aborted(异常中断，可续跑)/done(正常完成即清理)
 // 断点续跑依据：status != 'done' 的检查点在用户重新打开会话时提示「继续生成」
 db.exec(`CREATE TABLE IF NOT EXISTS tasks (
