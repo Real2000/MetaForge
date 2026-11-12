@@ -1739,3 +1739,56 @@ db.exec(`CREATE TABLE IF NOT EXISTS chat_whitelist (
   created_at TEXT,
   UNIQUE(bind_id, sender_id)
 );`);
+
+// ---------------- P1-11~14 沙箱执行子线（2026-11-12） ----------------
+// P1-12 远程主机登记：SSH 白名单主体——未登记主机一律拒绝执行；
+// credential 为 AES-256-GCM 密文（密码或私钥）；known_hosts_mode：
+//   strict=指纹必须匹配 / accept-new=首次记录（TOFU）/ off=不校验（不推荐）
+db.exec(`CREATE TABLE IF NOT EXISTS remote_hosts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  host TEXT NOT NULL,
+  port INTEGER DEFAULT 22,
+  username TEXT DEFAULT '',
+  credential TEXT DEFAULT '',          -- 密文：password 或 private key
+  credential_type TEXT DEFAULT 'password',  -- password | key
+  fingerprint TEXT DEFAULT '',         -- 预登记主机指纹（known_hosts 校验）
+  known_hosts_mode TEXT DEFAULT 'strict',
+  docker_enabled INTEGER DEFAULT 0,    -- 可选：Docker 容器内执行
+  enabled INTEGER DEFAULT 1,
+  created_by TEXT DEFAULT '',
+  created_at TEXT,
+  updated_at TEXT
+);`);
+// P1-13 运行环境实例：每次沙箱/远程执行的审计记录（环境/归属/状态/版本/产物）
+db.exec(`CREATE TABLE IF NOT EXISTS sandbox_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_env TEXT DEFAULT 'local-process',  -- local-vm | local-process | remote-ssh | docker
+  owner TEXT DEFAULT '',                 -- 发起用户
+  agent_id INTEGER,
+  session_id INTEGER,
+  status TEXT DEFAULT 'running',         -- running | success | failed | timeout | denied
+  exit_code INTEGER,
+  duration_ms INTEGER DEFAULT 0,
+  node_version TEXT DEFAULT '',          -- 运行环境版本（process.versions.node / ssh 目标标识）
+  code_digest TEXT DEFAULT '',           -- 代码指纹（sha256 前 16 位，审计比对用）
+  artifacts TEXT DEFAULT '[]',           -- 产物清单 JSON [{name,size,url}]
+  stdout_excerpt TEXT DEFAULT '',
+  stderr_excerpt TEXT DEFAULT '',
+  created_at TEXT
+);`);
+db.exec('CREATE INDEX IF NOT EXISTS idx_sandbox_runs_owner ON sandbox_runs(owner, id);');
+// P1-14 HITL 五态审批：pending → approved | rejected | expired；批准且执行完 → executed
+db.exec(`CREATE TABLE IF NOT EXISTS tool_approvals (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  confirm_key TEXT NOT NULL,
+  tool_name TEXT DEFAULT '',
+  args_json TEXT DEFAULT '',
+  requester TEXT DEFAULT '',             -- 发起对话的用户
+  approver TEXT DEFAULT '',              -- 实际点击批准/拒绝的人（记录审批与决策）
+  status TEXT DEFAULT 'pending',         -- pending | approved | rejected | expired | executed
+  decision_at TEXT,
+  reason TEXT DEFAULT '',
+  created_at TEXT
+);`);
+db.exec('CREATE INDEX IF NOT EXISTS idx_tool_approvals_status ON tool_approvals(status, id);');

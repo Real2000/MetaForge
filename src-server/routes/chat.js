@@ -504,17 +504,31 @@ router.get('/models', (req, res) => {
 });
 
 /**
- * P5.25 工具执行确认决议：{ key, approve: true/false }（「默认权限」下前端确认卡回调）
+ * P5.25 工具执行确认决议：{ key, approve: true/false, reason? }
  * 校验归属（仅发起用户本人可决议）与时效；批准唤醒等待的 executeTool 继续执行，拒绝则返回拒因。
+ * P1-14：决议即记录审批人（approver）与决策时间——审计可追溯"谁批的"；
+ * 批准的记录由 executeTool 执行完成后回写终态 executed。
  */
 router.post('/confirm', (req, res) => {
-  const { key, approve } = req.body || {};
+  const { key, approve, reason } = req.body || {};
   if (!key) return res.status(400).json({ code: 400, msg: '缺少 key' });
   const entry = toolConfirmRegistry.get(key);
   if (!entry) return res.status(404).json({ code: 404, msg: '确认请求不存在或已处理（可能已超时）' });
   if (entry.username !== req.user.username) return res.status(403).json({ code: 403, msg: '仅发起对话的用户可确认' });
+  entry.finalizeApproval?.(approve === true ? 'approved' : 'rejected', req.user.username, reason);
   entry.resolve(approve === true);
   res.json({ code: 0, msg: approve === true ? '已批准执行' : '已拒绝执行' });
+});
+
+/** P1-14 审批记录查询（adminOnly）：五态审批台账 */
+router.get('/approvals', adminOnly, (req, res) => {
+  const { status, q } = req.query;
+  const wh = [];
+  const args = [];
+  if (status && status !== 'all') { wh.push('status=?'); args.push(status); }
+  if (q) { wh.push('(tool_name LIKE ? OR requester LIKE ? OR approver LIKE ?)'); args.push(`%${q}%`, `%${q}%`, `%${q}%`); }
+  const rows = db.prepare(`SELECT * FROM tool_approvals${wh.length ? ' WHERE ' + wh.join(' AND ') : ''} ORDER BY id DESC LIMIT 200`).all(...args);
+  res.json({ code: 0, data: rows });
 });
 
 /**
@@ -1077,11 +1091,19 @@ router.post('/stream', async (req, res) => {
     // SSE 推 tool_confirm 事件 → 前端在消息流中弹确认卡 → 用户批准/拒绝 → POST /api/chat/confirm 决议唤醒等待；
     // 「全自动执行」（perm='auto'）全部放行；low 风险永不拦截（确认疲劳无意义）；120s 未决议按拒绝处理防会话悬挂
     const chatPerm = String((req.body || {}).perm || 'default') === 'auto' ? 'auto' : 'default';
+    // P1-14 HITL 五态审批：pending → approved/rejected/expired；批准且执行完 → executed
+    // 每次确认全程落 tool_approvals（含审批人与决策时间），审计可查
     const waitUserConfirm = (toolKey, name, argsJson) => new Promise(resolve => {
-      const timer = setTimeout(() => { toolConfirmRegistry.delete(toolKey); resolve('timeout'); }, 120000);
+      db.prepare('INSERT INTO tool_approvals (confirm_key, tool_name, args_json, requester, status, created_at) VALUES (?,?,?,?,"pending",?)')
+        .run(toolKey, name, String(argsJson || '').slice(0, 500), req.user.username, now());
+      const finalizeApproval = (status, approver, reason) => {
+        db.prepare('UPDATE tool_approvals SET status=?, approver=?, decision_at=?, reason=? WHERE confirm_key=? AND status="pending"')
+          .run(status, approver || '', now(), String(reason || '').slice(0, 200), toolKey);
+      };
+      const timer = setTimeout(() => { toolConfirmRegistry.delete(toolKey); finalizeApproval('expired'); resolve('timeout'); }, 120000);
       // P5.29：用户停止生成时立即结束确认等待（否则主循环会卡到 120s 超时才落库 partial）
-      abortCleanups.push(() => { clearTimeout(timer); toolConfirmRegistry.delete(toolKey); resolve('stopped'); });
-      toolConfirmRegistry.set(toolKey, { resolve: v => { clearTimeout(timer); toolConfirmRegistry.delete(toolKey); resolve(v); }, username: req.user.username, expires: Date.now() + 120000 });
+      abortCleanups.push(() => { clearTimeout(timer); toolConfirmRegistry.delete(toolKey); finalizeApproval('expired'); resolve('stopped'); });
+      toolConfirmRegistry.set(toolKey, { resolve: v => { clearTimeout(timer); toolConfirmRegistry.delete(toolKey); resolve(v); }, finalizeApproval, username: req.user.username, expires: Date.now() + 120000 });
       send('tool_confirm', { key: toolKey, name, args: argsJson });
     });
     const executeTool = async (name, argsJson) => {
@@ -1090,6 +1112,7 @@ router.post('/stream', async (req, res) => {
       // P5.34（审查建议③）：create_task 即使「全自动执行」也强制确认——持久化自动执行实体不应被
       // 一次性授权（auto）静默创建；防提示词注入借 auto 权限批量造任务烧 token
       const needConfirm = risk !== 'low' && (chatPerm === 'default' || name === 'create_task');
+      let approvedApprovalId = null; // P1-14：批准的审批行——工具实际执行完成后升终态 executed
       if (needConfirm) {
         const toolKey = `${session_id}:${Date.now()}:${name}`;
         send('tool', { name, status: 'awaiting' });
@@ -1099,20 +1122,39 @@ router.post('/stream', async (req, res) => {
           send('notice', { msg: `⛔ ${name} 未执行：${reason}` });
           return `工具 ${name} 未获得用户授权（${reason}）。请基于已有信息回答，或询问用户是否允许执行该操作。`;
         }
+        const approvedRow = db.prepare('SELECT id FROM tool_approvals WHERE confirm_key=? AND status=?').get(toolKey, 'approved');
+        approvedApprovalId = approvedRow ? approvedRow.id : null;
       }
+      // P1-14：工具真正执行完毕（含异常）才把审批升为 executed——"批准且已兑现"语义
+      const markExecuted = () => {
+        if (approvedApprovalId != null) {
+          try {
+            db.prepare('UPDATE tool_approvals SET status=?, decision_at=? WHERE id=? AND status=?')
+              .run('executed', now(), approvedApprovalId, 'approved');
+          } catch { /* 审计回写失败不影响工具结果 */ }
+        }
+      };
       send('tool', { name, status: 'executing' });
       // 子智能体工具：agent_call_{id} → 阻塞执行子智能体（含其知识库检索）
       if (name.startsWith('agent_call_')) {
         const c = childTools.find(t => t.schema.function.name === name);
-        if (!c) return '未知子智能体：' + name;
+        if (!c) { markExecuted(); return '未知子智能体：' + name; }
         let args = {};
         try { args = JSON.parse(argsJson || '{}'); } catch { }
-        return runChildAgent(c.child, args.task, agent?.max_reply, req.user).then(r => `子智能体「${c.child.name}」的执行结果：\n${r}`);
+        try {
+          const r = await runChildAgent(c.child, args.task, agent?.max_reply, req.user);
+          markExecuted();
+          return `子智能体「${c.child.name}」的执行结果：\n${r}`;
+        } catch (e) { markExecuted(); throw e; }
       }
       // P5.27：ctx 补 username——local_exec 按用户路由到其默认设备
       // V1.2 审查加固 2026-10-30：主链路工具执行同样受智能体元数据过滤约束（kb_search 旁路收口——
       // 否则主链路检索被过滤，LLM 经 function calling 调 kb_search 却全库检索，机密分块经工具结果回流对话）
-      return runTool(name, argsJson, { kbId: agent?.kb_id || null, mcpServers: agent?.mcp_servers || '[]', username: req.user.username, metadataFilter: resolveKbFilter(agent, req.user) || undefined });
+      try {
+        const r = await runTool(name, argsJson, { kbId: agent?.kb_id || null, mcpServers: agent?.mcp_servers || '[]', username: req.user.username, metadataFilter: resolveKbFilter(agent, req.user) || undefined });
+        markExecuted();
+        return r;
+      } catch (e) { markExecuted(); throw e; }
     };
     const gen = workflowGen || classifierGen || chat(messages, {
       model: model || agent?.model,

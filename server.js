@@ -42,6 +42,7 @@ app.use('/api/auth/sso', require('./src-server/routes/sso'));
 app.use('/api/agents', require('./src-server/routes/agents'));
 app.use('/api/memories', require('./src-server/routes/memories')); // P1-5 记忆管理（查看/搜索/合并/删除/导出，adminOnly）
 app.use('/api/channel', require('./src-server/routes/channel')); // P1-7 渠道适配层（统一入站模型 + 出站发送封装）
+app.use('/api/sandbox', require('./src-server/routes/sandbox')); // P1-11~13 沙箱执行子线（运行记录/远程主机/执行测试）
 app.use('/api/chat', require('./src-server/routes/chat'));
 app.use('/api/knowledge', require('./src-server/routes/knowledge'));
 app.use('/api/tasks', require('./src-server/routes/tasks'));
