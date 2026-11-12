@@ -1,14 +1,37 @@
 #!/bin/bash
-# 智能体平台 - macOS/Linux 一键启动
-# 双击运行时 GUI shell 不加载 nvm/homebrew 等初始化脚本，
-# 因此这里自动探测 node 的常见安装位置。
+# 智能体平台 - macOS 一键启动（可靠版，2026-11-12 修复）
+# 修复内容：
+#   ① 原脚本存在未闭合引号的语法错误（echo ""/scripts/...），
+#      bash 解析直接失败——node server.js 与自动开浏览器的代码从未执行
+#   ② 原先 node server.js & + wait 模式：关闭终端窗口后服务易被 SIGHUP 连带终止
+# 现在的行为：
+#   - 平台已在运行 → 直接打开浏览器，不重复启动
+#   - 未运行 → nohup 常驻启动（关闭本窗口不影响服务），
+#     健康检查通过后自动打开浏览器
+#   - 启动失败 → 展示日志尾部并保留窗口，便于排查
 cd "$(dirname "$0")"
+
+PORT=3210
+URL="http://localhost:${PORT}"
+LOG_DIR="logs"
+LOG_FILE="${LOG_DIR}/server.log"
 
 echo "=============================================="
 echo "  正在启动 智能体平台 ..."
 echo "=============================================="
 
-# ---- 探测 node ----
+# ---- 0. 已在运行则直接打开浏览器（不重复启动）----
+if lsof -nP -iTCP:${PORT} -sTCP:LISTEN 2>/dev/null | grep -q LISTEN; then
+  echo "[i] 检测到平台已在运行（端口 ${PORT}），直接打开浏览器"
+  echo "    如需重新加载最新代码：先双击「停止平台.command」，再双击本脚本"
+  command -v open >/dev/null 2>&1 && open "${URL}" 2>/dev/null
+  sleep 2
+  exit 0
+fi
+
+# ---- 1. 探测 node ----
+# 双击运行时 GUI shell 不加载 nvm/homebrew 等初始化脚本，
+# 因此这里自动探测 node 的常见安装位置。
 if ! command -v node >/dev/null 2>&1; then
   FOUND=""
   # 常见安装位置按优先级探测（必须在当前 shell 中 export PATH）
@@ -54,31 +77,48 @@ fi
 
 echo "Node 版本: $(node -v)"
 
+# ---- 2. 依赖检查 ----
 if [ ! -d node_modules ]; then
-  echo "[1/2] 首次运行，安装依赖中..."
+  echo "[1/3] 首次运行，安装依赖中..."
   npm install --no-audit --no-fund || { echo "依赖安装失败，请检查网络后重试"; read -p "按回车退出..."; exit 1; }
 else
-  echo "[1/2] 依赖已就绪"
+  echo "[1/3] 依赖已就绪"
 fi
 
-echo "[2/2] 启动服务..."
-echo ""
-echo "启动后将自动打开浏览器访问 http://localhost:3210"
-echo "（关闭本窗口或按 Ctrl+C 即停止服务）"
-echo ""
-echo "  Docker 部署：docker compose up -d                 详见 docs/ 与根目录 Dockerfile"
-echo "  Linux 部署：systemd 单元文件在 scripts/          详见 scripts/agent-platform.service"
-echo ""./scripts/agent-platform.service"
-echo ""
-node server.js &
+# ---- 3. 常驻启动（nohup：关闭窗口服务不停止；日志落盘）----
+echo "[2/3] 启动服务…（常驻后台，关闭本窗口不影响运行）"
+echo "      Docker 部署：docker compose up -d（详见 docs/ 与根目录 Dockerfile）"
+echo "      Linux 部署：systemd 单元（详见 scripts/agent-platform.service）"
+mkdir -p "$LOG_DIR"
+nohup node server.js >>"$LOG_FILE" 2>&1 &
 SERVER_PID=$!
-sleep 2
-# 尝试用系统默认浏览器打开
-if command -v open >/dev/null 2>&1; then
-  open "http://localhost:3210" 2>/dev/null
-elif command -v xdg-open >/dev/null 2>&1; then
-  xdg-open "http://localhost:3210" 2>/dev/null
+disown "$SERVER_PID" 2>/dev/null || true
+
+# ---- 4. 健康检查通过后自动打开浏览器 ----
+echo "[3/3] 等待服务就绪（最长 40 秒）…"
+OK=""
+for i in $(seq 1 40); do
+  if curl -sf -m 2 "${URL}/api/health" >/dev/null 2>&1; then OK="1"; break; fi
+  if ! kill -0 "$SERVER_PID" 2>/dev/null; then break; fi   # 进程夭折则提前失败
+  sleep 1
+done
+
+if [ -n "$OK" ]; then
+  echo ""
+  echo "✅ 平台已启动：${URL}（进程 ${SERVER_PID}）"
+  echo "   浏览器即将自动打开；若未打开请手动访问上述地址"
+  echo "   运行日志：${LOG_FILE}（滚动追加，可随时查看）"
+  echo "   停止服务：双击「停止平台.command」"
+  command -v open >/dev/null 2>&1 && open "${URL}" 2>/dev/null
+  sleep 3
+  exit 0
+else
+  echo ""
+  echo "❌ 服务启动失败，最近日志（${LOG_FILE}）如下："
+  echo "----------------------------------------"
+  tail -n 25 "$LOG_FILE" 2>/dev/null
+  echo "----------------------------------------"
+  echo "常见原因：依赖损坏（试试 rm -rf node_modules 后重跑）/ 数据库被锁 / 端口被其他程序占用"
+  read -p "按回车退出..."
+  exit 1
 fi
-wait $SERVER_PID
-echo ""
-read -p "服务已停止，按回车退出..."
