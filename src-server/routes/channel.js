@@ -9,8 +9,44 @@ const { db, now } = require('../db');
 const { auth, adminOnly } = require('../lib/auth');
 const { normalizeInbound, send, CHANNEL_TYPES, upsertChannel, listChannels, getChannelConfig, updateCallbackStatus, toggleChannel, deleteChannel } = require('../lib/channel');
 const { loadSecrets } = require('../lib/secrets');
+const { upsertBind, deleteBind, listBinds, addWhitelist, removeWhitelist, listWhitelist, inbound } = require('../lib/group-context');
+const { getAdapter, listAdapterStatus } = require('../lib/im-adapters');
 
 const router = express.Router();
+
+// ---------------- P1-9 IM 事件回调（免 auth：飞书/企微服务器回调不带平台 token，
+// 安全靠渠道侧 URL 验证握手 + 渗透面与钩钉 callback 同构；必须注册在 router.use(auth) 之前） ----------------
+/** POST /api/channel/event/:id —— 飞书事件订阅填此地址；URL 验证握手 / 消息事件均走这里 */
+router.post('/event/:id', async (req, res) => {
+  const ch = db.prepare('SELECT id, type, enabled FROM channels WHERE id=?').get(Number(req.params.id));
+  if (!ch) return res.status(404).json({ code: 404, msg: '渠道不存在' });
+  if (!ch.enabled) return res.status(200).json({ code: 0, msg: '渠道已停用' });
+  const adapter = getAdapter(ch.type);
+  if (!adapter || adapter.status === 'reserved') {
+    return res.status(200).json({ code: 0, msg: `渠道类型 ${ch.type} 适配器为预留接口，事件已接收但未处理` });
+  }
+  try {
+    const result = adapter.handleEvent(ch.id, req.headers, req.body || {});
+    // 飞书 url 验证握手：必须回 { challenge }
+    if (result?.challenge) return res.json({ challenge: result.challenge });
+    if (result?.error) return res.status(400).json({ code: 400, msg: result.error });
+    if (result?.ignored) return res.json({ code: 0, data: { ignored: true } });
+    // message 事件 → P1-10 群上下文管线
+    const msg = result.message;
+    const verdict = inbound(msg);
+    if (verdict.ok) {
+      res.json({ code: 0, data: { routed: true, agent_id: verdict.agentId, text: verdict.text } });
+    } else if (verdict.silent) {
+      res.json({ code: 0, data: { silent: true } }); // 群内未@：静默
+    } else {
+      res.json({ code: 0, data: { routed: false, reply: verdict.reply } }); // 提示语由渠道方回发
+    }
+  } catch (e) {
+    try { updateCallbackStatus(ch.id, 'error', '事件处理异常：' + e.message); } catch { }
+    res.status(500).json({ code: 500, msg: '事件处理异常：' + e.message });
+  }
+});
+
 router.use(auth);
 
 /** 入站投递：任何系统把消息 POST 到此端点即可（渠道自动识别）。
@@ -153,6 +189,99 @@ router.post('/oauth/consume', adminOnly, (req, res) => {
   if (expired) return res.json({ code: 400, msg: 'state 已过期，请重新发起连接' });
   db.prepare('UPDATE connector_oauth_states SET consumed=1 WHERE id=?').run(row.id);
   res.json({ code: 0, data: { channel_id: row.channel_id, username: row.username } });
+});
+
+// ---------------- P1-9 第二 IM 渠道（飞书）+ 适配器注册表 ----------------
+
+/** 适配器注册表状态（P1-9 预留接口可发现） */
+router.get('/adapters', adminOnly, (req, res) => {
+  res.json({ code: 0, data: listAdapterStatus() });
+});
+
+/** 渠道出站发送（复用 P1-7 统一 send，飞书走 im-feishu 适配器） */
+router.post('/:id/send-im', adminOnly, async (req, res) => {
+  const ch = db.prepare('SELECT id, type, enabled FROM channels WHERE id=?').get(Number(req.params.id));
+  if (!ch) return res.json({ code: 404, msg: '渠道不存在' });
+  const b = req.body || {};
+  if (!b.receiver || !b.content) return res.json({ code: 400, msg: 'receiver 与 content 必填' });
+  const adapter = getAdapter(ch.type);
+  if (!adapter || adapter.status === 'reserved') return res.json({ code: 400, msg: `渠道类型 ${ch.type} 适配器尚未实现` });
+  // 兜底 try-catch：适配器实现异常不影响服务进程（正常适配器自身不 reject，此为双保险）
+  let r;
+  try {
+    r = await adapter.send(ch.id, { receiver: b.receiver, receiverType: b.receiverType || 'open_id' }, { title: b.title, content: b.content });
+  } catch (e) {
+    return res.json({ code: 502, msg: '发送异常：' + e.message });
+  }
+  if (!r.ok) return res.json({ code: 502, msg: r.error });
+  res.json({ code: 0, data: r, msg: r.mock ? '已发送（mock 降级站内信）' : '已发送' });
+});
+
+// ---------------- P1-10 群绑定与白名单 ----------------
+
+/** 绑定列表（含智能体名/渠道名/白名单数） */
+router.get('/binds', adminOnly, (req, res) => {
+  res.json({ code: 0, data: listBinds(req.query.channel_id ? Number(req.query.channel_id) : undefined) });
+});
+
+/** 创建/更新绑定（chat_key 幂等） */
+router.post('/binds/upsert', adminOnly, (req, res) => {
+  const b = req.body || {};
+  if (!b.channel_id || !b.chat_id) return res.json({ code: 400, msg: 'channel_id 与 chat_id 必填' });
+  try {
+    const bind = upsertBind({
+      channelId: Number(b.channel_id), chatId: String(b.chat_id), chatName: b.chat_name,
+      agentId: b.agent_id ? Number(b.agent_id) : undefined,
+      bindMode: b.bind_mode, createdBy: req.user.username,
+    });
+    res.json({ code: 0, data: bind, msg: '已保存' });
+  } catch (e) { res.json({ code: 400, msg: e.message }); }
+});
+
+/** 解绑（级联删白名单） */
+router.delete('/binds/:id', adminOnly, (req, res) => {
+  deleteBind(Number(req.params.id));
+  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
+    .run(req.user.username, '解绑群聊', `#${req.params.id}`, req.ip, now());
+  res.json({ code: 0, msg: '已解绑' });
+});
+
+/** 白名单管理 */
+router.get('/binds/:id/whitelist', adminOnly, (req, res) => {
+  res.json({ code: 0, data: listWhitelist(Number(req.params.id)) });
+});
+router.post('/binds/:id/whitelist', adminOnly, (req, res) => {
+  const b = req.body || {};
+  if (!b.sender_id) return res.json({ code: 400, msg: 'sender_id 必填' });
+  try {
+    addWhitelist(Number(req.params.id), b.sender_id, b.sender_name);
+    res.json({ code: 0, msg: '已添加' });
+  } catch (e) { res.json({ code: 400, msg: e.message }); }
+});
+router.delete('/binds/:id/whitelist/:senderId', adminOnly, (req, res) => {
+  removeWhitelist(Number(req.params.id), req.params.senderId);
+  res.json({ code: 0, msg: '已移除' });
+});
+
+/** mock 入站全链路验证（P1-9/P1-10 验收用）：模拟一条渠道消息走完整管线
+ *  POST /api/channel/mock-dispatch { channel_type, chat_id, chat_type, sender_id, text, with_at, feishu_style }
+ *  说明：直接构造统一入站模型（绕过各渠道原始报文格式差异——格式解析已由
+ *  P1-7 的 normalizeInbound 单独覆盖），此处专测 P1-10 群上下文管线本身 */
+router.post('/mock-dispatch', adminOnly, (req, res) => {
+  const b = req.body || {};
+  if (!b.channel_type || !b.chat_id || b.text === undefined) return res.json({ code: 400, msg: 'channel_type / chat_id / text 必填' });
+  const model = {
+    channel: String(b.channel_type),
+    sender: { id: String(b.sender_id || 'mock-user'), name: String(b.sender_name || 'Mock用户'), type: 'user' },
+    chat: { id: String(b.chat_id), type: b.chat_type === 'group' ? 'group' : 'single', name: String(b.chat_name || '') },
+    text: String(b.text),
+    attachments: [],
+    ts: Date.now(),
+    raw: b.with_at ? { mentions: [{ key: '@_user_1', name: 'robot' }] } : {},
+    eventId: 'mock-' + Date.now(),
+  };
+  const verdict = inbound(model);
+  res.json({ code: 0, data: { model: { ...model, raw: undefined }, verdict } });
 });
 
 module.exports = router;

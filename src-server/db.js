@@ -1715,3 +1715,27 @@ db.exec(`CREATE TABLE IF NOT EXISTS connector_oauth_states (
   consumed INTEGER DEFAULT 0,
   created_at TEXT
 );`);
+
+// ---------------- P1-10 群上下文（2026-11-12）：群聊绑定 + 成员白名单 ----------------
+// channel_bound_chats：渠道群/会话 ↔ 平台智能体绑定（@机器人或群里发消息 → 路由到绑定的 agent）
+//   chat_key 归一化：{channel}:{chat_id}（如 feishu:oc-abc123）；bind_mode 即 P1-10 白名单模式
+db.exec(`CREATE TABLE IF NOT EXISTS channel_bound_chats (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  channel_id INTEGER NOT NULL,
+  chat_key TEXT NOT NULL UNIQUE,     -- '{channel}:{chat_id}'
+  chat_name TEXT DEFAULT '',
+  agent_id INTEGER,                  -- 绑定的智能体（@机器人命中后由它回答）
+  bind_mode TEXT DEFAULT 'all',      -- all=全员可用 / whitelist=白名单 / admin=仅管理员
+  created_by TEXT DEFAULT '',
+  created_at TEXT,
+  updated_at TEXT
+);`);
+// chat_whitelist：白名单成员（bind_mode=whitelist 时生效；channel 侧用户标识）
+db.exec(`CREATE TABLE IF NOT EXISTS chat_whitelist (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  bind_id INTEGER NOT NULL,          -- FK → channel_bound_chats.id（删除绑定级联）
+  sender_id TEXT NOT NULL,           -- 渠道侧用户标识（如飞书 open_id）
+  sender_name TEXT DEFAULT '',
+  created_at TEXT,
+  UNIQUE(bind_id, sender_id)
+);`);
