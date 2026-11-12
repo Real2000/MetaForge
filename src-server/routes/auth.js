@@ -2,7 +2,7 @@
 const express = require('express');
 const crypto = require('crypto');
 const { db, hashPwd, verifyPwd, hashPwdAsync, now } = require('../db');
-const { sign, auth, revokeToken, TOKEN_TTL_MS, setAuthCookie, clearAuthCookie } = require('../lib/auth');
+const { sign, auth, adminOnly, revokeToken, TOKEN_TTL_MS, setAuthCookie, clearAuthCookie } = require('../lib/auth');
 const { createLimiter, clientIp } = require('../lib/rate-limit');
 const { loadSecrets } = require('../lib/secrets'); // 钉钉 OAuth 凭证（DINGTALK_APP_KEY/APP_SECRET）
 const { mint: mintExchange, consume: consumeExchange } = require('../lib/exchange-code'); // #14：一次性交换码换 JWT

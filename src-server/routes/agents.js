@@ -256,12 +256,13 @@ router.get('/:id/memories', (req, res) => {
   const whereClause = req.user.role !== 'admin' ? ' AND username=?' : '';
   const args = req.user.role !== 'admin' ? [req.user.username] : [];
   const rows = db.prepare(`SELECT id, fact, type, confidence, source, summary, summary_source, created_at, username FROM agent_memories WHERE agent_id=? ${whereClause} ORDER BY id DESC LIMIT 200`).all(req.params.id, ...args);
-  // P1-4 聚合摘要：按智能体+用户聚合所有记忆，生成摘要统计
+  // P1-4 聚合摘要：按智能体+用户聚合所有记忆，生成摘要统计（老数据无 type 时按 fact 计数，与前端展示兜底一致）
   const stat = { fact: 0, preference: 0, summary: 0 };
   const summaryIds = [];
   for (const r of rows) {
     if (r.type === 'summary') summaryIds.push(r.id);
-    if (stat.hasOwnProperty(r.type)) stat[r.type]++;
+    const bucket = (r.type === 'preference' || r.type === 'summary') ? r.type : 'fact';
+    if (stat.hasOwnProperty(bucket)) stat[bucket]++;
   }
   res.json({ code: 0, data: { list: rows, stat } });
 });

@@ -663,16 +663,28 @@ export async function render(el, params) {
     }
   }
 
-  // 记忆事实列表
+  // 记忆事实列表（P1-4 分层记忆：适配 {list, stat} 结构，展示类型徽标/置信度/归属）
   async function renderMemFacts() {
     const box = el.querySelector('#memFacts');
     if (!box) return;
     try {
       const j = await api(`/agents/${id}/memories`);
-      box.innerHTML = j.data.length ? `
-        <div style="font-size:12px;font-weight:600;color:var(--text,#374151);margin-bottom:6px">${t('已记住 {n} 条用户特征').replace('{n}', j.data.length)}</div>
-        ${j.data.slice(0, 10).map(m => `<div class="mem-row">📌 ${esc(m.fact)}<span style="color:var(--text-3,#9ca3af);font-size:10px">${esc((m.created_at || '').slice(5, 10))}</span></div>`).join('')}
-        ${j.data.length > 10 ? `<div class="hint">${t('仅显示最近 10 条')}</div>` : ''}
+      const list = (j.data && j.data.list) || []; // P1-4 起后端返回 {list, stat}
+      const stat = (j.data && j.data.stat) || {};
+      const normType = v => (v === 'preference' || v === 'summary') ? v : 'fact'; // 老数据 type 为 NULL，兜底按事实展示
+      const TYPE_META = { fact: { icon: '📌', label: t('事实') }, preference: { icon: '⭐', label: t('偏好') }, summary: { icon: '🧾', label: t('摘要') } };
+      box.innerHTML = list.length ? `
+        <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-size:12px;font-weight:600;color:var(--text,#374151);margin-bottom:6px">
+          <span>${t('已记住 {n} 条用户特征').replace('{n}', list.length)}</span>
+          <span style="font-weight:400;font-size:10px;color:var(--text-3,#9ca3af)">（${t('事实')} ${stat.fact || 0} · ${t('偏好')} ${stat.preference || 0} · ${t('摘要')} ${stat.summary || 0}）</span>
+        </div>
+        ${list.slice(0, 10).map(m => {
+          const meta = TYPE_META[normType(m.type)];
+          const conf = (m.confidence == null || m.confidence === '') ? '' : `<span style="color:var(--text-3,#9ca3af);font-size:10px">${Math.round(m.confidence * 100)}%</span>`;
+          const owner = (me.role === 'admin' && m.username) ? `<span style="color:var(--text-3,#9ca3af);font-size:10px">@${esc(m.username)}</span>` : '';
+          return `<div class="mem-row">${meta.icon} <span style="font-size:10px;padding:0 4px;border:1px solid var(--border,#e5e7eb);border-radius:4px;color:var(--text-2,#6b7280);white-space:nowrap">${meta.label}</span> ${esc(m.fact)}${conf}${owner}<span style="color:var(--text-3,#9ca3af);font-size:10px">${esc((m.created_at || '').slice(5, 10))}</span></div>`;
+        }).join('')}
+        ${list.length > 10 ? `<div class="hint">${t('仅显示最近 10 条')}</div>` : ''}
         <button class="btn sm danger" id="clearMem" style="margin-top:6px">${t('清空记忆')}</button>` :
         `<div class="hint">${t('暂无记忆。开启长期记忆并对话后，系统自动提取用户特征。')}</div>`;
       const btn = el.querySelector('#clearMem');
