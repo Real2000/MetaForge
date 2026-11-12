@@ -1588,3 +1588,26 @@ db.exec(`CREATE TABLE IF NOT EXISTS login_attempts (
 );
 CREATE INDEX IF NOT EXISTS idx_login_attempts_username ON login_attempts(username);
 CREATE INDEX IF NOT EXISTS idx_login_attempts_locked ON login_attempts(locked_until);`);
+
+// ---------------- P1-3 邀请注册表（2026-11-11）----------------
+db.exec(`CREATE TABLE IF NOT EXISTS invited_users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  invite_code TEXT NOT NULL UNIQUE,
+  role TEXT DEFAULT 'user',
+  dept TEXT DEFAULT '',
+  quota_total INTEGER DEFAULT 0,
+  max_use INTEGER DEFAULT 1,
+  use_count INTEGER DEFAULT 0,
+  expires_at TEXT,
+  created_by TEXT,
+  enabled INTEGER DEFAULT 1,
+  created_at TEXT,
+  updated_at TEXT
+);`);
+db.exec(`CREATE TABLE IF NOT EXISTS invite_registrations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  username TEXT NOT NULL,
+  invite_code TEXT NOT NULL,
+  ip TEXT DEFAULT '',
+  created_at TEXT
+);`);

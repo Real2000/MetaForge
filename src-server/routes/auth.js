@@ -271,4 +271,45 @@ router.post('/dingtalk/exchange', dingExchangeLimiter, (req, res) => {
   res.json({ code: 0, data: payload });
 });
 
+// ==================== P1-3 邀请与开通（2026-11-11） ====================
+// 管理员生成邀请码
+router.post('/invites', auth, adminOnly, (req, res) => {
+  const { role, dept, quota_total, max_use, expires_at } = req.body || {};
+  const inviteCode = crypto.randomBytes(6).toString('hex'); // 12 位 hex 码
+  const max = Math.min(Math.max(parseInt(max_use) || 1, 1), 100);
+  db.prepare(`INSERT INTO invited_users (invite_code, role, dept, quota_total, max_use, expires_at, created_by, enabled, created_at, updated_at)
+    VALUES (?,?,?,?,?,?,?,1,datetime('now','localtime'),datetime('now','localtime'))`)
+    .run(inviteCode, role || 'user', dept || '', parseInt(quota_total) || 0, max, expires_at || null, req.user.username);
+  res.json({ code: 0, data: { invite_code: inviteCode } });
+});
+
+// 被邀请用户使用邀请码注册
+router.post('/register', async (req, res) => {
+  const { username, password, nickname, invite_code } = req.body || {};
+  if (!username || !password || !invite_code) return res.json({ code: 400, msg: '缺少必要参数' });
+  let codeInfo = db.prepare('SELECT * FROM invited_users WHERE invite_code=? AND enabled=1').get(invite_code);
+  if (!codeInfo) return res.json({ code: 400, msg: '邀请码无效' });
+  // 检查过期
+  if (codeInfo.expires_at && new Date(codeInfo.expires_at) < new Date()) return res.json({ code: 400, msg: '邀请码已过期' });
+  // 检查使用次数
+  if (codeInfo.max_use > 0 && codeInfo.use_count >= codeInfo.max_use) return res.json({ code: 400, msg: '邀请码已被使用完毕' });
+  // 检查用户名唯一性
+  const exists = db.prepare('SELECT id FROM users WHERE username=?').get(username);
+  if (exists) return res.json({ code: 400, msg: '用户名已被占用' });
+  // 创建新用户
+  const pwdHash = await hashPwdAsync(password);
+  db.prepare('INSERT INTO users (username, password, nickname, role, dept, quota_total, status, must_change_pwd, created_at) VALUES (?,?,?,?,?,?,1,0,datetime(\'now\',\'localtime\'))')
+    .run(username, pwdHash, nickname || username, codeInfo.role, codeInfo.dept, codeInfo.quota_total);
+  // 增加邀请码使用计数
+  db.prepare('UPDATE invited_users SET use_count=use_count+1, updated_at=datetime(\'now\',\'localtime\') WHERE id=?').run(codeInfo.id);
+  // 记录注册日志
+  db.prepare('INSERT INTO invite_registrations (username, invite_code, ip, created_at) VALUES (?,?,?,?)')
+    .run(username, invite_code, req.ip, now());
+  // 签发 Token 自动登录
+  const user = db.prepare('SELECT id, username, nickname, role, dept, onboarded FROM users WHERE username=?').get(username);
+  const token = sign({ uid: user.id });
+  setAuthCookie(res, token);
+  res.json({ code: 0, msg: '注册成功', data: { token, user } });
+});
+
 module.exports = router;
