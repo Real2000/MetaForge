@@ -248,6 +248,33 @@ CREATE TABLE IF NOT EXISTS messages (
     console.log('[db] messages 表已迁移：新增 solved 字段');
   }
 }
+// ---------------- P1-6 会话检查点 v2（2026-11-12）----------------
+// messages.branch：消息分支归属（main=当前活跃线；回放归档线 br-{ts} 只读保留，防误删上下文）
+// sessions.active_branch：会话当前查看/写入的分支（v1 恒 main，预留切换能力）
+{
+  const msgCols = db.prepare('PRAGMA table_info(messages)').all().map(c => c.name);
+  if (!msgCols.includes('branch')) {
+    db.exec("ALTER TABLE messages ADD COLUMN branch TEXT DEFAULT 'main'");
+    console.log('[db] messages 表已迁移：新增 branch 字段（P1-6 分支回放）');
+  }
+  const sessCols = db.prepare('PRAGMA table_info(sessions)').all().map(c => c.name);
+  if (!sessCols.includes('active_branch')) {
+    db.exec("ALTER TABLE sessions ADD COLUMN active_branch TEXT DEFAULT 'main'");
+    console.log('[db] sessions 表已迁移：新增 active_branch 字段（P1-6 分支回放）');
+  }
+}
+db.exec(`CREATE TABLE IF NOT EXISTS checkpoints (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id INTEGER,
+  user_content TEXT DEFAULT '',
+  partial_content TEXT DEFAULT '',
+  status TEXT DEFAULT 'generating',
+  model TEXT DEFAULT '',
+  created_at TEXT,
+  updated_at TEXT
+);`);
+// checkpoints 补充：SSE 流式生成快照——generating(生成中)/aborted(异常中断，可续跑)/done(正常完成即清理)
+// 断点续跑依据：status != 'done' 的检查点在用户重新打开会话时提示「继续生成」
 db.exec(`CREATE TABLE IF NOT EXISTS tasks (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,

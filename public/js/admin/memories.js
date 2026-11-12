@@ -34,7 +34,7 @@ export async function render(el) {
   <div class="grid-4" id="statCards" style="margin-bottom:14px"></div>
   <div class="card" style="padding:12px 18px;margin-bottom:14px">
     <div class="mm-filter">
-      <input class="mm-search" id="qInput" placeholder="${t('搜索记忆内容…')}" value="${esc(q)}">
+      <input class="mm-search" id="qInput" placeholder="${t('搜索记忆内容…')}">
       <button class="btn sm" id="qBtn">${t('搜索')}</button>
       <span style="width:1px;height:16px;background:#e5e7eb"></span>
       <span id="typeChips"></span>
@@ -82,7 +82,6 @@ export async function render(el) {
   function renderSelBar() {
     const bar = el.querySelector('#selBar');
     if (!checked.size) { bar.innerHTML = ''; return; }
-    // 前端预校验：勾选项必须同一智能体+同一用户，否则不允许合并
     const rows = data.list.filter(r => checked.has(r.id));
     const mergeable = new Set(rows.map(r => `${r.agent_id}|${r.username}`)).size === 1;
     bar.innerHTML = `<div class="mm-bar">✅ ${t('已选 {n} 条').replace('{n}', checked.size)}
@@ -131,7 +130,7 @@ export async function render(el) {
   function renderTable() {
     const list = data.list;
     tbody.innerHTML = list.length ? list.map(r => {
-      const tm = TYPE_META[r.type] || { ic: '📌', label: () => t('事实'), cls: 'blue' }; // 老数据 NULL 按事实展示
+      const tm = TYPE_META[r.type] || { ic: '📌', label: () => t('事实'), cls: 'blue' };
       const conf = (r.confidence == null || r.confidence === '') ? '-' : `${Math.round(r.confidence * 100)}%`;
       return `
       <tr>
@@ -165,19 +164,6 @@ export async function render(el) {
     renderSelBar();
   }
 
-  async function load() {
-    const params = new URLSearchParams();
-    if (q) params.set('q', q);
-    if (tp !== 'all') params.set('type', tp);
-    if (agentId !== 'all') params.set('agent_id', agentId);
-    if (username !== 'all') params.set('username', username);
-    data = (await api(`/memories?${params.toString()}`)).data;
-    renderStat();
-    renderFilters();
-    renderTable();
-  }
-
-  // P1-5 导出：按当前筛选条件导出 JSON/CSV（fetch + blob，带 Bearer 与 Cookie 双通道）
   async function exportMemories(format) {
     const params = new URLSearchParams({ format });
     if (q) params.set('q', q);
@@ -194,6 +180,18 @@ export async function render(el) {
     link.click();
     URL.revokeObjectURL(url);
     toast(t('已导出当前筛选结果'));
+  }
+
+  async function load() {
+    const params = new URLSearchParams();
+    if (q) params.set('q', q);
+    if (tp !== 'all') params.set('type', tp);
+    if (agentId !== 'all') params.set('agent_id', agentId);
+    if (username !== 'all') params.set('username', username);
+    data = (await api(`/memories?${params.toString()}`)).data;
+    renderStat();
+    renderFilters();
+    renderTable();
   }
 
   el.querySelector('#expJson').onclick = () => exportMemories('json');
