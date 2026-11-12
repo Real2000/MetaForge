@@ -31,6 +31,8 @@ const routes = {
   '/admin/dashboard': { page: () => import('./admin/dashboard.js'), layout: 'admin', title: '数据看板', admin: true },
   '/admin/agents': { page: () => import('./admin/agents.js'), layout: 'admin', title: '智能体管理', admin: true },
   '/admin/users': { page: () => import('./admin/users.js'), layout: 'admin', title: '用户管理', admin: true },
+  '/admin/departments': { page: () => import('./admin/departments.js'), layout: 'admin', title: '组织架构', admin: true }, // P0-3b 组织架构管理页
+  '/admin/sso': { page: () => import('./admin/sso.js'), layout: 'admin', title: 'SSO 企业登录', admin: true }, // P1-1b SSO 配置页
   '/admin/studio': { page: () => import('./admin/studio.js'), layout: 'none', title: '智能体编排' }, // P3：协作者（非管理员）可进入，页面内经详情接口鉴权
   '/admin/knowledge': { page: () => import('./admin/knowledge.js'), layout: 'admin', title: '知识库管理', admin: true },
   '/admin/memories': { page: () => import('./admin/memories.js'), layout: 'admin', title: '记忆管理', admin: true }, // P1-5 记忆管理页
@@ -64,6 +66,8 @@ const adminNav = [
   { href: '#/admin/dashboard', ic: '📊', label: '数据看板' },
   { href: '#/admin/agents', ic: '🤖', label: '智能体管理' },
   { href: '#/admin/users', ic: '👥', label: '用户管理' },
+  { href: '#/admin/departments', ic: '🏢', label: '组织架构' },
+  { href: '#/admin/sso', ic: '🔐', label: 'SSO 企业登录' },
   { href: '#/admin/knowledge', ic: '📚', label: '知识库管理' },
   { href: '#/admin/memories', ic: '🧠', label: '记忆管理' },
   { href: '#/admin/access', ic: '🔌', label: '接入管理' },

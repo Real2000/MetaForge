@@ -29,12 +29,20 @@ function ensureTables() {
       token_url TEXT DEFAULT '',
       userinfo_url TEXT DEFAULT '',
       scopes TEXT DEFAULT '',
+      type TEXT DEFAULT 'oidc',
       jwt_bind_mode INTEGER DEFAULT 1,
       allow_local_login INTEGER DEFAULT 1,
       enabled INTEGER DEFAULT 0,
       created_at TEXT,
       updated_at TEXT
     )`);
+  }
+  // 2026-11-12 P1-1b 修复：早期建表语句缺 type 列（routes/sso.js INSERT/UPDATE 均用到），
+  // 导致创建服务商 500「no column named type」；对已建表的老库（含生产）幂等补列
+  const ssoCols = db.prepare('PRAGMA table_info(sso_providers)').all().map(c => c.name);
+  if (!ssoCols.includes('type')) {
+    db.exec("ALTER TABLE sso_providers ADD COLUMN type TEXT DEFAULT 'oidc'");
+    console.log('[sso] sso_providers 表已迁移：新增 type 字段');
   }
   if (!existing.get('sso_login_states')) {
     db.exec(`CREATE TABLE IF NOT EXISTS sso_login_states (

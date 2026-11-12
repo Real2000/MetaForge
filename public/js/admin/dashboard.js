@@ -7,6 +7,12 @@ export async function render(el) {
   el.innerHTML = `<div class="empty-box"><div class="big">⏳</div>${t('加载中…')}</div>`;
   const j = await api('/stats/dashboard');
   const d = j.data;
+  // P0-3b 界面补齐：edition 版本快照消费（此前 GET /api/edition 后端已交付但无 UI 展示）
+  let editionHtml = '';
+  try {
+    const ed = (await api('/edition')).data;
+    editionHtml = `<span class="tag ${ed.licensed ? 'green' : 'gray'}" style="margin-left:10px;vertical-align:middle">${ed.licensed ? '✅' : '🆓'} ${esc(ed.name || (ed.licensed ? t('专业版') : t('社区版')))}${ed.licensed && ed.expires_at ? ` · ${t('到期')} ${esc(ed.expires_at)}` : ''}</span>`;
+  } catch { /* 版本信息加载失败不影响看板 */ }
   const cards = [
     { label: t('智能体总量'), num: d.cards.agentTotal, color: '#2563eb', sub: `${t('已发布')} ${d.cards.agentPublished} · ${t('含草稿（前台只展示已发布，且分类 tab 会再过滤——数字小于本卡为正常）')}` },
     { label: t('用户总量'), num: d.cards.userTotal, color: '#7c3aed', sub: t('平台注册用户') },
@@ -22,7 +28,7 @@ export async function render(el) {
   const todayTokens = d.tokensByDay[todayIdx] ?? 0;
 
   el.innerHTML = `
-    <div class="page-head"><h2>${t('数据看板')}</h2><div class="desc">${t('平台核心运营指标总览（统计范围：全部数据 / 近 7 天趋势）')}</div></div>
+    <div class="page-head"><h2>${t('数据看板')}${editionHtml}</h2><div class="desc">${t('平台核心运营指标总览（统计范围：全部数据 / 近 7 天趋势）')}</div></div>
     <div class="grid-stats">${cards.map(c => `
       <div class="stat-card">
         <div class="label">${c.label}</div>
