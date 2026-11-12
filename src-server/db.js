@@ -1683,3 +1683,35 @@ db.exec(`CREATE TABLE IF NOT EXISTS invite_registrations (
   ip TEXT DEFAULT '',
   created_at TEXT
 );`);
+
+// ---------------- P1-8 channels 表（2026-11-12）：渠道注册/配置加密/启停/回调状态 ----------------
+// 渠道适配层（P1-7 lib/channel.js）的持久化地基——把渠道配置从散落的 secrets 键升级为可管理表结构
+//   type：dingtalk / wecom / feishu / telegram / discord / mqtt / webhook（扩展即加枚举）
+//   config：JSON 密文（AES-256-GCM；存凭证字段如 appKey/appSecret/agentId）
+//   callback_status：ok / warning / error / pending；callback_last_at 最近回调时间
+//   callback_err：最近回调错误摘要（排障用）
+db.exec(`CREATE TABLE IF NOT EXISTS channels (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  type TEXT NOT NULL DEFAULT 'webhook',
+  config TEXT DEFAULT '',          -- JSON 密文（加密失败兜底明文，与 crypto-util 约定一致）
+  enabled INTEGER DEFAULT 1,
+  callback_status TEXT DEFAULT 'pending',
+  callback_last_at TEXT DEFAULT '',
+  callback_err TEXT DEFAULT '',
+  created_by TEXT DEFAULT '',
+  created_at TEXT,
+  updated_at TEXT
+);`);
+// connector_oauth_states：IM 渠道 OAuth 连接流程的 state 防重放/续程表
+//   （对应 P1-9 第二 IM 渠道接入时使用；state 一次性消费 + 过期清理）
+db.exec(`CREATE TABLE IF NOT EXISTS connector_oauth_states (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  state TEXT NOT NULL UNIQUE,
+  channel_id INTEGER,
+  redirect_uri TEXT DEFAULT '',
+  username TEXT DEFAULT '',
+  expires_at TEXT,
+  consumed INTEGER DEFAULT 0,
+  created_at TEXT
+);`);

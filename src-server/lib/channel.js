@@ -213,9 +213,90 @@ async function send(to, message) {
   return { ok: false, channel, error: `未知渠道：${channel}` };
 }
 
+// ---------------- ③ P1-8 channels 表：渠道注册/配置加密/启停/回调状态 ----------------
+const { encrypt, decrypt } = require('./crypto-util');
+
+const CHANNEL_TYPES = ['dingtalk', 'wecom', 'feishu', 'telegram', 'discord', 'mqtt', 'webhook'];
+
+/** 新增/更新渠道（config 整体 AES-256-GCM 加密落库；回显时解密+脱敏） */
+function upsertChannel({ id, name, type, config, enabled, createdBy }) {  const n = String(name || '').trim();
+  if (!n) throw new Error('渠道名称不能为空');
+  // P1-8 修正：编辑场景未传字段保留旧值（type 同样适用——只改名不应把类型重置成默认 webhook）
+  const effType = String(type || '').trim();
+  let cfgPlain = {};
+  if (config && typeof config === 'object') cfgPlain = config;
+  else if (typeof config === 'string' && config.trim()) { try { cfgPlain = JSON.parse(config); } catch { cfgPlain = {}; } }
+  const cfgJson = JSON.stringify(cfgPlain);
+  const cfgEnc = cfgJson === '{}' ? '' : (encrypt(cfgJson) || cfgJson); // 加密失败兜底明文（crypto-util 约定）
+  if (id) {
+    const old = db.prepare('SELECT * FROM channels WHERE id=?').get(id);
+    if (!old) throw new Error('渠道不存在');
+    // 校验仅在显式传 type 时做；未传沿用旧类型
+    if (effType && !CHANNEL_TYPES.includes(effType)) throw new Error(`不支持的字段类型：${effType}（可选：${CHANNEL_TYPES.join('/')}）`);
+    const finalType = effType || old.type;
+    const finalName = n || old.name;
+    db.prepare('UPDATE channels SET name=?, type=?, config=?, enabled=?, updated_at=? WHERE id=?')
+      .run(finalName, finalType, config === undefined ? old.config : cfgEnc, enabled === undefined ? old.enabled : (enabled ? 1 : 0), now(), id);
+    return db.prepare('SELECT * FROM channels WHERE id=?').get(id);
+  }
+  if (!effType) throw new Error('新增渠道必须指定 type');
+  const t = effType;
+  if (!CHANNEL_TYPES.includes(t)) throw new Error(`不支持的字段类型：${t}（可选：${CHANNEL_TYPES.join('/')}）`);
+  const info = db.prepare(`INSERT INTO channels (name, type, config, enabled, created_by, created_at, updated_at)
+    VALUES (?,?,?,?,?,?,?)`)
+    .run(n, t, cfgEnc, enabled === undefined ? 1 : (enabled ? 1 : 0), String(createdBy || ''), now(), now());
+  return db.prepare('SELECT * FROM channels WHERE id=?').get(info.lastInsertRowid);
+}
+
+/** 渠道列表（配置解密后按敏感键脱敏：*Secret/secret/Key/appSecret 一律 ••••） */
+function listChannels() {
+  const rows = db.prepare('SELECT * FROM channels ORDER BY id').all();
+  return rows.map(r => {
+    let cfg = {};
+    try { cfg = r.config ? JSON.parse(decrypt(r.config) || r.config) : {}; } catch { cfg = {}; }
+    const masked = {};
+    for (const [k, v] of Object.entries(cfg)) {
+      masked[k] = /secret|key|token|password/i.test(k) ? (String(v || '') ? '••••••••' : '') : v;
+    }
+    return { ...r, config: masked, has_config: !!(r.config && r.config.length > 10) };
+  });
+}
+
+/** 渠道详情（内部消费：解密明文配置，不脱敏——仅 lib 内部/发消息用） */
+function getChannelConfig(id) {
+  const r = db.prepare('SELECT * FROM channels WHERE id=?').get(id);
+  if (!r) return null;
+  try { return { ...r, config: r.config ? JSON.parse(decrypt(r.config) || r.config) : {} }; } catch { return { ...r, config: {} }; }
+}
+
+/** 回调状态上报（入站投递/回调处理结果写回渠道行——排障与看板消费） */
+function updateCallbackStatus(channelId, status, err) {
+  const s = ['ok', 'warning', 'error', 'pending'].includes(status) ? status : 'pending';
+  db.prepare('UPDATE channels SET callback_status=?, callback_last_at=?, callback_err=?, updated_at=? WHERE id=?')
+    .run(s, now(), String(err || '').slice(0, 300), now(), channelId);
+}
+
+/** 启停切换 */
+function toggleChannel(id) {
+  const old = db.prepare('SELECT id, enabled FROM channels WHERE id=?').get(id);
+  if (!old) throw new Error('渠道不存在');
+  const next = old.enabled ? 0 : 1;
+  db.prepare('UPDATE channels SET enabled=?, updated_at=? WHERE id=?').run(next, now(), id);
+  return { id, enabled: !!next };
+}
+
+/** 删除渠道（级联清 OAuth states） */
+function deleteChannel(id) {
+  db.prepare('DELETE FROM connector_oauth_states WHERE channel_id=?').run(id);
+  db.prepare('DELETE FROM channels WHERE id=?').run(id);
+}
+
 module.exports = {
   // 入站
   normalizeInbound, parseDingtalk, parseWecom, parseFeishu, parseWebhook,
   // 出站
   send, sendInbox,
+  // P1-8 渠道注册表管理
+  CHANNEL_TYPES, upsertChannel, listChannels, getChannelConfig,
+  updateCallbackStatus, toggleChannel, deleteChannel,
 };
