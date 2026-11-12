@@ -40,6 +40,7 @@ app.use('/api/auth', require('./src-server/routes/auth'));
 app.use('/api/auth/sso', require('./src-server/routes/sso'));
 
 app.use('/api/agents', require('./src-server/routes/agents'));
+app.use('/api/memories', require('./src-server/routes/memories')); // P1-5 记忆管理（查看/搜索/合并/删除/导出，adminOnly）
 app.use('/api/chat', require('./src-server/routes/chat'));
 app.use('/api/knowledge', require('./src-server/routes/knowledge'));
 app.use('/api/tasks', require('./src-server/routes/tasks'));

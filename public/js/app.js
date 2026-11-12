@@ -33,6 +33,7 @@ const routes = {
   '/admin/users': { page: () => import('./admin/users.js'), layout: 'admin', title: '用户管理', admin: true },
   '/admin/studio': { page: () => import('./admin/studio.js'), layout: 'none', title: '智能体编排' }, // P3：协作者（非管理员）可进入，页面内经详情接口鉴权
   '/admin/knowledge': { page: () => import('./admin/knowledge.js'), layout: 'admin', title: '知识库管理', admin: true },
+  '/admin/memories': { page: () => import('./admin/memories.js'), layout: 'admin', title: '记忆管理', admin: true }, // P1-5 记忆管理页
   '/admin/access': { page: () => import('./admin/access.js'), layout: 'admin', title: '接入管理', admin: true },
   '/admin/models': { page: () => import('./admin/models.js'), layout: 'admin', title: '模型接入', admin: true },
   '/admin/secrets': { page: () => import('./admin/secrets.js'), layout: 'admin', title: '密钥管理', admin: true },
@@ -64,6 +65,7 @@ const adminNav = [
   { href: '#/admin/agents', ic: '🤖', label: '智能体管理' },
   { href: '#/admin/users', ic: '👥', label: '用户管理' },
   { href: '#/admin/knowledge', ic: '📚', label: '知识库管理' },
+  { href: '#/admin/memories', ic: '🧠', label: '记忆管理' },
   { href: '#/admin/access', ic: '🔌', label: '接入管理' },
   { href: '#/admin/mcp', ic: '🧩', label: 'MCP 服务' },
   { href: '#/admin/models', ic: '🧠', label: '模型接入' },
