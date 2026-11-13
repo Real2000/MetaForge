@@ -12,6 +12,7 @@
  */
 const fs = require('fs');
 const path = require('path');
+const storage = require('./storage'); // P1-19 对象存储抽象层
 const { db, now } = require('../db');
 const { chatOnce } = require('./llm');
 const { check } = require('./security'); // P5.33：create_task 任务指令敏感词校验
@@ -711,11 +712,10 @@ async function mdToWordFile(md, title) {
     sections: [{ properties: {}, children: mdToDocxChildren(md) }],
   });
   const buf = await DOCX.Packer.toBuffer(doc);
-  const dir = ensureUploads('exports');
+  storage.ensureDir('exports');
   const safe = String(title || '文档').replace(/[\\/:*?"<>|\s]+/g, '-').slice(0, 40) || '文档';
   const fname = `${safe}-${Date.now()}.docx`;
-  fs.writeFileSync(path.join(dir, fname), buf);
-  return `/uploads/exports/${fname}`;
+  return storage.write('exports', fname, buf);
 }
 const export_word = {
   schema: {

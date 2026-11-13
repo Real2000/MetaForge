@@ -16,6 +16,7 @@
  * P1-13：每次执行落 sandbox_runs 审计（环境/归属/状态/版本/产物）。
  */
 const { spawn } = require('child_process');
+const storage = require('./storage'); // P1-19 对象存储抽象层
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
@@ -120,19 +121,19 @@ async function runIsolated(opts) {
     child.on('close', (exitCode) => {
       clearTimeout(killer);
       const durationMs = Date.now() - t0;
-      // 产物收集（工作目录新文件 → public/uploads/sandbox/）
+      // 产物收集（通过存储抽象层）
       const artifacts = [];
       try {
-        const uploadsDir = path.join(__dirname, '..', '..', 'public', 'uploads', 'sandbox');
-        fs.mkdirSync(uploadsDir, { recursive: true });
+        storage.ensureDir('sandbox');
         for (const f of fs.readdirSync(workDir)) {
           if (f === 'main.js') continue;
           const fp = path.join(workDir, f);
           const st = fs.statSync(fp);
           if (st.isFile() && st.size <= ARTIFACT_MAX) {
             const destName = `${sbxId}-${f.replace(/\.html?$/i, '.html.txt')}`;
-            fs.copyFileSync(fp, path.join(uploadsDir, destName));
-            artifacts.push({ name: f, size: st.size, url: `/uploads/sandbox/${destName}` });
+            const buf = fs.readFileSync(fp);
+            const url = storage.write('sandbox', destName, buf);
+            artifacts.push({ name: f, size: st.size, url });
           }
         }
       } catch { /* 产物收集失败不影响执行结果 */ }
