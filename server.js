@@ -97,6 +97,10 @@ app.use('/api/catalog', require('./src-server/routes/catalog'));
 app.use('/api/config', require('./src-server/routes/config'));
 // P1-21 API 文档站（自动生成 OpenAPI 规范 + Redoc 渲染页面）
 app.use('/api/api-docs', require('./src-server/routes/api-docs'));
+// P2-20 语音供应商管理（2026-11-13）
+app.use('/api/voice-providers', require('./src-server/routes/voice-providers'));
+// P2-18 浏览器自动化（2026-11-13）
+app.use('/api/browser', require('./src-server/routes/browser'));
 // P3 MCP Server（2026-10-22 ⑤）：已发布智能体暴露为 MCP 工具（Streamable HTTP + Bearer 令牌；管理端 /api/mcp-server）
 app.use('/mcp', require('./src-server/routes/mcp-server'));
 app.use('/api/mcp-server', require('./src-server/routes/mcp-server'));

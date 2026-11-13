@@ -2101,9 +2101,42 @@ db.exec(`CREATE TABLE IF NOT EXISTS recall_eval_results (
   created_at TEXT
 );`);
 db.exec('CREATE INDEX IF NOT EXISTS idx_rer_kb ON recall_eval_results(kb_id);');
-db.exec('CREATE INDEX IF NOT EXISTS idx_rer_time ON recall_eval_results(created_at);');
 
-console.log('[db] 创建 file_catalog/file_revisions/external_sources/recall_eval_results 表（P2-12~14 文件台账/外部知识库/召回闭环）');
+// ================== P2-20 语音供应商（2026-11-13）==================
+db.exec(`CREATE TABLE IF NOT EXISTS voice_providers (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL DEFAULT '',
+  type TEXT DEFAULT 'both',                -- stt | tts | both
+  base_url TEXT DEFAULT '',
+  api_key TEXT DEFAULT '',
+  endpoint TEXT DEFAULT '',                 -- 专用端点 URL（如 /v1/audio/speech）
+  voices TEXT DEFAULT '[]',                 -- JSON：可用音色列表 [{name,id,lang,gender}]
+  languages TEXT DEFAULT '[]',              -- JSON：支持的语言列表
+  rate_options TEXT DEFAULT '[]',           -- JSON：速率范围 [{label,value}]
+  model_name TEXT DEFAULT '',               -- 模型名
+  configured INTEGER DEFAULT 0,
+  is_default INTEGER DEFAULT 0,
+  remark TEXT DEFAULT '',
+  created_at TEXT,
+  updated_at TEXT
+);`);
+console.log('[db] 创建 voice_providers 表（P2-20 语音供应商）');
+
+// ================== P2-18 浏览器自动化记录表（2026-11-13）==================
+db.exec(`CREATE TABLE IF NOT EXISTS browser_automations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT DEFAULT '',               -- CDP 会话 ID / Playwright session ID
+  url TEXT DEFAULT '',                       -- 页面 URL
+  action TEXT DEFAULT '',                    -- 操作类型
+  action_input TEXT DEFAULT '',              -- 操作参数 JSON
+  action_result TEXT DEFAULT '',             -- 操作结果
+  status TEXT DEFAULT 'done',               -- pending | running | done | failed
+  screenshot_path TEXT DEFAULT '',
+  duration_ms INTEGER DEFAULT 0,
+  created_by TEXT DEFAULT '',
+  created_at TEXT
+);`);
+console.log('[db] 创建 browser_automations 表（P2-18 浏览器自动化）');
 
 // P1-17 版本化迁移框架（2026-11-13）：执行 _migrations 注册表中尚未登记的列迁移
 // 新迁移直接在该框架中追加，逐步替代 db.js 内联 ALTER TABLE 块
