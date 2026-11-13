@@ -56,17 +56,20 @@ router.post('/', (req, res) => {
 router.put('/:id', (req, res) => {
   const old = db.prepare('SELECT * FROM providers WHERE id=?').get(req.params.id);
   if (!old) return res.json({ code: 404, msg: '供应商不存在' });
-  const { name, base_url, api_key, models, remark } = req.body || {};
+  const { name, base_url, api_key, models, remark, auth_type, auth_config, status, status_msg } = req.body || {};
   let ms;
   if (Array.isArray(models)) ms = models;
   else if (typeof models === 'string' && models) ms = models.split(/[,，\s]+/).filter(Boolean);
   else ms = JSON.parse(old.models || '[]');
-  // P5.30 安全止血：api_key 为空或含掩码（旧前端缓存的脱敏回显值）一律视为「不修改」，防掩码串覆盖真 Key
+  // P5.30 安全止血：api_key 为空或含掩码一律视为「不修改」
   const keyIn = typeof api_key === 'string' ? api_key.trim() : '';
   const nextKey = keyIn && !keyIn.includes('****') ? encrypt(keyIn) : old.api_key;
   const configured = base_url && nextKey ? 1 : old.configured;
-  db.prepare('UPDATE providers SET name=?,base_url=?,api_key=?,models=?,configured=?,remark=? WHERE id=?')
-    .run(name || old.name, base_url ?? old.base_url, nextKey, JSON.stringify(ms), configured, remark ?? old.remark, old.id);
+  const nextAuthType = auth_type || old.auth_type || 'bearer';
+  const nextAuthConfig = auth_config !== undefined ? (typeof auth_config === 'string' ? auth_config : JSON.stringify(auth_config)) : (old.auth_config || '{}');
+  db.prepare('UPDATE providers SET name=?,base_url=?,api_key=?,models=?,configured=?,remark=?,auth_type=?,auth_config=?,status=?,status_msg=? WHERE id=?')
+    .run(name || old.name, base_url ?? old.base_url, nextKey, JSON.stringify(ms), configured, remark ?? old.remark,
+      nextAuthType, nextAuthConfig, status !== undefined ? status : (old.status ?? 1), status_msg ?? old.status_msg ?? '', old.id);
   db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)').run(req.user.username, '配置模型供应商', name || old.name, req.ip, now());
   res.json({ code: 0, msg: '已保存' });
 });
@@ -203,3 +206,67 @@ router.post('/:id/test', async (req, res) => {
 
 module.exports = router;
 module.exports.verifyModelByType = verifyModelByType; // 导出供冒烟测试校验端点映射
+
+/* ==================== P2-9 模型能力注册表 ==================== */
+
+// 注册模型能力
+router.post('/capabilities', adminOnly, (req, res) => {
+  const { model_name, provider_name, capability, priority, enabled } = req.body || {};
+  if (!model_name || !capability) return res.json({ code: 400, msg: '请提供 model_name 和 capability' });
+  const allowed = ['text', 'vision', 'audio', 'embedding', 'rerank', 'image_gen', 'video_gen', 'tool_call', 'streaming'];
+  if (!allowed.includes(capability)) return res.json({ code: 400, msg: `capability 必须为以下之一：${allowed.join(', ')}` });
+  try {
+    const info = db.prepare(`INSERT OR REPLACE INTO model_capabilities (model_name,provider_name,capability,priority,enabled,created_at)
+      VALUES (?,?,?,?,?,datetime('now','localtime'))`)
+      .run(model_name, provider_name || '', capability, priority || 0, enabled !== undefined ? (enabled ? 1 : 0) : 1);
+    res.json({ code: 0, data: { id: Number(info.lastInsertRowid) } });
+  } catch (e) {
+    res.json({ code: 500, msg: e.message });
+  }
+});
+
+// 按模型名查询能力
+router.get('/capabilities', (req, res) => {
+  const { model_name, capability, provider_name } = req.query;
+  let sql = 'SELECT * FROM model_capabilities WHERE 1=1';
+  const args = [];
+  if (model_name) { sql += ' AND model_name=?'; args.push(model_name); }
+  if (capability) { sql += ' AND capability=?'; args.push(capability); }
+  if (provider_name) { sql += ' AND provider_name=?'; args.push(provider_name); }
+  sql += ' ORDER BY model_name, priority DESC';
+  const rows = db.prepare(sql).all(...args);
+  res.json({ code: 0, data: rows });
+});
+
+// 按能力筛选可用模型（合并供应商的 model_types + model_capabilities 注册表）
+router.get('/capabilities/filter', (req, res) => {
+  const { capability } = req.query;
+  if (!capability) return res.json({ code: 400, msg: '请指定 capability' });
+  // 1. 从已配置供应商的 model_types 中提取
+  const ps = db.prepare("SELECT name, models FROM providers WHERE configured=1").all();
+  const fromType = [];
+  for (const p of ps) {
+    let mt = {};
+    try { mt = JSON.parse(p.model_types || '{}'); } catch {}
+    for (const [model, type] of Object.entries(mt)) {
+      if (type === capability) fromType.push({ model, provider: p.name, source: 'model_types' });
+    }
+  }
+  // 2. 从 model_capabilities 注册表中提取
+  const regRows = db.prepare('SELECT * FROM model_capabilities WHERE capability=? AND enabled=1').all(capability);
+  const fromReg = regRows.map(r => ({ model: r.model_name, provider: r.provider_name || '*', source: 'registry' }));
+  // 3. 合并去重
+  const seen = new Set();
+  const merged = [];
+  for (const item of [...fromType, ...fromReg]) {
+    const key = `${item.model}:${item.provider}`;
+    if (!seen.has(key)) { seen.add(key); merged.push(item); }
+  }
+  res.json({ code: 0, data: merged });
+});
+
+// 删除能力注册
+router.delete('/capabilities/:id', adminOnly, (req, res) => {
+  db.prepare('DELETE FROM model_capabilities WHERE id=?').run(req.params.id);
+  res.json({ code: 0 });
+});

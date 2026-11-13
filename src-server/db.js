@@ -1980,6 +1980,54 @@ db.exec(`CREATE TABLE IF NOT EXISTS market_hubs (
 );`);
 console.log('[db] 创建 expert_catalog/sub_agent_library/plugins/market_hubs 表（P2-4~8 资产目录）');
 
+// ================== P2-9 模型能力注册表（2026-11-13）==================
+db.exec(`CREATE TABLE IF NOT EXISTS model_capabilities (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  model_name TEXT NOT NULL,              -- 模型名
+  provider_name TEXT NOT NULL DEFAULT '', -- 供应商名（空=全局注册，适用于所有供应商的同名模型）
+  capability TEXT NOT NULL,              -- 能力标签：text | vision | audio | embedding | rerank | image_gen | video_gen | tool_call | streaming
+  priority INTEGER DEFAULT 0,            -- 同模型多能力时的优先级
+  enabled INTEGER DEFAULT 1,
+  created_at TEXT
+);`);
+db.exec('CREATE INDEX IF NOT EXISTS idx_mc_model ON model_capabilities(model_name);');
+db.exec('CREATE INDEX IF NOT EXISTS idx_mc_cap ON model_capabilities(capability);');
+db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_mc_unique ON model_capabilities(model_name, provider_name, capability);');
+
+// P2-10 供应商鉴权配置列扩充（2026-11-13）
+// auth_type: bearer | aksk | oauth | custom
+// auth_config: JSON（aksk 存 {access_key,secret_key}；oauth 存 {client_id,client_secret,token_url}；custom 存 {headers:{}}）
+// status: 连接状态 1=正常 0=异常（连通测试结果）
+{
+  const pCols = db.prepare('PRAGMA table_info(providers)').all().map(c => c.name);
+  if (!pCols.includes('auth_type')) {
+    db.exec("ALTER TABLE providers ADD COLUMN auth_type TEXT DEFAULT 'bearer'");
+    db.exec("ALTER TABLE providers ADD COLUMN auth_config TEXT DEFAULT '{}'");
+    db.exec("ALTER TABLE providers ADD COLUMN status INTEGER DEFAULT 1");
+    db.exec("ALTER TABLE providers ADD COLUMN status_msg TEXT DEFAULT ''");
+    console.log('[db] providers 表已迁移：新增 auth_type/auth_config/status/status_msg 字段（P2-10 鉴权多样性）');
+  }
+}
+
+// ================== P2-11 用量归集表（2026-11-13）==================
+// 按维度分解的每次用量记录（对话/工具/召回/分享/OpenAPI）
+// dimension: model | tool | kb | share | openapi
+db.exec(`CREATE TABLE IF NOT EXISTS usage_records (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  username TEXT NOT NULL DEFAULT '',
+  dimension TEXT NOT NULL,               -- model | tool | kb | share | openapi
+  dimension_key TEXT NOT NULL DEFAULT '', -- 模型名 | 工具名 | 知识库名 | 分享token | 路由名
+  tokens INTEGER DEFAULT 0,              -- 对话 tokens 消耗（非模型维度可为 0）
+  count INTEGER DEFAULT 1,               -- 调用次数
+  cost REAL DEFAULT 0.0,                -- 成本估算（元）
+  meta TEXT DEFAULT '{}',                 -- JSON：额外维度信息
+  created_at TEXT
+);`);
+db.exec('CREATE INDEX IF NOT EXISTS idx_ur_user ON usage_records(username);');
+db.exec('CREATE INDEX IF NOT EXISTS idx_ur_dim ON usage_records(dimension);');
+db.exec('CREATE INDEX IF NOT EXISTS idx_ur_day ON usage_records(created_at);');
+console.log('[db] 创建 model_capabilities/usage_records 表 + providers 扩充列（P2-9~11 模型能力/鉴权/用量）');
+
 // P1-17 版本化迁移框架（2026-11-13）：执行 _migrations 注册表中尚未登记的列迁移
 // 新迁移直接在该框架中追加，逐步替代 db.js 内联 ALTER TABLE 块
 try {

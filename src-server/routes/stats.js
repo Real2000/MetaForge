@@ -167,3 +167,50 @@ router.get('/traces/summary', (req, res) => {
 });
 
 module.exports = router;
+
+/* ==================== P2-11 用量归集 ==================== */
+
+// 记录用量（POST /api/stats/usage）
+router.post('/usage', auth, (req, res) => {
+  const { dimension, dimension_key, tokens, count, cost, meta } = req.body || {};
+  if (!dimension) return res.json({ code: 400, msg: 'dimension 不能为空' });
+  if (!['model', 'tool', 'kb', 'share', 'openapi'].includes(dimension))
+    return res.json({ code: 400, msg: 'dimension 必须为 model/tool/kb/share/openapi 之一' });
+  try {
+    db.prepare(`INSERT INTO usage_records (username, dimension, dimension_key, tokens, count, cost, meta, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now','localtime'))`)
+      .run(req.user.username, dimension, dimension_key || '', tokens || 0, count || 1, cost || 0, JSON.stringify(meta || {}));
+    res.json({ code: 0 });
+  } catch (e) {
+    res.json({ code: 500, msg: e.message });
+  }
+});
+
+// 查询用量汇总（GET /api/stats/usage/summary?dimension=&since=&until=）
+router.get('/usage/summary', auth, (req, res) => {
+  const { dimension, since, until, group_by, page = 1, pageSize = 50 } = req.query;
+  let sql = 'SELECT *, SUM(tokens) AS total_tokens, SUM(count) AS total_count, SUM(cost) AS total_cost FROM usage_records WHERE 1=1';
+  const args = [];
+  if (dimension) { sql += ' AND dimension=?'; args.push(dimension); }
+  if (since) { sql += ' AND created_at >= ?'; args.push(since); }
+  if (until) { sql += ' AND created_at < ?'; args.push(until); }
+  sql += ' GROUP BY dimension';
+  const rows = db.prepare(sql + ' ORDER BY total_cost DESC').all(...args);
+  const total = rows.reduce((s, r) => ({ tokens: s.tokens + r.total_tokens, count: s.count + r.total_count, cost: s.cost + r.total_cost }), { tokens: 0, count: 0, cost: 0 });
+  res.json({ code: 0, data: { summary: rows, grandTotal: total } });
+});
+
+// 查询详细用量明细（GET /api/stats/usage?dimension=&page=&pageSize=）
+router.get('/usage', auth, (req, res) => {
+  const { dimension, dimension_key, since, until, page = 1, pageSize = 50 } = req.query;
+  let sql = 'SELECT * FROM usage_records WHERE 1=1';
+  const args = [];
+  if (dimension) { sql += ' AND dimension=?'; args.push(dimension); }
+  if (dimension_key) { sql += ' AND dimension_key=?'; args.push(dimension_key); }
+  if (since) { sql += ' AND created_at >= ?'; args.push(since); }
+  if (until) { sql += ' AND created_at < ?'; args.push(until); }
+  if (!isAdmin) { sql += ' AND username=?'; args.push(req.user.username); }
+  const total = db.prepare(`SELECT COUNT(*) c FROM usage_records WHERE 1=1${dimension?' AND dimension=?':''}`).get(...(dimension?[dimension]:[])).c;
+  const rows = db.prepare(sql + ' ORDER BY id DESC LIMIT ? OFFSET ?').all(...args, +pageSize, (+page - 1) * +pageSize);
+  res.json({ code: 0, data: { list: rows, total, page: +page, pageSize: +pageSize } });
+});
