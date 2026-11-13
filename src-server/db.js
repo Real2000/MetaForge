@@ -1876,6 +1876,26 @@ db.exec('CREATE INDEX IF NOT EXISTS idx_cri_code ON collab_room_invites(invite_c
 
 console.log('[db] 创建 collab 协作协作表（P2-1 协作房间）');
 
+// P2-2 任务分解表
+db.exec(`CREATE TABLE IF NOT EXISTS collab_room_tasks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  room_id INTEGER NOT NULL,
+  parent_id INTEGER DEFAULT NULL,     -- 父任务 ID（子任务分解）
+  title TEXT NOT NULL DEFAULT '',
+  description TEXT DEFAULT '',
+  assignee TEXT DEFAULT '',            -- 负责人（username 或 agent_id 字符串）
+  assignee_type TEXT DEFAULT 'human',  -- human | ai
+  deps TEXT DEFAULT '[]',             -- 依赖任务 ID 列表 JSON
+  status TEXT DEFAULT 'pending',       -- pending | assigned | running | done | cancelled
+  result TEXT DEFAULT '',              -- 执行结果摘要
+  created_by TEXT DEFAULT '',
+  created_at TEXT,
+  updated_at TEXT
+);`);
+db.exec('CREATE INDEX IF NOT EXISTS idx_crt_room ON collab_room_tasks(room_id);');
+db.exec('CREATE INDEX IF NOT EXISTS idx_crt_parent ON collab_room_tasks(parent_id);');
+console.log('[db] 创建 collab_room_tasks 表（P2-2 任务分解）');
+
 // P1-17 版本化迁移框架（2026-11-13）：执行 _migrations 注册表中尚未登记的列迁移
 // 新迁移直接在该框架中追加，逐步替代 db.js 内联 ALTER TABLE 块
 try {
