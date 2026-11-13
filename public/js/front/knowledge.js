@@ -2,6 +2,7 @@
 import { api } from '../api.js';
 import { esc, toast, modal, confirmBox, fmtBytes } from '../ui.js';
 import { t } from '../i18n.js';
+import { openViewer } from '../viewer.js'; // P1-15 统一文档查看器（分块/全文预览复用）
 
 // ---------- V2.3 #5 摄取管道（2026-10-31）：步骤定义（key 与后端白名单一致） ----------
 // 顺序即默认管道执行顺序；name 为中文步骤名、desc 为一句话说明（配置弹窗展示用）
@@ -231,6 +232,7 @@ export async function render(el) {
               <button class="btn sm ${preview ? 'primary' : ''}" id="oc_tab_full">📄 ${t('全文预览')}</button>
               <button class="btn sm ${preview ? '' : 'primary'}" id="oc_tab_chunks">🧩 ${t('分块列表')}</button>
             </div>
+            <button class="btn sm" id="oc_open_viewer" title="${t('用统一文档查看器打开（适合长文档阅读）')}">📖 ${t('阅读视图')}</button>
             <button class="btn sm" data-gen-meta="${file.id}" title="${t('用已配置模型为每个分块抽取部门/密级/文档类型元数据（V1.2 审查加固：先传文件后开开关的存量文件补抽取途径）')}">🏷 ${t('AI 补抽取元数据')}</button>
             <button class="btn sm" data-gen-kw="${file.id}" title="${t('用已配置模型为每个分块生成检索关键词与问法')}">✨ ${t('AI 生成关键词')}</button>
           </div>
@@ -258,6 +260,9 @@ export async function render(el) {
       foot: `<button class="btn" data-close>${t('关闭')}</button>`,
       onMount(mask, close) {
         mask.querySelector('[data-close]').onclick = close;
+        // P1-15：统一查看器阅读视图（知识库分块与对话产物、分享页共用同一查看器）
+        const viewerBtn = mask.querySelector('#oc_open_viewer');
+        if (viewerBtn) viewerBtn.onclick = () => openViewer({ name: file.name, chunks, note: t('知识库全文 · 依序拼接') });
         // P2-4：全文/分块双视图切换（切换后仅改 display + 按钮高亮，数据零重拉）
         const fullView = mask.querySelector('#oc_full_view');
         const chunksView = mask.querySelector('#oc_chunks_view');

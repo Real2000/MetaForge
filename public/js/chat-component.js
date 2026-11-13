@@ -4,6 +4,7 @@
 import { api, sseChat, getToken } from './api.js';
 import { esc, toast, modal, confirmBox } from './ui.js';
 import { t, getLang } from './i18n.js';
+import './viewer.js'; // P1-15 统一文档查看器（注册 data-doc-preview 委托，产物卡预览用）
 
 /** 错误文案兜底翻译（服务端已尽量给中文，仍可能透出英文原文——最后一道防线） */
 function friendlyError(msg) {
@@ -545,6 +546,7 @@ export function mountChat(el, opts) {
         ? `<div class="ppt-card">
         <div class="ppt-icon">📊</div>
         <div class="ppt-info"><b>${esc(fname)}</b><span>${pages} 页 · PPTX · 可下载编辑</span></div>
+        <button class="btn sm" data-doc-preview="${esc(url)}" data-doc-name="${esc(fname)}" data-doc-kind="pptx">${t('预览')}</button>
         <a class="btn primary" href="${esc(url)}" download="${esc(fname)}" style="text-decoration:none">${t('⬇ 下载')}</a>
       </div>` : '');
     // P3 扩展产物卡（2026-10-22）：[CHART:url|标题] 图表 iframe 卡 / [WORD:url|名] Word 下载卡 / [AUDIO:url] 音频播放卡
@@ -561,6 +563,7 @@ export function mountChat(el, opts) {
         ? `<div class="word-card">
         <div class="word-icon">📄</div>
         <div class="word-info"><b>${esc(fname)}</b><span>DOCX · ${t('Word 文档')} · ${t('可下载编辑')}</span></div>
+        <button class="btn sm" data-doc-preview="${esc(url)}" data-doc-name="${esc(fname)}">${t('预览')}</button>
         <a class="btn primary" href="${esc(url)}" download="${esc(fname)}" style="text-decoration:none">${t('⬇ 下载')}</a>
       </div>` : '');
     html = html.replace(/\[AUDIO:([^\|\]]+)\]/g, (all, url) =>

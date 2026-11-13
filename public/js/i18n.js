@@ -2752,6 +2752,21 @@ const EN = {
   '到期': 'expires',
   '社区版': 'Community Edition',
   '专业版': 'Professional Edition',
+  // ---------- P1-15 文档预览套件 ----------
+  '预览': 'Preview',
+  '文档预览': 'Document Preview',
+  '下载原文': 'Download',
+  '正在渲染…': 'Rendering…',
+  '无法渲染该文档': 'Unable to render this document',
+  '下载原文查看': 'Download to view',
+  '新窗口打开': 'Open in new tab',
+  '阅读视图': 'Reading view',
+  '用统一文档查看器打开（适合长文档阅读）': 'Open in the unified document viewer (better for long documents)',
+  '知识库全文 · 依序拼接': 'Knowledge base full text · concatenated',
+  '已渲染前 {n} 页（共 {m} 页），完整内容请下载原文查看': 'Rendered the first {n} of {m} pages; download to see everything',
+  '仅显示前 {n} 行（共 {m} 行）': 'Showing first {n} of {m} rows',
+  '（空表）': '(empty sheet)',
+  '正在加载预览组件…': 'Loading preview components…',
 };
 
 /** 翻译：中文即 key；英文查词典，缺失回退中文 */
