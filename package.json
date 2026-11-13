@@ -29,6 +29,7 @@
     "vectordb": "^0.21.2"
   },
   "devDependencies": {
-    "autocannon": "^9.0.0"
+    "autocannon": "^9.0.0",
+    "commander": "^15.1.0"
   }
 }

@@ -3,6 +3,11 @@
  * 前台：首页对话 / 智能体 / 知识库 / 任务管理
  * 后台：数据看板 / 智能体管理 / 用户管理 / 知识库管理 / 接入管理 / 模型接入 / 安全合规 / 用量与配额 / 系统监控 / 运营监控
  */
+
+// P2-23 OTEL 外部追踪（必须在所有模块加载前初始化；OTEL_ENABLED=1 时生效）
+if (process.env.OTEL_ENABLED === '1') {
+  try { require('./src-server/lib/opentelemetry'); } catch { }
+}
 const express = require('express');
 const path = require('path');
 const { startScheduler } = require('./src-server/lib/scheduler');
