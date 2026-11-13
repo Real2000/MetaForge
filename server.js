@@ -60,6 +60,8 @@ app.use('/api/dingtalk', require('./src-server/routes/dingtalk'));
 // P5.14 文件一等变量：工作流文件上传/下载（画布 file 变量 + 聊天附件共用）
 app.use('/api/files', require('./src-server/routes/files'));
 app.use('/api/doc', require('./src-server/routes/doc')); // P1-15/16 文档预览（受控原文流 + 权限校验）
+// P2-16 工具注册表统一化（内置工具 + MCP + 子智能体同表登记）
+app.use('/api/tools', require('./src-server/routes/tools'));
 // MCP 服务管理与行业模板库（P2）
 app.use('/api/mcp', require('./src-server/routes/mcp'));
 app.use('/api/templates', require('./src-server/routes/templates'));

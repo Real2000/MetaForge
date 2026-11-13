@@ -1369,5 +1369,54 @@ router.get('/video/tasks/:taskId/content', async (req, res) => {
 });
 
 // V1.2 #2 2026-10-30：resolveKbFilter 挂到 router 导出上（冒烟用例直测占位符替换/fail-closed 语义，无需起服务）
+
+// ==================== P2-17 会话变量与状态 ====================
+
+// GET /api/chat/sessions/:id/vars — 获取会话变量
+router.get('/sessions/:id/vars', auth, (req, res) => {
+  const s = db.prepare('SELECT id, wf_vars FROM sessions WHERE id=?').get(req.params.id);
+  if (!s) return res.json({ code: 404, msg: '会话不存在' });
+  let vars = {};
+  try { vars = JSON.parse(s.wf_vars || '{}'); } catch { vars = {}; }
+  res.json({ code: 0, data: vars });
+});
+
+// PUT /api/chat/sessions/:id/vars — 更新会话变量（全量替换）
+router.put('/sessions/:id/vars', auth, (req, res) => {
+  const s = db.prepare('SELECT id FROM sessions WHERE id=?').get(req.params.id);
+  if (!s) return res.json({ code: 404, msg: '会话不存在' });
+  const { vars } = req.body || {};
+  const payload = typeof vars === 'object' && vars !== null ? JSON.stringify(vars) : (vars || '{}');
+  db.prepare('UPDATE sessions SET wf_vars=?,updated_at=datetime(\'now\',\'localtime\') WHERE id=?').run(payload, s.id);
+  res.json({ code: 0 });
+});
+
+// PATCH /api/chat/sessions/:id/vars — 合并更新会话变量（增量）
+router.patch('/sessions/:id/vars', auth, (req, res) => {
+  const s = db.prepare('SELECT id, wf_vars FROM sessions WHERE id=?').get(req.params.id);
+  if (!s) return res.json({ code: 404, msg: '会话不存在' });
+  let current = {};
+  try { current = JSON.parse(s.wf_vars || '{}'); } catch { current = {}; }
+  const { vars } = req.body || {};
+  if (typeof vars === 'object' && vars !== null) {
+    Object.assign(current, vars);
+  }
+  db.prepare('UPDATE sessions SET wf_vars=?,updated_at=datetime(\'now\',\'localtime\') WHERE id=?').run(JSON.stringify(current), s.id);
+  res.json({ code: 0, data: current });
+});
+
+// GET /api/chat/sessions/:id/state — 获取会话状态（约定键集：phase/status/context）
+router.get('/sessions/:id/state', auth, (req, res) => {
+  const s = db.prepare('SELECT id, wf_vars FROM sessions WHERE id=?').get(req.params.id);
+  if (!s) return res.json({ code: 404, msg: '会话不存在' });
+  let vars = {};
+  try { vars = JSON.parse(s.wf_vars || '{}'); } catch { vars = {}; }
+  // 用约定键提取状态层
+  const stateKeys = ['phase', 'status', 'context', 'step', 'mode', 'error', 'completed'];
+  const state = {};
+  for (const k of stateKeys) { if (vars[k] !== undefined) state[k] = vars[k]; }
+  res.json({ code: 0, data: state });
+});
+
 module.exports = router;
 module.exports.resolveKbFilter = resolveKbFilter;

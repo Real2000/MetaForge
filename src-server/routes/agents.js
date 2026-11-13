@@ -166,9 +166,60 @@ function parseBody(b) {
       const { validateWorkflowV2 } = require('../lib/workflow-schema');
       const r = validateWorkflowV2(b.workflow);
       if (r && r.error) return r; // {error} 交由 PUT 路由返回 400
+      // P2-15 变量引用完整性校验（仅在画布模式下执行）
+      const wfParsed = r ? r : null;
+      if (wfParsed && b.edit_mode === 'canvas') {
+        const wfIssues = checkVariableRefs(wfParsed, variables || []);
+        wfParsed._varIssues = wfIssues;
+        if (wfIssues.length) {
+          return wfParsed; // 将问题附加到返回的画布中，由路由判断是否允许保存
+        }
+      }
       return r ? JSON.stringify(r) : null;
     })(),
   };
+}
+
+/**
+ * P2-15 变量引用完整性校验：检测画布中 LLM 节点输出引用、必填缺失、断链变量。
+ * @param {object} wf      已解析的画布 JSON（{nodes,edges}）
+ * @param {Array}  vars    变量声明列表 [{name,type,required}]
+ * @returns {Array} 问题描述字符串数组
+ */
+function checkVariableRefs(wf, vars) {
+  const issues = [];
+  if (!wf || !wf.nodes) return issues;
+  const usedVars = new Set();
+  const declaredNames = new Set();
+  const requiredMissing = [];
+  for (const v of (vars || [])) {
+    if (v && v.name) {
+      declaredNames.add(v.name);
+      if (v.required) requiredMissing.push(v.name);
+    }
+  }
+  for (const node of wf.nodes) {
+    const data = node.data || {};
+    const dstr = JSON.stringify(data);
+    const refs = dstr.match(/\{\{\w+\}\}/g);
+    if (refs) refs.forEach(r => usedVars.add(r.slice(2, -2)));
+  }
+  // 检查边和conditions也含有变量引用
+  if (wf.edges) {
+    for (const edge of wf.edges) {
+      if (edge.condition) {
+        const refs = String(edge.condition).match(/\{\{\w+\}\}/g);
+        if (refs) refs.forEach(r => usedVars.add(r.slice(2, -2)));
+      }
+    }
+  }
+  // 检查必填变量未被引用
+  for (const v of requiredMissing) {
+    if (!usedVars.has(v)) {
+      issues.push(`必填变量「${v}」在画布中未被任何节点引用`);
+    }
+  }
+  return issues;
 }
 
   // V2.2 #8 2026-10-31 License 功能闸门（接线示范）：community 即含 agents 特性，当前实际不拦——
@@ -293,6 +344,10 @@ router.put('/:id', (req, res) => {
   const spaceDenyUpd = denySpaceNotOwned(a.space_id, req.user); // P2-6 修复：空间归属校验
   if (spaceDenyUpd) return res.json(spaceDenyUpd);
   if (a.workflow && a.workflow.error) return res.json({ code: 400, msg: '画布工作流结构错误：' + a.workflow.error });
+  // P2-15：变量引用完整性检查
+  if (a.edit_mode === 'canvas' && a.workflow && a.workflow._varIssues && a.workflow._varIssues.length) {
+    return res.json({ code: 400, msg: '画布变量引用存在问题', data: { issues: a.workflow._varIssues } });
+  }
   // 有画布数据但无 start 节点 → 结构错误拒绝（前端画布模式应保证有 start）
   // 可见性与协作者名单：仅归属级（创建者/管理员）可改；协作者保存时保留原值（不能自我提权/改可见范围）
   const permEditable = isOwnerLevel(old, req.user);
