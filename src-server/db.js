@@ -1896,6 +1896,90 @@ db.exec('CREATE INDEX IF NOT EXISTS idx_crt_room ON collab_room_tasks(room_id);'
 db.exec('CREATE INDEX IF NOT EXISTS idx_crt_parent ON collab_room_tasks(parent_id);');
 console.log('[db] 创建 collab_room_tasks 表（P2-2 任务分解）');
 
+// ================== P2-4 专家目录 / P2-5 子智能体库 / P2-7 插件体系（2026-11-13）==================
+
+// P2-4 专家目录表：每个专家一条 manifest
+db.exec(`CREATE TABLE IF NOT EXISTS expert_catalog (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  agent_id INTEGER DEFAULT NULL UNIQUE,  -- 可空，未关联智能体时可先创建专家目录
+  identifier TEXT NOT NULL UNIQUE,       -- 英文标识（如 'legal-counsel'）
+  name_zh TEXT NOT NULL DEFAULT '',
+  name_en TEXT NOT NULL DEFAULT '',
+  description_zh TEXT DEFAULT '',
+  description_en TEXT DEFAULT '',
+  welcome TEXT DEFAULT '',               -- 欢迎语
+  icon TEXT DEFAULT '🤖',
+  color TEXT DEFAULT '#818cf8',          -- 配色（主题色）
+  category TEXT DEFAULT '',              -- 业务域（engineering/legal/finance/marketing/test/ops）
+  tags TEXT DEFAULT '[]',                -- 标签 JSON
+  prompt TEXT DEFAULT '',                 -- 核心提示词（来源于 agents.prompt）
+  version INTEGER DEFAULT 1,             -- 版本号
+  status TEXT DEFAULT 'draft',           -- draft | published | deprecated
+  published_by TEXT DEFAULT '',
+  created_by TEXT DEFAULT '',
+  created_at TEXT,
+  updated_at TEXT
+);`);
+db.exec('CREATE INDEX IF NOT EXISTS idx_ec_category ON expert_catalog(category);');
+db.exec('CREATE INDEX IF NOT EXISTS idx_ec_idfr ON expert_catalog(identifier);');
+
+// P2-5 子智能体库：按业务域分类的预配置智能体
+db.exec(`CREATE TABLE IF NOT EXISTS sub_agent_library (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name_zh TEXT NOT NULL DEFAULT '',
+  name_en TEXT NOT NULL DEFAULT '',
+  description_zh TEXT DEFAULT '',
+  description_en TEXT DEFAULT '',
+  prompt TEXT DEFAULT '',                -- 子智能体提示词
+  tools TEXT DEFAULT '[]',               -- 授权工具名列表
+  model_recommend TEXT DEFAULT '',       -- 推荐模型
+  category TEXT DEFAULT '',              -- 业务域
+  icon TEXT DEFAULT '🧩',
+  agent_id INTEGER DEFAULT NULL,         -- 已挂载的智能体 ID（null=未挂载）
+  status TEXT DEFAULT 'active',          -- active | archived
+  source TEXT DEFAULT 'builtin',         -- builtin | custom | market
+  version INTEGER DEFAULT 1,
+  created_by TEXT DEFAULT '',
+  created_at TEXT,
+  updated_at TEXT
+);`);
+db.exec('CREATE INDEX IF NOT EXISTS idx_sal_cat ON sub_agent_library(category);');
+
+// P2-7 插件注册表
+db.exec(`CREATE TABLE IF NOT EXISTS plugins (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  plugin_id TEXT NOT NULL UNIQUE,         -- 唯一插件 ID（如 'code-runner.v2'）
+  name TEXT NOT NULL DEFAULT '',
+  name_en TEXT DEFAULT '',
+  type TEXT DEFAULT 'tool',              -- tool | skill | trigger | event
+  entry TEXT DEFAULT '',                 -- 入口文件或 URL
+  icon TEXT DEFAULT '🧩',
+  description TEXT DEFAULT '',
+  version TEXT DEFAULT '1.0.0',
+  author TEXT DEFAULT '',
+  homepage TEXT DEFAULT '',
+  runtime TEXT DEFAULT 'node',           -- node | python | container
+  settings_schema TEXT DEFAULT '{}',     -- JSON schema 配置面板
+  enabled INTEGER DEFAULT 0,             -- 启用/停用
+  installed_by TEXT DEFAULT '',
+  installed_at TEXT,
+  updated_at TEXT
+);`);
+
+// P2-8 市场对接：远程 Hub 配置表
+db.exec(`CREATE TABLE IF NOT EXISTS market_hubs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL DEFAULT '',
+  url TEXT NOT NULL DEFAULT '',
+  type TEXT DEFAULT 'skill',             -- skill | expert | plugin | agent
+  enabled INTEGER DEFAULT 1,
+  last_sync_at TEXT,
+  sync_status TEXT DEFAULT 'never',      -- never | syncing | success | failed
+  created_at TEXT,
+  updated_at TEXT
+);`);
+console.log('[db] 创建 expert_catalog/sub_agent_library/plugins/market_hubs 表（P2-4~8 资产目录）');
+
 // P1-17 版本化迁移框架（2026-11-13）：执行 _migrations 注册表中尚未登记的列迁移
 // 新迁移直接在该框架中追加，逐步替代 db.js 内联 ALTER TABLE 块
 try {
