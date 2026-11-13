@@ -8,13 +8,14 @@
 const fs = require('fs');
 const path = require('path');
 const { db, now } = require('../db');
+const config = require('./config'); // P1-20 配置中心
 
 const DATA_DIR = process.env.AGENT_DATA_DIR || path.join(__dirname, '..', '..', 'data');
 const BACKUP_DIR = path.join(DATA_DIR, 'backups');
 const UPLOAD_ROOT = path.join(__dirname, '..', '..', 'public', 'uploads');
-const KEEP_BACKUPS = +(process.env.AGENT_BACKUP_KEEP || 30) || 30;       // 备份保留份数
-const UPLOAD_TTL_DAYS = +(process.env.AGENT_UPLOAD_TTL_DAYS || 30) || 30; // 产物保留天数
-const LOG_TTL_DAYS = +(process.env.AGENT_LOG_TTL_DAYS || 90) || 90;       // 日志保留天数
+const KEEP_BACKUPS = config.get('backup_keep') || 30;
+const UPLOAD_TTL_DAYS = config.get('upload_ttl_days') || 30;
+const LOG_TTL_DAYS = config.get('log_ttl_days') || 90;
 
 function dayKey(d = new Date()) {
   return d.toLocaleDateString('sv-SE', { timeZone: 'Asia/Shanghai' }); // YYYY-MM-DD
@@ -27,16 +28,38 @@ function dailyBackup() {
     const fname = `platform-${dayKey()}.db`;
     const target = path.join(BACKUP_DIR, fname);
     if (fs.existsSync(target)) return { ok: true, skipped: true, msg: '今日已备份' }; // 幂等
-    db.prepare(`VACUUM INTO ?`).run(target);
-    // 清理超量旧备份（按文件名日期排序，最旧先删）
+
+    // P1-22 备份排除表支持：先获取配置中的排除表名
+    const excludeRaw = config.get('backup_exclude_tables') || '';
+    const excludeTables = excludeRaw ? excludeRaw.split(',').map(s => s.trim()).filter(Boolean) : [];
+    let tempPath = target;
+
+    // 如果有排除表，先创建临时数据库排除后再备份
+    if (excludeTables.length) {
+      const tmpTarget = path.join(BACKUP_DIR, `.tmp-${fname}`);
+      // 先 VACUUM INTO 到临时文件
+      db.prepare(`VACUUM INTO ?`).run(tmpTarget);
+      // 然后打开临时库删表
+      const tmpDb = require('better-sqlite3')(tmpTarget);
+      for (const tbl of excludeTables) {
+        try { tmpDb.exec(`DROP TABLE IF EXISTS "${tbl}"`); } catch { /* 表不存在跳过 */ }
+      }
+      tmpDb.close();
+      fs.renameSync(tmpTarget, target);
+    } else {
+      db.prepare(`VACUUM INTO ?`).run(target);
+    }
+
+    // 清理超量旧备份
     const all = fs.readdirSync(BACKUP_DIR).filter(f => /^platform-\d{4}-\d{2}-\d{2}\.db$/.test(f)).sort();
     while (all.length > KEEP_BACKUPS) {
       fs.unlinkSync(path.join(BACKUP_DIR, all.shift()));
     }
     const sizeMB = (fs.statSync(target).size / 1048576).toFixed(2);
-    console.log(`[ops] 数据库已备份：${fname}（${sizeMB} MB，共保留 ${all.length} 份）`);
+    const msg = `${fname}（${sizeMB} MB，共保留 ${all.length} 份${excludeTables.length ? `，排除表：${excludeTables.join(',')}` : ''}）`;
+    console.log(`[ops] 数据库已备份：${msg}`);
     db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-      .run('system', '数据库备份', `${fname}（${sizeMB} MB）`, '', now());
+      .run('system', '数据库备份', msg, '', now());
     return { ok: true, msg: fname, sizeMB };
   } catch (e) {
     console.error('[ops] 备份失败：', e.message);
@@ -49,9 +72,12 @@ function dailyBackup() {
 function cleanupUploads() {
   const cutoff = Date.now() - UPLOAD_TTL_DAYS * 86400000;
   let removed = 0, freedMB = 0;
+  const excludeRaw = config.get('backup_exclude_dirs') || '';
+  const excludeDirs = excludeRaw ? new Set(excludeRaw.split(',').map(s => s.trim()).filter(Boolean)) : new Set();
   try {
     if (!fs.existsSync(UPLOAD_ROOT)) return { ok: true, removed: 0 };
     for (const dir of fs.readdirSync(UPLOAD_ROOT)) {
+      if (excludeDirs.has(dir)) continue; // P1-22 排除目录
       const p = path.join(UPLOAD_ROOT, dir);
       if (!fs.statSync(p).isDirectory()) continue;
       for (const f of fs.readdirSync(p)) {

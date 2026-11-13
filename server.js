@@ -87,6 +87,10 @@ app.use('/api/localbridge', require('./src-server/routes/localbridge').router);
 app.use('/api/biz', require('./src-server/routes/biz'));
 // P5.5 通用密钥管理（画布 {{env.XXX}} 占位符数据源；仅管理员）
 app.use('/api/secrets', require('./src-server/routes/secrets'));
+// P1-20 配置中心（统一配置管理，格式检查 + 脱敏回显 + 审计日志）
+app.use('/api/config', require('./src-server/routes/config'));
+// P1-21 API 文档站（自动生成 OpenAPI 规范 + Redoc 渲染页面）
+app.use('/api/api-docs', require('./src-server/routes/api-docs'));
 // P3 MCP Server（2026-10-22 ⑤）：已发布智能体暴露为 MCP 工具（Streamable HTTP + Bearer 令牌；管理端 /api/mcp-server）
 app.use('/mcp', require('./src-server/routes/mcp-server'));
 app.use('/api/mcp-server', require('./src-server/routes/mcp-server'));
