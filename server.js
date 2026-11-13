@@ -87,6 +87,8 @@ app.use('/api/localbridge', require('./src-server/routes/localbridge').router);
 app.use('/api/biz', require('./src-server/routes/biz'));
 // P5.5 通用密钥管理（画布 {{env.XXX}} 占位符数据源；仅管理员）
 app.use('/api/secrets', require('./src-server/routes/secrets'));
+// P2-1~3 协作房间+任务分解+人机协同（2026-11-13）
+app.use('/api/collab', require('./src-server/routes/collab'));
 // P1-20 配置中心（统一配置管理，格式检查 + 脱敏回显 + 审计日志）
 app.use('/api/config', require('./src-server/routes/config'));
 // P1-21 API 文档站（自动生成 OpenAPI 规范 + Redoc 渲染页面）

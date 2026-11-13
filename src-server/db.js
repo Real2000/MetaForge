@@ -1793,6 +1793,89 @@ db.exec(`CREATE TABLE IF NOT EXISTS tool_approvals (
 );`);
 db.exec('CREATE INDEX IF NOT EXISTS idx_tool_approvals_status ON tool_approvals(status, id);');
 
+// ================== P2-1 协作房间（2026-11-13）==================
+
+// 房间表
+db.exec(`CREATE TABLE IF NOT EXISTS collab_rooms (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL DEFAULT '',
+  description TEXT DEFAULT '',
+  room_type TEXT DEFAULT 'collab',   -- collab | huddle（协作 / 快闪）
+  host TEXT NOT NULL DEFAULT '',      -- 主持人 username
+  model TEXT DEFAULT '',              -- 房间默认模型
+  status TEXT DEFAULT 'active',       -- active | archived | closed
+  settings TEXT DEFAULT '{}',         -- JSON：允许@所有人/允许撤回/自动AI加入等
+  created_at TEXT,
+  updated_at TEXT,
+  closed_at TEXT
+);`);
+
+// 成员表
+db.exec(`CREATE TABLE IF NOT EXISTS collab_room_members (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  room_id INTEGER NOT NULL,
+  username TEXT NOT NULL,
+  role TEXT DEFAULT 'member',         -- host | admin | member | viewer
+  nickname TEXT DEFAULT '',
+  joined_at TEXT,
+  left_at TEXT,
+  status TEXT DEFAULT 'active'        -- active | left | kicked
+);`);
+db.exec('CREATE INDEX IF NOT EXISTS idx_crm_room ON collab_room_members(room_id);');
+db.exec('CREATE INDEX IF NOT EXISTS idx_crm_user ON collab_room_members(username);');
+
+// AI 参与者表（智能体作为协作者加入）
+db.exec(`CREATE TABLE IF NOT EXISTS collab_ai_participants (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  room_id INTEGER NOT NULL,
+  agent_id INTEGER NOT NULL,
+  role TEXT DEFAULT 'collaborator',   -- lead | collaborator | watcher
+  instruction TEXT DEFAULT '',        -- 该AI在此房间的角色提示
+  status TEXT DEFAULT 'active',       -- active | paused | removed
+  added_by TEXT DEFAULT '',
+  added_at TEXT
+);`);
+db.exec('CREATE INDEX IF NOT EXISTS idx_cap_room ON collab_ai_participants(room_id);');
+db.exec('CREATE INDEX IF NOT EXISTS idx_cap_agent ON collab_ai_participants(agent_id);');
+
+// 房间消息表
+db.exec(`CREATE TABLE IF NOT EXISTS collab_room_messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  room_id INTEGER NOT NULL,
+  parent_id INTEGER DEFAULT NULL,     -- 回复目标消息ID（线程/回复）
+  sender TEXT NOT NULL DEFAULT '',     -- username 或 'agent:{$agentId}'
+  role TEXT DEFAULT 'user',           -- user | ai | system
+  content TEXT NOT NULL DEFAULT '',
+  attachments TEXT DEFAULT '[]',      -- JSON：附件列表[{name,url,type}]
+  msg_type TEXT DEFAULT 'text',       -- text | system | task | image | file
+  meta TEXT DEFAULT '{}',             -- JSON：来源/模型等扩展字段
+  recalled INTEGER DEFAULT 0,         -- 1=已撤回（软删除）
+  hidden_for TEXT DEFAULT '[]',       -- ['userA','userB'] 特定成员隐藏
+  read_by TEXT DEFAULT '[]',          -- ['userA','userB'] 已读用户
+  edited_at TEXT,
+  created_at TEXT
+);`);
+db.exec('CREATE INDEX IF NOT EXISTS idx_crm_msg_room ON collab_room_messages(room_id, id);');
+db.exec('CREATE INDEX IF NOT EXISTS idx_crm_msg_parent ON collab_room_messages(parent_id);');
+
+// 邀请表
+db.exec(`CREATE TABLE IF NOT EXISTS collab_room_invites (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  room_id INTEGER NOT NULL,
+  invite_code TEXT NOT NULL UNIQUE,
+  target_username TEXT DEFAULT '',     -- 空=公开邀请；非空=定向邀请
+  role TEXT DEFAULT 'member',         -- 受邀请将成为的角色
+  max_use INTEGER DEFAULT 0,          -- 0=无限
+  use_count INTEGER DEFAULT 0,
+  expires_at TEXT,
+  created_by TEXT NOT NULL DEFAULT '',
+  enabled INTEGER DEFAULT 1,
+  created_at TEXT
+);`);
+db.exec('CREATE INDEX IF NOT EXISTS idx_cri_code ON collab_room_invites(invite_code);');
+
+console.log('[db] 创建 collab 协作协作表（P2-1 协作房间）');
+
 // P1-17 版本化迁移框架（2026-11-13）：执行 _migrations 注册表中尚未登记的列迁移
 // 新迁移直接在该框架中追加，逐步替代 db.js 内联 ALTER TABLE 块
 try {
