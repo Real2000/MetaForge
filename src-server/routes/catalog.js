@@ -18,9 +18,8 @@ router.get('/experts', (req, res) => {
   const args = [];
   if (category) { sql += ' AND category=?'; args.push(category); }
   if (status) { sql += ' AND status=?'; args.push(status); }
-  else { sql += " AND status='published'"; }
   sql += ' ORDER BY id DESC';
-  const total = db.prepare(`SELECT COUNT(*) c FROM expert_catalog WHERE 1=1${category?' AND category=?':''}${status?' AND status=?':" AND status='published'"}`).get(...(category?[category]:[]), ...(status?[status]:[])).c;
+  const total = db.prepare(`SELECT COUNT(*) c FROM expert_catalog WHERE 1=1${category?' AND category=?':''}${status?' AND status=?':''}`).get(...(category?[category]:[]), ...(status?[status]:[])).c;
   const rows = db.prepare(sql + ' LIMIT ? OFFSET ?').all(...args, +pageSize, (+page - 1) * +pageSize);
   res.json({ code: 0, data: { list: rows, total, page: +page, pageSize: +pageSize } });
 });
