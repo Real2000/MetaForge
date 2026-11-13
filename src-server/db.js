@@ -1792,3 +1792,12 @@ db.exec(`CREATE TABLE IF NOT EXISTS tool_approvals (
   created_at TEXT
 );`);
 db.exec('CREATE INDEX IF NOT EXISTS idx_tool_approvals_status ON tool_approvals(status, id);');
+
+// P1-17 版本化迁移框架（2026-11-13）：执行 _migrations 注册表中尚未登记的列迁移
+// 新迁移直接在该框架中追加，逐步替代 db.js 内联 ALTER TABLE 块
+try {
+  const { runMigrations, ALL_MIGRATIONS } = require('./lib/migrate');
+  runMigrations(ALL_MIGRATIONS);
+} catch (e) {
+  console.error('[migrate] 迁移框架初始化失败（非致命）：', e.message);
+}
