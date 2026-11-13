@@ -2028,6 +2028,83 @@ db.exec('CREATE INDEX IF NOT EXISTS idx_ur_dim ON usage_records(dimension);');
 db.exec('CREATE INDEX IF NOT EXISTS idx_ur_day ON usage_records(created_at);');
 console.log('[db] 创建 model_capabilities/usage_records 表 + providers 扩充列（P2-9~11 模型能力/鉴权/用量）');
 
+// ================== P2-12 文件台账与修订（2026-11-13）==================
+db.exec(`CREATE TABLE IF NOT EXISTS file_catalog (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL DEFAULT '',           -- 文件名
+  type TEXT DEFAULT 'unknown',             -- 文件类型：pdf|docx|xlsx|pptx|image|txt|markdown|csv|code|other
+  path TEXT DEFAULT '',                    -- 源路径
+  url TEXT DEFAULT '',                     -- 公共 URL
+  size INTEGER DEFAULT 0,                 -- 字节
+  hash TEXT DEFAULT '',                    -- SHA256 文件指纹（内容去重）
+  source TEXT DEFAULT 'upload',            -- upload | import | sync | export | attach
+  ref_type TEXT DEFAULT '',                -- 关联类型：kb | session | wf | share
+  ref_id INTEGER DEFAULT NULL,             -- 关联记录 ID
+  owner TEXT DEFAULT '',                   -- 归属用户
+  status TEXT DEFAULT 'active',            -- active | archived | deleted
+  meta TEXT DEFAULT '{}',                  -- JSON 扩展元数据
+  created_at TEXT,
+  updated_at TEXT
+);`);
+db.exec(`CREATE TABLE IF NOT EXISTS file_revisions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  file_id INTEGER NOT NULL,                -- 关联 file_catalog.id
+  version INTEGER NOT NULL,                -- 版本号（从 1 递增）
+  name TEXT DEFAULT '',                     -- 该版本的文件名
+  size INTEGER DEFAULT 0,                  -- 该版本大小
+  hash TEXT DEFAULT '',                     -- 该版本 SHA256
+  path TEXT DEFAULT '',                     -- 该版本存储路径
+  change_note TEXT DEFAULT '',              -- 变更备注
+  created_by TEXT DEFAULT '',
+  created_at TEXT
+);`);
+db.exec('CREATE INDEX IF NOT EXISTS idx_fc_owner ON file_catalog(owner);');
+db.exec('CREATE INDEX IF NOT EXISTS idx_fc_source ON file_catalog(source);');
+db.exec('CREATE INDEX IF NOT EXISTS idx_fc_hash ON file_catalog(hash);');
+db.exec('CREATE INDEX IF NOT EXISTS idx_fr_file ON file_revisions(file_id, version);');
+
+// ================== P2-13 外部知识库登记（2026-11-13）==================
+db.exec(`CREATE TABLE IF NOT EXISTS external_sources (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kb_id INTEGER NOT NULL,                  -- 关联 kbs.id
+  name TEXT NOT NULL DEFAULT '',            -- 数据源名称
+  type TEXT NOT NULL DEFAULT '',            -- confluence | notion | sharepoint | web | api | s3 | custom
+  config TEXT DEFAULT '{}',                 -- JSON：连接配置（URL/Key 用 $ref 引用 secrets 表，不直接存储明文）
+  sync_interval INTEGER DEFAULT 0,          -- 同步间隔（分钟，0=手动）
+  last_sync_at TEXT,
+  sync_status TEXT DEFAULT 'never',         -- never | syncing | success | partial | failed
+  sync_message TEXT DEFAULT '',
+  doc_count INTEGER DEFAULT 0,              -- 已同步文档数
+  enabled INTEGER DEFAULT 1,
+  created_by TEXT DEFAULT '',
+  created_at TEXT,
+  updated_at TEXT
+);`);
+db.exec('CREATE INDEX IF NOT EXISTS idx_es_kb ON external_sources(kb_id);');
+
+// ================== P2-14 召回质量闭环（2026-11-13）==================
+// 召回评测结果表：每次跑召回对比的记录，scores JSON 存储各评测条目得分
+db.exec(`CREATE TABLE IF NOT EXISTS recall_eval_results (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kb_id INTEGER NOT NULL,                  -- 评测对象知识库
+  eval_name TEXT DEFAULT '',                -- 评测名称（如 '2026-11月度回归'）
+  version TEXT DEFAULT '',                  -- 评测版本标记
+  type TEXT DEFAULT 'full',                 -- full（全量）| incremental（增量）
+  total_questions INTEGER DEFAULT 0,        -- 题目总数
+  avg_recall REAL DEFAULT 0.0,             -- 平均召回率
+  avg_accuracy REAL DEFAULT 0.0,           -- 平均准确率
+  scores TEXT DEFAULT '[]',                 -- JSON：每条评分详情 [{question_id,recall,accuracy,note}]
+  negatives TEXT DEFAULT '[]',              -- JSON：本次新沉淀的差评案例
+  missees TEXT DEFAULT '[]',               -- JSON：未命中案例
+  triggered_by TEXT DEFAULT 'manual',       -- manual | schedule | threshold
+  created_by TEXT DEFAULT '',
+  created_at TEXT
+);`);
+db.exec('CREATE INDEX IF NOT EXISTS idx_rer_kb ON recall_eval_results(kb_id);');
+db.exec('CREATE INDEX IF NOT EXISTS idx_rer_time ON recall_eval_results(created_at);');
+
+console.log('[db] 创建 file_catalog/file_revisions/external_sources/recall_eval_results 表（P2-12~14 文件台账/外部知识库/召回闭环）');
+
 // P1-17 版本化迁移框架（2026-11-13）：执行 _migrations 注册表中尚未登记的列迁移
 // 新迁移直接在该框架中追加，逐步替代 db.js 内联 ALTER TABLE 块
 try {
