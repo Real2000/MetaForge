@@ -12,6 +12,7 @@
  *   wecom    —— 企微自建应用消息（与钉钉同构，待凭证）
  */
 const feishu = require('./im-feishu');
+const wecom = require('./im-wecom'); // U0-1 企业微信适配器
 
 const adapters = {
   // P1-9 飞书适配器：统一接口命名（accessToken/send/handleEvent）
@@ -40,10 +41,10 @@ const adapters = {
     handleEvent: () => ({ error: 'MQTT 适配器为预留接口，尚未实现' }),
   },
   wecom: {
-    status: 'reserved',
-    accessToken: async () => null,
-    send: async () => ({ ok: false, error: '企业微信适配器为预留接口，尚未实现' }),
-    handleEvent: () => ({ error: '企业微信适配器为预留接口，尚未实现' }),
+    status: 'active',
+    accessToken: wecom.wecomAccessToken,
+    send: wecom.wecomSend,
+    handleEvent: wecom.handleWecomEvent,
   },
 };
 

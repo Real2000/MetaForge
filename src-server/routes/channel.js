@@ -16,7 +16,20 @@ const router = express.Router();
 
 // ---------------- P1-9 IM 事件回调（免 auth：飞书/企微服务器回调不带平台 token，
 // 安全靠渠道侧 URL 验证握手 + 渗透面与钩钉 callback 同构；必须注册在 router.use(auth) 之前） ----------------
-/** POST /api/channel/event/:id —— 飞书事件订阅填此地址；URL 验证握手 / 消息事件均走这里 */
+/** POST /api/channel/event/:id —— 飞书/企微事件订阅共用的回调端点 */
+router.get('/event/:id', async (req, res) => {
+  // 企微 URL 验证握手（GET + query params）
+  const ch = db.prepare('SELECT id, type, enabled FROM channels WHERE id=?').get(Number(req.params.id));
+  if (!ch) return res.status(404).json({ code: 404, msg: '渠道不存在' });
+  const adapter = getAdapter(ch.type);
+  if (!adapter || adapter.status === 'reserved') return res.status(200).send(req.query.echostr || '');
+  try {
+    const result = adapter.handleEvent(ch.id, req.query, null);
+    if (result?.echo) return res.send(result.echo);
+    return res.status(400).json({ code: 400, msg: 'URL 验证失败' });
+  } catch { return res.status(500).json({ code: 500, msg: '事件处理异常' }); }
+});
+
 router.post('/event/:id', async (req, res) => {
   const ch = db.prepare('SELECT id, type, enabled FROM channels WHERE id=?').get(Number(req.params.id));
   if (!ch) return res.status(404).json({ code: 404, msg: '渠道不存在' });
@@ -26,7 +39,9 @@ router.post('/event/:id', async (req, res) => {
     return res.status(200).json({ code: 0, msg: `渠道类型 ${ch.type} 适配器为预留接口，事件已接收但未处理` });
   }
   try {
-    const result = adapter.handleEvent(ch.id, req.headers, req.body || {});
+    // 飞书: body 是 JSON；企微: body 是 XML 字符串
+    const rawBody = typeof req.body === 'string' ? req.body : (req.body || {});
+    const result = adapter.handleEvent(ch.id, req.headers, rawBody);
     // 飞书 url 验证握手：必须回 { challenge }
     if (result?.challenge) return res.json({ challenge: result.challenge });
     if (result?.error) return res.status(400).json({ code: 400, msg: result.error });
