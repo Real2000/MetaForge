@@ -24,6 +24,7 @@
     "express": "^4.21.1",
     "mammoth": "^1.13.0",
     "msedge-tts": "^2.1.0",
+    "multer": "^2.5.0",
     "pdf-parse": "^2.4.5",
     "pptxgenjs": "^4.0.1",
     "vectordb": "^0.21.2"

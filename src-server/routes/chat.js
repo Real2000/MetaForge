@@ -1418,5 +1418,28 @@ router.get('/sessions/:id/state', auth, (req, res) => {
   res.json({ code: 0, data: state });
 });
 
+// ==================== U0-2 STT 语音识别 + 录音上传 ====================
+
+const multer = require('multer');
+const sttUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 25 * 1024 * 1024 }, // 25MB
+});
+
+router.post('/stt', auth, sttUpload.single('audio'), async (req, res) => {
+  if (!req.file) return res.json({ code: 400, msg: '请上传音频文件' });
+  try {
+    const sttModule = require('../lib/stt');
+    const result = await sttModule.stt({ audio: req.file.buffer, format: req.file.originalname?.split('.').pop() || 'webm', language: req.body?.language || 'zh' });
+    if (result.ok) {
+      res.json({ code: 0, data: { text: result.text, provider: result.provider } });
+    } else {
+      res.json({ code: 500, msg: result.error || '语音识别失败' });
+    }
+  } catch (e) {
+    res.json({ code: 500, msg: '语音识别异常：' + e.message });
+  }
+});
+
 module.exports = router;
 module.exports.resolveKbFilter = resolveKbFilter;
