@@ -937,6 +937,9 @@ async function runGraph(wf, inputVars = {}, ctx = {}) {
       emit({ event: 'nodeDone', nodeId: id, type: node.type, title: node.data?.title || id, ok: true, ms: Date.now() - t0, preview, retries, ...childInfo, ...costInfo,
         inputs: maskSecrets(JSON.stringify(inputs)).slice(0, 2000), outputFull: maskSecrets(JSON.stringify(out)).slice(0, 2000) });
 
+      // U1-3 工作流断点检查点（预留——当前代码已透传 _currentRunId，写入在确认检测通过后单独激活）
+      if (false && ctx._currentRunId) { const checkpoint = JSON.stringify({ results, logs, branchOf: Object.fromEntries(branchOf), node_logs: logs, lastNodeId: id }); try { db.prepare('UPDATE workflow_runs SET node_checkpoint=? WHERE id=?').run(checkpoint, ctx._currentRunId); } catch {} }
+
       if (node.type === 'end' && !output) output = out.reply;
     } catch (err) {
       // P5.11 异常分支（最高优先级）：节点画了 __error__ 出边 → 不中断不走策略，错误信息成输出变量（补救节点可引用），激活切换到异常分支
@@ -1011,7 +1014,7 @@ async function runWorkflow(agent, inputVars = {}, context = {}) {
   if (typeof wf === 'string') { try { wf = JSON.parse(wf); } catch { wf = null; } }
   if (!wf || !Array.isArray(wf.nodes) || !wf.nodes.length) throw new Error('未编排工作流（画布为空）');
   // P5.6：flow_type 透传给子图执行（Chatflow 下 llm 默认携带历史）
-  return runGraph(wf, inputVars, { ...context, flowType: wf.flow_type === 'chatflow' ? 'chatflow' : 'workflow' });
+  return runGraph(wf, inputVars, { ...context, flowType: wf.flow_type === 'chatflow' ? 'chatflow' : 'workflow', _currentRunId: context._currentRunId });
 }
 
 /**

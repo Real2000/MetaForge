@@ -1015,6 +1015,15 @@ db.exec(`CREATE INDEX IF NOT EXISTS idx_wf_runs_agent ON workflow_runs(agent_id,
   }
   db.exec(`CREATE INDEX IF NOT EXISTS idx_wf_runs_parent ON workflow_runs(parent_run_id) WHERE parent_run_id IS NOT NULL;`); // 索引在列迁移之后（新库 CREATE TABLE 无此列）
 }
+// U1-3 工作流断点恢复（2026-11-13）：workflow_runs.node_checkpoint 存每个节点完成后的中间结果/logs。
+// 执行中断后从最后检查点续跑（runGraph 的 skipSet 模式），恢复行为落审计日志
+{
+  const wfRunCols = db.prepare('PRAGMA table_info(workflow_runs)').all().map(c => c.name);
+  if (!wfRunCols.includes('node_checkpoint')) {
+    db.exec('ALTER TABLE workflow_runs ADD COLUMN node_checkpoint TEXT DEFAULT NULL');
+    console.log('[db] workflow_runs 表已迁移：新增 node_checkpoint 字段（U1-3 工作流断点恢复）');
+  }
+}
 // P5.8 差异化能力 #11：tasks 表支持 Webhook 触发（exec_type='webhook' + webhook_token 路由鉴权）
 {
   const taskCols = db.prepare('PRAGMA table_info(tasks)').all().map(c => c.name);
