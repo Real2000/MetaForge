@@ -299,4 +299,31 @@ router.post('/mock-dispatch', adminOnly, (req, res) => {
   res.json({ code: 0, data: { model: { ...model, raw: undefined }, verdict } });
 });
 
+// ==================== U0-5 卡片消息回调 ====================
+
+/** POST /api/channel/card-callback —— 用户点击卡片按钮后的回调端点
+ *  钉钉卡片点击按钮 → 用户确认/拒绝 → 回调到此端点 → 解析决议 → 写 tool_approvals
+ *  body: { channel, callbackData, action, user_id, reason? }
+ *    callbackData: 卡片发送时携带的 confirm_key
+ *    action: 'approve' | 'reject'
+ */
+router.post('/card-callback', async (req, res) => {
+  const { channel, callbackData, action, user_id, reason } = req.body || {};
+  if (!callbackData || !action) return res.json({ code: 400, msg: '缺少 callbackData 或 action' });
+  if (!['approve', 'reject'].includes(action)) return res.json({ code: 400, msg: 'action 应为 approve 或 reject' });
+  try {
+    // 查找对应的 tool_approval 记录
+    const row = db.prepare('SELECT * FROM tool_approvals WHERE confirm_key=?').get(callbackData);
+    if (!row) return res.json({ code: 404, msg: '审批记录不存在（可能已过期或已被处理）' });
+    if (row.status !== 'pending') return res.json({ code: 400, msg: '该审批已有处理结果（' + row.status + '），无法再次操作' });
+
+    const newStatus = action === 'approve' ? 'approved' : 'rejected';
+    db.prepare('UPDATE tool_approvals SET status=?, approver=?, decision_at=?, reason=? WHERE confirm_key=? AND status="pending"')
+      .run(newStatus, user_id || 'card-user', now(), reason || '', callbackData);
+    res.json({ code: 0, data: { confirm_key: callbackData, status: newStatus } });
+  } catch (e) {
+    res.status(500).json({ code: 500, msg: '卡片回调处理失败：' + e.message });
+  }
+});
+
 module.exports = router;
