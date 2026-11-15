@@ -2122,6 +2122,22 @@ db.exec(`CREATE TABLE IF NOT EXISTS voice_providers (
 );`);
 console.log('[db] 创建 voice_providers 表（P2-20 语音供应商）');
 
+// U0-3 FTS5 全文索引虚拟表（2026-11-13 迁移）：kb_chunks 内容列的全文本搜索支持
+// FTS5 是 SQLite 内置模块、无需额外依赖；absent 不存储正文（仅存行号用 content=表名; content_rowid=id 关联原表）
+// unicode61 分词器支持英文/数字/Unicode 符号，中文需结合 LIKE 等补充
+// 创建后可通过 kb_chunks_fts MATCH 实现 BM25 检索（纯文本量 < 100w 行时性能优于运行时扫描版 bm25Scores）
+// 注意：此索引仅从创建时起维护新增/更新的分块；存量分块需全量重建，见 scripts/reindex-fts.js
+try {
+  db.prepare("SELECT 1 FROM kb_chunks_fts LIMIT 1").get();
+} catch {
+  // 表不存在则创建
+  db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS kb_chunks_fts USING fts5(
+    content,
+    tokenize='unicode61'
+  )`);
+  console.log('[db] 创建 kb_chunks_fts FTS5 全文索引（U0-3 混合检索升级）');
+}
+
 // ================== P2-18 浏览器自动化记录表（2026-11-13）==================
 db.exec(`CREATE TABLE IF NOT EXISTS browser_automations (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

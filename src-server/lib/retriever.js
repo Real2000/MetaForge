@@ -195,8 +195,32 @@ function parseVec(s) {
   } catch { return { v: null, engine: null }; }
 }
 
-/** BM25 通道打分（r._idx 存在时用扩展索引文本 = 原文 + 关键词/问法，提升换说法召回） */
-function bm25Scores(rows, qTerms) {
+/** BM25 通道打分（U0-3：FTS5 可选。useFts=true 时走 SQL MATCH，缺省运行时扫描维持既有测试行为） */
+function bm25Scores(rows, qTerms, opts) {
+  if (opts && opts.useFts) {
+    try {
+      const hasFts = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='kb_chunks_fts'").get();
+      if (hasFts) return bm25ScoresFts5(rows, qTerms);
+    } catch { /* 退化 */ }
+  }
+  return bm25ScoresMemory(rows, qTerms);
+}
+
+/** FTS5 加速版 */
+function bm25ScoresFts5(rows, qTerms) {
+  if (!rows.length || !qTerms.length) return rows.map(() => 0);
+  const ftsQuery = qTerms.filter(t => t.length > 0).join(' OR ');
+  if (!ftsQuery.trim()) return rows.map(() => 0);
+  const ids = rows.map(r => r.id);
+  const ph = ids.map(() => '?').join(',');
+  const ftsRows = db.prepare(`SELECT rowid, bm25(kb_chunks_fts, 0) AS fts_score FROM kb_chunks_fts WHERE kb_chunks_fts MATCH ? AND rowid IN (${ph})`).all(ftsQuery, ...ids);
+  const scoreMap = new Map();
+  for (const r of ftsRows) scoreMap.set(r.rowid, -r.fts_score);
+  return rows.map(r => scoreMap.get(r.id) || 0);
+}
+
+/** 内存 BM25 通道打分（原实现，匹配增强关键词/问法扩展 _idx） */
+function bm25ScoresMemory(rows, qTerms) {
   const N = rows.length;
   const df = new Map();
   const docTerms = rows.map(r => {

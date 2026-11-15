@@ -410,13 +410,19 @@ router.post('/recall-test', async (req, res) => {
   }
   // V1.2 #2 2026-10-30：元数据过滤参数——sanitizeMetadata 清洗后传 retrieve；空对象不传（与无过滤行为一致）
   const mFilter = sanitizeMetadata(metadataFilter);
+  const vecWeight = vector_weight !== undefined ? Number(vector_weight) : 0.5;
+  const isPureVec = vecWeight >= 1;
+  const isPureBm25 = vecWeight <= 0;
+  const mode = isPureVec ? 'pure_vector' : (isPureBm25 ? 'pure_bm25' : 'hybrid');
   const hits = await retrieve(query, kbId, top_n || 5, threshold ?? 0.01, {
-    vecWeight: vector_weight,               // 向量权重 0~1（默认 0.5，滑块实时调）
-    rerankModel: rerank_model || null,      // 重排模型（下拉选择）
+    vecWeight,                              // 0=纯BM25  / 1=纯向量 / 默认0.5均衡
+    rerankModel: rerank_model || null,      // 重排模型（下拉选择，null=默认）
     rerankEnabled: rerank_enabled !== false, // 重排开关（对比效果用）
-    ...(Object.keys(mFilter).length ? { metadataFilter: mFilter } : {}), // V1.2 #2：非空才下发（AND 语义，fail-closed）
+    ...(Object.keys(mFilter).length ? { metadataFilter: mFilter } : {}),
   });
-  res.json({ code: 0, data: { query, hits, count: hits.length, mode: 'hybrid' } });
+  // 检查最终结果中是否有 rerank_score 来判断重排是否实际生效
+  const rerankApplied = hits.some(h => h.rerank_score !== undefined && h.rerank_score !== null);
+  res.json({ code: 0, data: { query, hits, count: hits.length, mode, rerankApplied, vecWeight } });
 });
 
 // ---------- V1.3 #6 2026-10-30：知识库级召回评测集（保存/列表/重跑 diff/删除，全端点归属校验） ----------
