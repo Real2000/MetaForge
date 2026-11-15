@@ -1156,6 +1156,18 @@ router.post('/stream', async (req, res) => {
         return r;
       } catch (e) { markExecuted(); throw e; }
     };
+    if (!model && agent?.model === 'auto') {
+      try {
+        const { autoRoute } = require('../lib/model-router');
+        const routeResult = await autoRoute({ input, attachments: req.body?.attachments, agentName: agent?.name });
+        if (routeResult.ok) {
+          model = routeResult.model;
+          console.log(`[route] ${agent?.name} auto → ${routeResult.model}@${routeResult.provider}`);
+        } else {
+          console.warn(`[route] ${agent?.name} auto route failed: ${routeResult.error}`);
+        }
+      } catch (e) { console.warn('[route] auto route exception:', e.message); }
+    }
     const gen = workflowGen || classifierGen || chat(messages, {
       model: model || agent?.model,
       username: req.user.username, // P3：用户自有模型优先路由（自带 Key 只为选中的模型买单）
