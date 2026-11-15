@@ -2154,6 +2154,25 @@ db.exec(`CREATE TABLE IF NOT EXISTS browser_automations (
 );`);
 console.log('[db] 创建 browser_automations 表（P2-18 浏览器自动化）');
 
+// ================== U0-6 A2A 任务审计表（2026-11-13）==================
+db.exec(`CREATE TABLE IF NOT EXISTS a2a_tasks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id TEXT NOT NULL UNIQUE,            -- A2A 标准 task_id 格式
+  agent_id INTEGER NOT NULL,
+  agent_name TEXT DEFAULT '',
+  input TEXT DEFAULT '{}',
+  output TEXT DEFAULT '{}',
+  status TEXT DEFAULT 'submitted',         -- submitted | working | input_required | completed | failed | canceled
+  error TEXT DEFAULT '',
+  meta TEXT DEFAULT '{}',
+  created_by TEXT DEFAULT '',
+  created_at TEXT,
+  updated_at TEXT
+);`);
+db.exec('CREATE INDEX IF NOT EXISTS idx_a2a_task_id ON a2a_tasks(task_id);');
+db.exec('CREATE INDEX IF NOT EXISTS idx_a2a_status ON a2a_tasks(status);');
+console.log('[db] 创建 a2a_tasks 表（U0-6 A2A Task 审计）');
+
 // P1-17 版本化迁移框架（2026-11-13）：执行 _migrations 注册表中尚未登记的列迁移
 // 新迁移直接在该框架中追加，逐步替代 db.js 内联 ALTER TABLE 块
 try {
