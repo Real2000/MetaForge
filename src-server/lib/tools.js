@@ -100,6 +100,64 @@ const TOOL_DEFS = {
       }
     },
   },
+
+  // U1-4 浏览器自动化工具（GUI Agent 工具化）
+  browser_use: {
+    schema: {
+      type: 'function',
+      function: {
+        name: 'browser_use',
+        description: '使用浏览器自动化执行网页操作：导航、截图、点击、输入文本。适合需要访问外部网页、抓取屏幕内容的场景。高危操作需审批。',
+        parameters: {
+          type: 'object',
+          properties: {
+            url: { type: 'string', description: '要访问的网页地址（必须以 http:// 或 https:// 开头）' },
+            action: { type: 'string', enum: ['navigate', 'screenshot', 'click', 'type'], description: '操作类型：navigate=导航/screenshot=截图/click=点击元素/type=输入文本' },
+            selector: { type: 'string', description: 'CSS 选择器（click/type 必填，如 #submit-button）' },
+            text: { type: 'string', description: '输入的文本（type 必填）' },
+          },
+          required: ['url', 'action'],
+        },
+      },
+    },
+    run: async (args) => {
+      const { url, action, selector, text } = args || {};
+      if (!url) return '请提供 URL';
+      try {
+        const ba = require('./browser-automation');
+        const session = await ba.launchSession();
+        if (!session || !session.session_id) return '浏览器自动化不可用（需要安装 playwright：npm install playwright）';
+        const sid = session.session_id;
+        if (action === 'navigate' || !action) {
+          const nav = await ba.navigate(sid, url);
+          await ba.closeSession(sid);
+          return `✅ 已导航到 ${url}（标题：${nav?.title || ''}）`;
+        }
+        if (action === 'screenshot' || !action) {
+          await ba.navigate(sid, url);
+          const shot = await ba.screenshot(sid);
+          await ba.closeSession(sid);
+          return `已截取 ${url} 的屏幕截图（${shot?.size || 0} 字节）。请注意：base64 图片数据仅在当前对话中可用，不会持久化。\n![截图](data:image/png;base64,${shot?.base64 || ''})`;
+        }
+        if (action === 'click') {
+          await ba.navigate(sid, url);
+          await ba.click(sid, selector);
+          await ba.closeSession(sid);
+          return `✅ 已在 ${url} 页面上点击元素「${selector}」`;
+        }
+        if (action === 'type') {
+          await ba.navigate(sid, url);
+          await ba.typeText(sid, selector, text);
+          await ba.closeSession(sid);
+          return `✅ 已在 ${url} 的「${selector}」输入文本`;
+        }
+        await ba.closeSession(sid);
+        return `未知操作：${action}`;
+      } catch (e) {
+        return `浏览器自动化执行失败：${e.message}`;
+      }
+    },
+  },
 };
 
 // P3 扩展工具（2026-10-22）：Text2SQL / 图表 / 联网 / 行情 / Word 导出 / TTS / 文档评审（tools-extra.js 注册合并；只取工具定义，忽略其导出的辅助函数）
@@ -129,7 +187,7 @@ const TOOL_RISK = {
     'uuid_gen', 'hash_tool', 'base64_tool', 'json_tool', 'text_count', 'date_calc', 'unit_convert', 'cron_explain',
     'weather_query', 'translate_text', 'exchange_rate'],
   medium: ['image_gen', 'export_word', 'tts', 'run_code'],
-  high: ['create_task'], // P5.31：定时任务 = 持久化自动执行实体，提示词注入最想拿到的能力，必弹确认卡
+  high: ['create_task', 'browser_use'], // P5.31：定时任务；U1-4：浏览器自动化（高危操作如网页操作需确认）
 };
 function toolRiskOf(name, ctx = {}) {
   if (name.startsWith('agent_call_') || name.startsWith('local_')) return 'high';
