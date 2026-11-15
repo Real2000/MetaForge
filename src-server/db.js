@@ -2154,7 +2154,32 @@ db.exec(`CREATE TABLE IF NOT EXISTS browser_automations (
 );`);
 console.log('[db] 创建 browser_automations 表（P2-18 浏览器自动化）');
 
-// ================== U0-6 A2A 任务审计表（2026-11-13）==================
+// ================== U1-1 内建数据库（2026-11-14）==================
+db.exec(`CREATE TABLE IF NOT EXISTS app_tables (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,                    -- 表名（字母数字下划线，20字符内）
+  display_name TEXT DEFAULT '',
+  description TEXT DEFAULT '',
+  columns TEXT NOT NULL DEFAULT '[]',    -- JSON：[{name, type, required, default, comment}] 列定义
+  row_count INTEGER DEFAULT 0,           -- 当前行数（快照，精确值由 count_rows SQL 维护）
+  max_rows INTEGER DEFAULT 5000,         -- 行数上限
+  owner TEXT NOT NULL DEFAULT '',
+  space_id INTEGER DEFAULT NULL,
+  created_at TEXT,
+  updated_at TEXT
+);`);
+db.exec(`CREATE TABLE IF NOT EXISTS app_table_rows (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  table_id INTEGER NOT NULL,              -- 关联 app_tables.id
+  data TEXT NOT NULL DEFAULT '{}',        -- JSON：行数据，键值对应 columns 定义
+  created_at TEXT,
+  updated_at TEXT
+);`);
+db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_at_name_owner ON app_tables(name, owner);');
+db.exec('CREATE INDEX IF NOT EXISTS idx_atr_table ON app_table_rows(table_id);');
+console.log('[db] 创建 app_tables/app_table_rows 表（U1-1 内建数据库）');
+
+// ================== a2a_tasks 表 ==================
 db.exec(`CREATE TABLE IF NOT EXISTS a2a_tasks (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   task_id TEXT NOT NULL UNIQUE,            -- A2A 标准 task_id 格式

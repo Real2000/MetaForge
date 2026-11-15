@@ -104,6 +104,8 @@ app.use('/api/collab', require('./src-server/routes/collab'));
 app.use('/api/catalog', require('./src-server/routes/catalog'));
 // P1-20 配置中心（统一配置管理，格式检查 + 脱敏回显 + 审计日志）
 app.use('/api/config', require('./src-server/routes/config'));
+// U1-1 内建数据库（用户自定义表CRUD + 行数据管理）
+app.use('/api/database', require('./src-server/routes/database'));
 // P1-21 API 文档站（自动生成 OpenAPI 规范 + Redoc 渲染页面）
 app.use('/api/api-docs', require('./src-server/routes/api-docs'));
 // P2-20 语音供应商管理（2026-11-13）
