@@ -323,21 +323,42 @@ function failPipeline(ctx, errMsg) {
  * 全部自改造前路由 L244-262 逐字搬移（等价性硬指标）：
  * 先插父分片再插子分片、parent_id/chapter_id 计算逻辑、toc 回写 kbs、op_logs「上传知识库文件」。
  * 状态流转在此从 pending/processing → success（chunk_count 落值 + parsed_at 解析完成时间）。
+ * U0-7：每个 chunk 写入前过内容安全审核（敏感词/PII/注入检测）。
  */
 function persistSuccess(ctx) {
   const kb = ctx.kb;
   const chunks = ctx.chunks || [];
+  const { review } = require('./content-filter');
+  // 审核命中分块列表（中断上传但不清空已有，方便排查修复后重传）
+  const blockedChunks = [];
+
   // 先插父分片，再插子分片
   if (ctx.hasParentSlice && ctx.parentChunks.length) {
     const insParent = db.prepare('INSERT INTO kb_chunks (file_id,kb_id,content,parent_id) VALUES (?,?,?,?)');
-    ctx.parentChunks.forEach(pc => insParent.run(ctx.fileId, kb.id, pc, null));
+    ctx.parentChunks.forEach(pc => {
+      const result = review(pc, 'kb_import');
+      if (result.blocked) { blockedChunks.push('父分片：' + result.reason); return; }
+      insParent.run(ctx.fileId, kb.id, result.cleaned || pc, null);
+    });
   }
   const ins = db.prepare('INSERT INTO kb_chunks (file_id,kb_id,content,parent_id,chapter_id) VALUES (?,?,?,?,?)');
   const parentStartIdx = ctx.hasParentSlice ? ctx.parentChunks.length : 0;
   chunks.forEach((c, i) => {
+    const result = review(c, 'kb_import');
+    if (result.blocked) { blockedChunks.push(`分块 #${i + 1}：${result.reason}`); return; }
     const parentId = ctx.hasParentSlice && ctx.childToParent[i] >= 0 ? (parentStartIdx + ctx.childToParent[i] + 1) : null;
-    ins.run(ctx.fileId, kb.id, c, parentId, ctx.chapterIds ? ctx.chapterIds[i] : null); // chapter_id = TOC 章节归属
+    ins.run(ctx.fileId, kb.id, result.cleaned || c, parentId, ctx.chapterIds ? ctx.chapterIds[i] : null);
   });
+
+  // 有审核拦截的分块 → 记录但不中断已通过的分块写入（不影响已合法内容入库）
+  if (blockedChunks.length) {
+    const detail = `文件「${ctx.originalName || ctx.file?.name || ''}」上传中有 ${blockedChunks.length} 个分块因内容安全审核被跳过：${blockedChunks.join('；')}`;
+    console.warn('[content-filter]', detail);
+    try {
+      const { logSecurityEvent } = require('./security');
+      logSecurityEvent('kb_import_blocked', detail.slice(0, 500), '拦截', 'knowledge_base');
+    } catch { }
+  }
   // 如果有 TOC，回写入 kbs 表
   if (ctx.toc && ctx.toc.length) {
     db.prepare('UPDATE kbs SET toc=? WHERE id=?').run(JSON.stringify(ctx.toc), kb.id);

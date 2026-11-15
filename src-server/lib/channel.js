@@ -174,6 +174,19 @@ async function send(to, message) {
   if (!content) return { ok: false, channel, error: '消息内容不能为空' };
   const title = String(message?.title || '').trim();
 
+  // U0-7：渠道出站前过内容安全审核（非 inbox 渠道，防止站内信重复拦截）
+  if (channel !== 'inbox') {
+    try {
+      const { review } = require('./content-filter');
+      const r = review(content, 'output', { autoMask: true });
+      if (r.blocked) {
+        console.warn('[content-filter] send blocked:', r.reason);
+        return { ok: false, channel, error: '发送内容因安全审核被拦截：' + r.reason };
+      }
+      if (r.cleaned) message.content = r.cleaned;
+    } catch { /* 审核模块加载失败不阻塞发送 */ }
+  }
+
   // 卡片模式：构造渠道原生卡片消息
   if (contentType === 'card' && message?.card) {
     return sendCard(channel, receivers, title, message.card, message);
