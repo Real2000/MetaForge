@@ -121,6 +121,50 @@ function archiveLogs() {
     return { ok: true, ...t };
   } catch (e) {
     console.error('[ops] 日志归档失败：', e.message);
+  return { ok: false, msg: e.message };
+}
+}
+
+/** U0-8：记忆摘要。遍历近 24h 有交互的长会话，统计话题写入 agent_memories（source='digest'）。同步版本，不调用模型以免打乱现有定时任务架构 */
+function digestMemories() {
+  const today = dayKey();
+  try {
+    const rows = db.prepare(`
+      SELECT s.agent_id, s.username
+      FROM sessions s
+      JOIN messages m ON m.session_id = s.id
+      JOIN agents a ON a.id = s.agent_id AND a.long_memory = 1
+      WHERE m.created_at >= datetime('now','-1 day') AND m.role = 'user'
+      GROUP BY s.id HAVING COUNT(m.id) >= 5
+    `).all();
+    if (!rows.length) return { ok: true, skipped: true, msg: '今日无待摘要会话' };
+    const seen = new Set();
+    for (const r of rows) {
+      const key = `${r.agent_id}:${r.username}`;
+      if (seen.has(key)) continue;
+      const hasDigest = db.prepare("SELECT id FROM agent_memories WHERE agent_id=? AND username=? AND source='digest' LIMIT 1").get(r.agent_id, r.username);
+      if (hasDigest) { seen.add(key); continue; }
+      const msgs = db.prepare(`
+        SELECT role, content FROM messages m JOIN sessions s ON s.id = m.session_id
+        WHERE s.agent_id = ? AND s.username = ? ORDER BY m.id DESC LIMIT 30
+      `).all(r.agent_id, r.username);
+      const userMsgs = msgs.filter(x => x.role === 'user').map(x => (x.content || '').slice(0, 200)).filter(Boolean);
+      if (!userMsgs.length) continue;
+      const topics = userMsgs.slice(0, 5).map(t => t.length > 50 ? t.slice(0, 50) + '…' : t);
+      const summary = `用户提出 ${userMsgs.length} 条消息。话题：${topics.join('； ')}。`;
+      db.prepare(`INSERT INTO agent_memories (agent_id,username,fact,type,confidence,source,summary,created_at) VALUES (?,?,?,?,?,?,?,datetime('now','localtime'))`)
+        .run(r.agent_id, r.username, summary, 'fact', 0.5, 'digest', summary);
+      seen.add(key);
+    }
+    if (seen.size) {
+      console.log(`[ops] 记忆摘要：已蒸馏 ${seen.size} 条（${today}）`);
+      db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
+        .run('system', '记忆摘要', `${seen.size} 条摘要（${today}）`, '', now());
+    }
+    return { ok: true, digested: seen.size };
+  } catch (e) {
+    console.error('[ops] 记忆摘要失败：', e.message);
+    db.prepare('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)').run('ops-digest', e.message, now());
     return { ok: false, msg: e.message };
   }
 }
@@ -142,7 +186,10 @@ function startOps() {
     dailyOps('uploads', cleanupUploads);
     dailyOps('logs', archiveLogs);
   }, 30 * 60000);
-  console.log(`[ops] 运维任务已启动（每日备份保留 ${KEEP_BACKUPS} 份 / 产物保留 ${UPLOAD_TTL_DAYS} 天 / 日志保留 ${LOG_TTL_DAYS} 天）`);
+  console.log(`[ops] 运维任务已启动（每日备份保留 ${KEEP_BACKUPS} 份 / 产物保留 ${UPLOAD_TTL_DAYS} 天 / 日志保留 ${LOG_TTL_DAYS} 天 / 记忆摘要已开启）`);
+  // U0-8：启动后 2 分钟跑第一轮摘要，后每 2 小时检查
+  setTimeout(() => dailyOps('digest', digestMemories), 120000);
+  setInterval(() => dailyOps('digest', digestMemories), 120 * 60000);
 }
 
-module.exports = { dailyBackup, cleanupUploads, archiveLogs, startOps };
+module.exports = { dailyBackup, cleanupUploads, archiveLogs, digestMemories, startOps };
