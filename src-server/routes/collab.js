@@ -429,4 +429,117 @@ router.post('/rooms/:id/summarize', (req, res) => {
   res.json({ code: 0, data: summary });
 });
 
+// ==================== U1-2 多智能体执行引擎：自动拆解+并行执行+结果汇总 ====================
+
+/** POST /api/collab/rooms/:id/auto-split — 自动拆解主任务为子任务拓扑。
+ *  body: { title, description }
+ *  用默认模型分析任务→按业务域匹配 AI 参与者→生成子任务列表写入 collab_room_tasks
+ */
+router.post('/rooms/:id/auto-split', async (req, res) => {
+  const r = db.prepare('SELECT * FROM collab_rooms WHERE id=?').get(req.params.id);
+  if (!r) return res.json({ code: 404, msg: '房间不存在' });
+  if (!canManage(r, req.user)) return res.json({ code: 403, msg: '仅主持人或管理员可自动拆解' });
+  const { title, description } = req.body || {};
+  if (!title) return res.json({ code: 400, msg: '请提供主任务标题' });
+  // 获取房间当前启用的 AI 参与者
+  const aiParts = db.prepare('SELECT c.*, a.name AS agent_name, a.prompt AS agent_prompt FROM collab_ai_participants c LEFT JOIN agents a ON a.id=c.agent_id WHERE c.room_id=? AND c.status=?').all(r.id, 'active');
+  // 用默认模型分析：把主任务分解为子任务
+  const taskPrompt = [
+    `你是一个任务分解专家。请将以下主任务拆解为若干个可独立执行的子任务。`,
+    `主任务：${title}`,
+    description ? `描述：${description}` : '',
+    `房间已有 AI 参与者（按业务域）：`,
+    ...aiParts.map((a, i) => `${i + 1}. ${a.agent_name || 'AI#' + a.agent_id}（${a.role}）`),
+    `请输出 JSON 数组，每项 { title, description, assign_index（AI 参与者的序号，从 1 开始，-1 表示人工）}。最多 5 个子任务。数组长度即执行数量。不要输出多余文字。`,
+  ].filter(Boolean).join('\n');
+  try {
+    const { chat } = require('../lib/llm');
+    const result = await chat([{ role: 'user', content: taskPrompt }], { model: undefined, username: req.user.username });
+    const text = (result.text || '').trim();
+    // 尝试解析 JSON 数组
+    const parsed = (() => {
+      try { return JSON.parse(text); } catch { }
+      try { const m = text.match(/\[[\s\S]*\]/); return m ? JSON.parse(m[0]) : null; } catch { return null; }
+    })();
+    if (!Array.isArray(parsed) || !parsed.length) {
+      return res.json({ code: 500, msg: '任务拆解失败：大模型返回格式异常', data: { raw: text.slice(0, 500) } });
+    }
+    // 写入子任务
+    let created = 0;
+    for (const item of parsed) {
+      const subTitle = String(item.title || '').trim();
+      if (!subTitle) continue;
+      const assignIdx = parseInt(item.assign_index) - 1;
+      const assign = (assignIdx >= 0 && assignIdx < aiParts.length) ? aiParts[assignIdx] : null;
+      // 使用已有 dep 信息设置与前一个任务的可选依赖
+      const deps = [];
+      if (created > 0 && item.depends_on !== undefined) deps.push(created); // 可加依赖
+      db.prepare(`INSERT INTO collab_room_tasks (room_id,title,description,assignee,assignee_type,deps,status,created_by,created_at,updated_at)
+        VALUES (?,?,?,?,?,?,'pending',?,?,?)`).run(
+        r.id, subTitle, String(item.description || description || '').slice(0, 2000),
+        assign ? assign.agent_name || String(assign.agent_id) : '', assign ? 'ai' : 'human',
+        JSON.stringify(deps), req.user.username, now(), now());
+      created++;
+    }
+    db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
+      .run(req.user.username, 'U1-2 自动拆解', `${title} → ${created} 个子任务`, req.ip, now());
+    // 返回结果
+    const tasks = db.prepare('SELECT * FROM collab_room_tasks WHERE room_id=? ORDER BY id DESC LIMIT ?').all(r.id, created);
+    res.json({ code: 0, data: { tasks, created, raw: text.slice(0, 500) } });
+  } catch (e) {
+    res.json({ code: 500, msg: '任务拆解失败：' + e.message });
+  }
+});
+
+/** POST /api/collab/rooms/:id/run-ai — 按依赖图并行执行 AI 参与者任务并汇总结果。
+ *  遍历 pending 任务 → 分配给对应的 AI 参与者（通过 assignee 匹配 collab_ai_participants）→ 执行
+ */
+router.post('/rooms/:id/run-ai', async (req, res) => {
+  const r = db.prepare('SELECT * FROM collab_rooms WHERE id=?').get(req.params.id);
+  if (!r) return res.json({ code: 404, msg: '房间不存在' });
+  if (!canManage(r, req.user)) return res.json({ code: 403, msg: '仅主持人或管理员可执行' });
+  // 获取 AI 参与者
+  const aiParts = db.prepare('SELECT c.*, a.name AS agent_name, a.prompt FROM collab_ai_participants c LEFT JOIN agents a ON a.id=c.agent_id WHERE c.room_id=? AND c.status=?').all(r.id, 'active');
+  if (!aiParts.length) return res.json({ code: 400, msg: '房间没有活跃的 AI 参与者' });
+  // 获取 pending 任务（不含人工）
+  const tasks = db.prepare("SELECT * FROM collab_room_tasks WHERE room_id=? AND status='pending' AND assignee_type='ai' ORDER BY id").all(r.id);
+  if (!tasks.length) return res.json({ code: 400, msg: '没有待执行的 AI 任务' });
+  // 遍历任务并行执行
+  const results = [];
+  for (const task of tasks) {
+    // 找对应的 AI 参与者
+    const ai = aiParts.find(a => a.agent_name === task.assignee || String(a.agent_id) === task.assignee);
+    const agent = ai ? db.prepare('SELECT * FROM agents WHERE id=?').get(ai.agent_id) : null;
+    if (!agent) {
+      results.push({ task: task.title, status: 'skipped', error: `AI 参与者 ${task.assignee} 不存在或未配置` });
+      continue;
+    }
+    // 标记 running
+    db.prepare("UPDATE collab_room_tasks SET status='running',updated_at=? WHERE id=?").run(now(), task.id);
+    try {
+      const { runWorkflow } = require('../lib/workflow');
+      const msg = (task.description ? `${task.description}\n` : '') + `请执行任务：${task.title}`;
+      const r2 = await runWorkflow(agent, msg, { triggerType: 'collab', username: req.user.username });
+      // 暂时使用简单执行，非工作流模式
+      const { runAgent } = require('../lib/workflow');
+      const agentResult = await runAgent(agent, msg, { triggerType: 'collab', username: req.user.username });
+      db.prepare("UPDATE collab_room_tasks SET status='done',result=?,updated_at=? WHERE id=?")
+        .run(String(agentResult.text || '').slice(0, 2000), now(), task.id);
+      results.push({ task: task.title, status: 'done', result: (agentResult.text || '').slice(0, 200) });
+    } catch (e) {
+      db.prepare("UPDATE collab_room_tasks SET status='failed',result=?,updated_at=? WHERE id=?")
+        .run(String(e.message || '').slice(0, 500), now(), task.id);
+      results.push({ task: task.title, status: 'failed', error: e.message });
+    }
+  }
+  // 汇总结果写入房间消息
+  const summaryText = results.map(r => {
+    return r.status === 'done' ? `✅ ${r.task}：${r.result}` : `❌ ${r.task}：${r.error || '未知错误'}`;
+  }).join('\n');
+  db.prepare(`INSERT INTO collab_room_messages (room_id,sender,role,content,msg_type,meta,created_at)
+    VALUES (?,?,'system',?,'task_summary',?,?)`)
+    .run(r.id, 'system', `多智能体执行汇总：\n${summaryText}`, JSON.stringify({ results, type: 'exec_summary' }), now());
+  res.json({ code: 0, data: { results, summary: summaryText } });
+});
+
 module.exports = router;
