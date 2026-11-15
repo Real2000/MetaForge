@@ -18,7 +18,7 @@ const app = express();
 // U0-6 A2A Agent Card 公开发现端点（必须在任何鉴权中间件之前注册）
 const { publicRouter, authRouter } = require('./src-server/routes/a2a');
 app.use(publicRouter); // /.well-known/agent-card.json 公开访问
-app.use('/api', authRouter); // /api/a2a/* 需认证
+app.use('/api/a2a', authRouter); // /api/a2a/* 需认证
 const PORT = process.env.PORT || 3210;
 
 app.use(express.json({ limit: '20mb' })); // 知识库支持 PDF/DOCX base64 上传
