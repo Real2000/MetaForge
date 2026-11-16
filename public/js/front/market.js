@@ -250,7 +250,7 @@ export async function render(el) {
       // 内置工具卡（P3-2 新区）：图标/名称/风险徽章/描述/参数徽章/keyed 工具的配置引导
       if (x._t === 'builtin_tool') {
         const r = RISK_META[x.risk] || RISK_META.auto;
-        return `<div class="agent-card">
+        return `<div class="agent-card" data-plugin-id="tool_${esc(x.name)}">
           <div class="a-ava" style="background:linear-gradient(135deg,#0891b2,#2563eb)">${TOOL_ICON[x.name] || '🔧'}</div>
           <div class="a-info">
             <div class="mk-name">${esc(x.name)} <span class="tag ${r.cls}">${t(r.label)}</span>${x.keyed ? `<span class="tag ${x.key_configured ? 'green' : 'orange'}" title="${esc(x.key_provider)}">${x.key_configured ? '🔑 ' + t('已配 Key') : '🔑 ' + t('可配 Key')}</span>` : ''}</div>
@@ -267,7 +267,8 @@ export async function render(el) {
         </div>`;
       }
       if (x._t === 'wf_template') {
-        return `<div class="agent-card">
+return `<div class="agent-card" data-plugin-id="plat_${x.platform_type}_${x.app_id}">
+
           ${starHTML('wf_template', x.id, inFav('wf_template', x.id))}
           <div class="a-ava" style="background:linear-gradient(135deg,#2563eb,#7c3aed)">${esc(x.icon || '🎨')}</div>
           <div class="a-info">
@@ -282,7 +283,7 @@ export async function render(el) {
       }
       if (x._t === 'skill_asset') {
         // P3-2 融合：技能卡在市场浏览基础上叠加 CRUD（我的：编辑/删除/发布开关 + 详情 + 复制调用词）
-        return `<div class="agent-card" data-skill="${x.id}">
+        return `<div class="agent-card" data-plugin-id="skill_${x.id}">
           ${starHTML('skill_asset', x.id, inFav('skill_asset', x.id))}
           <div class="a-ava" style="background:linear-gradient(135deg,#059669,#0d9488)">${esc(x.icon || '✨')}</div>
           <div class="a-info">
@@ -298,7 +299,7 @@ export async function render(el) {
       }
       if (x._t === 'mcp_tool') {
         const r = RISK_META[x.risk] || RISK_META.auto;
-        return `<div class="agent-card">
+        return `<div class="agent-card" data-plugin-id="mcp_${x.tool_name}">
           ${starHTML('mcp_tool', x.id, inFav('mcp_tool', x.id))}
           <div class="a-ava" style="background:linear-gradient(135deg,#d97706,#dc2626)">🔧</div>
           <div class="a-info">

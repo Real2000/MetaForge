@@ -226,10 +226,29 @@ async function send(to, message) {
     } catch (e) { return { ok: false, channel, error: '钉钉服务不可达：' + e.message }; }
   }
 
-  // ③ 企微/飞书：适配位（本期未配置凭证时统一降级站内信，留扩展点）
+  // ③ 企微/飞书：通过 im-adapters 适配器发送（真实渠道或降级站内信）
   if (channel === 'wecom' || channel === 'feishu') {
-    sendInbox('*', { title: title || `${channel === 'wecom' ? '企业微信' : '飞书'}渠道未接入`, content: `该渠道暂未接入，消息已降级站内信：${title ? '【' + title + '】' : ''}${content}` });
-    return { ok: true, channel: 'inbox', degraded: true, receivers, mock: true };
+    const chType = channel;
+    const chRow = db.prepare("SELECT id FROM channels WHERE type=? AND enabled=1 LIMIT 1").get(chType);
+    if (!chRow) {
+      sendInbox('*', { title: `${chType === 'wecom' ? '企业微信' : '飞书'}未配置`, content: `该渠道未配置，消息已降级站内信：${title ? '【' + title + '】' : ''}${content}` });
+      return { ok: true, channel: 'inbox', degraded: true, receivers, mock: true };
+    }
+    try {
+      const { getAdapter } = require('./im-adapters');
+      const adapter = getAdapter(chType);
+      if (!adapter || adapter.status === 'reserved') {
+        sendInbox('*', { title: `${chType === 'wecom' ? '企业微信' : '飞书'}渠道未启用`, content: `该渠道适配器未启用，消息已降级：${title ? '【' + title + '】' : ''}${content}` });
+        return { ok: true, channel: 'inbox', degraded: true, receivers, mock: true };
+      }
+      const r = chType === 'wecom'
+        ? await adapter.send(chRow.id, { receiver: receivers[0] || '@all', receiverType: 'user' }, { title, content })
+        : await adapter.send(chRow.id, { receiver: receivers[0] || '', receiverType: 'open_id' }, { title, content });
+      if (r.ok) return { ok: true, channel: chType, receivers, messageId: r.messageId };
+      return { ok: false, channel: chType, error: r.error || '发送失败' };
+    } catch (e) {
+      return { ok: false, channel: chType, error: '适配器执行异常：' + e.message };
+    }
   }
   return { ok: false, channel, error: `未知渠道：${channel}` };
 }
