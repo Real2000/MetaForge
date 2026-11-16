@@ -628,13 +628,13 @@ function t(name, fn) {
     r = String(await extra.local_exec.run({ op: 'mkdir', target: 'Desktop/x' }, { username: 'tester-no-device' }));
     assert.ok(r.includes('还没有配对') && r.includes('助手'), '未配对应给安装引导');
   });
-  await t('扩展工具注册：TOOL_DEFS 合并后共 26 个（P3-2 工具市场 +5.26 run_code + P5.27 local_exec + P5.31 create_task）', () => {
+  await t('扩展工具注册：TOOL_DEFS 合并后共 27 个（+browser_use U1-4）', () => {
     const need = ['db_query', 'db_chart', 'web_search', 'web_fetch', 'stock_quote', 'export_word', 'tts', 'doc_review', 'run_code', 'local_exec', 'create_task'];
     need.forEach(n => assert.ok(tools.TOOL_DEFS[n], `缺少工具 ${n}`));
     // P3-2 工具市场扩展（2026-11-06）：11 个新工具（8 纯本地 + 3 网络），15 → 26
     const market = ['uuid_gen', 'hash_tool', 'base64_tool', 'json_tool', 'text_count', 'date_calc', 'unit_convert', 'cron_explain', 'weather_query', 'translate_text', 'exchange_rate'];
     market.forEach(n => assert.ok(tools.TOOL_DEFS[n], `缺少 P3-2 工具 ${n}`));
-    assert.strictEqual(Object.keys(tools.TOOL_DEFS).length, 26);
+    assert.strictEqual(Object.keys(tools.TOOL_DEFS).length, 27);
     [...need, ...market].forEach(n => assert.strictEqual(tools.TOOL_DEFS[n].schema.function.name, n, `schema 名不匹配 ${n}`));
     assert.strictEqual(tools.toolRiskOf('create_task'), 'high', 'create_task 应归 high（默认权限必弹确认卡）');
     // P3-2：11 个新工具全部 low（只读无副作用，不弹确认卡）
