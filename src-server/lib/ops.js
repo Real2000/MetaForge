@@ -169,6 +169,41 @@ function digestMemories() {
   }
 }
 
+/** U1-5：评测回归流水线。扫描所有开启了自动回归的知识库，对其评测集逐个重跑并记录 recall_eval_results。由于调用路径是 dailyOps 同步回调，内层异步用 then() 处理 */
+function runEvalRegression() {
+  const today = dayKey();
+  try {
+    const kbs = db.prepare("SELECT id, name, owner FROM kbs WHERE enabled=1").all();
+    let totalEvalCount = 0;
+    for (const kb of kbs) {
+      const evals = db.prepare("SELECT id, name, score, dataset, kb_id FROM evaluations WHERE kb_id=? AND type='kb'").all(kb.id);
+      totalEvalCount += evals.length;
+      for (const ev of evals) {
+        const { rerunEvalSet } = require('./kb-eval-regression');
+        rerunEvalSet(ev).then(r => {
+          if (r && r.score !== undefined) {
+            db.prepare(`INSERT INTO recall_eval_results (kb_id, eval_name, version, type, total_questions, avg_recall, avg_accuracy, scores, negatives, missees, triggered_by, created_by, created_at)
+              VALUES (?,?,?,?,?,?,?,?,?,?,'schedule',?,?)`)
+              .run(kb.id, ev.name, r.version || 'v1', 'full', r.items_count || 0, r.score || 0, 0,
+                JSON.stringify(r.detail || []), '[]', '[]', 'system', now());
+            console.log(`[ops] 评测回归：kb#${kb.id}「${ev.name}」= ${r.score}`);
+          }
+        }).catch(e => console.warn(`[ops] 评测回归失败：kb#${kb.id}/eval#${ev.id}`, e.message));
+      }
+    }
+    if (totalEvalCount) {
+      console.log(`[ops] 评测回归：今日计划执行 ${totalEvalCount} 个评测集（${today}）`);
+      db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
+        .run('system', '评测回归', `计划 ${totalEvalCount} 个评测集（${today}）`, '', now());
+    }
+    return { ok: true, total: totalEvalCount };
+  } catch (e) {
+    console.error('[ops] 评测回归失败：', e.message);
+    db.prepare('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)').run('ops-eval', e.message, now());
+    return { ok: false, msg: e.message };
+  }
+}
+
 /** 每日运维任务（幂等标记，防同日重复执行） */
 const ranAt = new Map(); // job -> dayKey
 function dailyOps(job, fn) {
@@ -186,10 +221,13 @@ function startOps() {
     dailyOps('uploads', cleanupUploads);
     dailyOps('logs', archiveLogs);
   }, 30 * 60000);
-  console.log(`[ops] 运维任务已启动（每日备份保留 ${KEEP_BACKUPS} 份 / 产物保留 ${UPLOAD_TTL_DAYS} 天 / 日志保留 ${LOG_TTL_DAYS} 天 / 记忆摘要已开启）`);
+  console.log(`[ops] 运维任务已启动（每日备份保留 ${KEEP_BACKUPS} 份 / 产物保留 ${UPLOAD_TTL_DAYS} 天 / 日志保留 ${LOG_TTL_DAYS} 天 / 记忆摘要已开启 / 评测回归已开启）`);
   // U0-8：启动后 2 分钟跑第一轮摘要，后每 2 小时检查
   setTimeout(() => dailyOps('digest', digestMemories), 120000);
   setInterval(() => dailyOps('digest', digestMemories), 120 * 60000);
+  // U1-5：启动后 3 分钟跑第一轮评测回归，后每 4 小时检查
+  setTimeout(() => dailyOps('eval', runEvalRegression), 180000);
+  setInterval(() => dailyOps('eval', runEvalRegression), 240 * 60000);
 }
 
-module.exports = { dailyBackup, cleanupUploads, archiveLogs, digestMemories, startOps };
+module.exports = { dailyBackup, cleanupUploads, archiveLogs, digestMemories, runEvalRegression, startOps };
