@@ -29,3 +29,4 @@ public/downloads/
 # 备份归档与系统文件
 *.tar.gz
 .DS_Store
+__pycache__/
