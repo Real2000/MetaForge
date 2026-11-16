@@ -96,6 +96,8 @@ app.use('/api/feedback', require('./src-server/routes/feedback'));
 app.use('/api/localbridge', require('./src-server/routes/localbridge').router);
 // 商业化（2026-10-20）：套餐定价/企业线索/账单发票/客户成功洞察（plans 与 lead 免登录）
 app.use('/api/biz', require('./src-server/routes/biz'));
+// U2-3 插件运行时管理（安装/卸载/启用/沙箱试运行）
+app.use('/api/plugins', require('./src-server/routes/plugins'));
 // P5.5 通用密钥管理（画布 {{env.XXX}} 占位符数据源；仅管理员）
 app.use('/api/secrets', require('./src-server/routes/secrets'));
 // P2-1~3 协作房间+任务分解+人机协同（2026-11-13）
