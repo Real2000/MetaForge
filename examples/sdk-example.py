@@ -1,109 +1,65 @@
 """
-智能体开发平台 Python 调用示例
+智能体开发平台 SDK 调用示例（U1-8 起为官方 SDK 用法）
+
+前置：
+    1. 平台后台 →「智能体管理」→ 目标智能体（须已发布）→「API」→ 创建密钥 sk-ap-xxx
+    2. 安装 SDK（二选一）：
+       - 平台「API 密钥」弹窗下载 agent_platform_sdk-x.x.x-py3-none-any.whl 后：
+         pip install agent_platform_sdk-x.x.x-py3-none-any.whl
+       - pip 私有仓就绪后：pip install agent-platform-sdk
 
 用法：
-    pip install requests
-    python sdk-example.py
+    python sdk-example.py            # 非流式三行调用
+    python sdk-example.py --stream   # 流式调用
+    python sdk-example.py --models   # 列出可用智能体
 """
-import requests
-import json
 import sys
+from agent_platform import AgentPlatform
 
-BASE = 'http://localhost:3210'
+BASE_URL = 'http://localhost:3210'
+API_KEY = 'sk-ap-替换为你的密钥'          # 后台「智能体管理 → API」创建
+MODEL = 'agent-1-智能体名称'              # ap.list_models() 获取
 
 
-class PlatformClient:
-    """平台 API 客户端"""
+def demo_models(ap):
+    """列出全部可用智能体（model id 即对话用的 model 名）"""
+    models = ap.list_models()
+    print(f'可用智能体 {len(models)} 个：')
+    for m in models:
+        print(f"  - {m['id']}  {m.get('description', '')[:40]}")
 
-    def __init__(self, base_url=BASE):
-        self.base = base_url.rstrip('/')
-        self.token = None
-        self.session = requests.Session()
 
-    def login(self, username, password):
-        """登录获取 token"""
-        r = self.session.post(f'{self.base}/api/auth/login',
-                              json={'username': username, 'password': password})
-        data = r.json()
-        if data['code'] != 0:
-            raise Exception(f"登录失败：{data.get('msg', '未知错误')}")
-        self.token = data['data']['token']
-        self.session.headers['Authorization'] = f'Bearer {self.token}'
-        print(f'✅ 登录成功（{username}）')
-        return self.token
+def demo_chat(ap):
+    """三行核心用法：非流式对话"""
+    r = ap.chat.completions.create(
+        model=MODEL,
+        messages=[{'role': 'user', 'content': '你好，介绍一下你能做什么？'}],
+    )
+    print('回复：', r['choices'][0]['message']['content'])
 
-    def get_agents(self):
-        """获取智能体列表"""
-        r = self.session.get(f'{self.base}/api/agents')
-        return r.json()
 
-    def create_agent(self, name, prompt, model='gpt-4'):
-        """创建智能体"""
-        r = self.session.post(f'{self.base}/api/agents', json={
-            'name': name,
-            'description': f'通过 SDK 创建的智能体：{name}',
-            'prompt': prompt,
-            'model': model,
-            'type': 'chat',
-            'status': 'published',
-        })
-        return r.json()
+def demo_stream(ap):
+    """流式对话（SSE，逐块打印）"""
+    stream = ap.chat.completions.create(
+        model=MODEL,
+        messages=[{'role': 'user', 'content': '给我讲一个 100 字以内的小故事'}],
+        stream=True,
+    )
+    print('回复：', end='')
+    for chunk in stream:
+        print(chunk['choices'][0]['delta'].get('content', '') or '', end='')
+    print()
 
-    def get_models(self):
-        """获取可用模型列表"""
-        r = self.session.get(f'{self.base}/api/chat/models')
-        return r.json()
 
-    def chat(self, agent_id, content):
-        """同步对话"""
-        r = self.session.post(f'{self.base}/api/chat', json={
-            'agent_id': agent_id,
-            'content': content,
-        })
-        return r.json()
-
-    def get_knowledge(self):
-        """获取知识库列表"""
-        r = self.session.get(f'{self.base}/api/knowledge')
-        return r.json()
-
-    def get_config(self):
-        """获取系统配置"""
-        r = self.session.get(f'{self.base}/api/config')
-        return r.json()
+def main():
+    ap = AgentPlatform(base_url=BASE_URL, api_key=API_KEY)
+    if '--models' in sys.argv:
+        demo_models(ap)
+    elif '--stream' in sys.argv:
+        demo_stream(ap)
+    else:
+        demo_chat(ap)
 
 
 if __name__ == '__main__':
-    import getpass
-
-    client = PlatformClient()
-
-    try:
-        # 登录
-        username = input('用户名（默认 admin）: ') or 'admin'
-        password = getpass.getpass('密码（默认 Admin@2026）: ') or 'Admin@2026'
-        client.login(username, password)
-
-        # 获取模型列表
-        print('\n📋 可用模型：')
-        models = client.get_models()
-        if models['code'] == 0:
-            for m in models['data'][:5]:
-                print(f'   - {m["name"]}（{m.get("provider", "?")}）')
-            print(f'   ...共 {len(models["data"])} 个模型')
-
-        # 获取智能体列表
-        print('\n🤖 智能体列表：')
-        agents = client.get_agents()
-        if agents['code'] == 0:
-            for a in agents['data'][:5]:
-                print(f'   - #{a["id"]} {a["name"]}（{a["status"]}）')
-            print(f'   ...共 {len(agents["data"])} 个智能体')
-
-        print('\n✅ 测试通过')
-
-    except KeyboardInterrupt:
-        print('\n已取消')
-    except Exception as e:
-        print(f'\n❌ 错误：{e}')
-        sys.exit(1)
+    main()

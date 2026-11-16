@@ -24,7 +24,7 @@ function buildOpenApiSpec() {
     openapi: '3.0.3',
     info: {
       title: '智能体开发平台 API',
-      version: 'p5.37',
+      version: 'u1.8',
       description: '企业级智能体开发平台 REST API。本文档由服务端自动生成，覆盖全部已注册路由。\n\n' +
         '认证方式：HttpOnly Cookie（推荐）或 Bearer Token（登录返回的 JWT）。\n' +
         '响应格式：统一 `{ code: 0, data: ... }` 包裹，code !== 0 时 msg 包含错误信息。',
@@ -36,8 +36,21 @@ function buildOpenApiSpec() {
       securitySchemes: {
         bearerAuth: { type: 'http', scheme: 'bearer', bearerFormat: 'JWT' },
         cookieAuth: { type: 'apiKey', in: 'cookie', name: 'token' },
+        apiKeyAuth: { type: 'http', scheme: 'bearer', description: '智能体 API 密钥（sk-ap-xxx，agent_api_keys 表；后台「智能体管理→API」创建）——开放端点 /openapi/* 与 SDK 使用' },
       },
       schemas: {
+        AgentModel: { type: 'object', properties: { id: { type: 'string', example: 'agent-1-智能体名称' }, object: { type: 'string', example: 'model' }, owned_by: { type: 'string', example: 'agent-platform' }, description: { type: 'string' } } },
+        ChatCompletion: {
+          type: 'object',
+          properties: {
+            id: { type: 'string', example: 'chatcmpl-ap-1700000000' },
+            object: { type: 'string', example: 'chat.completion' },
+            created: { type: 'integer' },
+            model: { type: 'string' },
+            choices: { type: 'array', items: { type: 'object', properties: { index: { type: 'integer' }, message: { type: 'object', properties: { role: { type: 'string' }, content: { type: 'string' } } }, finish_reason: { type: 'string' } } } },
+            usage: { type: 'object', properties: { prompt_tokens: { type: 'integer' }, completion_tokens: { type: 'integer' }, total_tokens: { type: 'integer' } } },
+          },
+        },
         ApiResponse: {
           type: 'object',
           properties: {
@@ -119,11 +132,72 @@ function collectPaths() {
   return paths;
 }
 
+/** OpenAI 兼容开放端点（/openapi/*，SDK 对接的正式契约）——U1-8 补全为真实可调试定义 */
+function openApiPaths() {
+  const json = (obj) => ({ 'application/json': { schema: obj } });
+  return {
+    '/openapi/v1/models': {
+      get: {
+        summary: '列出可用智能体（model id = agent-<id>-<名称>）',
+        description: 'SDK：`ap.listModels()` / `GET /openapi/v1/models`。鉴权 Bearer sk-ap-xxx；全域密钥可见全部已发布智能体，绑定 agent_id 的密钥仅见绑定智能体。',
+        security: [{ apiKeyAuth: [] }],
+        responses: { '200': { description: 'OpenAI models 格式', content: json({ type: 'object', properties: { object: { type: 'string' }, data: { type: 'array', items: { $ref: '#/components/schemas/AgentModel' } } } }) }, '401': { description: '密钥无效或已停用' }, '429': { description: '频率限制（每 Key 60 次/分钟）' } },
+      },
+    },
+    '/openapi/v1/chat/completions': {
+      post: {
+        summary: '对话补全（OpenAI 兼容；SDK 主入口）',
+        description: 'SDK 三行代码：`new AgentPlatform({baseUrl, apiKey}).chat.completions.create({model, messages})`。model 形如 agent-<id>-<名称>；messages 取最后一条 user 作为输入；支持 stream（SSE，data: chunk + data: [DONE]）。',
+        security: [{ apiKeyAuth: [] }],
+        requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['model', 'messages'], properties: { model: { type: 'string', example: 'agent-1-智能体名称' }, messages: { type: 'array', items: { type: 'object', properties: { role: { type: 'string', enum: ['system', 'user', 'assistant'] }, content: { type: 'string' } } } }, stream: { type: 'boolean' } } } } } },
+        responses: {
+          '200': { description: 'ChatCompletion 或 SSE 流', content: json({ $ref: '#/components/schemas/ChatCompletion' }) },
+          '400': { description: '消息为空 / 输入含违规词汇被拦截' },
+          '401': { description: '密钥无效或已停用' },
+          '403': { description: '密钥作用域不含目标智能体（key_scope_denied）' },
+          '404': { description: 'model 不存在或未发布（model_not_found）' },
+          '429': { description: '频率限制（每 Key 20 次/分钟）' },
+        },
+      },
+    },
+  };
+}
+
+/** SDK 信息区块（文档页展示下载与三行代码用法） */
+function sdkDownloads() {
+  const dir = path.join(__dirname, '..', '..', 'public', 'downloads');
+  const out = [];
+  try {
+    for (const f of fs.readdirSync(dir)) {
+      if (/^agent-platform-sdk-\d/.test(f) && f.endsWith('.tgz')) out.push({ name: f, lang: 'TypeScript/Node', url: '/downloads/' + f, kind: 'tgz' });
+      if (/^agent_platform_sdk-\d/.test(f) && f.endsWith('.whl')) out.push({ name: f, lang: 'Python', url: '/downloads/' + f, kind: 'whl' });
+    }
+  } catch { /* 目录不存在时返回空 */ }
+  return out;
+}
+
 /* ---------- 路由 ---------- */
 
 router.get('/openapi.json', (req, res) => {
   const spec = buildOpenApiSpec();
+  // U1-8：合并真实可调试的 /openapi/* 端点定义（SDK 对接契约；SDK 元数据）
+  Object.assign(spec.paths, openApiPaths());
+  spec['x-sdk'] = {
+    name: 'agent-platform-sdk', version: '1.0.0',
+    languages: ['TypeScript/Node', 'Python'],
+    auth: 'agent_api_keys（Bearer sk-ap-xxx）',
+    downloads: sdkDownloads(),
+    quickstart: {
+      typescript: "const { AgentPlatform } = require('agent-platform-sdk'); const ap = new AgentPlatform({ baseUrl, apiKey: 'sk-ap-xxx' }); const r = await ap.chat.completions.create({ model: 'agent-1-名称', messages: [{ role: 'user', content: '你好' }] });",
+      python: "from agent_platform import AgentPlatform; ap = AgentPlatform(base_url, 'sk-ap-xxx'); r = ap.chat.completions.create(model='agent-1-名称', messages=[{'role': 'user', 'content': '你好'}])",
+    },
+  };
   res.json(spec);
+});
+
+// U1-8：SDK 下载清单（前端「API 密钥」弹窗消费）
+router.get('/sdk', (req, res) => {
+  res.json({ code: 0, data: { name: 'agent-platform-sdk', version: '1.0.0', downloads: sdkDownloads() } });
 });
 
 router.get('/', (req, res) => {

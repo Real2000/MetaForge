@@ -11,7 +11,7 @@
  *   （即任何会被 STATIC_CACHE 缓存的资源变更），发版前必须 bump SW_VERSION，否则用户端拿旧缓存。
  * 提交前自检：git diff --name-only HEAD~1 | grep -E '^public/(js|css|vendor|sw\.js|index\.html)' 命中则必须改本常量。
  */
-const SW_VERSION = 'u1.7-v1'; // 2026-11-16 bump：U1-7 画布多人实时协作（studio 协作入口/在线状态/远程光标 + canvas applyDiff/applyMoves）
+const SW_VERSION = 'u1.8-v1'; // 2026-11-16 bump：U1-8 SDK 正式发布（agents.js 密钥弹窗 SDK 下载区块 + i18n 词条）
 const STATIC_CACHE = `ap-static-${SW_VERSION}`;
 const NEVER_CACHE = [/^\/api\//, /\/sse/, /\/stream/, /\/files\/download/, /\?[^\s]*download/];
 

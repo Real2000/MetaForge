@@ -125,6 +125,9 @@ const EN = {
   '已添加：': 'Added: ',
   '添加失败': 'Add failed',
   '加入实时协作': 'Join realtime collaboration',
+  // ---------- U1-8 SDK 正式发布 ----------
+  '官方 SDK（三行代码完成一次对话）': 'Official SDK (three lines to a chat call)',
+  '私有仓就绪前直接下载安装：npm i agent-platform-sdk-x.x.x.tgz / pip install agent_platform_sdk-x.x.x-py3-none-any.whl': 'Before the private registry is ready, install directly: npm i agent-platform-sdk-x.x.x.tgz / pip install agent_platform_sdk-x.x.x-py3-none-any.whl',
   // ---------- 通用按钮 / 状态 ----------
   '保存': 'Save',
   '取消': 'Cancel',

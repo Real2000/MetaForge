@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-platform-sdk"
+version = "1.0.0"
+description = "智能体开发平台官方 Python SDK（OpenAI 兼容端点）"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.8"
+keywords = ["agent-platform", "agent", "llm", "chat", "sdk", "openai-compatible"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: OS Independent",
+]
+# 标准库零依赖（urllib）；requests 可选：装了则自动使用（连接复用更快）
+dependencies = []
+
+[project.optional-dependencies]
+requests = ["requests>=2.28"]
+
+[tool.setuptools]
+packages = ["agent_platform"]

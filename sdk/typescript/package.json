@@ -1,0 +1,12 @@
+{
+  "name": "agent-platform-sdk",
+  "version": "1.0.0",
+  "description": "智能体开发平台官方 TypeScript/JavaScript SDK（OpenAI 兼容端点；零运行时依赖，Node 18+ 原生 fetch）",
+  "license": "Apache-2.0",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": ["index.js", "index.d.ts", "README.md"],
+  "keywords": ["agent-platform", "agent", "llm", "chat", "sdk", "openai-compatible"],
+  "engines": { "node": ">=18" },
+  "repository": { "type": "git", "url": "https://github.com/TeleAgent/agent-platform" }
+}

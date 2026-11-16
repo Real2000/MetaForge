@@ -11,7 +11,8 @@
     "package": "node scripts/package.js",
     "package:version": "node scripts/package.js --version",
     "deploy:check": "node scripts/deploy-check.js",
-    "deploy:linux": "npm rebuild better-sqlite3 --update-binary && node scripts/deploy-check.js"
+    "deploy:linux": "npm rebuild better-sqlite3 --update-binary && node scripts/deploy-check.js",
+    "build:sdk": "sh scripts/build-sdk.sh"
   },
   "engines": {
     "node": ">=18"

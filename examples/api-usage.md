@@ -2,6 +2,30 @@
 
 本文档提供用 JS (Node.js) 和 Python 调用平台 REST API 的示例。
 
+## 官方 SDK（推荐，U1-8 起）
+
+对话调用优先用官方 SDK（认证走智能体 API 密钥 sk-ap-xxx，无需登录 token）：
+
+- TypeScript/Node：`npm install agent-platform-sdk`（或平台「API 密钥」弹窗下载 .tgz 安装）
+- Python：`pip install agent-platform-sdk`（或下载 .whl 安装）
+
+三行代码完成一次对话（详见 `sdk-example.mjs` / `sdk-example.py`）：
+
+```javascript
+const { AgentPlatform } = require('agent-platform-sdk');
+const ap = new AgentPlatform({ baseUrl: 'http://localhost:3210', apiKey: 'sk-ap-xxx' });
+const r = await ap.chat.completions.create({ model: 'agent-1-名称', messages: [{ role: 'user', content: '你好' }] });
+```
+
+```python
+from agent_platform import AgentPlatform
+ap = AgentPlatform(base_url='http://localhost:3210', api_key='sk-ap-xxx')
+r = ap.chat.completions.create(model='agent-1-名称', messages=[{'role': 'user', 'content': '你好'}])
+```
+
+> SDK 调用的是 OpenAI 兼容端点（`/openapi/v1/chat/completions`），密钥在后台「智能体管理 → API」创建。
+> 下方原始 REST 示例适用于**平台管理 API**（登录 token 认证）——SDK 之外的运维/集成场景。
+
 ## 认证方式
 
 支持两种认证方式（二选一）：

@@ -6100,6 +6100,132 @@ function t(name, fn) {
     }
   }
 
+  console.log('【U1-8】SDK 正式发布：TS/Python 客户端行为 / 真实端到端 / 下载端点 / 规范契约');
+  {
+    const { AgentPlatform, AgentPlatformError } = require('../sdk/typescript/index.js');
+
+    // ===== 纯函数行为（mock fetch 注入）=====
+    await t('U1-8 TS SDK：三行调用链路（chat.completions.create / chatOnce / baseUrl 规范化）', async () => {
+      const fake = async () => ({
+        ok: true, status: 200, text: async () => JSON.stringify({
+          id: 'chatcmpl-ap-1', object: 'chat.completion', created: 1, model: 'agent-1-x',
+          choices: [{ index: 0, message: { role: 'assistant', content: '你好，我是智能体' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 0, completion_tokens: 5, total_tokens: 5 },
+        }),
+      });
+      const ap = new AgentPlatform({ baseUrl: 'http://x/', apiKey: 'sk-ap-test', fetchImpl: fake });
+      assert.strictEqual(ap.baseUrl, 'http://x', 'baseUrl 尾斜杠应去除');
+      const r = await ap.chat.completions.create({ model: 'agent-1-x', messages: [{ role: 'user', content: 'hi' }] });
+      assert.strictEqual(r.choices[0].message.content, '你好，我是智能体', '非流式回复内容应匹配');
+      assert.strictEqual(await ap.chatOnce('agent-1-x', 'hi'), '你好，我是智能体', 'chatOnce 便捷方法');
+    });
+    await t('U1-8 TS SDK：错误信封解析 + 配置校验 + 流式 SSE（分片/[DONE]）', async () => {
+      const fake401 = async () => ({ ok: false, status: 401, text: async () => JSON.stringify({ error: { message: 'API Key 无效或已停用', type: 'invalid_api_key' } }) });
+      const ap = new AgentPlatform({ baseUrl: 'http://x', apiKey: 'bad', fetchImpl: fake401 });
+      await assert.rejects(ap.listModels(), e => {
+        assert.ok(e instanceof AgentPlatformError, '错误类型应为 AgentPlatformError');
+        assert.strictEqual(e.status, 401);
+        assert.strictEqual(e.apiError.type, 'invalid_api_key');
+        return true;
+      }, '错误信封字段应完整');
+      assert.throws(() => new AgentPlatform({ baseUrl: '', apiKey: 'x' }), /baseUrl/);
+      assert.throws(() => new AgentPlatform({ baseUrl: 'http://x', apiKey: '' }), /apiKey/);
+      // 流式：分片到达 + [DONE] 终止
+      const sseBody = 'data: ' + JSON.stringify({ id: 'c1', object: 'chat.completion.chunk', created: 1, model: 'm', choices: [{ index: 0, delta: { content: '流式内容' }, finish_reason: 'stop' }] }) + '\n\ndata: [DONE]\n\ndata: {"should":"not-yield"}\n\n';
+      const enc = new TextEncoder();
+      const chunks = [enc.encode(sseBody.slice(0, 30)), enc.encode(sseBody.slice(30))];
+      let i = 0;
+      const fakeStream = async () => ({ ok: true, status: 200, text: async () => '', body: { getReader: () => ({ read: async () => i < chunks.length ? { done: false, value: chunks[i++] } : { done: true, value: undefined } }) } });
+      const ap2 = new AgentPlatform({ baseUrl: 'http://x', apiKey: 'sk-ap-t', fetchImpl: fakeStream });
+      const stream = await ap2.chat.completions.create({ model: 'm', messages: [], stream: true });
+      let got = '', n = 0;
+      for await (const c of stream) { got += (c.choices[0].delta.content || ''); n++; }
+      assert.strictEqual(got, '流式内容', '流式内容应完整');
+      assert.strictEqual(n, 1, '[DONE] 后应终止（不再产出后续行）');
+    });
+    await t('U1-8 Python SDK：SSE 解析 / 错误信封 / 配置校验（纯函数）', async () => {
+      const { execFileSync } = require('child_process');
+      const py = `
+import sys, json
+sys.path.insert(0, 'sdk/python')
+from agent_platform import AgentPlatform, AgentPlatformError, _sse_lines, _from_error_response
+
+ap = AgentPlatform('http://x/', 'sk-ap-t')
+assert ap.base_url == 'http://x'
+for bad in ('', None):
+    try: AgentPlatform(bad, 'k'); raise SystemExit('should raise')
+    except ValueError: pass
+try: AgentPlatform('http://x', ''); raise SystemExit('should raise')
+except ValueError: pass
+
+sse = 'data: {"a":1}\\n\\ndata: [DONE]\\n\\ndata: {"b":2}\\n'
+got = list(_sse_lines([sse[:15].encode(), sse[15:].encode()]))
+assert got == [{'a': 1}], got
+
+e = _from_error_response(401, json.dumps({'error': {'message': 'x', 'type': 'invalid_api_key'}}))
+assert isinstance(e, AgentPlatformError) and e.status == 401 and e.api_error['type'] == 'invalid_api_key'
+e2 = _from_error_response(502, '<html>bad</html>')
+assert e2.api_error is None and 'HTTP 502' in str(e2)
+print('PY_OK')
+`;
+      const out = execFileSync('python3', ['-c', py], { cwd: path.join(__dirname, '..'), encoding: 'utf8', timeout: 30000 });
+      assert.ok(out.includes('PY_OK'), 'Python SDK 纯函数断言应全过：' + out.slice(0, 300));
+    });
+
+    // ===== 真实端到端：临时实例 + 真密钥 + SDK 完成一次对话（验收标准）=====
+    await t('U1-8 端到端：SDK 三行代码真实调用 /openapi/v1/chat/completions（mock 模型链路）', async () => {
+      // 产物 public/downloads/ 被 gitignore——测试前幂等构建（已存在同版本则 npm pack 覆盖，无副作用）
+      const { execFileSync } = require('child_process');
+      try { execFileSync('sh', ['scripts/build-sdk.sh'], { cwd: path.join(__dirname, '..'), encoding: 'utf8', timeout: 120000, stdio: 'pipe' }); } catch (e) { throw new Error('SDK 构建失败：' + String(e.message).slice(0, 200)); }
+      const { spawn } = require('child_process');
+      const { sign } = require('../src-server/lib/auth');
+      // 造数：admin 发布一个内置智能体（无 Key 走 mock 引擎，不外呼真实网关）+ 全域 API 密钥
+      const wfNull = null;
+      const sp = db.prepare("SELECT id FROM spaces WHERE type='enterprise' LIMIT 1").get() || db.prepare("SELECT id FROM spaces LIMIT 1").get();
+      const agId = db.prepare(`INSERT INTO agents (name,type,space_id,owner,status,visibility,prompt,created_at) VALUES ('U18SDK智能体','other',?,'admin','published','public','你是测试智能体，回复固定内容。',datetime('now','localtime'))`).run(sp.id).lastInsertRowid;
+      const kInfo = db.prepare("INSERT INTO agent_api_keys (agent_id,key,name,status,created_at) VALUES (?,?, 'U18测试密钥',1,datetime('now','localtime'))").run(agId, 'sk-ap-u18test-' + require('crypto').randomBytes(8).toString('hex'));
+      const apiKey = db.prepare('SELECT key FROM agent_api_keys WHERE id=?').get(kInfo.lastInsertRowid).key;
+      const port = 39000 + Math.floor(Math.random() * 1000);
+      const base = `http://127.0.0.1:${port}`;
+      const child = spawn(process.execPath, ['server.js'], {
+        cwd: path.join(__dirname, '..'),
+        env: { ...process.env, PORT: String(port), AGENT_DATA_DIR: process.env.AGENT_DATA_DIR },
+        stdio: 'ignore',
+      });
+      try {
+        let up = false;
+        for (let i = 0; i < 60 && !up; i++) { await new Promise(r => setTimeout(r, 250)); try { up = (await fetch(base + '/api/health')).ok; } catch { } }
+        assert.ok(up, 'U1-8 子进程应在 15s 内就绪');
+        const models = await (new AgentPlatform({ baseUrl: base, apiKey })).listModels();
+        assert.ok(Array.isArray(models) && models.some(m => String(m.id).startsWith(`agent-${agId}-`)), 'listModels 应含测试智能体：' + JSON.stringify(models).slice(0, 160));
+        // 三行调用（验收标准）
+        const ap = new AgentPlatform({ baseUrl: base, apiKey });
+        const r = await ap.chat.completions.create({ model: `agent-${agId}-U18SDK智能体`, messages: [{ role: 'user', content: '你好' }] });
+        assert.strictEqual(r.object, 'chat.completion', '响应应 OpenAI 兼容');
+        assert.ok(r.choices && r.choices[0].message && typeof r.choices[0].message.content === 'string', '应有回复内容');
+        assert.ok(r.usage && r.usage.total_tokens >= 0, '应有 usage 字段');
+        // 下载端点（构建产物在 public/downloads）
+        const dl = await fetch(base + '/downloads/agent-platform-sdk-1.0.0.tgz');
+        assert.ok(dl.ok && (dl.headers.get('content-type') || '').includes('gzip') || dl.ok, 'SDK tgz 应可下载');
+        const dl2 = await fetch(base + '/downloads/agent_platform_sdk-1.0.0-py3-none-any.whl');
+        assert.ok(dl2.ok, 'SDK whl 应可下载');
+        // /api/api-docs/sdk 清单与规范契约
+        const sdkJ = await (await fetch(base + '/api/api-docs/sdk')).json();
+        assert.ok(sdkJ.code === 0 && sdkJ.data.downloads.length >= 2, 'SDK 清单应含两个产物');
+        const spec = await (await fetch(base + '/api/api-docs/openapi.json')).json();
+        assert.ok(spec.paths['/openapi/v1/chat/completions'] && spec.paths['/openapi/v1/chat/completions'].post, '规范应含 chat/completions POST 定义');
+        assert.ok(spec.paths['/openapi/v1/models'] && spec.paths['/openapi/v1/models'].get, '规范应含 models GET 定义');
+        assert.strictEqual(spec['x-sdk'].name, 'agent-platform-sdk', '规范应含 SDK 元数据');
+        assert.ok(spec.components.securitySchemes.apiKeyAuth, '规范应含 apiKeyAuth 安全方案');
+      } finally {
+        try { child.kill('SIGTERM'); } catch { }
+        try { child.kill('SIGKILL'); } catch { }
+        db.prepare('DELETE FROM agent_api_keys WHERE agent_id=?').run(agId);
+        db.prepare('DELETE FROM agents WHERE id=?').run(agId);
+      }
+    });
+  }
+
   // 收尾：关闭库并清理临时目录
   try { db.close(); } catch { }
   fs.rmSync(process.env.AGENT_DATA_DIR, { recursive: true, force: true });

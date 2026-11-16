@@ -460,7 +460,21 @@ export async function render(el) {
     const a = agents.find(x => x.id === id);
     const modelId = `agent-${a.id}-${a.name}`;
     loadKeys().then(keys => {
+      // U1-8：SDK 下载与三行代码示例（api-docs /sdk 端点；失败静默不影响密钥管理主流程）
+      api('/api-docs/sdk').then(j => {
+        const d = (j.data && j.data.downloads) || [];
+        if (!d.length) return;
+        const html = `<div class="hint" style="background:#f5f3ff;border:1px dashed #c4b5fd;border-radius:8px;padding:10px 12px;line-height:1.9;margin-bottom:12px">
+          🧩 <b>${t('官方 SDK（三行代码完成一次对话）')}</b><br>
+          ${d.map(x => `<a class="btn sm" href="${esc(x.url)}" download style="margin-right:6px;text-decoration:none">⬇️ ${esc(x.lang)}${x.kind === 'tgz' ? '（.tgz）' : '（.whl）'}</a>`).join('')}
+          <span style="font-size:11.5px;color:var(--text-3)">${t('私有仓就绪前直接下载安装：npm i agent-platform-sdk-x.x.x.tgz / pip install agent_platform_sdk-x.x.x-py3-none-any.whl')}</span><br>
+          <span class="mono" style="font-size:11.5px;word-break:break-all">const { AgentPlatform } = require('agent-platform-sdk');<br>const ap = new AgentPlatform({ baseUrl: '${esc(location.origin)}', apiKey: 'sk-ap-…' });<br>const r = await ap.chat.completions.create({ model: '${esc(modelId)}', messages: [{ role: 'user', content: '你好' }] });</span>
+        </div>`;
+        const slot = document.querySelector('#akSdkSlot');
+        if (slot) slot.innerHTML = html;
+      }).catch(() => { });
       const body = `
+        <div id="akSdkSlot"></div>
         <div class="hint" style="background:#f0f9ff;border:1px dashed #93c5fd;border-radius:8px;padding:10px 12px;line-height:1.8;margin-bottom:12px">
           🔌 <b>${t('OpenAI 兼容接口')}</b>${t('：外部系统可直接调用该智能体。')}<br>
           ${t('端点：')}<span class="mono" style="word-break:break-all">POST ${location.origin}/openapi/v1/chat/completions</span><br>
