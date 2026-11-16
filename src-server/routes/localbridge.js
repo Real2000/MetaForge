@@ -137,6 +137,23 @@ router.post('/result', deviceAuth, (req, res) => {
   if (!t || t.device_id !== req.device.id) return res.status(404).json({ code: 404, msg: '任务不存在' });
   db.prepare(`UPDATE localbridge_tasks SET status=?, result=?, updated_at=? WHERE id=?`)
     .run(result && result.ok ? 'done' : 'failed', JSON.stringify(result || {}).slice(0, 8000), now(), t.id);
+  // U2-4 Phase 2：结果回传渠道。如果该任务关联了 channel_msg_id，通过 channel.js send 回推结果
+  if (t.channel_msg_id) {
+    try {
+      const { send } = require('../lib/channel');
+      const msgRow = db.prepare('SELECT * FROM channel_messages WHERE id=?').get(t.channel_msg_id);
+      if (msgRow && msgRow.channel && msgRow.channel !== 'inbox') {
+        const opLabel = t.op === 'list_dir' ? '文件列表' : t.op === 'file_read' ? '文件内容' : t.op;
+        const summary = result && result.ok ? `✅「${opLabel}」执行成功` : `❌「${opLabel}」执行失败`;
+        await send({ channel: msgRow.channel, receivers: [msgRow.sender_id] }, {
+          title: summary,
+          content: `${summary}\n\n${result && result.data ? JSON.stringify(result.data, null, 2).slice(0, 3000) : result && result.result ? String(result.result).slice(0, 3000) : '（无输出）'}`,
+        });
+      }
+    } catch (e) {
+      console.error('[localbridge] 渠道回传失败：', e.message);
+    }
+  }
   res.json({ code: 0 });
 });
 

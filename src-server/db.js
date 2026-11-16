@@ -1623,6 +1623,18 @@ db.exec(`CREATE TABLE IF NOT EXISTS localbridge_tasks (
   updated_at TEXT
 );`);
 
+// ================== U2-4 Phase 2 端侧指令闭环：localbridge_tasks 加 channel_msg_id ==================
+{
+  try {
+    const lbtCols = db.prepare('PRAGMA table_info(localbridge_tasks)').all().map(c => c.name);
+    if (!lbtCols.includes('channel_msg_id')) {
+      db.exec('ALTER TABLE localbridge_tasks ADD COLUMN channel_msg_id INTEGER DEFAULT NULL');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_lbt_channel_msg ON localbridge_tasks(channel_msg_id);');
+      console.log('[db] localbridge_tasks 表已迁移：新增 channel_msg_id 字段（U2-4 Phase 2）');
+    }
+  } catch (e) { console.error('[db] U2-4 迁移失败（不阻塞）：', e.message); }
+}
+
 // ---------------- P1-4 分层记忆v1：agent_memories 增加 type/confidence/source/summary 字段（2026-11-11）----------------
 {
   const cols = db.prepare('PRAGMA table_info(agent_memories)').all().map(r => r.name);
