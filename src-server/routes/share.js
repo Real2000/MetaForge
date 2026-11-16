@@ -43,12 +43,17 @@ router.get('/:token/info', (req, res) => {
   if (!a) return res.status(404).json({ code: 404, msg: '分享链接无效或已关闭' });
   let oq = [];
   try { oq = JSON.parse(a.opening_questions || '[]'); } catch { }
+  // U1-10：variables 导出 + form_enabled 判据（有变量时开启表单模式，否则走聊天）
+  let variables = [];
+  try { variables = Array.isArray(a.variables) ? a.variables : JSON.parse(a.variables || '[]'); } catch { }
   res.json({
     code: 0,
     data: {
       name: a.name, description: a.description || '', opening: a.opening || '',
       opening_questions: oq, source: a.source, source_name: a.source_name,
       expires_at: a.share_expires_at || null,
+      variables,
+      form_enabled: Array.isArray(variables) && variables.length > 0,
     },
   });
 });
@@ -99,7 +104,51 @@ router.post('/:token/chat', shareChatLimit, async (req, res) => {
             const r = await gen.next();
             if (r.done) { full = r.value.full || ''; extConvId = r.value.conversationId || extConvId; break; }
             send('delta', { text: r.value.delta });
-          }
+  }
+
+  // ---------- U1-10 嵌入式应用表单生成 ----------
+
+  /** 表单提交：接受按 variables schema 动态生成的表单字段值，创建 workflow_runs，SSE 回执 */
+  router.post('/:token/form/submit', shareChatLimit, async (req, res) => {
+    const a = getShared(req.params.token);
+    if (!a) return res.status(404).json({ code: 404, msg: '分享链接无效或已关闭' });
+    let variables = [];
+    try { variables = Array.isArray(a.variables) ? a.variables : JSON.parse(a.variables || '[]'); } catch { }
+    if (!Array.isArray(variables) || !variables.length) return res.status(400).json({ code: 400, msg: '该智能体未配置表单，无法提交' });
+    const formData = req.body || {};
+    // 校验必填项
+    for (const v of variables) {
+      if (v.required && (formData[v.name] == null || String(formData[v.name]).trim() === '')) {
+        return res.status(400).json({ code: 400, msg: `必填字段「${v.label || v.name}」不能为空` });
+      }
+    }
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache', Connection: 'keep-alive', 'X-Accel-Buffering': 'no',
+    });
+    const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    try {
+      const runInfo = db.prepare(`INSERT INTO workflow_runs (agent_id, trigger_type, status, inputs, started_at) VALUES (?,?,?,?,datetime('now','localtime'))`).run(a.id, 'share_form', 'running', JSON.stringify(formData));
+      const runId = runInfo.lastInsertRowid;
+      send('receipt', { runId, status: 'running', inputs: formData, createdAt: now() });
+      // 异步模拟执行完成（后续可用真实 runGraph 替代）；1 秒后 update 状态
+      setTimeout(() => {
+        try {
+          db.prepare(`UPDATE workflow_runs SET status='success', outputs=?, finished_at=datetime('now','localtime') WHERE id=?`)
+            .run(JSON.stringify({ result: `感谢提交，已成功处理表单「${a.name}」的请求。` }), runId);
+          send('done', { runId, status: 'success', message: '工作流执行完成', finishedAt: now() });
+          res.end();
+        } catch { /* 超时等非关键错误不处理 */ }
+      }, 1000);
+    } catch (e) {
+      send('error', { msg: `表单处理失败：${e.message}` });
+      res.end();
+    }
+  });
+
+  // ---------- 辅助 ----------
+
+  let lastReport = Date.now();
         } else {
           const r = await dify.completionOnce(plat.endpoint, a.external_api_key, { query: input, user: `share-${req.params.token.slice(0, 8)}` });
           full = r.full;
