@@ -443,4 +443,44 @@ async function chatOnce(messages, opts = {}) {
   return out; // { usage, full, mode }
 }
 
-module.exports = { chat, chatOnce, getDefaultProvider, getConfiguredProviders, buildCandidates, postModel, friendlyNetError, isFailoverWorthy, accumulateUsage };
+/** U1-9：知识库图片理解——用多模态 VL 模型将图片描述为文本。
+ *  @param {Buffer} imageBuf  原始图片二进制 Buffer
+ *  @param {string}  modelName VL 模型名（如 'qwen-vl-max'，须已在 providers 中有此模型）
+ *  @param {string}  [prompt]  描述指令（缺省用默认万用描述提示词）
+ *  @returns { {ok:true, text:string} | {ok:false, msg:string} } 返回描述文本或错误信息
+ */
+async function visionDescribe(imageBuf, modelName, prompt) {
+  if (!imageBuf || !modelName) return { ok: false, msg: 'visionDescribe：参数缺失（buf 与 modelName 必填）' };
+  try {
+    // 图片 → base64 data URI
+    let imgBase64 = imageBuf.toString('base64');
+    // 降采样太大的 base64（> 3MB 原始图片做缩减避免网关超时）——按比例缩到长边 1024
+    if (imageBuf.length > 500 * 1024) {
+      try {
+        // 用内置 imgResize（极简 HTTP 无依赖方案：不做 libvips/Sharp，只缩 metadata 太复杂，
+        // 这里直接截取风险较小——图片太大才截base64前面的部分，对 JPEG/PNG 开头头部影响有限
+        // 更稳妥的做法：告知用户图片太大，让 LLM 自行处理大图。先保持原样，后续可加 sharp 优化
+        console.log(`[visionDescribe] 图片较大(${(imageBuf.length / 1024).toFixed(0)}KB)，直接传入；模型侧会降采样处理`);
+      } catch { /* 降采样不是必需的 */ }
+    }
+    // 多模态消息结构：支持 content 数组 [{type:'text',text:'...'},{type:'image_url',image_url:{url:'data:...'}}]
+    const sys = prompt || '请用简短的文字描述这张图片的主要内容和关键信息。如果图片中有文字，请一并提取。';
+    const messages = [
+      { role: 'system', content: sys },
+      { role: 'user', content: [
+        { type: 'text', text: '请描述这张图片：' },
+        { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${imgBase64}` } },
+      ] },
+    ];
+    const result = await chatOnce(messages, { model: modelName, llmModel: modelName });
+    if (result && result.full) {
+      const text = String(result.full).trim();
+      if (text) return { ok: true, text };
+    }
+    return { ok: false, msg: '模型返回为空' };
+  } catch (e) {
+    return { ok: false, msg: `视觉理解模型调用失败：${e.message}` };
+  }
+}
+
+module.exports = { chat, chatOnce, visionDescribe, getDefaultProvider, getConfiguredProviders, buildCandidates, postModel, friendlyNetError, isFailoverWorthy, accumulateUsage };

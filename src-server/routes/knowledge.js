@@ -100,7 +100,7 @@ router.post('/', (req, res) => {
 });
 
 router.put('/:id', (req, res) => {
-  const { name, description, enabled, chunk_size, chunk_overlap, chunk_separator, auto_metadata, pipeline } = req.body || {};
+  const { name, description, enabled, chunk_size, chunk_overlap, chunk_separator, auto_metadata, pipeline, vision_model } = req.body || {};
   const old = db.prepare('SELECT * FROM kbs WHERE id=?').get(req.params.id);
   const deny = denyIfNotAllowed(old, req.user);
   if (deny) return res.json(deny);
@@ -133,9 +133,10 @@ router.put('/:id', (req, res) => {
   } else {
     return res.json({ code: 400, msg: 'pipeline 须为步骤名字符串数组（null/空数组=恢复默认管道）' });
   }
-  db.prepare('UPDATE kbs SET name=?,description=?,enabled=?,chunk_size=?,chunk_overlap=?,chunk_separator=?,auto_metadata=?,pipeline=? WHERE id=?')
-    .run(name || old.name, description ?? old.description, enabled ?? old.enabled,
-      nextSize, nextOverlap, nextSep, autoMeta, nextPipeline, old.id);
+  const nextVm = vision_model !== undefined ? vision_model : (old.vision_model || '');
+  db.prepare('UPDATE kbs SET name=?,description=?,enabled=?,chunk_size=?,chunk_overlap=?,chunk_separator=?,auto_metadata=?,pipeline=?,vision_model=? WHERE id=?')
+     .run(name || old.name, description ?? old.description, enabled ?? old.enabled,
+       nextSize, nextOverlap, nextSep, autoMeta, nextPipeline, nextVm, old.id);
   // V1.3 #6 2026-10-30：切片参数任一实际变化（与 old 逐项比对；数值归一比较防字符串/数字形态误判）
   // → fire-and-forget 召回评测回归：重跑该库全部评测集 + 通知 owner，异步执行不阻塞保存响应
   const chunkChanged = Number(nextSize) !== Number(old.chunk_size)

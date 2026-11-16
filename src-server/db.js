@@ -889,6 +889,24 @@ if (!kbCols4.includes('pipeline')) {
   db.exec(`ALTER TABLE kbs ADD COLUMN pipeline TEXT DEFAULT NULL`);
   console.log('[db] kbs 表已迁移：新增 pipeline 字段（摄取管道配置）');
 }
+
+// ================== U1-9 知识库图片理解（2026-11-16）==================
+// kb_chunks.image_descs TEXT —— vision-describe 步骤生成的图片描述文本
+// kbs.vision_model TEXT —— 该知识库选用的多模态视觉理解模型名（空=不启用 vision 描述）
+{
+  try {
+    const chunkCols3 = db.prepare('PRAGMA table_info(kb_chunks)').all().map(c => c.name);
+    if (!chunkCols3.includes('image_descs')) {
+      db.exec(`ALTER TABLE kb_chunks ADD COLUMN image_descs TEXT DEFAULT ''`);
+      console.log('[db] kb_chunks 表已迁移：新增 image_descs 字段（U1-9 图片描述文本）');
+    }
+    const kbCols5 = db.prepare('PRAGMA table_info(kbs)').all().map(c => c.name);
+    if (!kbCols5.includes('vision_model')) {
+      db.exec(`ALTER TABLE kbs ADD COLUMN vision_model TEXT DEFAULT ''`);
+      console.log('[db] kbs 表已迁移：新增 vision_model 字段（U1-9 视觉理解模型）');
+    }
+  } catch (e) { console.error('[db] U1-9 图片理解迁移失败（不阻塞启动）：', e.message); }
+}
 // agents.kb_metadata_filter：挂知识库时声明的检索过滤（JSON 对象，AND 语义；值支持 "$user.dept" 占位符，
 // chat 时解析为请求用户部门文本名；NULL=不过滤）。例：{"level":"公开","dept":"$user.dept"}
 const agentCols2 = db.prepare('PRAGMA table_info(agents)').all().map(c => c.name);

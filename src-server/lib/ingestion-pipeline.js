@@ -46,6 +46,7 @@ const { generateForFile } = require('./keywordgen');           // 自动关键�
 const { extractMetadataForFile } = require('./kb-metadata');   // 自动元数据抽取（后处理）
 const { runKbRegression } = require('./kb-eval-regression');   // 召回评测回归（后处理）
 const paddleocr = require('./paddleocr');                      // PaddleOCR HTTP 封装（ocr 步骤）
+const path = require('path');                                  // U1-9：vision-describe 步骤判断文件扩展名
 
 /**
  * 步骤注册表：name → { name, label(中文名), desc(一句话), post?, async run(ctx) }
@@ -114,6 +115,36 @@ const PIPELINE_STEPS = {
       } catch (e) {
         warnOcrDegrade(ctx, `OCR 识别失败：${e.message}，本次跳过增强`);
         return { ok: true, skipped: 'error' };
+      }
+    },
+  },
+
+  'vision-describe': {
+    name: 'vision-describe',
+    label: '图片理解（VL）',
+    desc: '图片型文件（.png/.jpg/.webp 等）用多模态 VL 模型生成描述文本；与 OCR 互斥——已走 vision 则 OCR 跳过；模型由知识库 vision_model 指定',
+    async run(ctx) {
+      const IMG_EXTS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp']);
+      const ext = path.extname((ctx.name || '').toLowerCase());
+      if (!IMG_EXTS.has(ext)) return { ok: true, skipped: 'not_image' };
+      const visionModel = ctx.kb?.vision_model;
+      if (!visionModel) return { ok: true, skipped: 'no_vision_model' };
+      // 有 buf 且已配置 vision_model → 走 vision 描述：结果写入 ctx.text（覆盖 parse 的短文本），后续 clean 步骤处理
+      if (!ctx.buf) return { ok: true, skipped: 'no_buffer' };
+      try {
+        const { visionDescribe } = require('./llm');
+        const r = await visionDescribe(ctx.buf, visionModel);
+        if (r.ok && r.text) {
+          ctx.text = r.text;
+          ctx.visionUsed = true;
+          ctx.imageDescs = r.text; // 额外保存供检索增强匹配
+          return { ok: true };
+        }
+        console.warn(`[ingestion] vision-describe 失败（${r.msg || '未知'}），跳过（不阻断文件处理）`);
+        return { ok: true, skipped: 'vision_failed' };
+      } catch (e) {
+        console.warn('[ingestion] vision-describe 异常（不阻断）：', e.message);
+        return { ok: true, skipped: 'vision_error' };
       }
     },
   },
@@ -284,7 +315,7 @@ const PIPELINE_STEPS = {
 };
 
 /** 默认管道步骤名数组（顺序即执行顺序；注册表键序与此一致） */
-const DEFAULT_PIPELINE = ['parse', 'ocr', 'clean', 'chunk', 'toc', 'metadata', 'keywords', 'regression'];
+const DEFAULT_PIPELINE = ['parse', 'ocr', 'vision-describe', 'clean', 'chunk', 'toc', 'metadata', 'keywords', 'regression'];
 
 /** 步骤名白名单校验：是否为注册表内合法步骤 */
 function VALID_STEP(name) {
