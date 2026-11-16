@@ -12,12 +12,14 @@
  *  - billUsage：是否 addUsage 记账（Coze 工作流原本不记账，传 false）
  *  - extConvId !== undefined：回写 sessions.ext_conversation_id（Dify/Coze 对话链路；技能/工作流不传）
  *  - opDetail：op_logs 明细文案；传函数时以最终 tokens 为参（文案含 token 数的场景）
+ *  - promptTokens/completionTokens：U1-6 精细计费拆分基数（外部 usage 真实值优先；缺省 prompt 按输入估算、completion=最终 tokens）
  *
  * 注意：内部链路（含 PII/假图防御/建议生成等独有逻辑）不经过本 Sink，仍在 chat.js 主链路内。
  */
 const { db, now } = require('../db');
 const { check, countHits, mask } = require('./security');
 const { addUsage } = require('./quota');
+const { recordModelUsage } = require('./billing'); // U1-6：成本归因（与配额记账同点位，失败内部兜底不阻断）
 
 /**
  * 统一收尾一轮外部/技能对话。
@@ -30,6 +32,7 @@ function finishExternalTurn(opts) {
     input, full,
     tokens, agent = null,
     modelLabel = '', modeLabel = '',
+    promptTokens, completionTokens,
     tStart = Date.now(),
     maskOutput = true, billUsage = true,
     extConvId, opAction = '对话调用', opDetail = '',
@@ -62,6 +65,19 @@ function finishExternalTurn(opts) {
 
   // 4. 配额记账（唯一记账点；billUsage=false 保留 Coze 工作流不记账的原行为）
   if (billUsage && finalTokens > 0) addUsage(username, finalTokens);
+
+  // 4b. U1-6 成本归因：与配额记账同点位（billUsage=false 同样不记）；失败内部兜底不阻断收尾。
+  //     拆分基数：外部 usage 真实值优先（调用方传 promptTokens/completionTokens），
+  //     缺省 prompt 按输入长度估算（与 tokens 估算口径一致）、completion = 最终 tokens
+  if (billUsage && finalTokens > 0 && modelLabel) {
+    recordModelUsage({
+      username,
+      model: modelLabel,
+      promptTokens: Number.isFinite(+promptTokens) && +promptTokens > 0 ? +promptTokens : Math.ceil(String(input || '').length * 0.6),
+      completionTokens: Number.isFinite(+completionTokens) && +completionTokens > 0 ? +completionTokens : finalTokens,
+      meta: modeLabel ? { mode: modeLabel } : {},
+    });
+  }
 
   // 5. op_logs 审计（明细文案可为函数，以最终 tokens 为参）；审计/trace 写入失败不阻断 done 事件（P5.33 审查修复 F10：保证前端不悬挂）
   try {

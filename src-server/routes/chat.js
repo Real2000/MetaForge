@@ -12,6 +12,7 @@ const coze = require('../lib/coze');
 const { buildTools, runTool, loadMcpTools, toolRiskOf, AGENT_TOOL_DENY } = require('../lib/tools');
 const skills = require('../lib/skills');
 const { checkQuota, addUsage } = require('../lib/quota');
+const { recordModelUsage } = require('../lib/billing'); // U1-6：主链路成本归因记账
 const { parseSkillMentions, parseAgentMentions } = require('../lib/skill-mention');
 const { canView } = require('../lib/agent-access');
 const { finishExternalTurn } = require('../lib/chat-sink'); // P5.33：外部/技能链路统一收尾（唯一记账/落库/审计点）
@@ -196,6 +197,17 @@ router.post('/sessions/:id/resume', async (req, res) => {
     const msgInfo = db.prepare('INSERT INTO messages (session_id,role,content,tokens,created_at) VALUES (?,?,?,?,?)')
       .run(req.params.id, 'assistant', full, tokens, now());
     addUsage(req.user.username, tokens);
+    // U1-6 成本归因（续跑链路）：模型取检查点/路由记录的 model，输入按检查点存量内容估算
+    try {
+      recordModelUsage({
+        username: req.user.username,
+        model: genMeta?.model || ck.model || 'default',
+        provider: genMeta?.provider,
+        promptTokens: Math.ceil((ck.user_content || '').length * 0.6) + Math.ceil((ck.partial_content || '').length * 0.6),
+        completionTokens: tokens,
+        meta: { mode: 'resumed' },
+      });
+    } catch (e) { console.error('[chat] U1-6 续跑成本归因失败（不阻断）：', e.message); }
     db.prepare('UPDATE sessions SET updated_at=? WHERE id=?').run(now(), req.params.id);
     deleteCheckpoint(req.params.id);
     db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
@@ -706,12 +718,13 @@ router.post('/stream', async (req, res) => {
       }
 
       // P5.33：统一收尾经 ConversationSink（脱敏/落库/ext会话回写/记账/审计/trace/done）；
-      // tokens 外部 usage 优先（0 视为缺省按内容估算，与原 || 语义一致）
+      // tokens 外部 usage 优先（0 视为缺省按内容估算，与原 || 语义一致）；U1-6 拆分基数同传真实 usage
       finishExternalTurn({
         send, sessionId: session_id, username: req.user.username, ip: req.ip,
         input, full, agent,
         modelLabel: agent.model || 'dify-app', modeLabel: 'dify', tStart,
         tokens: usage?.total_tokens || undefined,
+        promptTokens: usage?.prompt_tokens, completionTokens: usage?.completion_tokens,
         extConvId,
         opDetail: (pt) => `与「${agent.name}」对话（Dify 真实转发，${pt} tokens）`,
       });
@@ -808,12 +821,13 @@ router.post('/stream', async (req, res) => {
         return res.end();
       }
 
-      // P5.33：统一收尾经 ConversationSink（同 Dify：脱敏/ext会话回写/usage 优先记账）
+      // P5.33：统一收尾经 ConversationSink（同 Dify：脱敏/ext会话回写/usage 优先记账）；U1-6 拆分基数同传真实 usage
       finishExternalTurn({
         send, sessionId: session_id, username: req.user.username, ip: req.ip,
         input, full, agent,
         modelLabel: agent.model || 'coze-bot', modeLabel: 'coze', tStart,
         tokens: usage?.total_tokens || undefined,
+        promptTokens: usage?.prompt_tokens, completionTokens: usage?.completion_tokens,
         extConvId,
         opDetail: (pt) => `与「${agent.name}」对话（Coze 真实转发，${pt} tokens）`,
       });
@@ -1252,6 +1266,17 @@ router.post('/stream', async (req, res) => {
     const msgInfo = db.prepare('INSERT INTO messages (session_id,role,content,tokens,created_at) VALUES (?,?,?,?,?)')
       .run(session_id, 'assistant', outMasked, tokens, now());
     addUsage(req.user.username, tokens); // P2 配额记账（本地模型链路）
+    // U1-6 成本归因（主链路）：按真实单价计成本；拆分基数与既有口径一致（输入按 promptChars 估算、输出按 tokens）
+    try {
+      recordModelUsage({
+        username: req.user.username,
+        model: genMeta?.model || model || agent?.model || 'default',
+        provider: genMeta?.provider,
+        promptTokens: Math.ceil(promptChars * 0.6),
+        completionTokens: tokens,
+        meta: { mode: 'real' },
+      });
+    } catch (e) { console.error('[chat] U1-6 成本归因失败（不阻断）：', e.message); }
     db.prepare('UPDATE sessions SET updated_at=? WHERE id=?').run(now(), session_id);
     db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
       .run(req.user.username, '对话调用', `与 ${agent ? '「' + agent.name + '」' : '首页助手'} 对话（${tokens} tokens${stopped ? '，用户停止生成' : ''}${usedSkills.length ? '，@技能 ' + usedSkills.map(s => s.name).join('/') : ''}${toolTrace.length ? '，工具×' + toolTrace.length : ''}${genMeta?.provider ? '，@' + genMeta.provider + '/' + (genMeta.model || model || '') : ''}）`, req.ip, now());

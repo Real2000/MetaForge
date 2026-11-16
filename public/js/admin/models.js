@@ -50,6 +50,7 @@ export async function render(el) {
         <div class="kv" style="margin-bottom:12px">
           <span class="k">${t('服务地址')}</span><span class="mono" style="word-break:break-all">${esc(p.base_url || '-')}</span>
           <span class="k">${t('模型列表')}</span><span>${models.length ? models.slice(0, 9).map(m => modelTag(m, p)).join('') + (models.length > 9 ? ` <span style="color:var(--text-3)">${t('等')} ${models.length} ${t('个')}</span>` : '') : `<span style="color:var(--text-3)">${t('暂未接入模型')}</span>`}</span>
+          <span class="k">${t('计费单价')}</span><span>${(() => { let n = 0; try { n = Object.keys(JSON.parse(p.model_price || '{}') || {}).length; } catch { } return n ? `💰 ${t('已配置')} ${n} ${t('个模型单价')}` : `<span style="color:var(--text-3)">${t('未配置（成本不计价）')}</span>`; })()}</span>
           <span class="k">${t('说明')}</span><span style="color:var(--text-2);font-size:12px">${esc(t(p.remark || ''))}</span>
         </div>
         <div style="display:flex;gap:8px;flex-wrap:wrap">
@@ -135,9 +136,20 @@ export async function render(el) {
   }
 
   function openCfg(id) {
-    const p = id ? providers.find(x => x.id === id) : { name: '', base_url: '', api_key: '', models: [], remark: '' };
+    const p = id ? providers.find(x => x.id === id) : { name: '', base_url: '', api_key: '', models: [], remark: '', model_price: '{}' };
     let models = [];
     try { models = Array.isArray(p.models) ? p.models : JSON.parse(p.models || '[]'); } catch { }
+    // U1-6：单价表回显（模型列表输入框变化时同步重渲染单价行）
+    let priceTable = {};
+    try { priceTable = JSON.parse(p.model_price || '{}') || {}; } catch { priceTable = {}; }
+    function priceRows(ms) {
+      if (!ms.length) return `<div class="hint">${t('先填写模型列表，再逐个配置单价')}</div>`;
+      return `<table class="tbl" style="font-size:12.5px"><thead><tr><th>${t('模型')}</th><th style="width:110px">${t('输入单价')}</th><th style="width:110px">${t('输出单价')}</th></tr></thead><tbody>` +
+        ms.map(m => `<tr><td class="mono">${esc(m)}</td>
+          <td><input class="input mono" data-pin="${esc(m)}" value="${priceTable[m] ? priceTable[m].input : ''}" placeholder="0.00"></td>
+          <td><input class="input mono" data-pout="${esc(m)}" value="${priceTable[m] ? priceTable[m].output : ''}" placeholder="0.00"></td></tr>`).join('') +
+        '</tbody></table>';
+    }
     const body = `
       <div class="form-row">
         <div class="form-item"><label>${t('供应商名称')}<span class="req">*</span></label><input class="input" id="pv_name" value="${esc(p.name)}" placeholder="${t('如：深度求索')}"></div>
@@ -151,20 +163,49 @@ export async function render(el) {
         <input class="input mono" id="pv_models" value="${esc(models.join(', '))}" placeholder="deepseek-chat, deepseek-reasoner">
         <div class="hint">${t('保存后也可用「同步模型」按钮从 /models 接口自动拉取')}</div>
       </div>
+      <div class="form-item"><label>${t('模型计费单价（元/千 Token，可选）')}</label>
+        <div id="pv_prices">${priceRows(models)}</div>
+        <div class="hint">${t('U1-6 成本归因：填写后平台按「单价 × 实际 token」计算各部门真实成本，未填的模型不计成本。输入/输出单价留空视为未配置。')}</div>
+      </div>
       <div class="form-item"><label>${t('备注')}</label><input class="input" id="pv_remark" value="${esc(p.remark || '')}"></div>`;
     modal({
       title: id ? `${t('配置')} - ${p.name}` : t('接入新供应商'), body, wide: true,
       foot: `<button class="btn" data-cancel>${t('取消')}</button><button class="btn primary" data-save>${t('保存')}</button>`,
       onMount(mask, close) {
         mask.querySelector('[data-cancel]').onclick = close;
+        // U1-6：模型列表输入变化 → 重渲染单价行（保留已填单价值）
+        mask.querySelector('#pv_models').addEventListener('input', e => {
+          const cur = {};
+          mask.querySelectorAll('[data-pin]').forEach(inp => {
+            const m = inp.dataset.pin, out = mask.querySelector(`[data-pout="${CSS.escape(m)}"]`);
+            if (inp.value !== '' || (out && out.value !== '')) cur[m] = { input: inp.value, output: out ? out.value : '' };
+          });
+          priceTable = cur;
+          const ms = e.target.value.split(/[,，\s]+/).filter(Boolean);
+          mask.querySelector('#pv_prices').innerHTML = priceRows(ms);
+        });
         mask.querySelector('[data-save]').onclick = async () => {
           try {
             const keyVal = mask.querySelector('#pv_key').value.trim(); // P5.30：留空=不修改 Key（后端掩码防御兑底）
+            // U1-6：收集单价表（两项均填才入表；非法数值拒保存）
+            const price = {};
+            let priceErr = '';
+            mask.querySelectorAll('[data-pin]').forEach(inp => {
+              const m = inp.dataset.pin;
+              const out = mask.querySelector(`[data-pout="${CSS.escape(m)}"]`);
+              const iv = (inp.value || '').trim(), ov = (out ? out.value : '').trim();
+              if (iv === '' && ov === '') return;
+              const fi = Number(iv), fo = Number(ov);
+              if (!Number.isFinite(fi) || fi < 0 || !Number.isFinite(fo) || fo < 0) { priceErr = t('单价必须为非负数字'); return; }
+              price[m] = { input: fi, output: fo };
+            });
+            if (priceErr) { toast(priceErr, 'err'); return; }
             const payload = {
               name: mask.querySelector('#pv_name').value.trim(),
               base_url: mask.querySelector('#pv_url').value.trim(),
               models: mask.querySelector('#pv_models').value,
               remark: mask.querySelector('#pv_remark').value,
+              model_price: JSON.stringify(price),
             };
             if (keyVal) payload.api_key = keyVal;
             if (id) await api('/providers/' + id, { method: 'PUT', body: payload });

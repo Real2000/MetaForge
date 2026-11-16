@@ -2037,6 +2037,34 @@ db.exec('CREATE INDEX IF NOT EXISTS idx_ur_dim ON usage_records(dimension);');
 db.exec('CREATE INDEX IF NOT EXISTS idx_ur_day ON usage_records(created_at);');
 console.log('[db] 创建 model_capabilities/usage_records 表 + providers 扩充列（P2-9~11 模型能力/鉴权/用量）');
 
+// ================== U1-6 成本归因与精细计费（2026-11-16）==================
+// providers.model_price：模型单价表 JSON，形如 {"deepseek-chat":{"input":0.001,"output":0.002}}（单位：元/千 Token）
+// usage_records 扩列：prompt_tokens/completion_tokens（拆分计费基数）、dept_id（写时部门快照，按部门归因聚合）
+// departments 扩列：monthly_budget（月度预算元，0=不设预算不告警）、budget_alert_level（已提醒档位 0/1/2，仿 users.quota_alert_level 防轰炸）
+{
+  try {
+    const pvCols = db.prepare('PRAGMA table_info(providers)').all().map(c => c.name);
+    if (!pvCols.includes('model_price')) {
+      db.exec("ALTER TABLE providers ADD COLUMN model_price TEXT DEFAULT '{}'");
+      console.log('[db] providers 表已迁移：新增 model_price 字段（U1-6 模型单价表）');
+    }
+    const urCols = db.prepare('PRAGMA table_info(usage_records)').all().map(c => c.name);
+    if (!urCols.includes('prompt_tokens')) db.exec('ALTER TABLE usage_records ADD COLUMN prompt_tokens INTEGER DEFAULT 0');
+    if (!urCols.includes('completion_tokens')) db.exec('ALTER TABLE usage_records ADD COLUMN completion_tokens INTEGER DEFAULT 0');
+    if (!urCols.includes('dept_id')) {
+      db.exec('ALTER TABLE usage_records ADD COLUMN dept_id INTEGER DEFAULT NULL');
+      console.log('[db] usage_records 表已迁移：新增 prompt_tokens/completion_tokens/dept_id 字段（U1-6 精细计费）');
+    }
+    db.exec('CREATE INDEX IF NOT EXISTS idx_ur_dept ON usage_records(dept_id);');
+    const dpCols = db.prepare('PRAGMA table_info(departments)').all().map(c => c.name);
+    if (!dpCols.includes('monthly_budget')) {
+      db.exec('ALTER TABLE departments ADD COLUMN monthly_budget REAL DEFAULT 0');
+      db.exec('ALTER TABLE departments ADD COLUMN budget_alert_level INTEGER DEFAULT 0');
+      console.log('[db] departments 表已迁移：新增 monthly_budget/budget_alert_level 字段（U1-6 部门预算告警）');
+    }
+  } catch (e) { console.error('[db] U1-6 成本计费迁移失败（不阻塞启动）：', e.message); }
+}
+
 // ================== P2-12 文件台账与修订（2026-11-13）==================
 db.exec(`CREATE TABLE IF NOT EXISTS file_catalog (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

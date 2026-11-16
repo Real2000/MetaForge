@@ -213,6 +213,37 @@ function dailyOps(job, fn) {
   fn();
 }
 
+/** U1-6：部门月度成本超预算告警（仿 quota.js quotaAlert 模式：跨 80%/100% 两档，升档才发防轰炸；
+ *  budget_alert_level 记录已提醒档位。通知发 admin + 部门成员——admin 可调预算，成员可感知本部门消耗） */
+function checkDeptBudgets() {
+  try {
+    const { deptCostOfMonth } = require('./billing');
+    const { month, departments } = deptCostOfMonth();
+    let alerted = 0;
+    for (const d of departments) {
+      if (!d.dept_id || !d.budget || d.budget <= 0) continue; // 未归属行与未设预算部门不告警
+      const pct = d.cost / d.budget;
+      const level = pct >= 1 ? 2 : (pct >= 0.8 ? 1 : 0);
+      const row = db.prepare('SELECT budget_alert_level FROM departments WHERE id=?').get(d.dept_id);
+      if (!row || level <= (row.budget_alert_level || 0)) continue; // 已提醒过同档/更高档不重复发
+      const pctTxt = Math.round(pct * 100);
+      const content = level === 2
+        ? `「${d.name}」本月模型成本已达预算 100%（${d.cost.toFixed(2)} 元 / 预算 ${d.budget} 元）。已超额支出，请尽快调整预算或限制部门用量。`
+        : `「${d.name}」本月模型成本已达预算 ${pctTxt}%（${d.cost.toFixed(2)} 元 / 预算 ${d.budget} 元），接近上限。可提前调整预算或关注部门用量趋势。`;
+      db.prepare('INSERT INTO notifications (username,title,content,type,link,is_read,created_at) VALUES (?,?,?,?,?,0,?)')
+        .run('*', `💸 部门预算${level === 2 ? '超支' : '预警'}：${d.name}`, content, 'budget', '#/admin/dashboard', now());
+      db.prepare('UPDATE departments SET budget_alert_level=? WHERE id=?').run(level, d.dept_id);
+      console.log(`[ops] ⚠️ 部门预算告警：${d.name} 当月 ${d.cost.toFixed(2)}/${d.budget} 元（第 ${level} 档，${month}）`);
+      alerted++;
+    }
+    return { ok: true, alerted };
+  } catch (e) {
+    console.error('[ops] 部门预算检查失败：', e.message);
+    db.prepare('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)').run('ops-budget', e.message, now());
+    return { ok: false, msg: e.message };
+  }
+}
+
 function startOps() {
   // 启动 60 秒后先跑一轮（首次部署即有备份），此后每 30 分钟检查跨日触发
   setTimeout(() => { dailyOps('backup', dailyBackup); dailyOps('uploads', cleanupUploads); dailyOps('logs', archiveLogs); }, 60000);
@@ -228,6 +259,9 @@ function startOps() {
   // U1-5：启动后 3 分钟跑第一轮评测回归，后每 4 小时检查
   setTimeout(() => dailyOps('eval', runEvalRegression), 180000);
   setInterval(() => dailyOps('eval', runEvalRegression), 240 * 60000);
+  // U1-6：部门超预算告警（与每日备份同批检查，每日一次；升档幂等在 checkDeptBudgets 内部）
+  setTimeout(() => dailyOps('deptBudget', checkDeptBudgets), 240000);
+  setInterval(() => dailyOps('deptBudget', checkDeptBudgets), 30 * 60000);
 }
 
-module.exports = { dailyBackup, cleanupUploads, archiveLogs, digestMemories, runEvalRegression, startOps };
+module.exports = { dailyBackup, cleanupUploads, archiveLogs, digestMemories, runEvalRegression, checkDeptBudgets, startOps };

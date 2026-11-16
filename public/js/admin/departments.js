@@ -48,6 +48,7 @@ export async function render(el) {
           ${'<span class="dep-line">└</span>'.repeat(depth ? 1 : 0)}
           <span>🏢</span><span class="dep-name">${esc(n.name)}</span>
           <span style="font-size:11px;color:var(--text-3)">#${n.id}</span>
+          ${n.monthly_budget > 0 ? `<span class="tag blue" style="font-size:10.5px" title="${t('月度成本预算：')}¥${n.monthly_budget}">💰 ${t('预算')} ¥${n.monthly_budget}</span>` : ''}
           <div class="dep-acts">
             <button class="btn sm" data-add="${n.id}">➕ ${t('子部门')}</button>
             <button class="btn sm" data-edit="${n.id}">✏️ ${t('编辑')}</button>
@@ -118,6 +119,10 @@ export async function render(el) {
             ${options.map(o => `<option value="${o.id}" ${String(parentId || '') === String(o.id) ? 'selected' : ''}>${esc(o.name)}</option>`).join('')}
           </select>
           ${isEdit ? `<div style="font-size:11px;color:var(--text-3);margin-top:4px">${t('自身及其子部门不会出现在上级列表中（防止形成环）')}</div>` : ''}
+        </div>
+        <div style="margin-top:12px"><label style="font-size:12px;color:var(--text-3)">${t('月度成本预算（元，可选 · U1-6）')}</label>
+          <input id="dBudget" class="input" type="number" min="0" step="0.01" style="width:100%" value="${node?.monthly_budget || ''}" placeholder="${t('如 500；留空或 0 表示不设预算不告警')}">
+          <div style="font-size:11px;color:var(--text-3);margin-top:4px">${t('按真实单价计算的本部门当月模型成本达预算 80%/100% 时，平台自动发站内信告警（每天检查一次，升档才发）')}</div>
         </div>`,
       foot: `<button class="btn" data-cancel>${t('取消')}</button><button class="btn primary" data-save>${isEdit ? t('保存') : t('创建')}</button>`,
       onMount(mask, close) {
@@ -126,7 +131,10 @@ export async function render(el) {
           const name = mask.querySelector('#dName').value.trim();
           const parentRaw = mask.querySelector('#dParent').value;
           if (!name) return toast(t('部门名称不能为空'), 'err');
-          const body = { name, parent_id: parentRaw ? +parentRaw : null };
+          const budgetRaw = (mask.querySelector('#dBudget').value || '').trim();
+          const budget = budgetRaw === '' ? 0 : Number(budgetRaw);
+          if (!Number.isFinite(budget) || budget < 0) return toast(t('月度预算必须为非负数字'), 'err');
+          const body = { name, parent_id: parentRaw ? +parentRaw : null, monthly_budget: budget };
           try {
             const j = isEdit
               ? await api(`/departments/${node.id}`, { method: 'PUT', body })

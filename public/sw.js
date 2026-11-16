@@ -11,7 +11,7 @@
  *   （即任何会被 STATIC_CACHE 缓存的资源变更），发版前必须 bump SW_VERSION，否则用户端拿旧缓存。
  * 提交前自检：git diff --name-only HEAD~1 | grep -E '^public/(js|css|vendor|sw\.js|index\.html)' 命中则必须改本常量。
  */
-const SW_VERSION = 'p5.37-v2'; // 2026-11-13 bump：P1-15/16 文档预览套件（viewer.js + vendor 预览库 + 知识库/产物预览入口）
+const SW_VERSION = 'u1.6-v1'; // 2026-11-16 bump：U1-6 成本归因与精细计费（models/departments/dashboard 单价配置 + 部门成本报表 + 预算编辑）
 const STATIC_CACHE = `ap-static-${SW_VERSION}`;
 const NEVER_CACHE = [/^\/api\//, /\/sse/, /\/stream/, /\/files\/download/, /\?[^\s]*download/];
 

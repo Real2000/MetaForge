@@ -19,6 +19,21 @@ function ensureTypes(ms, typesObj) {
   return out;
 }
 
+/** U1-6：解析/校验请求体里的 model_price（对象或 JSON 字符串）。返回规范化 JSON 字符串；非法返回 null */
+function parsePriceBody(v) {
+  let obj = v;
+  if (typeof v === 'string') { try { obj = JSON.parse(v); } catch { return null; } }
+  if (v === undefined || v === null) return null;
+  if (typeof obj !== 'object' || Array.isArray(obj)) return null;
+  const out = {};
+  for (const [m, p] of Object.entries(obj)) {
+    const input = Number(p && p.input), output = Number(p && p.output);
+    if (!Number.isFinite(input) || input < 0 || !Number.isFinite(output) || output < 0) return null; // 单价非法即整体拒绝（负价会污染报表）
+    out[m] = { input, output };
+  }
+  return JSON.stringify(out);
+}
+
 /** P5.30 安全止血：API Key 脱敏展示（保留前 3 后 4）——此前 GET /api/providers 把完整 Key 明文回传浏览器，
  *  XSS 或浏览器缓存泄露即丢全网关 Key。编辑语义改为「留空不修改」（前端 models.js 同步适配，PUT 侧另有掩码防御） */
 function maskKey(key) {
@@ -42,13 +57,15 @@ router.get('/health', (req, res) => {
 });
 
 router.post('/', (req, res) => {
-  const { name, base_url, api_key, models, remark } = req.body || {};
+  const { name, base_url, api_key, models, remark, model_price } = req.body || {};
   if (!name?.trim()) return res.json({ code: 400, msg: '供应商名称不能为空' });
   const ms = typeof models === 'string' ? models.split(/[,，\s]+/).filter(Boolean) : (models || []);
   const configured = 1;
+  const priceJson = parsePriceBody(model_price);
+  if (model_price !== undefined && priceJson === null) return res.json({ code: 400, msg: '模型单价格式不正确（应为 {"模型名":{"input":x,"output":y}}，元/千Token，非负）' });
   const encryptedKey = api_key ? encrypt(api_key) : '';
-  const info = db.prepare(`INSERT INTO providers (name,base_url,api_key,models,configured,is_default,remark,created_at) VALUES (?,?,?,?,?,0,?,datetime('now','localtime'))`)
-    .run(name.trim(), base_url || '', encryptedKey, JSON.stringify(ms), configured, remark || '');
+  const info = db.prepare(`INSERT INTO providers (name,base_url,api_key,models,configured,is_default,remark,model_price,created_at) VALUES (?,?,?,?,?,0,?,?,datetime('now','localtime'))`)
+    .run(name.trim(), base_url || '', encryptedKey, JSON.stringify(ms), configured, remark || '', priceJson || '{}');
   db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)').run(req.user.username, '新增模型供应商', name.trim(), req.ip, now());
   res.json({ code: 0, data: { id: info.lastInsertRowid } });
 });
@@ -56,7 +73,7 @@ router.post('/', (req, res) => {
 router.put('/:id', (req, res) => {
   const old = db.prepare('SELECT * FROM providers WHERE id=?').get(req.params.id);
   if (!old) return res.json({ code: 404, msg: '供应商不存在' });
-  const { name, base_url, api_key, models, remark, auth_type, auth_config, status, status_msg } = req.body || {};
+  const { name, base_url, api_key, models, remark, auth_type, auth_config, status, status_msg, model_price } = req.body || {};
   let ms;
   if (Array.isArray(models)) ms = models;
   else if (typeof models === 'string' && models) ms = models.split(/[,，\s]+/).filter(Boolean);
@@ -67,9 +84,13 @@ router.put('/:id', (req, res) => {
   const configured = base_url && nextKey ? 1 : old.configured;
   const nextAuthType = auth_type || old.auth_type || 'bearer';
   const nextAuthConfig = auth_config !== undefined ? (typeof auth_config === 'string' ? auth_config : JSON.stringify(auth_config)) : (old.auth_config || '{}');
-  db.prepare('UPDATE providers SET name=?,base_url=?,api_key=?,models=?,configured=?,remark=?,auth_type=?,auth_config=?,status=?,status_msg=? WHERE id=?')
+  // U1-6：model_price 未传保持原值；传入必须合法（非法拒绝保存，负价会污染成本报表）
+  const priceJson = parsePriceBody(model_price);
+  if (model_price !== undefined && priceJson === null) return res.json({ code: 400, msg: '模型单价格式不正确（应为 {"模型名":{"input":x,"output":y}}，元/千Token，非负）' });
+  const nextPrice = model_price !== undefined ? priceJson : (old.model_price || '{}');
+  db.prepare('UPDATE providers SET name=?,base_url=?,api_key=?,models=?,configured=?,remark=?,auth_type=?,auth_config=?,status=?,status_msg=?,model_price=? WHERE id=?')
     .run(name || old.name, base_url ?? old.base_url, nextKey, JSON.stringify(ms), configured, remark ?? old.remark,
-      nextAuthType, nextAuthConfig, status !== undefined ? status : (old.status ?? 1), status_msg ?? old.status_msg ?? '', old.id);
+      nextAuthType, nextAuthConfig, status !== undefined ? status : (old.status ?? 1), status_msg ?? old.status_msg ?? '', nextPrice, old.id);
   db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)').run(req.user.username, '配置模型供应商', name || old.name, req.ip, now());
   res.json({ code: 0, msg: '已保存' });
 });

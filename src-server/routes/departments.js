@@ -11,6 +11,8 @@
  *   path       TEXT DEFAULT '' —— "/1/5/12" 全文快速祖先/子节点查询
  *   order_num  INTEGER DEFAULT 0 —— 同级排序
  *   created_at TEXT
+ *   monthly_budget REAL DEFAULT 0 —— U1-6 月度成本预算（元，0=不设不告警）
+ *   budget_alert_level INTEGER DEFAULT 0 —— U1-6 已提醒档位（0/1/2，仿 quota_alert_level 防轰炸）
  */
 const express = require('express');
 const { db, now } = require('../db');
@@ -37,7 +39,7 @@ function nextOrder(parentId) {
 // V1.1 审查加固 2026-10-30：环状引用（互指成环，PUT 无校验时可构造）时环上节点从 roots 不可达——
 // DFS 标记可达集，不可达节点清空 children 后挂根级，防整棵树静默消失且与注释承诺一致
 function buildTree(rows) {
-  const list = (rows || []).map(r => ({ id: r.id, parent_id: r.parent_id ?? null, name: r.name, path: r.path, order_num: r.order_num ?? 0, children: [] }));
+  const list = (rows || []).map(r => ({ id: r.id, parent_id: r.parent_id ?? null, name: r.name, path: r.path, order_num: r.order_num ?? 0, monthly_budget: r.monthly_budget || 0, children: [] }));
   const byId = new Map(list.map(n => [n.id, n]));
   const roots = [];
   for (const n of list) {
@@ -80,9 +82,11 @@ router.get('/:id', (req, res) => {
 
 // ---------- 创建（V1.1 审查加固：仅管理员） ----------
 router.post('/', adminOnly, (req, res) => {
-  const { name, parent_id } = req.body || {};
+  const { name, parent_id, monthly_budget } = req.body || {};
   if (!name?.trim()) return res.json({ code: 400, msg: '部门名称不能为空' });
-  const info = db.prepare(`INSERT INTO departments (parent_id,name,path,order_num,created_at) VALUES (?,?,?,?,datetime('now','localtime'))`).run(parent_id || null, name.trim(), '', nextOrder(parent_id));
+  const budget = monthly_budget !== undefined ? Number(monthly_budget) : 0;
+  if (!Number.isFinite(budget) || budget < 0) return res.json({ code: 400, msg: '月度预算必须为非负数字' });
+  const info = db.prepare(`INSERT INTO departments (parent_id,name,path,order_num,monthly_budget,created_at) VALUES (?,?,?,?,?,datetime('now','localtime'))`).run(parent_id || null, name.trim(), '', nextOrder(parent_id), budget);
   const id = info.lastInsertRowid;
   // 更新 path
   const path = buildPath(id, parent_id || null);
@@ -94,9 +98,12 @@ router.post('/', adminOnly, (req, res) => {
 router.put('/:id', adminOnly, (req, res) => {
   const old = db.prepare('SELECT * FROM departments WHERE id=?').get(req.params.id);
   if (!old) return res.json({ code: 404, msg: '部门不存在' });
-  const { name, parent_id } = req.body || {};
+  const { name, parent_id, monthly_budget } = req.body || {};
   const n = (name || '').trim();
   if (!n) return res.json({ code: 400, msg: '部门名称不能为空' });
+  // U1-6：月度预算可更新（未传保持原值）；预算调整后重置告警档位重新计（仿 quota resetQuotaAlert）
+  const budget = monthly_budget !== undefined ? Number(monthly_budget) : (old.monthly_budget || 0);
+  if (!Number.isFinite(budget) || budget < 0) return res.json({ code: 400, msg: '月度预算必须为非负数字' });
   // V1.1 审查加固 2026-10-30：环校验——沿 parent_id 链上溯遇自身即拒绝；
   // 不校验时两步 PUT 可构造互指环，存量 walk() 递归更新 path 会栈溢出 500，且环上部门无法通过 API 删除自愈
   let cur = parent_id || null, hops = 0;
@@ -107,7 +114,7 @@ router.put('/:id', adminOnly, (req, res) => {
     cur = p.parent_id;
     if (++hops > 100) break; // 防御：数据异常时跳出，不阻塞请求
   }
-  db.prepare('UPDATE departments SET name=?,parent_id=? WHERE id=?').run(n, parent_id || null, old.id);
+  db.prepare('UPDATE departments SET name=?,parent_id=?,monthly_budget=?,budget_alert_level=0 WHERE id=?').run(n, parent_id || null, budget, old.id);
   // 更新本节点 path
   const path = buildPath(old.id, parent_id || null);
   db.prepare(`UPDATE departments SET path=? WHERE id=?`).run(path, old.id);

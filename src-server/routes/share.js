@@ -13,6 +13,7 @@ const { check, countHits, mask } = require('../lib/security');
 const dify = require('../lib/dify');
 const { createLimiter, clientIp } = require('../lib/rate-limit');
 const { addUsage } = require('../lib/quota');
+const { recordModelUsage } = require('../lib/billing'); // U1-6：分享页调用成本归因（归智能体发布者）
 
 const router = express.Router();
 
@@ -111,6 +112,14 @@ router.post('/:token/chat', shareChatLimit, async (req, res) => {
       const out = mask(full);
       db.prepare('UPDATE share_sessions SET ext_conversation_id=?, updated_at=? WHERE id=?').run(extConvId, now(), session.id);
       addUsage(a.owner || 'admin', Math.ceil(out.length * 0.6)); // P2：分享消耗归智能体发布者
+      // U1-6：成本归因（Dify 分支；share 链路未接 usage，按输出估算口径计）
+      try {
+        recordModelUsage({
+          username: a.owner || 'admin', model: a.model || 'dify-app', provider: '',
+          promptTokens: Math.ceil(String(input || '').length * 0.6), completionTokens: Math.ceil(out.length * 0.6),
+          meta: { via: 'share', agent: a.name },
+        });
+      } catch { /* 成本归因失败不影响分享页响应 */ }
       db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
         .run('share', '分享对话', `智能体「${a.name}」`, req.ip, now());
       send('done', { content: out });
@@ -145,6 +154,14 @@ router.post('/:token/chat', shareChatLimit, async (req, res) => {
     if (out !== full) send('notice', { msg: '回复内容包含违规词汇，已自动脱敏处理。' });
     db.prepare('UPDATE share_sessions SET updated_at=? WHERE id=?').run(now(), session.id);
     addUsage(a.owner || 'admin', Math.ceil(out.length * 0.6)); // P2：分享消耗归智能体发布者
+    // U1-6：成本归因（内置智能体分支；prompt 按检索注入后的完整上下文估算）
+    try {
+      recordModelUsage({
+        username: a.owner || 'admin', model: a.model || 'default', provider: '',
+        promptTokens: Math.ceil((sysFull.length + input.length) * 0.6), completionTokens: Math.ceil(out.length * 0.6),
+        meta: { via: 'share', agent: a.name },
+      });
+    } catch { /* 成本归因失败不影响分享页响应 */ }
     db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
       .run('share', '分享对话', `智能体「${a.name}」（${Math.ceil(out.length * 0.6)} tokens）`, req.ip, now());
     send('done', { content: out });

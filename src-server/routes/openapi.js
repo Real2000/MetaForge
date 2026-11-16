@@ -13,6 +13,7 @@ const { check, countHits, mask } = require('../lib/security');
 const dify = require('../lib/dify');
 const { createLimiter } = require('../lib/rate-limit');
 const { addUsage } = require('../lib/quota');
+const { recordModelUsage } = require('../lib/billing'); // U1-6：开放 API 调用成本归因（归智能体发布者）
 
 const router = express.Router();
 
@@ -137,6 +138,14 @@ router.post('/v1/chat/completions', keyChatLimit, async (req, res) => {
       const out = mask(full);
       const pt = usage?.total_tokens || Math.ceil(out.length * 0.6);
       addUsage(agent.owner || 'admin', pt); // P2：API 调用消耗归智能体发布者
+      // U1-6：成本归因（Dify 分支，真实 usage 拆分优先）
+      try {
+        recordModelUsage({
+          username: agent.owner || 'admin', model, provider: '',
+          promptTokens: usage?.prompt_tokens, completionTokens: usage?.completion_tokens || pt,
+          meta: { via: 'openapi', agent: agent.name },
+        });
+      } catch { /* 成本归因失败不影响 API 响应 */ }
       db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
         .run('openapi', 'API调用', `智能体「${agent.name}」（${pt} tokens）`, req.ip, now());
       finish(res, stream, modelId, created, out, pt);
@@ -169,6 +178,14 @@ router.post('/v1/chat/completions', keyChatLimit, async (req, res) => {
     const out = mask(full);
     const pt = Math.ceil(out.length * 0.6);
     addUsage(agent.owner || 'admin', pt); // P2：API 调用消耗归智能体发布者
+    // U1-6：成本归因（内置智能体分支；prompt 按检索注入后的完整上下文估算）
+    try {
+      recordModelUsage({
+        username: agent.owner || 'admin', model: agent.model || 'default', provider: '',
+        promptTokens: Math.ceil((sysFull.length + input.length) * 0.6), completionTokens: pt,
+        meta: { via: 'openapi', agent: agent.name },
+      });
+    } catch { /* 成本归因失败不影响 API 响应 */ }
     db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
       .run('openapi', 'API调用', `智能体「${agent.name}」（${pt} tokens）`, req.ip, now());
     finish(res, stream, modelId, created, out, pt);

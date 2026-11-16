@@ -170,6 +170,14 @@ module.exports = router;
 
 /* ==================== P2-11 用量归集 ==================== */
 
+// U1-6 月度部门成本报表（GET /api/stats/dept-cost?month=2026-11）
+// 数据源：usage_records（dimension='model'）按 dept_id 聚合，成本为真实单价计算值
+router.get('/dept-cost', (req, res) => {
+  const { deptCostOfMonth } = require('../lib/billing');
+  const r = deptCostOfMonth(req.query.month);
+  res.json({ code: 0, data: r });
+});
+
 // 记录用量（POST /api/stats/usage）
 router.post('/usage', auth, (req, res) => {
   const { dimension, dimension_key, tokens, count, cost, meta } = req.body || {};

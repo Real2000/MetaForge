@@ -49,7 +49,7 @@ export async function render(el) {
     </div>
     <div class="card" style="margin-top:16px"><h3>${t('智能体增长趋势')} <span class="sub">${t('累计创建数')}</span></h3><div class="chart-box"><canvas id="c3"></canvas></div></div>
     <div class="grid-3" style="margin-top:16px">
-      ${[
+       ${[
       { title: t('智能体对话数 TOP10'), key: 'topChat', unit: t('次') },
       { title: t('智能体用户数 TOP10'), key: 'topUsers', unit: t('人') },
       { title: t('Token 消耗 TOP10'), key: 'topTokens', unit: '' },
@@ -62,7 +62,31 @@ export async function render(el) {
       || `<tr><td class="empty" colspan="3">${t('暂无数据')}</td></tr>`}
          </tbody></table>
       </div>`).join('')}
-    </div>`;
+    </div>
+    <div id="deptCostBox"></div>`;
+
+  // U1-6 月度部门成本报表（成本按供应商配置的真实单价计算；预算超 80%/100% 高亮，后台定时任务发站内信告警）
+  try {
+    const dc = (await api('/stats/dept-cost')).data;
+    const rows = dc.departments || [];
+    el.querySelector('#deptCostBox').innerHTML = `
+      <div class="card" style="margin-top:16px">
+        <h3>💰 ${t('部门月度成本报表')} <span class="sub">${t('当前月份：')}${dc.month} · ${t('全平台合计')} ¥${dc.totalCost.toFixed(2)} · ${t('单价未配置的模型不计入成本')}</span></h3>
+        ${rows.length ? `<table class="tbl"><thead><tr>
+          <th>${t('部门')}</th><th>${t('成员数（本月有调用）')}</th><th>${t('Token 消耗')}</th><th>${t('成本（元）')}</th><th>${t('月度预算')}</th><th>${t('使用率')}</th>
+        </tr></thead><tbody>
+          ${rows.map(r => {
+            const pct = r.budget > 0 ? Math.round(r.cost / r.budget * 100) : null;
+            const pctHtml = pct == null ? `<span style="color:var(--text-3)">${t('未设预算')}</span>`
+              : `<span class="tag ${pct >= 100 ? 'red' : pct >= 80 ? 'orange' : 'green'}">${pct}%</span>`;
+            return `<tr${r.dept_id == null ? ' style="color:var(--text-3)"' : ''}>
+              <td>${esc(r.dept_name)}</td><td>${r.members}</td><td>${fmtNum(r.tokens)}</td>
+              <td><b>¥${Number(r.cost || 0).toFixed(2)}</b></td>
+              <td>${r.budget > 0 ? '¥' + r.budget : '—'}</td><td>${pctHtml}</td></tr>`;
+          }).join('')}
+        </tbody></table>` : `<div class="empty-box" style="padding:18px">${t('本月暂无模型用量记录（对话后将按单价自动归集各部门成本）')}</div>`}
+      </div>`;
+  } catch (e) { /* 部门成本报表加载失败不影响看板其余部分 */ }
 
   const labels = d.days.map(s => s.slice(5));
   lineChart(el.querySelector('#c1'), labels, d.activeUsers, '#2563eb');

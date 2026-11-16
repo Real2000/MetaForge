@@ -5774,6 +5774,169 @@ function t(name, fn) {
 
   }
 
+  console.log('【U1-6】成本归因与精细计费：单价表 / 真实计费 / 部门月度报表 / 超预算告警');
+  {
+    const billing = require('../src-server/lib/billing');
+    const { checkDeptBudgets } = require('../src-server/lib/ops');
+    const { sign } = require('../src-server/lib/auth');
+
+    await t('U1-6：computeCost 按真实单价计算（元/千Token）+ 无单价计 0', () => {
+      // 3000 输入 × 0.5 + 2000 输出 × 1.5 = 1.5 + 3 = 4.5
+      assert.strictEqual(billing.computeCost(3000, 2000, { input: 0.5, output: 1.5 }), 4.5);
+      assert.strictEqual(billing.computeCost(1000, 1000, { input: 0, output: 0 }), 0, '零价（免费模型）合法');
+      assert.strictEqual(billing.computeCost(500, 500, null), 0, '无单价不得估算成本');
+      assert.strictEqual(billing.computeCost(-10, -5, { input: 1, output: 1 }), 0, '负 token 容错为 0');
+      assert.strictEqual(billing.computeCost('abc', 1000, { input: 1, output: 1 }), 1, '非数值 prompt 容错按 0');
+    });
+    await t('U1-6：parsePriceTable 坏 JSON / 负价 / 非数值字段容错', () => {
+      assert.strictEqual(billing.parsePriceTable('{bad json').size, 0, '坏 JSON 应返回空表');
+      assert.strictEqual(billing.parsePriceTable(JSON.stringify({ m: { input: -1, output: 2 } })).size, 0, '负 input 价应剔除');
+      assert.strictEqual(billing.parsePriceTable(JSON.stringify({ m: { input: 'x', output: 2 } })).size, 0, '非数值价应剔除');
+      const ok = billing.parsePriceTable(JSON.stringify({ m: { input: 0, output: 0.002 }, n: { input: 1, output: 1 } }));
+      assert.strictEqual(ok.size, 2, '合法条目（含零价）应保留');
+    });
+
+    // ===== 造数：两部门（研发预算 10 元 / 市场无预算）+ 三用户（含无部门用户）+ 单价供应商 =====
+    const d1 = db.prepare(`INSERT INTO departments (parent_id,name,path,order_num,monthly_budget,created_at) VALUES (NULL,'U16研发部','/',0,10,datetime('now','localtime'))`).run().lastInsertRowid;
+    const d2 = db.prepare(`INSERT INTO departments (parent_id,name,path,order_num,monthly_budget,created_at) VALUES (NULL,'U16市场部','/',1,0,datetime('now','localtime'))`).run().lastInsertRowid;
+    const mkU16 = (name, deptId) => {
+      db.prepare(`INSERT INTO users (username,password,nickname,role,status,must_change_pwd,dept_id,created_at) VALUES (?,?,?,'user',1,0,?,datetime('now','localtime'))`).run(name, hashPwd('u16-pass-123'), name, deptId);
+      return db.prepare('SELECT id FROM users WHERE username=?').get(name).id;
+    };
+    mkU16('u16a', d1); mkU16('u16b', d2); mkU16('u16c', null);
+    const pid = db.prepare(`INSERT INTO providers (name,base_url,api_key,models,configured,is_default,remark,model_price,created_at) VALUES ('U16计费供应商','http://u16.test','sk-u16','["u16-model"]',1,0,'','{"u16-model":{"input":1,"output":2}}',datetime('now','localtime'))`).run().lastInsertRowid;
+
+    await t('U1-6：recordModelUsage 真实计费写入（单价快照 / 部门归属 / token 拆分）', () => {
+      const r = billing.recordModelUsage({ username: 'u16a', model: 'u16-model', promptTokens: 1000, completionTokens: 500 });
+      assert.ok(r && r.priced === true, '有单价应标记 priced=true');
+      assert.strictEqual(r.cost, 2, '1000×1/1000 + 500×2/1000 = 1 + 1 = 2 元');
+      const row = db.prepare("SELECT * FROM usage_records WHERE username='u16a' ORDER BY id DESC LIMIT 1").get();
+      assert.strictEqual(row.dimension, 'model', '维度应为 model');
+      assert.strictEqual(row.dimension_key, 'u16-model', 'dimension_key 应为模型名');
+      assert.strictEqual(row.tokens, 1500, 'tokens 应为 prompt+completion 总和');
+      assert.strictEqual(row.prompt_tokens, 1000, 'prompt_tokens 应拆分保存');
+      assert.strictEqual(row.completion_tokens, 500, 'completion_tokens 应拆分保存');
+      assert.strictEqual(row.dept_id, Number(d1), 'dept_id 应写入用户部门快照');
+      assert.strictEqual(row.cost, 2, 'cost 应为真实单价计算值（非估算）');
+      const meta = JSON.parse(row.meta);
+      assert.strictEqual(meta.priced, true, 'meta 应标记 priced');
+      assert.strictEqual(meta.price_input, 1, 'meta 应含输入单价快照');
+      assert.strictEqual(meta.price_output, 2, 'meta 应含输出单价快照');
+    });
+    await t('U1-6：无单价模型 cost=0 且 meta.priced=false（无单价不瞎估）', () => {
+      const r = billing.recordModelUsage({ username: 'u16b', model: 'u16-no-price-model', promptTokens: 800, completionTokens: 400 });
+      assert.ok(r && r.priced === false, '无单价应标记 priced=false');
+      assert.strictEqual(r.cost, 0, '无单价成本应为 0');
+      const row = db.prepare("SELECT * FROM usage_records WHERE username='u16b' ORDER BY id DESC LIMIT 1").get();
+      assert.strictEqual(row.cost, 0);
+      assert.strictEqual(row.tokens, 1200, 'tokens 照常计入用量（成本 0 不代表没用量）');
+      assert.strictEqual(JSON.parse(row.meta).priced, false);
+    });
+    await t('U1-6：deptCostOfMonth 月度部门聚合（分部门 / 未归属行 / 月度过滤）', () => {
+      // u16c（无部门）用计费模型：500×1/1000 + 250×2/1000 = 1 元 → 归入「未归属」行
+      billing.recordModelUsage({ username: 'u16c', model: 'u16-model', promptTokens: 500, completionTokens: 250 });
+      const r = billing.deptCostOfMonth();
+      assert.strictEqual(r.month.length, 7, '应返回 YYYY-MM 当前月');
+      const rd = r.departments.find(x => x.dept_id === Number(d1));
+      assert.ok(rd, '研发部应出现在报表：' + JSON.stringify(r.departments));
+      assert.strictEqual(rd.dept_name, 'U16研发部');
+      assert.strictEqual(rd.cost, 2, '研发部当月成本应为 2 元');
+      assert.strictEqual(rd.budget, 10, '研发部预算应带出');
+      assert.strictEqual(rd.members, 1, '研发部本月活跃成员 1 人');
+      const mk = r.departments.find(x => x.dept_id === Number(d2));
+      assert.strictEqual(mk.cost, 0, '市场部（无单价模型）成本 0');
+      const noDept = r.departments.find(x => x.dept_id === null);
+      assert.ok(noDept, '无部门用户应归入「未归属」行');
+      assert.strictEqual(noDept.cost, 1, '未归属行应聚 1 元');
+      assert.strictEqual(r.totalCost, 3, '全平台当月合计应为 3 元');
+      // 月度过滤：查上月应无数据（usage 均为当月写入）
+      const last = new Date(); last.setMonth(last.getMonth() - 1);
+      const lastMonth = last.toLocaleDateString('sv-SE', { timeZone: 'Asia/Shanghai' }).slice(0, 7);
+      const rLast = billing.deptCostOfMonth(lastMonth);
+      assert.strictEqual(rLast.totalCost, 0, '上月无记录应返回 0 成本');
+    });
+    await t('U1-6：checkDeptBudgets 超预算告警（80% 档触发 → 幂等不重发 → 100% 升档）', () => {
+      const budgetNotif = () => db.prepare("SELECT COUNT(*) c FROM notifications WHERE type='budget'").get().c;
+      const n0 = budgetNotif();
+      // 当前研发部 2/10 = 20%：未达档 → 不告警
+      assert.strictEqual(checkDeptBudgets().alerted, 0, '20% 未达 80% 档不应告警');
+      // +6 元 → 8/10 = 80%：第 1 档告警
+      billing.recordModelUsage({ username: 'u16a', model: 'u16-model', promptTokens: 2000, completionTokens: 2000 }); // 2×1 + 2×2 = 6 元
+      assert.strictEqual(checkDeptBudgets().alerted, 1, '80% 应触发第 1 档告警');
+      assert.strictEqual(budgetNotif(), n0 + 1, '应新增 1 条 budget 通知');
+      const lv1 = db.prepare('SELECT budget_alert_level FROM departments WHERE id=?').get(d1).budget_alert_level;
+      assert.strictEqual(lv1, 1, '部门告警档位应记为 1');
+      // 幂等：再跑不重发（同档不重复）
+      assert.strictEqual(checkDeptBudgets().alerted, 0, '同档再跑不应重复告警');
+      assert.strictEqual(budgetNotif(), n0 + 1, '通知数不变（防轰炸）');
+      // +2.1 元 → 10.1/10 = 101%：升第 2 档
+      billing.recordModelUsage({ username: 'u16a', model: 'u16-model', promptTokens: 700, completionTokens: 700 }); // 0.7 + 1.4 = 2.1 元
+      assert.strictEqual(checkDeptBudgets().alerted, 1, '超 100% 应升第 2 档告警');
+      const lv2 = db.prepare('SELECT budget_alert_level FROM departments WHERE id=?').get(d1).budget_alert_level;
+      assert.strictEqual(lv2, 2, '档位应升至 2');
+      assert.ok(db.prepare("SELECT content FROM notifications WHERE type='budget' ORDER BY id DESC LIMIT 1").get().content.includes('100%'), '第 2 档文案应含 100%');
+      // 市场部无预算（budget=0）→ 永不告警
+      assert.strictEqual(db.prepare('SELECT budget_alert_level FROM departments WHERE id=?').get(d2).budget_alert_level, 0, '未设预算部门不应告警');
+    });
+
+    // ===== HTTP 集成：PUT /providers 单价保存与校验 + GET /stats/dept-cost 权限 =====
+    await t('U1-6 HTTP：PUT /api/providers/:id 单价保存 / 非法单价 400 / dept-cost 仅管理员', async () => {
+      const { spawn } = require('child_process');
+      const adminId = db.prepare("SELECT id FROM users WHERE username='admin'").get().id;
+      const u16aId = db.prepare("SELECT id FROM users WHERE username='u16a'").get().id;
+      const adminTok = sign({ uid: adminId, exp: Date.now() + 3600000 });
+      const userTok = sign({ uid: u16aId, exp: Date.now() + 3600000 });
+      const port = 36000 + Math.floor(Math.random() * 2000);
+      const base = `http://127.0.0.1:${port}`;
+      const child = spawn(process.execPath, ['server.js'], {
+        cwd: path.join(__dirname, '..'),
+        env: { ...process.env, PORT: String(port), AGENT_DATA_DIR: process.env.AGENT_DATA_DIR },
+        stdio: 'ignore',
+      });
+      const jfetch = async (p, opts = {}, tok) => {
+        const r = await fetch(base + p, { ...opts, headers: { 'Content-Type': 'application/json', ...(tok ? { Authorization: 'Bearer ' + tok } : {}) } });
+        let j = null; try { j = await r.json(); } catch { }
+        return { status: r.status, j };
+      };
+      try {
+        let up = false;
+        for (let i = 0; i < 50 && !up; i++) {
+          await new Promise(r2 => setTimeout(r2, 200));
+          try { up = (await fetch(base + '/api/health')).ok; } catch { }
+        }
+        assert.ok(up, 'U1-6 HTTP 子进程应在 10s 内就绪');
+        // 合法单价保存（对象形态）
+        const okPut = await jfetch(`/api/providers/${pid}`, { method: 'PUT', body: JSON.stringify({ name: 'U16计费供应商', model_price: { 'u16-model': { input: 1.5, output: 3 } } }) }, adminTok);
+        assert.strictEqual(okPut.j && okPut.j.code, 0, '合法单价应保存成功：' + JSON.stringify(okPut.j));
+        const pv = db.prepare('SELECT model_price FROM providers WHERE id=?').get(pid).model_price;
+        assert.strictEqual(JSON.parse(pv)['u16-model'].input, 1.5, '单价应真实落库');
+        // 非法单价（负数）→ 400 拒绝
+        const badPut = await jfetch(`/api/providers/${pid}`, { method: 'PUT', body: JSON.stringify({ model_price: { 'u16-model': { input: -1, output: 2 } } }) }, adminTok);
+        assert.strictEqual(badPut.j && badPut.j.code, 400, '负单价应整体拒绝（防污染报表）：' + JSON.stringify(badPut.j));
+        // 非法单价（字符串垃圾）→ 400
+        const badPut2 = await jfetch(`/api/providers/${pid}`, { method: 'PUT', body: JSON.stringify({ model_price: 'not-json' }) }, adminTok);
+        assert.strictEqual(badPut2.j && badPut2.j.code, 400, '非法 JSON 应拒绝');
+        // GET /api/stats/dept-cost 管理员可见 + 结构校验
+        const dc = await jfetch('/api/stats/dept-cost', {}, adminTok);
+        assert.strictEqual(dc.j && dc.j.code, 0, '管理员应可访问部门成本报表');
+        assert.ok(dc.j.data.month && Array.isArray(dc.j.data.departments) && typeof dc.j.data.totalCost === 'number', '报表应含 month/departments/totalCost：' + JSON.stringify(dc.j.data).slice(0, 160));
+        // 普通用户 → 403（stats 路由 adminOnly）
+        const u403 = await jfetch('/api/stats/dept-cost', {}, userTok);
+        assert.ok(u403.status === 403 || (u403.j && u403.j.code === 403), '普通用户应被拒（403）：' + JSON.stringify({ s: u403.status, j: u403.j }));
+      } finally {
+        try { child.kill('SIGTERM'); } catch { }
+        try { child.kill('SIGKILL'); } catch { }
+      }
+    });
+
+    // 清理 U1-6 造数（不影响其他用例）
+    db.prepare('DELETE FROM usage_records WHERE username IN (?,?,?)').run('u16a', 'u16b', 'u16c');
+    db.prepare('DELETE FROM users WHERE username IN (?,?,?)').run('u16a', 'u16b', 'u16c');
+    db.prepare('DELETE FROM providers WHERE id=?').run(pid);
+    db.prepare('DELETE FROM departments WHERE id IN (?,?)').run(d1, d2);
+    db.prepare("DELETE FROM notifications WHERE type='budget'").run();
+  }
+
   // 收尾：关闭库并清理临时目录
   try { db.close(); } catch { }
   fs.rmSync(process.env.AGENT_DATA_DIR, { recursive: true, force: true });
