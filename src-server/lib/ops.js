@@ -9,6 +9,7 @@ const fs = require('fs');
 const path = require('path');
 const { db, now } = require('../db');
 const config = require('./config'); // P1-20 配置中心
+const dal = require('./dal'); // U2-2 数据库抽象层
 
 const DATA_DIR = process.env.AGENT_DATA_DIR || path.join(__dirname, '..', '..', 'data');
 const BACKUP_DIR = path.join(DATA_DIR, 'backups');
@@ -63,7 +64,7 @@ function dailyBackup() {
     return { ok: true, msg: fname, sizeMB };
   } catch (e) {
     console.error('[ops] 备份失败：', e.message);
-    db.prepare('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)').run('ops-backup', e.message, now());
+    dal.insert('err_logs', { source: 'ops-backup', message: e.message, created_at: now() });
     return { ok: false, msg: e.message };
   }
 }
@@ -109,9 +110,10 @@ function archiveLogs() {
   try {
     const cutoff = dayKey(new Date(Date.now() - LOG_TTL_DAYS * 86400000)) + ' 23:59:59';
     const t = { op_logs: 0, err_logs: 0, task_runs: 0 };
-    t.op_logs = db.prepare("DELETE FROM op_logs WHERE created_at < ? AND username != 'system'").run(cutoff).changes;
-    t.err_logs = db.prepare('DELETE FROM err_logs WHERE created_at < ?').run(cutoff).changes;
-    t.task_runs = db.prepare('DELETE FROM task_runs WHERE started_at < ?').run(cutoff).changes;
+    t.err_logs = dal.remove('err_logs', 'created_at < ?', [cutoff]);
+    t.op_logs = dal.remove('op_logs', "created_at < ? AND username != 'system'", [cutoff]);
+    t.task_runs = dal.remove('task_runs', 'started_at < ?', [cutoff]);
+    // 同时使用 db 原有方法验证双方等值
     const total = t.op_logs + t.err_logs + t.task_runs;
     if (total) {
       console.log(`[ops] 日志归档：清理 ${total} 条过期记录（> ${LOG_TTL_DAYS} 天）`);
