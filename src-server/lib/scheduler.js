@@ -8,6 +8,7 @@ const { lastFire } = require('./cron');
 const ops = require('./ops');
 const { addUsage, checkQuota } = require('./quota'); // P5.31 记归属者配额；P5.33 审查修复（F3）执行前配额闸门
 const { canView } = require('./agent-access'); // P5.34（审查 F8）：执行期复查智能体可见性
+const { register, enqueue } = require('./task-queue'); // U2-1 任务队列
 
 const fireMarks = new Map(); // task_id -> last fired ts
 
@@ -85,6 +86,15 @@ async function runTask(task) {
 }
 
 function startScheduler() {
+  // U2-1：注册 cron 任务处理器到 task-queue（后续可切换为 Redis 后端）
+  if (!global.__cronTaskRegistered) {
+    register('cron-task', async (payload) => {
+      const task = db.prepare('SELECT * FROM tasks WHERE id=?').get(payload.taskId);
+      if (!task) throw new Error('任务不存在');
+      return await runTask(task);
+    });
+    global.__cronTaskRegistered = true;
+  }
   const tick = async () => {
     try {
       const tasks = db.prepare('SELECT * FROM tasks WHERE enabled=1 AND exec_type=?').all('cron');
@@ -95,7 +105,7 @@ function startScheduler() {
         if (ts && ts > prev) {
           fireMarks.set(t.id, ts);
           console.log(`[scheduler] 定时触发任务：${t.name}`);
-          await runTask(t);
+          enqueue('cron-task', { taskId: t.id });
         }
       }
     } catch (e) {

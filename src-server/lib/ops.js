@@ -265,3 +265,13 @@ function startOps() {
 }
 
 module.exports = { dailyBackup, cleanupUploads, archiveLogs, digestMemories, runEvalRegression, checkDeptBudgets, startOps };
+
+// ================== U2-1 任务队列注册 ==================
+// 将 ops 各任务注册为命名任务类型，供 task-queue 调度执行（当前进程内 setImmediate，后续可切换为 Redis Worker）
+const { register } = require('./task-queue');
+register('daily-backup', async () => dailyBackup());
+register('uploads-cleanup', async () => cleanupUploads());
+register('logs-archive', async () => archiveLogs());
+register('memories-digest', async () => digestMemories());
+register('eval-regression', async () => runEvalRegression());
+register('dept-budget-check', async () => checkDeptBudgets());

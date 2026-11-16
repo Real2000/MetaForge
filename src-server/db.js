@@ -2267,6 +2267,29 @@ db.exec('CREATE INDEX IF NOT EXISTS idx_a2a_task_id ON a2a_tasks(task_id);');
 db.exec('CREATE INDEX IF NOT EXISTS idx_a2a_status ON a2a_tasks(status);');
 console.log('[db] 创建 a2a_tasks 表（U0-6 A2A Task 审计）');
 
+// ================== U2-1 任务队列表 ==================
+// task_queue：统一任务队列持久层。当前为进程内调度（setImmediate），
+// 后续可替换为 Redis/BullMQ 后端（接口语义等价：jobId/payload/retry/priority/scheduled_at）
+db.exec(`CREATE TABLE IF NOT EXISTS task_queue (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id TEXT NOT NULL UNIQUE,         -- 唯一任务 ID（客户端生成或服务端生成）
+  name TEXT NOT NULL,                  -- 任务类型名（对应 register 注册的 name）
+  payload TEXT DEFAULT '{}',           -- 任务参数 JSON
+  status TEXT DEFAULT 'pending',       -- pending | running | success | failed
+  priority INTEGER DEFAULT 0,          -- 优先级（高=先执行）
+  max_retries INTEGER DEFAULT 3,       -- 最大重试次数
+  retry_count INTEGER DEFAULT 0,       -- 已重试次数
+  delay_ms INTEGER DEFAULT 0,          -- 延迟毫秒（延迟任务）
+  scheduled_at TEXT,                   -- 计划执行时间
+  started_at TEXT,
+  finished_at TEXT,
+  result TEXT,                         -- 执行结果 JSON
+  error TEXT,                          -- 错误信息
+  created_at TEXT
+);`);
+db.exec('CREATE INDEX IF NOT EXISTS idx_tq_status ON task_queue(status, priority);');
+db.exec('CREATE INDEX IF NOT EXISTS idx_tq_job_id ON task_queue(job_id);');
+
 // P1-17 版本化迁移框架（2026-11-13）：执行 _migrations 注册表中尚未登记的列迁移
 // 新迁移直接在该框架中追加，逐步替代 db.js 内联 ALTER TABLE 块
 try {
