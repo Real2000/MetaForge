@@ -1632,6 +1632,8 @@ export function createCanvas(root, opts = {}) {
         const up = () => {
           window.removeEventListener('mousemove', mv); window.removeEventListener('mouseup', up);
           markDirty(); renderNodes(); renderMinimap(); pushHistory(); // 整批重渲染：分组底板/小地图同步
+          // U1-7：拖拽结束上报位置变更（实时协作 node:move 轻指令；位置无语义不计入 diff 版本）
+          opts.onMoveEnd?.(moving.filter(Boolean).map(m2 => ({ id: m2.n.id, x: Math.round(m2.n.position.x), y: Math.round(m2.n.position.y) })));
         };
         window.addEventListener('mousemove', mv); window.addEventListener('mouseup', up);
         return;
@@ -1640,7 +1642,7 @@ export function createCanvas(root, opts = {}) {
       const n = wf.nodes.find(x => x.id === dragId);
       const sx = e.clientX, sy = e.clientY, ox = n.position.x, oy = n.position.y;
       const mv = ev => { n.position.x = ox + (ev.clientX - sx) / wf.viewport.zoom; n.position.y = oy + (ev.clientY - sy) / wf.viewport.zoom; nodeEl.style.left = n.position.x + 'px'; nodeEl.style.top = n.position.y + 'px'; renderEdges(); };
-      const up = () => { window.removeEventListener('mousemove', mv); window.removeEventListener('mouseup', up); markDirty(); pushHistory(); };
+      const up = () => { window.removeEventListener('mousemove', mv); window.removeEventListener('mouseup', up); markDirty(); pushHistory(); opts.onMoveEnd?.([{ id: n.id, x: Math.round(n.position.x), y: Math.round(n.position.y) }]); };
       window.addEventListener('mousemove', mv); window.addEventListener('mouseup', up);
       return;
     }
@@ -2616,7 +2618,60 @@ export function createCanvas(root, opts = {}) {
   }
   function clearValidation() { validationProblems = null; renderNodes(); }
 
+  // ---------- U1-7 实时协作支持：远程增量应用 / 位置应用 / 坐标换算 / stage 引用 ----------
+  /** 应用服务端广播的画布增量（diffWorkflows 输出；added 含完整 node/edge）。
+   *  走 markDirty → 触发既有自动保存；触发的回环提交服务端 diff=0 会吸收（仅 ack 不广播） */
+  function applyDiff(d) {
+    if (!d || !d.nodes || !d.edges) return { ok: false };
+    const ek = e => e.id || `${e.source || '?'}|${e.target || '?'}|${e.sourceHandle || ''}`;
+    const rmIds = new Set((d.nodes.removed || []).map(r => String(r.id)));
+    if (rmIds.size) {
+      wf.nodes = wf.nodes.filter(n => !rmIds.has(String(n.id)));
+      if (sel && rmIds.has(String(sel))) sel = null;
+      if (selSet) selSet = new Set([...selSet].filter(id2 => !rmIds.has(String(id2))));
+    }
+    for (const a of (d.nodes.added || [])) {
+      if (a.node && typeof a.node === 'object' && a.node.id != null && !wf.nodes.some(n => String(n.id) === String(a.node.id))) {
+        wf.nodes.push({ ...a.node, position: a.node.position || { x: 0, y: 0 }, data: a.node.data || {} });
+      }
+    }
+    for (const c of (d.nodes.changed || [])) {
+      const n = wf.nodes.find(x => String(x.id) === String(c.id));
+      if (n) {
+        n.data = (n.data && typeof n.data === 'object') ? n.data : {};
+        for (const f of (c.fields || [])) n.data[f.key] = f.to; // 字段级覆盖（含对象/数组深值）
+      }
+    }
+    for (const r of (d.edges.removed || [])) wf.edges = wf.edges.filter(e => ek(e) !== r.key);
+    for (const a of (d.edges.added || [])) {
+      if (a.edge && typeof a.edge === 'object' && !wf.edges.some(e => ek(e) === ek(a.edge))) {
+        wf.edges.push({ id: a.edge.id, source: a.edge.source, target: a.edge.target, sourceHandle: a.edge.sourceHandle || 'out' });
+      }
+    }
+    for (const c of (d.edges.changed || [])) {
+      const e = wf.edges.find(x => ek(x) === c.key);
+      if (e) for (const f of (c.fields || [])) if (['id', 'source', 'target', 'sourceHandle'].includes(f.key)) e[f.key] = f.to;
+    }
+    refreshRefWarnings(); markDirty(); renderNodes(); renderProp(); renderMinimap(); pushHistory();
+    return { ok: true };
+  }
+  /** 应用远程位置移动（node:move 轻指令；不重渲染属性面板） */
+  function applyMoves(moves) {
+    if (!Array.isArray(moves)) return;
+    for (const v of moves) {
+      const n = wf.nodes.find(x => String(x.id) === String(v.id));
+      if (n && Number.isFinite(+v.x) && Number.isFinite(+v.y)) { n.position.x = +v.x; n.position.y = +v.y; }
+    }
+    markDirty(); renderNodes(); renderEdges(); renderMinimap();
+  }
+  /** 画布世界坐标 → stage 容器内像素坐标（远程光标层定位；stage 为 position:relative） */
+  function worldToStage(x, y) {
+    return { x: x * wf.viewport.zoom + wf.viewport.x, y: y * wf.viewport.zoom + wf.viewport.y };
+  }
+
   refreshRefWarnings();
   renderNodes(); renderProp();
-  return { getWorkflow, setWorkflow, destroy, pushHistory, validate: runValidation, clearValidation };
+  return { getWorkflow, setWorkflow, destroy, pushHistory, validate: runValidation, clearValidation,
+    // U1-7：实时协作 API（toWorld 已有：世界坐标换算；getStageEl：光标层挂载点）
+    applyDiff, applyMoves, toWorld, worldToStage, getStageEl: () => stage };
 }

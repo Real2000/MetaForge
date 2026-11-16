@@ -68,7 +68,8 @@ function diffWorkflows(a, b) {
 
   const nodes = { added: [], removed: [], changed: [] };
   for (const [id, nb] of B.nodes) {
-    if (!A.nodes.has(id)) nodes.added.push({ id, type: nb.type || '', label: nodeLabel(nb) });
+    // U1-7：added 携带完整 node 对象（node 字段，纯增量兼容）——实时协作接收方按 diff 即可重建画布，无需再拉全量
+    if (!A.nodes.has(id)) nodes.added.push({ id, type: nb.type || '', label: nodeLabel(nb), node: nb });
   }
   for (const [id, na] of A.nodes) {
     const nb = B.nodes.get(id);
@@ -80,7 +81,8 @@ function diffWorkflows(a, b) {
   const edges = { added: [], removed: [], changed: [] };
   const edgeBrief = e => ({ key: edgeKey(e), source: e.source || '', target: e.target || '', sourceHandle: e.sourceHandle || '' });
   for (const [k, eb] of B.edges) {
-    if (!A.edges.has(k)) edges.added.push(edgeBrief(eb));
+    // U1-7：added 携带完整 edge 对象（edge 字段，纯增量兼容）
+    if (!A.edges.has(k)) edges.added.push({ ...edgeBrief(eb), edge: eb });
   }
   for (const [k, ea] of A.edges) {
     const eb = B.edges.get(k);

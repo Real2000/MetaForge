@@ -34,15 +34,11 @@
  *   DELETE /api/collab/rooms/:id/invites/:iid — 删除邀请
  *   POST   /api/collab/join/:code            — 通过邀请码加入
  *
- * 任务分解（P2-2）：
- *   GET    /api/collab/rooms/:id/tasks           — 任务拓扑
- *   POST   /api/collab/rooms/:id/tasks           — 创建任务
- *   PUT    /api/collab/rooms/:id/tasks/:tid      — 更新任务状态
- *   PUT    /api/collab/rooms/:id/tasks/:tid/deps — 设置依赖
- *
- * 人机协同（P2-3）：
- *   POST   /api/collab/rooms/:id/assign          — 指派给 AI 或人
- *   POST   /api/collab/rooms/:id/summarize       — 汇总多 Agent 执行结果
+ * 画布实时协作（U1-7）：
+ *   POST   /api/collab/rooms/by-agent/:agentId — 为智能体创建画布协作房间（自动绑定 agent_id）
+ *   GET    /api/collab/rooms/by-agent/:agentId — 查询该智能体的活跃协作房间（无则返回 null）
+ *   PUT    /api/collab/rooms/:id/bind-agent   — 房间绑定/解绑画布（host/admin）
+ *   WS     /api/canvas-ws                      — 实时通道（见 lib/canvas-collab.js）
  */
 const express = require('express');
 const crypto = require('crypto');
@@ -132,7 +128,58 @@ router.post('/rooms/:id/close', (req, res) => {
   db.prepare("UPDATE collab_rooms SET status='closed',closed_at=?,updated_at=? WHERE id=?").run(now(), now(), r.id);
   db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
     .run(req.user.username, '关闭协作房间', r.name.slice(0, 100), req.ip, now());
+  // U1-7：同步踢出画布协作 WS 会话（成员端立即收 closed 提示并断开）
+  try { require('../lib/canvas-collab').notifyRoomClosed(r.id); } catch (e) { console.error('[collab] 通知画布协作关闭失败：', e.message); }
   res.json({ code: 0 });
+});
+
+/* ==================== U1-7 画布多人实时协作（房间↔智能体绑定） ==================== */
+
+// 为智能体创建画布协作房间（若已有活跃绑定房间 → 直接复用，幂等）
+router.post('/rooms/by-agent/:agentId', (req, res) => {
+  const agent = db.prepare('SELECT id, name FROM agents WHERE id=?').get(req.params.agentId);
+  if (!agent) return res.json({ code: 404, msg: '智能体不存在' });
+  const exist = db.prepare("SELECT * FROM collab_rooms WHERE agent_id=? AND status='active' ORDER BY id DESC LIMIT 1").get(agent.id);
+  if (exist) {
+    const mine = exist.host === req.user.username || req.user.role === 'admin'
+      || db.prepare("SELECT id FROM collab_room_members WHERE room_id=? AND username=? AND status='active'").get(exist.id, req.user.username);
+    if (!mine) return res.json({ code: 403, msg: '该画布已有协作房间，但你不是成员（请联系房主添加）' });
+    return res.json({ code: 0, data: { id: exist.id, reused: true, name: exist.name } });
+  }
+  const r = db.prepare(`INSERT INTO collab_rooms (name,description,room_type,host,model,status,settings,agent_id,created_at,updated_at)
+    VALUES (?,?,?,?,?,'active',?,?,?,?)`).run(
+    `画布协作 · ${agent.name}`.slice(0, 200), '', 'collab', req.user.username, '', JSON.stringify({ canvas: true }), agent.id, now(), now());
+  const roomId = Number(r.lastInsertRowid);
+  db.prepare(`INSERT INTO collab_room_members (room_id,username,role,nickname,joined_at,status) VALUES (?,?,'host',?,?,?)`)
+    .run(roomId, req.user.username, req.user.nickname || req.user.username, now(), 'active');
+  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
+    .run(req.user.username, '创建画布协作房间', `「${agent.name}」#${roomId}`, req.ip, now());
+  res.json({ code: 0, data: { id: roomId, name: `画布协作 · ${agent.name}` } });
+});
+
+// 查询智能体的活跃画布协作房间（登录即可查；能否入房由 WS 加入校验把守）
+router.get('/rooms/by-agent/:agentId', (req, res) => {
+  const r = db.prepare("SELECT id, name, host, room_type, created_at FROM collab_rooms WHERE agent_id=? AND status='active' ORDER BY id DESC LIMIT 1").get(req.params.agentId);
+  if (!r) return res.json({ code: 0, data: null });
+  const members = db.prepare("SELECT username, role, nickname FROM collab_room_members WHERE room_id=? AND status='active' ORDER BY role DESC, joined_at").all(r.id);
+  const isMember = req.user.role === 'admin' || r.host === req.user.username || members.some(m => m.username === req.user.username);
+  res.json({ code: 0, data: { ...r, members, isMember } });
+});
+
+// 房间绑定/解绑画布（host/admin；换绑会丢弃旧会话态内存版本——服务端以新 agent 画布重新初始化）
+router.put('/rooms/:id/bind-agent', (req, res) => {
+  const r = db.prepare('SELECT * FROM collab_rooms WHERE id=?').get(req.params.id);
+  if (!r) return res.json({ code: 404, msg: '房间不存在' });
+  if (!canManage(r, req.user)) return res.json({ code: 403, msg: '仅主持人或管理员可绑定画布' });
+  const agentId = (req.body || {}).agent_id;
+  if (agentId == null || agentId === '') {
+    db.prepare('UPDATE collab_rooms SET agent_id=NULL,updated_at=? WHERE id=?').run(now(), r.id);
+    return res.json({ code: 0, msg: '已解绑画布（房间转为普通协作）' });
+  }
+  const agent = db.prepare('SELECT id, name FROM agents WHERE id=?').get(Number(agentId));
+  if (!agent) return res.json({ code: 404, msg: '智能体不存在' });
+  db.prepare('UPDATE collab_rooms SET agent_id=?,updated_at=? WHERE id=?').run(agent.id, now(), r.id);
+  res.json({ code: 0, msg: `已绑定「${agent.name}」的画布` });
 });
 
 /* ==================== 成员管理 ==================== */

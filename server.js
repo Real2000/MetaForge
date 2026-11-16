@@ -159,10 +159,15 @@ const server = app.listen(PORT, () => {
   setInterval(checkExpiryNotice, 24 * 3600 * 1000).unref(); // 每 24h 复查（unref 不阻退出；notifications 当日同标题去重）
 });
 
+// U1-7 画布多人实时协作：WS 挂载到同一 HTTP server（/api/canvas-ws，upgrade 时经 HttpOnly Cookie 鉴权）
+const { attachCanvasCollab } = require('./src-server/lib/canvas-collab');
+const canvasCollabHandle = attachCanvasCollab(server);
+
 // 优雅停机（2026-10-20 P1）：SIGTERM/SIGINT 时停止接新连接、等待存量请求收尾、数据库落盘
 // 悬挂的 SSE 长连接由 5 秒兜底强退处理，避免卡死重启流程
 function shutdown(signal) {
   console.log(`\n[server] 收到 ${signal}，优雅停机中（停止接新连接，等待请求收尾）…`);
+  try { canvasCollabHandle.close(); } catch { } // U1-7：先断 WS 协作长连接，防 server.close 等待它悬挂至 5s 强退
   server.close(() => {
     try { db.close(); console.log('[server] 数据库已落盘关闭'); } catch { }
     console.log('[server] 停机完成');

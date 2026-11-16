@@ -2065,6 +2065,20 @@ console.log('[db] 创建 model_capabilities/usage_records 表 + providers 扩充
   } catch (e) { console.error('[db] U1-6 成本计费迁移失败（不阻塞启动）：', e.message); }
 }
 
+// ================== U1-7 画布多人实时协作（2026-11-16）==================
+// collab_rooms.agent_id：画布协作房间与智能体（及其 workflow 画布）的绑定；
+// 房间成员模型（collab_room_members）复用既有结构，在线状态由 WS 内存态承载不入库
+{
+  try {
+    const crCols = db.prepare('PRAGMA table_info(collab_rooms)').all().map(c => c.name);
+    if (!crCols.includes('agent_id')) {
+      db.exec('ALTER TABLE collab_rooms ADD COLUMN agent_id INTEGER DEFAULT NULL');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_cr_agent ON collab_rooms(agent_id);');
+      console.log('[db] collab_rooms 表已迁移：新增 agent_id 字段（U1-7 画布协作房间绑定）');
+    }
+  } catch (e) { console.error('[db] U1-7 collab_rooms 迁移失败（不阻塞启动）：', e.message); }
+}
+
 // ================== P2-12 文件台账与修订（2026-11-13）==================
 db.exec(`CREATE TABLE IF NOT EXISTS file_catalog (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -203,6 +203,7 @@ export async function render(el, params) {
       </div>
       <button class="btn" id="stSave">${t('保存')}</button>
       <button class="btn" id="stVersionBtn" title="${t('发布版本历史（快照/说明/一键回滚）')}">🕘 ${t('版本')}</button>
+      <button class="btn" id="stCollabBtn" title="${t('U1-7 画布多人实时协作：同画布成员实时同步/在线光标/服务端版本为准')}">👥 ${t('协作')}</button>
       <button class="btn primary" id="stPublish">${S.status === 'published' ? t('下架') : S.status === 'review' ? t('审核中…') : S.status === 'rejected' ? t('重新提审') : t('发布')}</button>
     </div>
     <div class="studio-body" id="stBody">
@@ -1029,9 +1030,210 @@ export async function render(el, params) {
       initial: S.workflow,
       models: allModels,
       agents: childCandidates.map(a => ({ id: a.id, name: a.name, icon: a.icon })),
-      markDirty: () => { if (pubInfo.has && !pubInfo.draftDirty) { pubInfo.draftDirty = true; renderPubVerBadge(); } scheduleSave(); }, // P5.9：画布真实交互才标「未发布改动」（自动保存/序列化差异不误报）
+      markDirty: () => { if (pubInfo.has && !pubInfo.draftDirty) { pubInfo.draftDirty = true; renderPubVerBadge(); } scheduleSave(); scheduleCollabSubmit(); }, // P5.9：画布真实交互才标「未发布改动」；U1-7：同步触发协作防抖提交（服务端 diff=0 时仅 ack 不广播，无回环）
+      onMoveEnd: moves => collabSendMove(moves), // U1-7：拖拽结束上报位置（轻指令，不占版本号）
     });
   }
+
+  // ---------- U1-7 画布多人实时协作（WebSocket：/api/canvas-ws，HttpOnly Cookie 同源自动鉴权） ----------
+  let collab = null; // {ws, roomId, version, members, cursors:Map, overlay, presenceEl, uiTimer, submitTimer, _mmHandler, cursorLast}
+  function collabConnected() { return !!(collab && collab.ws && collab.ws.readyState === 1); }
+
+  /** 画布语义变更防抖提交（400ms 合并连击；服务端 diffWorkflows 计算增量后广播其他成员） */
+  function scheduleCollabSubmit() {
+    if (!collabConnected()) return;
+    clearTimeout(collab.submitTimer);
+    collab.submitTimer = setTimeout(() => {
+      if (!collabConnected() || !cvAPI) return;
+      try { collab.ws.send(JSON.stringify({ type: 'wf', baseVersion: collab.version, workflow: cvAPI.getWorkflow() })); } catch { }
+    }, 400);
+  }
+  function collabSendMove(moves) {
+    if (!collabConnected() || !moves || !moves.length) return;
+    try { collab.ws.send(JSON.stringify({ type: 'op', op: 'node:move', moves })); } catch { }
+  }
+  function collabSendCursor(x, y) {
+    if (!collabConnected()) return;
+    if (collab.cursorLast && Date.now() - collab.cursorLast < 120) return;
+    collab.cursorLast = Date.now();
+    try { collab.ws.send(JSON.stringify({ type: 'cursor', x, y })); } catch { }
+  }
+
+  function collabStop() {
+    if (!collab) return;
+    clearInterval(collab.uiTimer); clearTimeout(collab.submitTimer);
+    if (collab._mmHandler) window.removeEventListener('mousemove', collab._mmHandler);
+    collab.overlay?.remove(); collab.presenceEl?.remove();
+    try { collab.ws?.close(); } catch { }
+    collab = null;
+    renderCollabBtnState();
+  }
+
+  function renderCollabBtnState() {
+    const btn = $('#stCollabBtn'); if (!btn) return;
+    btn.textContent = collabConnected() ? `👥 ${t('协作中')}` : `👥 ${t('协作')}`;
+    btn.classList.toggle('primary', collabConnected());
+  }
+
+  /** 远程成员头像色（用户名 hash → HSL，稳定不碰撞） */
+  function collabColor(name) {
+    let h = 0; for (const ch of String(name)) h = (h * 31 + ch.charCodeAt(0)) % 360;
+    return `hsl(${h}, 68%, 45%)`;
+  }
+
+  function renderPresence() {
+    if (!collab || !collab.presenceEl) return;
+    collab.presenceEl.innerHTML = `<span style="color:#9ca3af">👥</span>` +
+      collab.members.map(mem => `<span title="${esc(mem.nickname || mem.username)}" style="display:inline-flex;align-items:center;gap:4px;background:#f3f4f6;border-radius:999px;padding:2px 8px"><span style="width:8px;height:8px;border-radius:99px;background:#22c55e"></span><b style="color:${collabColor(mem.username)}">${esc((mem.nickname || mem.username).slice(0, 6))}</b></span>`).join('') +
+      ` <span style="color:#9ca3af">v${collab.version}</span><span data-exit style="cursor:pointer;color:#6b7280;padding:0 4px" title="${t('退出实时协作')}">✕</span>`;
+    collab.presenceEl.querySelector('[data-exit]')?.addEventListener('click', collabStop);
+  }
+
+  function renderCursors() {
+    if (!collab || !collab.overlay || !cvAPI) return;
+    for (const [name, c] of collab.cursors) {
+      let el = collab.overlay.querySelector(`[data-cu="${CSS.escape(name)}"]`);
+      if (!el) {
+        const color = collabColor(name);
+        el = document.createElement('div');
+        el.dataset.cu = name;
+        el.style.cssText = 'position:absolute;pointer-events:none;transition:left .12s,top .12s;z-index:61';
+        el.innerHTML = `<svg width="16" height="16" style="filter:drop-shadow(0 1px 2px rgba(0,0,0,.25))"><polygon points="0,0 0,10 6,7" fill="${color}"/></svg><span style="position:absolute;left:10px;top:10px;white-space:nowrap;background:${color};color:#fff;font-size:10px;padding:1px 6px;border-radius:4px">${esc(c.nickname || name)}</span>`;
+        collab.overlay.appendChild(el);
+      }
+      const p = cvAPI.worldToStage(c.x, c.y); // 平移/缩放跟随（250ms 轮询重定位）
+      el.style.left = p.x + 'px'; el.style.top = p.y + 'px';
+    }
+    collab.overlay.querySelectorAll('[data-cu]').forEach(el => { if (!collab.cursors.has(el.dataset.cu)) el.remove(); });
+  }
+
+  function buildCollabUI() {
+    if (!cvAPI || !collab) return;
+    const stage = cvAPI.getStageEl?.();
+    if (stage && !collab.overlay) {
+      const ov = document.createElement('div');
+      ov.style.cssText = 'position:absolute;inset:0;pointer-events:none;z-index:60;overflow:hidden';
+      stage.appendChild(ov);
+      collab.overlay = ov;
+    }
+    const area = $('#stCanvasArea');
+    if (area && !collab.presenceEl) {
+      area.style.position = 'relative'; // 协作状态条绝对定位锚点
+      const bar = document.createElement('div');
+      bar.style.cssText = 'position:absolute;top:10px;right:64px;z-index:70;display:flex;gap:6px;align-items:center;background:rgba(255,255,255,.94);border:1px solid #e5e7eb;border-radius:999px;padding:4px 12px;font-size:11.5px;color:#374151;box-shadow:0 2px 8px rgba(0,0,0,.07)';
+      area.appendChild(bar);
+      collab.presenceEl = bar;
+    }
+    renderPresence();
+    clearInterval(collab.uiTimer);
+    collab.uiTimer = setInterval(renderCursors, 250); // 光标随视口平移/缩放重定位
+  }
+
+  function connectCollab(roomId) {
+    collabStop();
+    if (studioMode !== 'canvas') switchMode('canvas'); // 协作面向画布：加入即切画布模式
+    if (!cvAPI) initCanvas();
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    const ws = new WebSocket(`${proto}://${location.host}/api/canvas-ws`); // HttpOnly Cookie 同源自动鉴权（P2-3 改造后 token 不入 JS 可读存储）
+    collab = { ws, roomId, version: 0, members: [], cursors: new Map(), overlay: null, presenceEl: null, uiTimer: null, submitTimer: null, cursorLast: 0 };
+    ws.onopen = () => { try { ws.send(JSON.stringify({ type: 'join', roomId: Number(roomId) })); } catch { } };
+    ws.onmessage = ev => {
+      let m; try { m = JSON.parse(ev.data); } catch { return; }
+      if (m.type === 'hello') {
+        collab.version = m.version;
+        if (cvAPI && m.workflow) cvAPI.setWorkflow(m.workflow); // 服务端版本为准：拉平本地（加入即接受服务端态）
+        collab.members = m.members || [];
+        buildCollabUI(); renderCollabBtnState();
+        toast(`${t('已加入画布协作「')}${esc(m.roomName || '')}${t('」：同步服务端 v')}${m.version}`);
+      } else if (m.type === 'presence') { collab.members = m.members || []; renderPresence(); }
+      else if (m.type === 'ok') { collab.version = m.version; renderPresence(); }
+      else if (m.type === 'diff') { collab.version = m.version; if (cvAPI) cvAPI.applyDiff(m.diff); renderPresence(); }
+      else if (m.type === 'op' && m.op === 'node:move') { if (cvAPI) cvAPI.applyMoves(m.moves); }
+      else if (m.type === 'cursor') {
+        if (m.x == null || m.y == null) collab.cursors.delete(m.by);
+        else collab.cursors.set(m.by, { x: m.x, y: m.y, nickname: m.nickname });
+        renderCursors();
+      }
+      else if (m.type === 'conflict') {
+        toast(t('协作版本冲突：他人已先行修改，已按服务端版本重同步（本地该次提交已丢弃）'), 'err');
+        try { ws.send(JSON.stringify({ type: 'sync' })); } catch { }
+      }
+      else if (m.type === 'sync') {
+        collab.version = m.version;
+        if (cvAPI && m.workflow) cvAPI.setWorkflow(m.workflow);
+        collab.members = m.members || []; renderPresence();
+      }
+      else if (m.type === 'closed') { toast(t('协作房间已被主持人关闭，实时协作已断开')); collabStop(); }
+      else if (m.type === 'error') { toast(t('协作错误：') + esc(m.msg || ''), 'err'); }
+    };
+    ws.onclose = () => { if (collab && collab.ws === ws) { collabStop(); toast(t('实时协作连接已断开')); } };
+    collab._mmHandler = ev2 => {
+      if (!collabConnected() || !cvAPI) return;
+      const stage = cvAPI.getStageEl?.();
+      if (!stage || !stage.contains(ev2.target)) return; // 仅画布区域内的光标上报
+      const w = cvAPI.toWorld(ev2.clientX, ev2.clientY);
+      collabSendCursor(Math.round(w.x), Math.round(w.y));
+    };
+    window.addEventListener('mousemove', collab._mmHandler);
+    renderCollabBtnState();
+  }
+
+  /** 协作入口弹窗：查/建/加房间 + 加入实时协作 */
+  async function openCollabModal() {
+    if (collabConnected()) {
+      if (!await confirmBox(t('正在实时协作中，确认退出？退出后不再接收他人变更。'))) return;
+      collabStop(); return;
+    }
+    const j = await api(`/collab/rooms/by-agent/${id}`);
+    const room = j.data;
+    if (!room) {
+      modal({
+        title: `👥 ${t('开启画布实时协作')}`,
+        body: `<div style="font-size:13px;line-height:1.9;color:var(--text-2)">${t('为「')}${esc(S.name)}${t('」创建协作房间：同房间成员的画布操作将实时同步（节点增删改/连线/拖拽位置），并互相看到在线状态与光标。冲突以服务端版本为准。')}
+          <br>${t('成员由房主在弹窗内按用户名添加；创建后房间自动绑定本智能体。')}</div>`,
+        foot: `<button class="btn" data-cancel>${t('取消')}</button><button class="btn primary" data-go>${t('创建并加入')}</button>`,
+        onMount(mask, close) {
+          mask.querySelector('[data-cancel]').onclick = close;
+          mask.querySelector('[data-go]').onclick = async () => {
+            try {
+              const r = await api(`/collab/rooms/by-agent/${id}`, { method: 'POST' });
+              if (r.code !== 0) return toast(r.msg || t('创建失败'), 'err');
+              close(); connectCollab(r.data.id);
+            } catch (e) { toast(e.message, 'err'); }
+          };
+        },
+      });
+      return;
+    }
+    // 已有绑定房间：成员展示 + 加入/成员管理
+    const me = await getUser();
+    const isHost = room.host === (me && me.username) || (me && me.role === 'admin');
+    const memberRows = (room.members || []).map(m => `<span style="display:inline-flex;align-items:center;gap:4px;background:#f3f4f6;border-radius:999px;padding:2px 10px;margin:2px">${esc(m.nickname || m.username)}${m.role === 'host' ? ' 🎩' : ''}</span>`).join('') || `<span style="color:var(--text-3)">${t('暂无成员')}</span>`;
+    modal({
+      title: `👥 ${t('画布实时协作')} — ${esc(room.name)}`,
+      body: `<div style="font-size:13px;line-height:1.9;color:var(--text-2)">
+          ${t('该画布已有协作房间（房主')} ${esc(room.host)}）：${room.isMember ? t('你是成员，可直接加入。') : t('你还不是成员——请联系房主添加，或让房主在下方按你的用户名添加。')}
+          <div style="margin:10px 0 4px;color:var(--text-3);font-size:12px">${t('房间成员：')}</div><div>${memberRows}</div>
+          ${isHost ? `<div style="margin-top:12px"><label style="font-size:12px;color:var(--text-3)">${t('按用户名添加成员')}</label>
+            <div style="display:flex;gap:8px"><input class="input" id="colAddUser" placeholder="username" style="flex:1"><button class="btn" id="colAddBtn">＋</button></div></div>` : ''}
+        </div>`,
+      foot: `${room.isMember ? `<button class="btn primary" data-go>🤝 ${t('加入实时协作')}</button>` : ''}<button class="btn" data-cancel>${t('关闭')}</button>`,
+      onMount(mask, close) {
+        mask.querySelector('[data-cancel]').onclick = close;
+        mask.querySelector('[data-go]').onclick = () => { close(); connectCollab(room.id); };
+        mask.querySelector('#colAddBtn')?.addEventListener('click', async () => {
+          const u2 = mask.querySelector('#colAddUser').value.trim();
+          if (!u2) return toast(t('请输入用户名'), 'err');
+          try {
+            const r = await api(`/collab/rooms/${room.id}/members`, { method: 'POST', body: { username: u2 } });
+            if (r.code !== 0) return toast(r.msg || t('添加失败'), 'err');
+            toast(t('已添加：') + esc(u2)); close(); openCollabModal();
+          } catch (e) { toast(e.message, 'err'); }
+        });
+      },
+    });
+  }
+  $('#stCollabBtn').onclick = openCollabModal;
   // P5.4 表单→画布；P5.8 #12 无损转换：表单配置完整映射——
   // kb_id → 📚知识库检索节点（llm 前，检索结果注入提示词上下文）；
   // 内置工具 → 工具节点链（llm 后，按表单勾选顺序串联，链尾输出进 end）；
@@ -1423,5 +1625,5 @@ export async function render(el, params) {
   renderEdit();
   $('#stSaved').textContent = t('就绪');
   // 返回 destroy：路由切换时清理画布 window 监听器（防编排页进出泄漏）
-  return { destroy() { if (cvAPI && typeof cvAPI.destroy === 'function') cvAPI.destroy(); } };
+  return { destroy() { collabStop(); if (cvAPI && typeof cvAPI.destroy === 'function') cvAPI.destroy(); } };
 }

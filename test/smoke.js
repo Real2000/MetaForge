@@ -5937,6 +5937,169 @@ function t(name, fn) {
     db.prepare("DELETE FROM notifications WHERE type='budget'").run();
   }
 
+  console.log('【U1-7】画布多人实时协作：WS 双客户端同步 / 服务端版本为准 / 光标 / 权限');
+  {
+    const { spawn } = require('child_process');
+    const { sign } = require('../src-server/lib/auth');
+    const WebSocket = require('ws');
+
+    // 造数：u7b（被添加成员）/ u7c（陌生人）+ 带画布的智能体（admin 作房主）
+    const mkU17 = (name) => {
+      db.prepare(`INSERT INTO users (username,password,nickname,role,status,must_change_pwd,created_at) VALUES (?,?,?,'user',1,0,datetime('now','localtime'))`).run(name, hashPwd('u17-pass-123'), name);
+      return db.prepare('SELECT id FROM users WHERE username=?').get(name).id;
+    };
+    const u7bId = mkU17('u17b'), u7cId = mkU17('u17c');
+    const adminId = db.prepare("SELECT id FROM users WHERE username='admin'").get().id;
+    const tokOf = uid => sign({ uid, exp: Date.now() + 3600000 });
+    const sp = db.prepare("SELECT id FROM spaces WHERE type='enterprise' LIMIT 1").get() || db.prepare("SELECT id FROM spaces LIMIT 1").get();
+    const wf0 = { nodes: [{ id: 'start', type: 'start', position: { x: 60, y: 60 }, data: { title: '开始', variables: [] } }], edges: [], viewport: { x: 0, y: 0, zoom: 1 } };
+    const u17Agent = db.prepare(`INSERT INTO agents (name,type,space_id,owner,status,visibility,workflow,created_at) VALUES ('U17协作画布','other',?,'admin','published','public',?,datetime('now','localtime'))`).run(sp.id, JSON.stringify(wf0)).lastInsertRowid;
+
+    const port = 37500 + Math.floor(Math.random() * 2000);
+    const base = `http://127.0.0.1:${port}`;
+    const child = spawn(process.execPath, ['server.js'], {
+      cwd: path.join(__dirname, '..'),
+      env: { ...process.env, PORT: String(port), AGENT_DATA_DIR: process.env.AGENT_DATA_DIR },
+      stdio: 'ignore',
+    });
+    const jfetch = async (p, opts = {}, tok) => {
+      const r = await fetch(base + p, { ...opts, headers: { 'Content-Type': 'application/json', ...(tok ? { Authorization: 'Bearer ' + tok } : {}) } });
+      let j = null; try { j = await r.json(); } catch { }
+      return { status: r.status, j };
+    };
+    // WS 客户端（HttpOnly Cookie 同源语义：测试里手动带 ap_token Cookie，浏览器自动携带）
+    const mkWs = uid => {
+      const msgs = [];
+      const ws = new WebSocket(`ws://127.0.0.1:${port}/api/canvas-ws`, { headers: { Cookie: 'ap_token=' + tokOf(uid) } });
+      ws.on('message', d => { try { msgs.push(JSON.parse(String(d))); } catch { } });
+      return { ws, msgs };
+    };
+    const waitMsg = async (cli, pred, ms = 5000) => {
+      const t0 = Date.now();
+      while (Date.now() - t0 < ms) {
+        const i = cli.msgs.findIndex(pred);
+        if (i >= 0) return cli.msgs.splice(i, 1)[0];
+        await new Promise(r => setTimeout(r, 60));
+      }
+      return null;
+    };
+    const wsend = (cli, obj) => cli.ws.send(JSON.stringify(obj));
+    const waitClose = cli => new Promise(res => { cli.ws.on('close', () => res(true)); setTimeout(() => res(false), 4000); });
+
+    let roomId = null, c1 = null, c2 = null, c3 = null;
+    try {
+      await t('U1-7：房间创建幂等 + WS 成员权限 + hello 初始态 + presence', async () => {
+        let up = false;
+        for (let i = 0; i < 60 && !up; i++) { await new Promise(r => setTimeout(r, 250)); try { up = (await fetch(base + '/api/health')).ok; } catch { } }
+        assert.ok(up, 'U1-7 子进程服务应在 15s 内就绪');
+
+        // HTTP：为智能体创建画布协作房间（幂等复用）
+        const rCreate = await jfetch(`/api/collab/rooms/by-agent/${u17Agent}`, { method: 'POST' }, tokOf(adminId));
+        assert.strictEqual(rCreate.j && rCreate.j.code, 0, '创建画布协作房间应成功：' + JSON.stringify(rCreate.j));
+        roomId = rCreate.j.data.id;
+        const rAgain = await jfetch(`/api/collab/rooms/by-agent/${u17Agent}`, { method: 'POST' }, tokOf(adminId));
+        assert.ok(rAgain.j.data.id === roomId && rAgain.j.data.reused === true, '重复创建应复用同一房间（幂等）：' + JSON.stringify(rAgain.j.data));
+        const rQuery = await jfetch(`/api/collab/rooms/by-agent/${u17Agent}`, {}, tokOf(adminId));
+        assert.ok(rQuery.j.data && rQuery.j.data.isMember === true && Array.isArray(rQuery.j.data.members), 'by-agent 查询应返回成员清单与 isMember');
+
+        // ws1（admin 房主）加入：hello 携带服务端初始画布 + 版本 0
+        c1 = mkWs(adminId);
+        await new Promise(r => c1.ws.on('open', r));
+        wsend(c1, { type: 'join', roomId });
+        const hello1 = await waitMsg(c1, m => m.type === 'hello');
+        assert.ok(hello1, '房主 join 应收到 hello');
+        assert.strictEqual(hello1.version, 0, '初始版本应为 0');
+        assert.strictEqual(hello1.workflow.nodes.length, 1, 'hello 应携带 agent 画布初始态（1 节点）');
+        assert.strictEqual(Number(hello1.agentId), Number(u17Agent), 'hello 应携带绑定 agentId');
+        assert.strictEqual(hello1.members.length, 1, '初始在线 1 人');
+
+        // 陌生人 u7c 加入被拒（成员模型把守）
+        c3 = mkWs(u7cId);
+        await new Promise(r => c3.ws.on('open', r));
+        wsend(c3, { type: 'join', roomId });
+        const rej = await waitMsg(c3, m => m.type === 'error');
+        assert.ok(rej && /成员/.test(rej.msg), '非成员 join 应被拒绝：' + JSON.stringify(rej));
+
+        // HTTP 添加成员 u7b → ws 加入 → 双方 presence
+        const rAdd = await jfetch(`/api/collab/rooms/${roomId}/members`, { method: 'POST', body: JSON.stringify({ username: 'u17b' }) }, tokOf(adminId));
+        assert.strictEqual(rAdd.j && rAdd.j.code, 0, '添加成员应成功');
+        c2 = mkWs(u7bId);
+        await new Promise(r => c2.ws.on('open', r));
+        wsend(c2, { type: 'join', roomId });
+        const hello2 = await waitMsg(c2, m => m.type === 'hello');
+        assert.ok(hello2 && hello2.members.length === 2, '成员 join 后在线应 2 人');
+        const pres = await waitMsg(c1, m => m.type === 'presence' && m.members.length === 2);
+        assert.ok(pres, '房主应收到 presence 广播（2 人在线）');
+      });
+
+      await t('U1-7：wf 提交→diff 广播→冲突拒绝→sync + 光标/位置转发（服务端版本为准）', async () => {
+        // ws1 提交带新增节点的画布 → ws1 ok v1；ws2 收到 diff（含完整 node 对象）
+        const wf1 = JSON.parse(JSON.stringify(wf0));
+        wf1.nodes.push({ id: 'node_u17', type: 'llm', position: { x: 200, y: 80 }, data: { title: '新增', model: 'm1', prompt: 'hi', max_tokens: 100, temperature: 0.5 } });
+        wf1.edges.push({ id: 'e_u17', source: 'start', target: 'node_u17', sourceHandle: 'out' });
+        wsend(c1, { type: 'wf', baseVersion: 0, workflow: wf1 });
+        const ok1 = await waitMsg(c1, m => m.type === 'ok');
+        assert.ok(ok1 && ok1.version === 1, '提交方应收到 ok v1：' + JSON.stringify(ok1));
+        const d1 = await waitMsg(c2, m => m.type === 'diff');
+        assert.ok(d1 && d1.version === 1 && d1.by === 'admin', '成员应收到 diff 广播（v1, by=admin）');
+        assert.strictEqual(d1.diff.nodes.added.length, 1, 'diff 应含 1 个新增节点');
+        assert.strictEqual(d1.diff.nodes.added[0].node.id, 'node_u17', 'added 应携带完整 node 对象（U1-7 扩展）');
+        assert.strictEqual(d1.diff.edges.added.length, 1, 'diff 应含 1 条新增连线');
+        assert.strictEqual(d1.diff.edges.added[0].edge.target, 'node_u17', 'added 应携带完整 edge 对象');
+
+        // 乐观锁兑底：ws2 用过期 baseVersion 提交 → conflict（服务端版本为准）
+        wsend(c2, { type: 'wf', baseVersion: 0, workflow: wf0 });
+        const conf = await waitMsg(c2, m => m.type === 'conflict');
+        assert.ok(conf && conf.currentVersion === 1, '过期提交应被拒并告知服务端版本：' + JSON.stringify(conf));
+        // sync 重同步 → 拿到 v1 全量
+        wsend(c2, { type: 'sync' });
+        const sync2 = await waitMsg(c2, m => m.type === 'sync');
+        assert.ok(sync2 && sync2.version === 1 && sync2.workflow.nodes.some(n => n.id === 'node_u17'), 'sync 应返回 v1 全量（含新增节点）');
+
+        // 光标转发
+        wsend(c1, { type: 'cursor', x: 123, y: 45 });
+        const cur = await waitMsg(c2, m => m.type === 'cursor' && m.by === 'admin');
+        assert.ok(cur && cur.x === 123 && cur.y === 45, '光标应转发给其他成员');
+
+        // node:move 轻指令转发（位置不占版本号）
+        wsend(c1, { type: 'op', op: 'node:move', moves: [{ id: 'node_u17', x: 300, y: 120 }] });
+        const mv = await waitMsg(c2, m => m.type === 'op' && m.op === 'node:move');
+        assert.ok(mv && mv.moves[0].x === 300 && mv.by === 'admin', '位置移动应转发（by 标识）');
+
+        // 会话态仅内存：DB 中 agent 画布不受影响（持久化仍走既有 PUT）
+        const dbWf = JSON.parse(db.prepare('SELECT workflow FROM agents WHERE id=?').get(u17Agent).workflow || '{}');
+        assert.strictEqual(dbWf.nodes.length, 1, '协作会话不直写 DB（持久化走既有保存链路）');
+      });
+
+      await t('U1-7：关闭房间广播断开 + 未认证握手 401', async () => {
+        // 关闭房间 → 在线成员收 closed 并断开
+        const rClose = await jfetch(`/api/collab/rooms/${roomId}/close`, { method: 'POST' }, tokOf(adminId));
+        assert.strictEqual(rClose.j && rClose.j.code, 0, '关闭房间应成功');
+        const closed1 = await waitMsg(c1, m => m.type === 'closed');
+        assert.ok(closed1, '成员应收到 closed 广播');
+        assert.ok(await waitClose(c1) && await waitClose(c2), 'closed 后连接应断开');
+
+        // 未认证握手：401（无 Cookie）
+        const bad = new WebSocket(`ws://127.0.0.1:${port}/api/canvas-ws`);
+        const rejCode = await new Promise(res => {
+          bad.on('unexpected-response', (req, resp) => res(resp && resp.statusCode));
+          bad.on('error', () => res('net-error'));
+          bad.on('open', () => res('opened'));
+          setTimeout(() => res('timeout'), 4000);
+        });
+        assert.strictEqual(rejCode, 401, '无凭据 WS 握手应返回 401（实际 ' + rejCode + '）');
+        try { bad.terminate(); } catch { }
+      });
+    } finally {
+      try { child.kill('SIGTERM'); } catch { }
+      try { child.kill('SIGKILL'); } catch { }
+      db.prepare('DELETE FROM collab_room_members WHERE room_id=?').run(roomId);
+      db.prepare('DELETE FROM collab_rooms WHERE agent_id=?').run(u17Agent);
+      db.prepare('DELETE FROM agents WHERE id=?').run(u17Agent);
+      db.prepare('DELETE FROM users WHERE username IN (?,?)').run('u17b', 'u17c');
+    }
+  }
+
   // 收尾：关闭库并清理临时目录
   try { db.close(); } catch { }
   fs.rmSync(process.env.AGENT_DATA_DIR, { recursive: true, force: true });
