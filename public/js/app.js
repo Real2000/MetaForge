@@ -81,6 +81,7 @@ const adminNav = [
   { href: '#/admin/feedback', ic: '💬', label: '意见反馈' },
   { href: '#/admin/quality', ic: '📊', label: '对话质量' },
   { href: '#/admin/biz', ic: '💼', label: '商业化管理' },
+  { href: '#/admin/plugins', ic: '🧩', label: '插件管理' },
 ];
 
 function renderNav(list, currentPath) {
