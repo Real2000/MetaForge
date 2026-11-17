@@ -1151,4 +1151,74 @@ router.delete('/evaluations/:id', (req, res) => {
   res.json({ code: 0, msg: '已删除' });
 });
 
+// ---------- U2-6 对话式建 Agent ----------
+
+const GEN_SUGGESTION_SYSTEM = `你是一个智能体创建专家。用户会描述他的需求，你需要根据以下格式输出 JSON 建议：
+{
+  "name": "建议的智能体名（简洁，限 30 字）",
+  "description": "一句话描述",
+  "type": "enterprise | digital | dept | other",
+  "prompt": "系统提示词（完整，包含角色设定+行为约束+输出格式）",
+  "tools": ["web_search", "get_datetime", "calculator", "kb_search"],
+  "model": "",
+  "variables": [{ "name": "user_name", "type": "string", "label": "用户姓名", "required": true, "desc": "请输入您的姓名" }],
+  "confirm_questions": ["确认问题1", "确认问题2"]
+}
+你现在需要帮助用户创建智能体，请先收集必要信息然后输出建议。输出格式必须是以上 JSON，不需要额外解释。`;
+
+/** POST /api/agents/generate-suggestion — AI 辅导对话，生成智能体创建建议
+ *  body: { messages: [{ role, content }] }
+ *  将对话历史 + 固定 system prompt 传給 chatOnce 生成 JSON 建议 */
+router.post('/generate-suggestion', async (req, res) => {
+  const { messages = [] } = req.body || {};
+  if (!Array.isArray(messages) || !messages.length) {
+    return res.json({ code: 400, msg: 'messages 数组不能为空' });
+  }
+  try {
+    const fullMessages = [{ role: 'system', content: GEN_SUGGESTION_SYSTEM }, ...messages];
+    const result = await chatOnce(fullMessages, { model: '' });
+    if (!result || !result.full) return res.json({ code: 400, msg: 'AI 未能生成建议，请重试' });
+    let suggestion = null;
+    try { suggestion = JSON.parse(result.full); } catch { /* 若输出不是纯 JSON，尝试提取第一个 { } 块 */ }
+    if (!suggestion) {
+      const m = result.full.match(/\{[\s\S]*\}/);
+      if (m) { try { suggestion = JSON.parse(m[0]); } catch { } }
+    }
+    if (!suggestion || !suggestion.name) return res.json({ code: 400, msg: 'AI 返回格式异常，建议重试' });
+    res.json({ code: 0, data: { suggestion, raw: result.full } });
+  } catch (e) {
+    res.json({ code: 500, msg: '建议生成失败：' + e.message });
+  }
+});
+
+/** POST /api/agents/bulk-create — AI 辅导一键创建智能体
+ *  body: { suggestion: { name, description, type, prompt, tools, model, variables } }
+ *  创建智能体（state='draft'）并返回 agent_id。调用方可继续编辑/发布 */
+router.post('/bulk-create', async (req, res) => {
+  const { suggestion } = req.body || {};
+  if (!suggestion || !suggestion.name) return res.json({ code: 400, msg: '智能体建议信息不完整' });
+  // 校验必填
+  const name = String(suggestion.name || '').trim().slice(0, 50);
+  if (!name) return res.json({ code: 400, msg: '智能体名不能为空' });
+  // 获取个人空间
+  const mySpace = db.prepare('SELECT id FROM spaces WHERE owner=? AND type=? LIMIT 1').get(req.user.username, 'personal') || {};
+  const spaceId = mySpace.id || 0;
+  const variables = Array.isArray(suggestion.variables) ? suggestion.variables : [];
+  const tools = Array.isArray(suggestion.tools) ? suggestion.tools : [];
+  const prompt = (suggestion.prompt || '').trim();
+  const type = ['enterprise', 'digital', 'dept', 'other'].includes(suggestion.type) ? suggestion.type : 'digital';
+  try {
+    const info = db.prepare(`INSERT INTO agents (name,description,prompt,type,space_id,owner,status,model,tools,variables,edit_mode,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,'draft',?,?,?,'canvas',?,?)`)
+      .run(name, (suggestion.description || '').slice(0, 200), prompt, type, spaceId, req.user.username,
+        suggestion.model || '', JSON.stringify(tools), JSON.stringify(variables), now(), now());
+    const agentId = info.lastInsertRowid;
+    db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
+      .run(req.user.username, 'AI 辅导创建智能体', `${name}（#${agentId}）`, req.ip, now());
+    res.json({ code: 0, data: { id: agentId, name }, msg: '智能体已创建，可进入编排页进一步编辑' });
+  } catch (e) {
+    res.json({ code: 500, msg: '创建失败：' + e.message });
+  }
+});
+
 module.exports = router;
