@@ -2276,6 +2276,29 @@ db.exec(`CREATE TABLE IF NOT EXISTS market_products (
 );`);
 console.log('[db] 创建 market_products 表（U2-5 市场商品）');
 
+// ================== U2-5 市场订单表 ==================
+// market_orders: 用户购买/订阅智能体商品的订单记录
+db.exec(`CREATE TABLE IF NOT EXISTS market_orders (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  order_no TEXT NOT NULL UNIQUE,          -- 订单号（异步生成，可视）
+  product_id INTEGER NOT NULL,           -- market_products.id
+  agent_id INTEGER NOT NULL,             -- 快照（关联 agents.id，方便直接查询）
+  buyer TEXT NOT NULL,                    -- 购买者 username
+  price REAL NOT NULL DEFAULT 0,          -- 成交金额
+  price_type TEXT DEFAULT 'one_time',    -- 快照 one_time | subscription
+  status TEXT DEFAULT 'pending',          -- pending | paid | completed | cancelled | refunded
+  paid_at TEXT,
+  completed_at TEXT,
+  subscription_end TEXT,                  -- 订阅到期时间（subscription 类型）
+  note TEXT DEFAULT '',
+  created_at TEXT,
+  updated_at TEXT
+);`);
+db.exec('CREATE INDEX IF NOT EXISTS idx_mo_buyer ON market_orders(buyer);');
+db.exec('CREATE INDEX IF NOT EXISTS idx_mo_product ON market_orders(product_id);');
+db.exec('CREATE INDEX IF NOT EXISTS idx_mo_status ON market_orders(status);');
+console.log('[db] 创建 market_orders 表（U2-5 市场订单）');
+
 // ================== a2a_tasks 表 ==================
 db.exec(`CREATE TABLE IF NOT EXISTS a2a_tasks (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

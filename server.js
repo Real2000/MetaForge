@@ -106,6 +106,8 @@ app.use('/api/collab', require('./src-server/routes/collab'));
 app.use('/api/catalog', require('./src-server/routes/catalog'));
 // U2-5 市场商品管理（智能体发行为市场可购买商品）
 app.use('/api/market', require('./src-server/routes/market-products'));
+// U2-5 Phase 2 市场订单管理（购买/订阅/支付回调）
+app.use('/api/market/orders', require('./src-server/routes/market-orders'));
 // P1-20 配置中心（统一配置管理，格式检查 + 脱敏回显 + 审计日志）
 app.use('/api/config', require('./src-server/routes/config'));
 // U1-1 内建数据库（用户自定义表CRUD + 行数据管理）
