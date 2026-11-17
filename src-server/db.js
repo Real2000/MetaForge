@@ -2260,6 +2260,22 @@ db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_at_name_owner ON app_tables(name,
 db.exec('CREATE INDEX IF NOT EXISTS idx_atr_table ON app_table_rows(table_id);');
 console.log('[db] 创建 app_tables/app_table_rows 表（U1-1 内建数据库）');
 
+// ================== U2-5 市场商品表 ==================
+db.exec(`CREATE TABLE IF NOT EXISTS market_products (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  agent_id INTEGER NOT NULL UNIQUE,
+  name TEXT NOT NULL DEFAULT '',
+  description TEXT DEFAULT '',
+  price_type TEXT DEFAULT 'free',          -- free | one_time | subscription
+  price REAL DEFAULT 0,
+  subscription_period TEXT DEFAULT 'month',
+  author_profit_share REAL DEFAULT 0.8,
+  status TEXT DEFAULT 'active',            -- active | inactive
+  created_at TEXT,
+  updated_at TEXT
+);`);
+console.log('[db] 创建 market_products 表（U2-5 市场商品）');
+
 // ================== a2a_tasks 表 ==================
 db.exec(`CREATE TABLE IF NOT EXISTS a2a_tasks (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

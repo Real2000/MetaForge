@@ -131,7 +131,7 @@ router.post('/poll', deviceAuth, (req, res) => {
 });
 
 // result：回推执行结果
-router.post('/result', deviceAuth, (req, res) => {
+router.post('/result', deviceAuth, async (req, res) => {
   const { task_id, result } = req.body || {};
   const t = db.prepare('SELECT * FROM localbridge_tasks WHERE id=?').get(Number(task_id));
   if (!t || t.device_id !== req.device.id) return res.status(404).json({ code: 404, msg: '任务不存在' });

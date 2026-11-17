@@ -6226,6 +6226,52 @@ print('PY_OK')
     });
   }
 
+  console.log('【U2-5】市场商业化闭环 Phase 1：商品表 + 上架 API');
+  {
+    const { sign } = require('../src-server/lib/auth');
+    const { spawn } = require('child_process');
+
+    await t('U2-5：market_products 表存在且可读写', () => {
+      const p = db.prepare('SELECT * FROM market_products LIMIT 1').all();
+      assert.ok(Array.isArray(p), 'market_products 表应存在并可查询');
+    });
+
+    const sp = (db.prepare("SELECT id FROM spaces WHERE type='enterprise' LIMIT 1").get() || db.prepare("SELECT id FROM spaces LIMIT 1").get()).id;
+    const agId = db.prepare("INSERT INTO agents (name,type,space_id,owner,status,visibility,prompt,created_at) VALUES ('U25测试智能体','other',?,'admin','published','public','测试',datetime('now','localtime'))").run(sp).lastInsertRowid;
+
+    await t('U2-5：商品表 CRUD——INSERT / SELECT / UPDATE / DELETE（完整链）', () => {
+      // 插入商品
+      const ts = new Date().toISOString().replace('T', ' ').slice(0, 19);
+      const info = db.prepare('INSERT INTO market_products (agent_id,name,price_type,price,subscription_period,author_profit_share,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)')
+        .run(agId, 'U25测试商品', 'subscription', 99, 'month', 0.8, 'active', ts, ts);
+      assert.ok(info.changes === 1, '插入商品应影响 1 行');
+      const pid = info.lastInsertRowid;
+      // SELECT 验证
+      const p = db.prepare('SELECT * FROM market_products WHERE id=?').get(pid);
+      assert.strictEqual(p.name, 'U25测试商品', '名称应匹配');
+      assert.strictEqual(p.price_type, 'subscription', '价格类型应正确');
+      assert.strictEqual(p.price, 99, '价格应匹配');
+      assert.strictEqual(p.author_profit_share, 0.8, '分成比例应为 0.8');
+      assert.strictEqual(p.status, 'active', '状态应为 active');
+      // JOIN 查询验证
+      const joined = db.prepare('SELECT mp.*, a.name AS agent_name FROM market_products mp JOIN agents a ON a.id = mp.agent_id WHERE mp.id=?').get(pid);
+      assert.strictEqual(joined.agent_name, 'U25测试智能体', 'JOIN agents 应返回智能体名');
+      // UPDATE
+      db.prepare('UPDATE market_products SET price=?,price_type=?,updated_at=? WHERE id=?').run(149, 'one_time', ts, pid);
+      const after = db.prepare('SELECT * FROM market_products WHERE id=?').get(pid);
+      assert.strictEqual(after.price, 149, '更新后价格应变化');
+      assert.strictEqual(after.price_type, 'one_time', '更新后类型应变化');
+      // 筛选查询
+      const all = db.prepare('SELECT * FROM market_products WHERE status=?').all('active');
+      assert.ok(all.some(x => x.id === pid), '活跃商品列表应包含测试商品');
+      // DELETE
+      db.prepare('DELETE FROM market_products WHERE id=?').run(pid);
+      const afterDel = db.prepare('SELECT * FROM market_products WHERE id=?').get(pid);
+      assert.strictEqual(afterDel, undefined, '删除后应查不到');
+    });
+    db.prepare('DELETE FROM agents WHERE id=?').run(agId);
+  }
+
   // 收尾：关闭库并清理临时目录
   try { db.close(); } catch { }
   fs.rmSync(process.env.AGENT_DATA_DIR, { recursive: true, force: true });
