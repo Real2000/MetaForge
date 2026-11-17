@@ -101,4 +101,19 @@ function deptCostOfMonth(month) {
   return { month: m, departments: out, totalCost: Number(out.reduce((s, r) => s + r.cost, 0).toFixed(6)) };
 }
 
-module.exports = { parsePriceTable, priceOf, computeCost, recordModelUsage, deptCostOfMonth };
+/** U2-7 Phase 2：跨组织知识库引用计费。外部源检索命中时调用。 */
+function recordKbFederatedUsage({ username, query, tokens = 1, sourceOrg = '', kbName = '', cost } = {}) {
+  if (!username) return { ok: false, reason: 'username 为空' };
+  try {
+    const dimKey = `kb_federated:${(sourceOrg || '').slice(0, 30)}:${(kbName || '').slice(0, 30)}`;
+    const finalCost = cost != null ? cost : Number((tokens * 0.001).toFixed(6));
+    db.prepare("INSERT INTO usage_records (username, dimension, dimension_key, tokens, count, cost, meta, created_at) VALUES (?, 'kb', ?, ?, 1, ?, ?, datetime('now','localtime'))")
+      .run(username, dimKey, tokens, finalCost, JSON.stringify({ sourceOrg, kbName, query, type: 'kb_federated' }));
+    return { ok: true, cost: finalCost };
+  } catch (e) {
+    console.error('[billing] kb_federated 计费失败（不阻断）：', e.message);
+    return { ok: false, reason: e.message };
+  }
+}
+
+module.exports = { parsePriceTable, priceOf, computeCost, recordModelUsage, deptCostOfMonth, recordKbFederatedUsage };

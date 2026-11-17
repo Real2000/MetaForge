@@ -129,13 +129,18 @@ function extractResults(type, data, query) {
  */
 function injectWatermark(chunks, kb, user) {
   if (!Array.isArray(chunks)) return [];
-  // 查询该知识库的外部源配置中是否有 org_name
-  let orgName = '';
+  let orgName = '', sourceName = '';
   try {
     const source = db.prepare("SELECT * FROM external_sources WHERE kb_id=? AND enabled=1 AND org_name!='' LIMIT 1").get(kb?.id || kb);
-    if (source) orgName = source.org_name;
+    if (source) { orgName = source.org_name; sourceName = source.name; }
   } catch { /* 容错 */ }
-  if (!orgName) return chunks; // 无外部源水印
+  if (!orgName) return chunks;
+  // U2-7 Phase 2：跨组织检索引用计费
+  try {
+    const { recordKbFederatedUsage } = require('./billing');
+    const username = (user && user.username) || 'system';
+    recordKbFederatedUsage({ username, tokens: chunks.length, sourceOrg: orgName, kbName: sourceName });
+  } catch { /* 计费失败不阻断 */ }
   return chunks.map(c => ({
     ...c,
     content: `[📡 来源组织：${orgName}]\n${c.content}`,

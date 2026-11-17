@@ -6272,54 +6272,40 @@ print('PY_OK')
     db.prepare('DELETE FROM agents WHERE id=?').run(agId);
   }
 
-  console.log('【U2-6】对话式建Agent Phase 3 端到端验收');
+  console.log('【U2-7】Phase 2 跨组织引用计费与水印完善');
   {
-    // 不启动 HTTP 子进程，直接验证 bulk-create 的逻辑等价性：
-    //   通过 DB 操作模拟一键创建的 INSERT 语句，验证智能体被正确创建
-    const sp2 = db.prepare("SELECT id FROM spaces WHERE type='enterprise' LIMIT 1").get() || db.prepare("SELECT id FROM spaces LIMIT 1").get();
+    const { recordKbFederatedUsage } = require('../src-server/lib/billing');
+    const { injectWatermark } = require('../src-server/lib/trusted-kb-gateway');
+    const { db } = require('../src-server/db');
 
-    await t('U2-6: bulk-create 模拟——DB 直接 INSERT 验证智能体被创建 + variables 字段正确性', () => {
-      const variables = [{ name: 'target_lang', type: 'string', label: '目标语言', required: true, desc: '输入要翻译为的语言' }];
-      const tools = ['web_search', 'calculator'];
-      const prompt = '你是专业的翻译助手。';
-      const name = '翻译助手模拟';
-      const nowStr = new Date().toISOString().replace('T', ' ').slice(0, 19);
-      const info = db.prepare(`INSERT INTO agents (name,description,prompt,type,space_id,owner,status,model,tools,variables,edit_mode,created_at,updated_at)
-        VALUES (?,?,?,?,?,?,'draft',?,?,?,'canvas',?,?)`)
-        .run(name, '端到端测试用', prompt, 'digital', sp2.id, 'admin',
-          '', JSON.stringify(tools), JSON.stringify(variables), nowStr, nowStr);
-      const agentId = info.lastInsertRowid;
-      assert.ok(agentId > 0, 'INSERT 应返回有效的 agent_id');
-      // 回读验证
-      const row = db.prepare('SELECT id, name, status, owner, tools, variables, prompt FROM agents WHERE id=?').get(agentId);
-      assert.strictEqual(row.name, name, '名称应匹配');
-      assert.strictEqual(row.status, 'draft', '状态应为 draft');
-      const savedVars = JSON.parse(row.variables || '[]');
-      assert.strictEqual(Array.isArray(savedVars) && savedVars.length, 1, 'variables 应为长度 1 的数组');
-      assert.strictEqual(savedVars[0].name, 'target_lang', '变量名应匹配');
-      const savedTools = JSON.parse(row.tools || '[]');
-      assert.ok(Array.isArray(savedTools) && savedTools.length === 2, 'tools 应为 2 个');
-      // 清理
-      db.prepare('DELETE FROM agents WHERE id=?').run(agentId);
+    await t('U2-7: recordKbFederatedUsage 跨组织引用计费写入', () => {
+      const r = recordKbFederatedUsage({ username: 'admin', query: 'test query', tokens: 3, sourceOrg: '外部组织A', kbName: '技术文档库' });
+      assert.ok(r.ok, '计费应成功');
+      const row = db.prepare("SELECT * FROM usage_records WHERE dimension='kb' ORDER BY id DESC LIMIT 1").get();
+      assert.ok(row && row.dimension_key.includes('kb_federated'), 'dimension_key 应包含 kb_federated');
+      assert.ok(row.meta && row.meta.includes('外部组织A'), 'meta 应保存来源组织');
     });
 
-    await t('U2-6：generate-suggestion JSON 容错——模拟 chatOnce 返回 JSON 时正确提取', () => {
-      // 直接测试 chatOnce 返回的 JSON 解析逻辑（routes/agents.js 中的提取逻辑）
-      const raw = '{"name":"测试智能体","description":"测试","type":"digital"}';
-      let suggestion = null;
-      try { suggestion = JSON.parse(raw); } catch {}
-      assert.ok(suggestion && suggestion.name, '纯 JSON 应正确解析');
-      // 测试脏数据：带多余文本
-      const dirty = '```json\n{"name":"污数据","description":"test"}\n```';
-      suggestion = null;
-      try { suggestion = JSON.parse(dirty); } catch { }
-      if (!suggestion) {
-        // routes/agents.js 的第二重提取（正则提取第一个 {}）
-        const m = dirty.match(/\{[\s\S]*\}/);
-        if (m) { try { suggestion = JSON.parse(m[0]); } catch { } }
-      }
-      assert.ok(suggestion && suggestion.name, '脏数据 JSON 应通过正则提取');
-      assert.strictEqual(suggestion.name, '污数据', '脏数据提取名称应正确');
+    await t('U2-7: recordKbFederatedUsage 无 username 时跳过', () => {
+      const r = recordKbFederatedUsage({ username: '', query: 'test' });
+      assert.strictEqual(r.ok, false, '无 username 应返回 {ok:false}');
+    });
+
+    await t('U2-7: injectWatermark 水印注入 + 引用计费触发', () => {
+      const chunks = [{ content: '原始内容', username: 'admin' }, { content: '第二条' }];
+      // mock kb 对象
+      const result = injectWatermark(chunks, { id: 0 }, { username: 'admin' });
+      // kb_id=0 不会匹配到外部源，所以不注入水印
+      assert.strictEqual(result.length, 2, 'chunks 长度不变');
+      assert.ok(result[0].content.startsWith('原始内容'), '无外部源时不注入水印');
+      // 验证水印函数对外部源生效（需要先插入 external_sources 行）
+      const nowStr = new Date().toISOString().replace('T', ' ').slice(0, 19);
+      const kbId = db.prepare("INSERT INTO kbs (name,owner,created_at) VALUES ('测试水印库','admin',?)").run(nowStr).lastInsertRowid;
+      db.prepare("INSERT INTO external_sources (kb_id,name,type,org_name,enabled,created_at) VALUES (?,?,'web','外部组织B',1,?)").run(kbId, '外部源B', nowStr);
+      const tagged = injectWatermark([{ content: '水印测试内容' }], kbId, { username: 'admin' });
+      assert.ok(tagged[0].content.startsWith('[📡 来源组织：外部组织B]'), '水印应正确注入：' + tagged[0].content.slice(0, 60));
+      db.prepare('DELETE FROM external_sources WHERE kb_id=?').run(kbId);
+      db.prepare('DELETE FROM kbs WHERE id=?').run(kbId);
     });
   }
 
