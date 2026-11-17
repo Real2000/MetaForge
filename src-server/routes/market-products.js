@@ -104,4 +104,29 @@ function normalizeProduct(p) {
   };
 }
 
+// ---------- U2-5 Phase 3 月度收入对账报表 ----------
+router.get('/revenue', adminOnly, (req, res) => {
+  const month = req.query.month || new Date().toISOString().slice(0, 7);
+  if (!/^\d{4}-\d{2}$/.test(month)) return res.json({ code: 400, msg: '月份格式非法，应为 YYYY-MM' });
+  const months = month;
+  const nextMonth = month.slice(0, 5) + String(+month.slice(5, 7) + 1).padStart(2, '0');
+  const rows = db.prepare(`
+    SELECT mp.id AS product_id, mp.name AS product_name, mp.price_type, a.name AS agent_name,
+      COUNT(o.id) AS orders, COALESCE(SUM(o.price),0) AS revenue,
+      COALESCE(SUM(o.price * mp.author_profit_share),0) AS author_share,
+      COALESCE(SUM(o.price * (1 - mp.author_profit_share)),0) AS platform_revenue
+    FROM market_products mp
+    JOIN agents a ON a.id = mp.agent_id
+    LEFT JOIN market_orders o ON o.product_id = mp.id AND o.status IN ('paid','completed')
+      AND o.paid_at >= ? AND o.paid_at < ?
+    GROUP BY mp.id ORDER BY revenue DESC LIMIT 200
+  `).all(`${months}-01 00:00:00`, `${nextMonth}-01 00:00:00`);
+  const total = {
+    revenue: rows.reduce((s, r) => s + r.revenue, 0),
+    authorShare: rows.reduce((s, r) => s + r.author_share, 0),
+    platformRevenue: rows.reduce((s, r) => s + r.platform_revenue, 0),
+  };
+  res.json({ code: 0, data: { month: months, details: rows, total } });
+});
+
 module.exports = router;

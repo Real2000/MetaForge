@@ -47,6 +47,7 @@ const routes = {
   '/admin/feedback': { page: () => import('./admin/feedback.js'), layout: 'admin', title: '意见反馈', admin: true },
   '/admin/quality': { page: () => import('./admin/quality.js'), layout: 'admin', title: '对话质量', admin: true },
   '/admin/biz': { page: () => import('./admin/biz.js'), layout: 'admin', title: '商业化管理', admin: true },
+  '/admin/market': { page: () => import('./admin/market.js'), layout: 'admin', title: '市场商业', admin: true },
 };
 
 const frontNav = [
@@ -82,6 +83,7 @@ const adminNav = [
   { href: '#/admin/quality', ic: '📊', label: '对话质量' },
   { href: '#/admin/biz', ic: '💼', label: '商业化管理' },
   { href: '#/admin/plugins', ic: '🧩', label: '插件管理' },
+  { href: '#/admin/market', ic: '💰', label: '市场商业' },
 ];
 
 function renderNav(list, currentPath) {
