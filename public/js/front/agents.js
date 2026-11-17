@@ -135,7 +135,7 @@ export async function render(el) {
     const m = modal({
       title: `${t('新增智能体（')} ${typeName[createType] || t('数字员工')}）`,
       body, wide: true,
-      foot: `<button class="btn" data-cancel>${t('取消')}</button><button class="btn primary" data-save>${t('创建')}</button>`,
+      foot: `<button class="btn" data-cancel>${t('取消')}</button><button class="btn" id="aiBtn">✨ ${t('AI 辅导')}</button><button class="btn primary" data-save>${t('创建')}</button>`,
       onMount(mask, close) {
         const qs = [];
         const qList = mask.querySelector('#qList');
@@ -199,6 +199,104 @@ export async function render(el) {
             close(); load();
           } catch (e) { toast(e.message, 'err'); }
         };
+
+        // U2-6 Phase 2：AI 辅导入口（打开对话弹窗 → 建议 → 一键创建）
+        mask.querySelector('#aiBtn').onclick = async () => {
+          openAiAdvisor(close);
+        };
+      },
+    });
+  }
+
+  /** U2-6 Phase 2：AI 辅导对话弹窗 + 建议卡片 + 一键创建 */
+  function openAiAdvisor(closeCreateModal) {
+    const conv = []; // 对话历史
+    const rootEl = document.createElement('div');
+    rootEl.innerHTML = `
+      <div style="display:flex;flex-direction:column;height:420px">
+        <div style="flex:1;overflow-y:auto;padding:12px 16px;background:#f8faff;border-radius:10px;margin-bottom:12px" id="aiMsgs">
+          <div style="text-align:center;color:#818cf8;font-size:13px;padding:24px 0">💬 ${t('描述你想要的智能体，我来帮您创建！')}</div>
+          <div style="text-align:center;color:#9ca3af;font-size:12px;margin-bottom:8px">${t('试试这样说：')}</div>
+          <div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-bottom:12px">
+            <span class="quick-q" data-hint="${esc('帮我创建一个翻译助手，英汉互译、保留格式')}">🌍 ${t('翻译助手')}</span>
+            <span class="quick-q" data-hint="${esc('我想做一个公文写作机器人，帮我写通知、会议纪要')}">📄 ${t('公文写作')}</span>
+            <span class="quick-q" data-hint="${esc('创建一个数据分析师，能回答销售数据、做报表')}">📊 ${t('数据分析')}</span>
+          </div>
+        </div>
+        <div style="display:flex;gap:8px">
+          <textarea class="input" id="aiInput" style="flex:1;min-height:44px;resize:none" placeholder="${t('描述你的需求…')}" rows="2"></textarea>
+          <button class="send-btn" id="aiSend" style="padding:0 18px">${t('发送')}</button>
+        </div>
+      </div>`;
+    const m = modal({
+      title: `✨ ${t('AI 辅导创建智能体')}`,
+      body: rootEl,
+      foot: `<button class="btn" data-cancel>${t('取消')}</button><button class="btn primary" id="aiCreateBtn" style="display:none">🚀 ${t('一键创建')}</button>`,
+      wide: true,
+      onMount(mask, close) {
+        let suggestion = null;
+        const msgsEl = mask.querySelector('#aiMsgs');
+        const chatInput = mask.querySelector('#aiInput');
+        const aiBtn = mask.querySelector('#aiCreateBtn');
+        const sendBtn = mask.querySelector('#aiSend');
+        [mask.querySelector('#aiInput'), ...mask.querySelectorAll('[data-hint]')].forEach(el => {
+          el?.addEventListener('click', () => {
+            if (el.dataset.hint) chatInput.value = el.dataset.hint;
+            aiClicked();
+          });
+        });
+        async function aiClicked() {
+          const text = chatInput.value.trim();
+          if (!text) return toast(t('请描述你的需求'), 'err');
+          conv.push({ role: 'user', content: text });
+          msgsEl.innerHTML += `<div style="margin-bottom:10px;text-align:right"><span style="display:inline-block;background:#2563eb;color:#fff;border-radius:10px;padding:6px 12px;font-size:13px">${escH(text)}</span></div>`;
+          chatInput.value = '';
+          msgsEl.innerHTML += `<div style="margin-bottom:10px"><div class="typing" style="display:inline-flex;gap:4px"><span></span><span></span><span></span></div></div>`;
+          msgsEl.scrollTop = msgsEl.scrollHeight;
+          sendBtn.disabled = true; aiBtn.style.display = 'none'; suggestion = null;
+          try {
+            const j = await api('/agents/generate-suggestion', { method: 'POST', body: { messages: conv } });
+            if (j.code !== 0) throw new Error(j.msg);
+            msgsEl.querySelector('.typing')?.remove();
+            suggestion = j.data.suggestion;
+            // 渲染建议卡片
+            const c = suggestion;
+            msgsEl.innerHTML += `
+              <div style="margin-bottom:10px">
+                <div style="display:inline-block;background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:14px;max-width:100%;font-size:13px;line-height:1.7">
+                  <div style="font-weight:600;margin-bottom:4px">📋 ${t('建议方案')}</div>
+                  <div><b>${t('名称')}：</b>${escH(c.name)}</div>
+                  <div><b>${t('描述')}：</b>${escH(c.description || '')}</div>
+                  <div style="margin-top:6px"><b>${t('确认问题')}：</b><br>${(c.confirm_questions || []).map((q, i) => `<span style="display:inline-block;background:#f3f4f6;border-radius:8px;padding:4px 10px;margin:2px">${i+1}. ${escH(q)}</span>`).join('')}</div>
+                </div>
+              </div>`;
+            msgsEl.scrollTop = msgsEl.scrollHeight;
+            aiBtn.style.display = ''; // 显示一键创建按钮
+          } catch (e) {
+            msgsEl.querySelector('.typing')?.remove();
+            msgsEl.innerHTML += `<div style="margin-bottom:10px;color:#dc2626;font-size:13px">⚠ ${escH(e.message)}</div>`;
+          }
+          sendBtn.disabled = false;
+        }
+        sendBtn.onclick = aiClicked;
+        chatInput.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); aiClicked(); } });
+        // 一键创建：调用 bulk-create → 关闭弹窗 → 关闭创建弹窗 → 跳转编排页
+        aiBtn.onclick = async () => {
+          if (!suggestion || !suggestion.name) return;
+          aiBtn.disabled = true; aiBtn.textContent = '⏳ ' + t('创建中…');
+          try {
+            const j = await api('/agents/bulk-create', { method: 'POST', body: { suggestion } });
+            if (j.code !== 0) throw new Error(j.msg);
+            const agentId = j.data.id;
+            toast(t('智能体已创建，正在跳转编排页…'));
+            close(); // 关闭辅导弹窗
+            if (closeCreateModal) closeCreateModal(); // 关闭创建弹窗
+            // 跳转到编排页
+            location.hash = '#/admin/studio/' + agentId;
+          } catch (e) { toast(e.message, 'err'); }
+          aiBtn.disabled = false; aiBtn.textContent = '🚀 ' + t('一键创建');
+        };
+        mask.querySelector('[data-cancel]').onclick = close;
       },
     });
   }
