@@ -2163,6 +2163,19 @@ db.exec(`CREATE TABLE IF NOT EXISTS external_sources (
 );`);
 db.exec('CREATE INDEX IF NOT EXISTS idx_es_kb ON external_sources(kb_id);');
 
+// ================== U2-7 external_sources 扩展列 ==================
+{
+  try {
+    const esCols = db.prepare('PRAGMA table_info(external_sources)').all().map(c => c.name);
+    if (!esCols.includes('auth_type')) {
+      db.exec("ALTER TABLE external_sources ADD COLUMN auth_type TEXT DEFAULT 'none'");
+      db.exec("ALTER TABLE external_sources ADD COLUMN auth_config TEXT DEFAULT ''");
+      db.exec("ALTER TABLE external_sources ADD COLUMN org_name TEXT DEFAULT ''");
+      console.log('[db] external_sources 表已迁移：新增 auth_type/auth_config/org_name 字段（U2-7 跨租户联邦）');
+    }
+  } catch (e) { console.error('[db] U2-7 迁移失败（不阻塞）：', e.message); }
+}
+
 // ================== P2-14 召回质量闭环（2026-11-13）==================
 // 召回评测结果表：每次跑召回对比的记录，scores JSON 存储各评测条目得分
 db.exec(`CREATE TABLE IF NOT EXISTS recall_eval_results (

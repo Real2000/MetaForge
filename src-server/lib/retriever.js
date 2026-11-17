@@ -23,6 +23,8 @@ const RERANK_TIMEOUT = 10000; // 重排调用超时
 const RERANK_CANDIDATES = 30; // 粗召回送入 Rerank 的候选数
 const RERANK_TOP_N = 5;      // Rerank 后精排输出数
 
+const { injectWatermark } = require('./trusted-kb-gateway'); // U2-7 外部源引用水印
+
 /* ---------------- bge-m3 网关嵌入（多供应商尝试，失败自动降级本地） ---------------- */
 
 /** 找到拥有 bge/embedding 模型的已配置供应商（默认优先） */
@@ -384,13 +386,13 @@ async function rerankAndSlice(query, rrfResults, topN, opts = {}) {
       // 按 rerank 索引重排
       const resultMap = new Map();
       rrfResults.forEach((r, i) => resultMap.set(i, r));
-      return attachChapterContext(attachParentContext(ranked
+      return injectWatermark(attachChapterContext(attachParentContext(ranked
         .map(r => ({ ...resultMap.get(r.index), rerank_score: r.score }))
         .filter(Boolean)
-        .slice(0, topN)));
+        .slice(0, topN))), kbId);
     }
   } catch { /* fallthrough: 退回 RRF 排序 */ }
-  return attachChapterContext(attachParentContext(rrfResults.slice(0, topN)));
+  return injectWatermark(attachChapterContext(attachParentContext(rrfResults.slice(0, topN))), kbId);
 }
 
 /** 父分片上下文增强：对命中子分片的结果，查找其父分片（parent_id）并将其内容合并到 content 前 */
