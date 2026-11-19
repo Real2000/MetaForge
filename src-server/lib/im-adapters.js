@@ -13,6 +13,7 @@
  */
 const feishu = require('./im-feishu');
 const wecom = require('./im-wecom'); // U0-1 企业微信适配器
+const wechatMp = require('./im-wechat-mp'); // U0-1③ 微信公众号适配器（N4）
 
 const adapters = {
   // P1-9 飞书适配器：统一接口命名（accessToken/send/handleEvent）
@@ -47,6 +48,13 @@ const adapters = {
     send: wecom.wecomSend,
     sendCard: wecom.wecomSendCard, // U0-5 P1 交互卡片
     handleEvent: wecom.handleWecomEvent,
+  },
+  'wechat-mp': {
+    status: 'active',
+    accessToken: wechatMp.wechatMpAccessToken,
+    send: wechatMp.wechatMpSend,
+    sendCard: wechatMp.wechatMpSendCard, // 公众号无交互卡 → 文本化降级
+    handleEvent: wechatMp.handleWechatMpEvent,
   },
 };
 

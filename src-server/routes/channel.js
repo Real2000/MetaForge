@@ -7,51 +7,67 @@
 const express = require('express');
 const { db, now } = require('../db');
 const { auth, adminOnly } = require('../lib/auth');
-const { normalizeInbound, send, CHANNEL_TYPES, upsertChannel, listChannels, getChannelConfig, updateCallbackStatus, toggleChannel, deleteChannel, upsertUserBinding, listUserBindings, deleteUserBinding, resolveCardCallback, sendCardResult } = require('../lib/channel');
+const { normalizeInbound, send, CHANNEL_TYPES, upsertChannel, listChannels, getChannelConfig, updateCallbackStatus, toggleChannel, deleteChannel, upsertUserBinding, listUserBindings, deleteUserBinding, resolveCardCallback, sendCardResult, auditInbound } = require('../lib/channel');
 const { loadSecrets } = require('../lib/secrets');
 const { upsertBind, deleteBind, listBinds, addWhitelist, removeWhitelist, listWhitelist, inbound } = require('../lib/group-context');
 const { getAdapter, listAdapterStatus } = require('../lib/im-adapters');
 const { verifyCardCallback } = require('../lib/card-callback-verify'); // U0-5 P3 回调验签
+const { buildPassiveReply } = require('../lib/im-wechat-mp'); // U0-1③ 公众号被动回复（N4）
 
 const router = express.Router();
 
+// 渠道事件回调体解析：XML（企微/公众号，安全模式为 Encrypt 包裹的 XML 文本）
+// 全局仅挂 express.json()，XML 请求体不被解析；此处按内容类型补 text 解析（挂在免 auth 回调端点前）
+const xmlParser = express.text({ type: ['text/xml', 'application/xml'], limit: '2mb' });
+
 // ---------------- P1-9 IM 事件回调（免 auth：飞书/企微服务器回调不带平台 token，
 // 安全靠渠道侧 URL 验证握手 + 渗透面与钩钉 callback 同构；必须注册在 router.use(auth) 之前） ----------------
-/** POST /api/channel/event/:id —— 飞书/企微事件订阅共用的回调端点 */
+/** POST /api/channel/event/:id —— 飞书/企微/公众号 事件订阅共用的回调端点 */
 router.get('/event/:id', async (req, res) => {
-  // 企微 URL 验证握手（GET + query params）
+  // URL 验证握手（企微/公众号 GET + query params）
   const ch = db.prepare('SELECT id, type, enabled FROM channels WHERE id=?').get(Number(req.params.id));
   if (!ch) return res.status(404).json({ code: 404, msg: '渠道不存在' });
   const adapter = getAdapter(ch.type);
   if (!adapter || adapter.status === 'reserved') return res.status(200).send(req.query.echostr || '');
   try {
-    const result = adapter.handleEvent(ch.id, req.query, null);
+    const result = adapter.handleEvent(ch.id, { ...req.headers, ...req.query }, null, req.query);
     if (result?.echo) return res.send(result.echo);
-    return res.status(400).json({ code: 400, msg: 'URL 验证失败' });
+    return res.status(400).send('verify failed');
   } catch { return res.status(500).json({ code: 500, msg: '事件处理异常' }); }
 });
 
-router.post('/event/:id', async (req, res) => {
+router.post('/event/:id', xmlParser, async (req, res) => {
   const ch = db.prepare('SELECT id, type, enabled FROM channels WHERE id=?').get(Number(req.params.id));
   if (!ch) return res.status(404).json({ code: 404, msg: '渠道不存在' });
-  if (!ch.enabled) return res.status(200).json({ code: 0, msg: '渠道已停用' });
+  const isXmlChannel = ch.type === 'wechat-mp' || ch.type === 'wecom';
+  if (!ch.enabled) return isXmlChannel ? res.type('text/xml').send('success') : res.status(200).json({ code: 0, msg: '渠道已停用' });
   const adapter = getAdapter(ch.type);
   if (!adapter || adapter.status === 'reserved') {
-    return res.status(200).json({ code: 0, msg: `渠道类型 ${ch.type} 适配器为预留接口，事件已接收但未处理` });
+    return isXmlChannel ? res.type('text/xml').send('success')
+      : res.status(200).json({ code: 0, msg: `渠道类型 ${ch.type} 适配器为预留接口，事件已接收但未处理` });
   }
   try {
-    // 飞书: body 是 JSON；企微: body 是 XML 字符串
+    // 飞书: body 是 JSON 对象；企微/公众号: body 是 XML 字符串（经 xmlParser）
     const rawBody = typeof req.body === 'string' ? req.body : (req.body || {});
-    const result = adapter.handleEvent(ch.id, req.headers, rawBody);
+    const result = adapter.handleEvent(ch.id, { ...req.headers, ...req.query }, rawBody, req.query);
     // 飞书 url 验证握手：必须回 { challenge }
     if (result?.challenge) return res.json({ challenge: result.challenge });
-    if (result?.error) return res.status(400).json({ code: 400, msg: result.error });
-    if (result?.ignored) return res.json({ code: 0, data: { ignored: true } });
-    // message 事件 → P1-10 群上下文管线
+    if (result?.error) return isXmlChannel ? res.type('text/xml').send('success') : res.status(400).json({ code: 400, msg: result.error });
+    if (result?.ignored) return isXmlChannel ? res.type('text/xml').send('success') : res.json({ code: 0, data: { ignored: true } });
+    // message 事件 → 审计落库 + P1-10 群上下文管线
     const msg = result.message;
+    const audit = auditInbound(msg);
     const verdict = inbound(msg);
+    // 公众号：被动回复 XML（≤5s 同步返回；内容按路由结果构造）
+    if (result.reply) {
+      let content = '';
+      if (verdict.ok) content = '正在处理，请稍候…'; // P1 占位；P2 接「客服接口异步回推」双通道
+      else if (verdict.reply) content = verdict.reply;
+      const xml = buildPassiveReply(result.reply.toUser, result.reply.fromUser, content);
+      return res.type('text/xml').send(xml);
+    }
     if (verdict.ok) {
-      res.json({ code: 0, data: { routed: true, agent_id: verdict.agentId, text: verdict.text } });
+      res.json({ code: 0, data: { routed: true, agent_id: verdict.agentId, text: verdict.text, audit_id: audit.id } });
     } else if (verdict.silent) {
       res.json({ code: 0, data: { silent: true } }); // 群内未@：静默
     } else {
@@ -59,6 +75,7 @@ router.post('/event/:id', async (req, res) => {
     }
   } catch (e) {
     try { updateCallbackStatus(ch.id, 'error', '事件处理异常：' + e.message); } catch { }
+    if (isXmlChannel) return res.type('text/xml').send('success');
     res.status(500).json({ code: 500, msg: '事件处理异常：' + e.message });
   }
 });
@@ -140,27 +157,13 @@ router.use(auth);
 router.post('/inbound', (req, res) => {
   const model = normalizeInbound(req.body || {}, 'auto');
   // 审计落库（event_id 幂等：同条渠道消息重复投递只记一次）
-  let audId = null;
-  try {
-    const exists = model.eventId ? db.prepare('SELECT id FROM channel_messages WHERE event_id=?').get(model.eventId) : null;
-    if (!exists) {
-      const info = db.prepare(`INSERT INTO channel_messages (event_id, channel, sender_id, chat_id, chat_type, text, attachments, raw, created_at)
-        VALUES (?,?,?,?,?,?,?,?,?)`).run(
-        model.eventId, model.channel, model.sender.id, model.chat.id, model.chat.type,
-        model.text.slice(0, 2000), JSON.stringify(model.attachments || []),
-        JSON.stringify(model.raw || {}).slice(0, 5000), now());
-      audId = info.lastInsertRowid;
-    } else {
-      audId = exists.id;
-      db.prepare('UPDATE channel_messages SET created_at=? WHERE id=?').run(now(), audId);
-    }
-  } catch { /* 审计失败不阻断投递 */ }
+  const audit = auditInbound(model);
   // P1-8：投递时可选 X-Channel-Id 头 → 写回该渠道行回调状态（ok/err）
   const chId = Number(req.get('X-Channel-Id') || 0);
   if (chId) {
     try { updateCallbackStatus(chId, model.text ? 'ok' : 'warning', model.text ? '' : '入站消息文本为空'); } catch { }
   }
-  res.json({ code: 0, data: { ...model, raw: undefined, audit_id: audId } });
+  res.json({ code: 0, data: { ...model, raw: undefined, audit_id: audit.id } });
 });
 
 /** 入站消息审计（adminOnly）：渠道侧进来的每条消息可查 */

@@ -6803,6 +6803,144 @@ print('PY_OK')
     db.prepare("DELETE FROM tool_approvals WHERE confirm_key LIKE 'ut:p3:%'").run();
   }
 
+  console.log('【U0-1③ / N4】微信公众号渠道（入站验签/解析/审计 + 出站降级）');
+  {
+    const { db } = require('../src-server/db');
+    const { upsertChannel, normalizeInbound, auditInbound, parseWechatMp, send, deleteChannel } = require('../src-server/lib/channel');
+    const mp = require('../src-server/lib/im-wechat-mp');
+    const { adapters } = require('../src-server/lib/im-adapters');
+
+    // 测试渠道（配 token 以覆盖验签路径；appSecret 留空 → 出站走 mock 降级）
+    const mpCh = upsertChannel({ name: '测试公众号', type: 'wechat-mp', config: { appId: 'wx-test', appSecret: '', token: 'mytoken' } });
+    const chId = mpCh.id;
+
+    await t('U0-1③/N4: im-adapters 已注册 wechat-mp（active，含 send/sendCard/handleEvent）', () => {
+      const a = adapters['wechat-mp'];
+      assert.ok(a, '应注册 wechat-mp');
+      assert.strictEqual(a.status, 'active');
+      assert.strictEqual(typeof a.send, 'function');
+      assert.strictEqual(typeof a.sendCard, 'function');
+      assert.strictEqual(typeof a.handleEvent, 'function');
+    });
+
+    await t('U0-1③/N4: computeSignature 与微信 sha1(token+ts+nonce 字典序) 一致', () => {
+      const crypto = require('crypto');
+      const token = 'tok', ts = '1700000000', nonce = 'abc123';
+      const expect = crypto.createHash('sha1').update([token, ts, nonce].sort().join('')).digest('hex');
+      assert.strictEqual(mp.computeSignature(token, ts, nonce), expect);
+      const enc = 'CIPHER';
+      const expect4 = crypto.createHash('sha1').update([token, ts, nonce, enc].sort().join('')).digest('hex');
+      assert.strictEqual(mp.computeSignature(token, ts, nonce, enc), expect4);
+    });
+
+    await t('U0-1③/N4: safeEqualHex 恒时比较（相等 true / 不同 false / 长度不同 false）', () => {
+      assert.strictEqual(mp.safeEqualHex('abc', 'abc'), true);
+      assert.strictEqual(mp.safeEqualHex('abc', 'abd'), false);
+      assert.strictEqual(mp.safeEqualHex('ab', 'abc'), false);
+    });
+
+    await t('U0-1③/N4: parseXml 解析 CDATA+扁平元素，外层 <xml> 不被吞并为键', () => {
+      const xml = `<xml><ToUserName><![CDATA[gh_1]]></ToUserName><FromUserName><![CDATA[openid_1]]></FromUserName><CreateTime>1700000000</CreateTime><MsgType><![CDATA[text]]></MsgType><Content><![CDATA[你好 <世界>]]></Content><MsgId>123456</MsgId></xml>`;
+      const o = mp.parseXml(xml);
+      assert.strictEqual(o.ToUserName, 'gh_1');
+      assert.strictEqual(o.FromUserName, 'openid_1');
+      assert.strictEqual(o.CreateTime, '1700000000');
+      assert.strictEqual(o.MsgType, 'text');
+      assert.strictEqual(o.Content, '你好 <世界>', 'CDATA 内容应允许含 <');
+      assert.strictEqual(o.MsgId, '123456');
+      assert.strictEqual(o.xml, undefined, '外层 <xml> 不应被解析为键');
+    });
+
+    await t('U0-1③/N4: parseWechatMp 归一化（channel/eventId/秒→毫秒/文本去空白）', () => {
+      const m = parseWechatMp({ FromUserName: 'openid_1', ToUserName: 'gh_1', MsgType: 'text', Content: '  hi  ', CreateTime: '1700000000', MsgId: '999' });
+      assert.strictEqual(m.channel, 'wechat-mp');
+      assert.strictEqual(m.sender.id, 'openid_1');
+      assert.strictEqual(m.chat.type, 'single');
+      assert.strictEqual(m.text, 'hi');
+      assert.strictEqual(m.ts, 1700000000000);
+      assert.strictEqual(m.eventId, '999');
+    });
+
+    await t('U0-1③/N4: normalizeInbound 自动识别公众号（特征命中 / 显式 hint）', () => {
+      const m = normalizeInbound({ FromUserName: 'o1', ToUserName: 'g1', MsgType: 'text', Content: 'x', MsgId: 'm1' });
+      assert.strictEqual(m.channel, 'wechat-mp');
+      const m2 = normalizeInbound({ FromUserName: 'o2', Content: 'y' }, 'wechat-mp');
+      assert.strictEqual(m2.channel, 'wechat-mp');
+    });
+
+    await t('U0-1③/N4: auditInbound 落库 channel_messages + event_id 幂等去重', () => {
+      const model = parseWechatMp({ FromUserName: 'audit_o', ToUserName: 'g1', MsgType: 'text', Content: '审计', CreateTime: '1700000001', MsgId: 'ut:mp:audit_1' });
+      const a1 = auditInbound(model);
+      assert.ok(a1.id && !a1.deduped, '首次应插入');
+      const row = db.prepare('SELECT * FROM channel_messages WHERE event_id=?').get('ut:mp:audit_1');
+      assert.strictEqual(row.channel, 'wechat-mp');
+      assert.strictEqual(row.sender_id, 'audit_o');
+      assert.strictEqual(row.text, '审计');
+      const a2 = auditInbound(model);
+      assert.strictEqual(a2.id, a1.id);
+      assert.strictEqual(a2.deduped, true);
+      const cnt = db.prepare('SELECT COUNT(*) c FROM channel_messages WHERE event_id=?').get('ut:mp:audit_1').c;
+      assert.strictEqual(cnt, 1, '同一 event_id 不应重复插入');
+      db.prepare('DELETE FROM channel_messages WHERE event_id=?').run('ut:mp:audit_1');
+    });
+
+    await t('U0-1③/N4: buildPassiveReply 空内容→success，有内容→可还原 XML', () => {
+      assert.strictEqual(mp.buildPassiveReply('o1', 'g1', ''), 'success');
+      const xml = mp.buildPassiveReply('o1', 'g1', '你好');
+      assert.ok(xml.includes('<ToUserName><![CDATA[o1]]></ToUserName>'));
+      assert.ok(xml.includes('<FromUserName><![CDATA[g1]]></FromUserName>'));
+      assert.ok(xml.includes('<Content><![CDATA[你好]]></Content>'));
+      assert.strictEqual(mp.parseXml(xml).Content, '你好');
+    });
+
+    await t('U0-1③/N4: verifyUrlSignature 未配 token 放行标注；配 token 通过/失败', () => {
+      assert.deepStrictEqual(mp.verifyUrlSignature({}, { signature: 'x', timestamp: '1', nonce: '2' }), { ok: true, unverified: true });
+      const cfg = { token: 'mytoken' };
+      const ts = '1700000000', nonce = 'nnn';
+      const sig = mp.computeSignature('mytoken', ts, nonce);
+      assert.strictEqual(mp.verifyUrlSignature(cfg, { signature: sig, timestamp: ts, nonce }).ok, true);
+      assert.strictEqual(mp.verifyUrlSignature(cfg, { signature: sig, timestamp: ts, nonce: 'other' }).ok, false);
+    });
+
+    await t('U0-1③/N4: handleWechatMpEvent GET 握手返回 echostr；错误签名拒绝', () => {
+      const ts = '1700000000', nonce = 'nnn';
+      const sig = mp.computeSignature('mytoken', ts, nonce);
+      const r = mp.handleWechatMpEvent(chId, { signature: sig, timestamp: ts, nonce, echostr: 'ECHO123' }, null);
+      assert.strictEqual(r.echo, 'ECHO123');
+      const bad = mp.handleWechatMpEvent(chId, { signature: 'wrong', timestamp: ts, nonce, echostr: 'ECHO' }, null);
+      assert.ok(bad.error, '错误签名应拒绝');
+    });
+
+    await t('U0-1③/N4: handleWechatMpEvent POST 文本→模型+reply；非文本→ignored', () => {
+      const xml = `<xml><ToUserName><![CDATA[gh_1]]></ToUserName><FromUserName><![CDATA[openid_9]]></FromUserName><CreateTime>1700000002</CreateTime><MsgType><![CDATA[text]]></MsgType><Content><![CDATA[hello]]></Content><MsgId>888</MsgId></xml>`;
+      const r = mp.handleWechatMpEvent(chId, {}, xml);
+      assert.strictEqual(r.message.channel, 'wechat-mp');
+      assert.strictEqual(r.message.text, 'hello');
+      assert.strictEqual(r.reply.toUser, 'openid_9');
+      assert.strictEqual(r.reply.fromUser, 'gh_1');
+      const img = `<xml><ToUserName><![CDATA[gh_1]]></ToUserName><FromUserName><![CDATA[o1]]></FromUserName><MsgType><![CDATA[image]]></MsgType><PicUrl><![CDATA[http://x/a.jpg]]></PicUrl></xml>`;
+      const r2 = mp.handleWechatMpEvent(chId, {}, img);
+      assert.strictEqual(r2.ignored, true);
+      assert.strictEqual(r2.type, 'image');
+    });
+
+    await t('U0-1③/N4: handleWechatMpEvent 渠道不存在/类型不符 → error', () => {
+      const r = mp.handleWechatMpEvent(999999, {}, '<xml><MsgType><![CDATA[text]]></MsgType></xml>');
+      assert.ok(r.error, '不存在渠道应报错');
+    });
+
+    await t('U0-1③/N4: send/wechatMpSendCard 凭证不全（appSecret 空）→ 降级 mock', async () => {
+      const r = await send({ channel: 'wechat-mp', receivers: ['openid_x'] }, { content: '通知测试' });
+      assert.ok(r.ok && r.degraded && r.mock, '未配 appSecret 应降级 mock 站内信');
+      const c = await mp.wechatMpSendCard(chId, { receiver: 'openid_x' }, { title: 'T', content: 'C', card: { buttons: [{ text: '同意', url: 'http://x/a' }] } });
+      assert.ok(c.ok && c.textDegraded, '卡片应文本化降级');
+    });
+
+    // 清理测试渠道
+    try { db.prepare('DELETE FROM channel_messages WHERE channel=?').run('wechat-mp'); } catch { }
+    try { deleteChannel(chId); } catch { }
+  }
+
   // 收尾：关闭库并清理临时目录
   try { db.close(); } catch { }
   fs.rmSync(process.env.AGENT_DATA_DIR, { recursive: true, force: true });

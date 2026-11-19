@@ -92,6 +92,22 @@ function parseFeishu(body) {
   };
 }
 
+/** 公众号消息（微信回调 XML 已解析为对象）→ 统一模型 */
+function parseWechatMp(body) {
+  const content = String(body?.Content ?? body?.content ?? '').trim();
+  const fromUser = String(body?.FromUserName ?? body?.from ?? '');
+  return {
+    channel: 'wechat-mp',
+    sender: { id: fromUser, name: '', type: 'user' },
+    chat: { id: fromUser, type: 'single', name: '' },
+    text: content,
+    attachments: extractAttachments(body),
+    ts: body?.CreateTime ? Number(body.CreateTime) * 1000 : null,
+    raw: body,
+    eventId: String(body?.MsgId ?? (fromUser ? fromUser + ':' + (body?.CreateTime || '') : '')),
+  };
+}
+
 /** 通用 Webhook（任务触发用；兼容任意 JSON/纯文本）→ 统一模型 */
 function parseWebhook(body) {
   let text = '';
@@ -126,15 +142,33 @@ function extractAttachments(src) {
 /** 渠道自动识别 + 解析（入站统一入口） */
 function normalizeInbound(body, channelHint) {
   if (channelHint && channelHint !== 'auto') {
-    const parser = { dingtalk: parseDingtalk, wecom: parseWecom, feishu: parseFeishu, webhook: parseWebhook }[channelHint];
+    const parser = { dingtalk: parseDingtalk, wecom: parseWecom, feishu: parseFeishu, 'wechat-mp': parseWechatMp, webhook: parseWebhook }[channelHint];
     if (parser) return parser(body);
   }
-  // 自动识别特征：钉钉 text.content / senderStaffId；企微 chatid / from.user_id；飞书 event.message
+  // 自动识别特征：钉钉 text.content / senderStaffId；企微 chatid / from.user_id；飞书 event.message；公众号 FromUserName+ToUserName+MsgType
   const s = JSON.stringify(body || {});
+  if (body?.FromUserName != null && body?.ToUserName != null && (body?.MsgType != null || body?.Content != null)) return parseWechatMp(body);
   if ((body?.event?.message) || (body?.schema === '2.0' && body?.header?.event_type === 'im.message.receive_v1')) return parseFeishu(body);
   if (body?.senderStaffId || body?.conversationId || body?.chatId) return parseDingtalk(body);
   if (body?.chatid || body?.ChatId || body?.from?.user_id || body?.From) return parseWecom(body);
   return parseWebhook(body);
+}
+
+/** 入站消息审计落库（event_id 幂等去重；失败不阻断投递）。返回 { id } */
+function auditInbound(model) {
+  try {
+    const exists = model.eventId ? db.prepare('SELECT id FROM channel_messages WHERE event_id=?').get(model.eventId) : null;
+    if (exists) {
+      db.prepare('UPDATE channel_messages SET created_at=? WHERE id=?').run(now(), exists.id);
+      return { id: exists.id, deduped: true };
+    }
+    const info = db.prepare(`INSERT INTO channel_messages (event_id, channel, sender_id, chat_id, chat_type, text, attachments, raw, created_at)
+      VALUES (?,?,?,?,?,?,?,?,?)`).run(
+      model.eventId, model.channel, model.sender.id, model.chat.id, model.chat.type,
+      String(model.text || '').slice(0, 2000), JSON.stringify(model.attachments || []),
+      JSON.stringify(model.raw || {}).slice(0, 5000), now());
+    return { id: info.lastInsertRowid };
+  } catch { return { id: null }; }
 }
 
 // ---------------- ② 出站统一封装 ----------------
@@ -228,25 +262,29 @@ async function send(to, message) {
     } catch (e) { return { ok: false, channel, error: '钉钉服务不可达：' + e.message }; }
   }
 
-  // ③ 企微/飞书：通过 im-adapters 适配器发送（真实渠道或降级站内信）
-  if (channel === 'wecom' || channel === 'feishu') {
+  // ③ 企微/飞书/公众号：通过 im-adapters 适配器发送（真实渠道或降级站内信）
+  if (channel === 'wecom' || channel === 'feishu' || channel === 'wechat-mp') {
     const chType = channel;
+    const label = { wecom: '企业微信', feishu: '飞书', 'wechat-mp': '公众号' }[chType] || chType;
     const chRow = db.prepare("SELECT id FROM channels WHERE type=? AND enabled=1 LIMIT 1").get(chType);
     if (!chRow) {
-      sendInbox('*', { title: `${chType === 'wecom' ? '企业微信' : '飞书'}未配置`, content: `该渠道未配置，消息已降级站内信：${title ? '【' + title + '】' : ''}${content}` });
+      sendInbox('*', { title: `${label}未配置`, content: `该渠道未配置，消息已降级站内信：${title ? '【' + title + '】' : ''}${content}` });
       return { ok: true, channel: 'inbox', degraded: true, receivers, mock: true };
     }
     try {
       const { getAdapter } = require('./im-adapters');
       const adapter = getAdapter(chType);
       if (!adapter || adapter.status === 'reserved') {
-        sendInbox('*', { title: `${chType === 'wecom' ? '企业微信' : '飞书'}渠道未启用`, content: `该渠道适配器未启用，消息已降级：${title ? '【' + title + '】' : ''}${content}` });
+        sendInbox('*', { title: `${label}渠道未启用`, content: `该渠道适配器未启用，消息已降级：${title ? '【' + title + '】' : ''}${content}` });
         return { ok: true, channel: 'inbox', degraded: true, receivers, mock: true };
       }
-      const r = chType === 'wecom'
-        ? await adapter.send(chRow.id, { receiver: receivers[0] || '@all', receiverType: 'user' }, { title, content })
-        : await adapter.send(chRow.id, { receiver: receivers[0] || '', receiverType: 'open_id' }, { title, content });
-      if (r.ok) return { ok: true, channel: chType, receivers, messageId: r.messageId };
+      const to = chType === 'wecom'
+        ? { receiver: receivers[0] || '@all', receiverType: 'user' }
+        : (chType === 'feishu'
+          ? { receiver: receivers[0] || '', receiverType: 'open_id' }
+          : { receiver: receivers[0] || '', receiverType: 'openid' });
+      const r = await adapter.send(chRow.id, to, { title, content });
+      if (r.ok) return { ok: true, channel: chType, receivers, messageId: r.messageId, degraded: r.degraded, mock: r.mock };
       return { ok: false, channel: chType, error: r.error || '发送失败' };
     } catch (e) {
       return { ok: false, channel: chType, error: '适配器执行异常：' + e.message };
@@ -293,8 +331,8 @@ async function sendCard(channel, receivers, title, card, message) {
     } catch (e) { return { ok: false, channel, error: '钉钉服务不可达：' + e.message }; }
   }
 
-  // ② 企微/飞书：适配器原生卡片
-  if (channel === 'wecom' || channel === 'feishu') {
+  // ② 企微/飞书/公众号：适配器原生卡片（公众号无交互卡 → 适配器内文本化降级）
+  if (channel === 'wecom' || channel === 'feishu' || channel === 'wechat-mp') {
     const chRow = db.prepare('SELECT id FROM channels WHERE type=? AND enabled=1 LIMIT 1').get(channel);
     if (!chRow) return degradeCardToInbox(channel, receivers, title, card, message);
     try {
@@ -305,7 +343,9 @@ async function sendCard(channel, receivers, title, card, message) {
       }
       const to = channel === 'wecom'
         ? { receiver: receivers[0] || '@all', receiverType: 'user' }
-        : { receiver: receivers[0] || '', receiverType: 'open_id' };
+        : (channel === 'feishu'
+          ? { receiver: receivers[0] || '', receiverType: 'open_id' }
+          : { receiver: receivers[0] || '', receiverType: 'openid' });
       const r = await adapter.sendCard(chRow.id, to, msg);
       if (r.ok) return { ok: true, channel, receivers, messageId: r.messageId, degraded: r.degraded, mock: r.mock };
       return { ok: false, channel, error: r.error || '卡片发送失败' };
@@ -321,7 +361,7 @@ async function sendCard(channel, receivers, title, card, message) {
 // ---------------- ③ P1-8 channels 表：渠道注册/配置加密/启停/回调状态 ----------------
 const { encrypt, decrypt } = require('./crypto-util');
 
-const CHANNEL_TYPES = ['dingtalk', 'wecom', 'feishu', 'telegram', 'discord', 'mqtt', 'webhook'];
+const CHANNEL_TYPES = ['dingtalk', 'wecom', 'feishu', 'wechat-mp', 'telegram', 'discord', 'mqtt', 'webhook'];
 
 /** 新增/更新渠道（config 整体 AES-256-GCM 加密落库；回显时解密+脱敏） */
 function upsertChannel({ id, name, type, config, enabled, createdBy }) {  const n = String(name || '').trim();
@@ -497,7 +537,7 @@ async function sendCardResult(channel, receiver, { status, toolName, confirmKey,
 
 module.exports = {
   // 入站
-  normalizeInbound, parseDingtalk, parseWecom, parseFeishu, parseWebhook,
+  normalizeInbound, parseDingtalk, parseWecom, parseFeishu, parseWechatMp, parseWebhook, auditInbound,
   // 出站
   send, sendInbox, sendCard,
   // P1-8 渠道注册表管理
