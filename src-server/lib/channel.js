@@ -24,6 +24,7 @@ const { db, now } = require('../db');
 const { loadSecrets } = require('./secrets');
 const { auth } = require('./auth');
 const { renderDingtalkCard } = require('./card-render'); // U0-5 P1 卡片渲染器
+const toolConfirmRegistry = require('./tool-confirm-registry'); // U0-5 P3 卡片回调唤醒共用注册表
 
 // ---------------- ① 入站解析器（各渠道 → 统一模型） ----------------
 
@@ -437,6 +438,63 @@ function deleteUserBinding(id) {
   db.prepare('DELETE FROM user_channel_bindings WHERE id=?').run(Number(id));
 }
 
+// ---------------- ⑤ U0-5 R4/R6 卡片回调决议核心 ----------------
+
+/**
+ * 卡片回调决议核心（U0-5 R4）：查审批记录 → 归属校验 → 写终态 → 唤醒进程内等待。
+ * 从 routes/channel.js 抽出为纯逻辑，便于单测（不依赖 Express）。
+ *
+ * 幂等：审批非 pending（已决议/已过期）→ 返回 ok:false（不重复唤醒）；
+ * 唤醒：调用 toolConfirmRegistry.resolveByKey —— 本进程存在该等待项时立即 resolve，
+ *       无等待项（已超时/服务重启）返回 resumed:false，但库终态已写（审计可查）。
+ *
+ * @param {{callbackData:string, action:'approve'|'reject', userId?:string, reason?:string, channelId?:number}} p
+ * @returns {{ok:boolean, code?:number, msg?:string, status?:string, resumed?:boolean, requester?:string, toolName?:string}}
+ */
+function resolveCardCallback(p) {
+  const key = String(p?.callbackData || '');
+  const action = String(p?.action || '');
+  if (!key || !['approve', 'reject'].includes(action)) return { ok: false, code: 400, msg: '缺少 callbackData 或 action' };
+  const row = db.prepare('SELECT * FROM tool_approvals WHERE confirm_key=?').get(key);
+  if (!row) return { ok: false, code: 404, msg: '审批记录不存在（可能已过期或已被处理）' };
+
+  // R6 归属校验：能通过「渠道绑定」把渠道侧身份映射回平台用户名时，决议人必须与审批发起人一致
+  let approver = String(p?.userId || 'card-user');
+  const channelId = Number(p?.channelId) || 0;
+  const channelUserId = String(p?.userId || '');
+  if (channelId && channelUserId) {
+    const bind = db.prepare('SELECT username FROM user_channel_bindings WHERE channel_id=? AND channel_user_id=?')
+      .get(channelId, channelUserId);
+    if (bind && bind.username) {
+      if (bind.username !== row.requester) {
+        return { ok: false, code: 403, msg: '决议人与审批发起人不一致，已拒绝该决议', requester: row.requester };
+      }
+      approver = bind.username;
+    }
+  }
+
+  if (row.status !== 'pending') {
+    return { ok: false, code: 400, msg: '该审批已有处理结果（' + row.status + '），无法再次操作', status: row.status, requester: row.requester };
+  }
+
+  const newStatus = action === 'approve' ? 'approved' : 'rejected';
+  // 先写库终态（即使本进程无等待项也能落审计）；resolveByKey 命中的 finalizeApproval 会以同一 approver 再写一次，值一致
+  db.prepare('UPDATE tool_approvals SET status=?, approver=?, decision_at=?, reason=? WHERE confirm_key=? AND status=\'pending\'')
+    .run(newStatus, approver, now(), String(p?.reason || '').slice(0, 200), key);
+  const resumed = toolConfirmRegistry.resolveByKey(key, action === 'approve', approver, p?.reason);
+  return { ok: true, status: newStatus, resumed, requester: row.requester, toolName: row.tool_name };
+}
+
+/** 卡片决议结果回发（U0-5 R5）：向原渠道补发文字结果条（钉钉/企微无卡片 update 接口时降级；
+ *  飞书 update 能力后续接入）。失败静默——不阻断回调主流程。 */
+async function sendCardResult(channel, receiver, { status, toolName, confirmKey, reason }) {
+  const label = status === 'approved' ? '✅ 已批准' : (status === 'rejected' ? '⛔ 已拒绝' : String(status || '已处理'));
+  const content = `审批结果：${label}\n工具：${toolName || confirmKey}${reason ? '\n原因：' + reason : ''}`;
+  try {
+    return await send({ channel, receivers: [receiver] }, { title: '审批结果', content, type: 'text' });
+  } catch { return { ok: false, channel, error: '结果回发失败' }; }
+}
+
 module.exports = {
   // 入站
   normalizeInbound, parseDingtalk, parseWecom, parseFeishu, parseWebhook,
@@ -447,4 +505,6 @@ module.exports = {
   updateCallbackStatus, toggleChannel, deleteChannel,
   // U0-5 R2 用户↔渠道身份绑定
   upsertUserBinding, listUserBindings, getUserChannelBindings, deleteUserBinding,
+  // U0-5 R4/R5 卡片回调决议
+  resolveCardCallback, sendCardResult,
 };

@@ -1111,7 +1111,7 @@ router.post('/stream', async (req, res) => {
       db.prepare('INSERT INTO tool_approvals (confirm_key, tool_name, args_json, requester, status, created_at) VALUES (?,?,?,?,"pending",?)')
         .run(toolKey, name, String(argsJson || '').slice(0, 500), req.user.username, now());
       const finalizeApproval = (status, approver, reason) => {
-        db.prepare('UPDATE tool_approvals SET status=?, approver=?, decision_at=?, reason=? WHERE confirm_key=? AND status="pending"')
+        db.prepare('UPDATE tool_approvals SET status=?, approver=?, decision_at=?, reason=? WHERE confirm_key=? AND status=\'pending\'')
           .run(status, approver || '', now(), String(reason || '').slice(0, 200), toolKey);
       };
       const timer = setTimeout(() => { toolConfirmRegistry.del(toolKey); finalizeApproval('expired'); resolve('timeout'); }, 120000);

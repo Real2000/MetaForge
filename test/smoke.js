@@ -6456,6 +6456,115 @@ print('PY_OK')
     db.prepare('DELETE FROM channels WHERE id IN (?,?)').run(chId, chId2);
   }
 
+  console.log('【U0-5】P3 卡片回调验签 + 唤醒 registry + 结果回发');
+  {
+    const crypto = require('crypto');
+    const { db } = require('../src-server/db');
+    const { verifyCardCallback } = require('../src-server/lib/card-callback-verify');
+    const { resolveCardCallback, sendCardResult } = require('../src-server/lib/channel');
+    const { sha1Sign } = require('../src-server/lib/dingtalk-crypto');
+    const registry = require('../src-server/lib/tool-confirm-registry');
+    const nowStr = new Date().toISOString().replace('T', ' ').slice(0, 19);
+
+    await t('U0-5: verifyCardCallback 未配置验签材料 → 放行且标注 unverified', () => {
+      const r = verifyCardCallback({ type: 'dingtalk', config: {} }, {}, { callbackData: 'k' }, {});
+      assert.strictEqual(r.ok, true);
+      assert.strictEqual(r.unverified, true);
+    });
+
+    await t('U0-5: verifyCardCallback 通用 HMAC 校验（通过 / 失败）', () => {
+      const secret = 'cb-secret-1';
+      const body = { callbackData: 'k2', action: 'approve' };
+      const raw = JSON.stringify(body);
+      const good = crypto.createHmac('sha256', secret).update(raw).digest('hex');
+      const okR = verifyCardCallback({ type: 'webhook', config: { callbackSecret: secret } }, { 'x-callback-signature': good }, body, {});
+      assert.strictEqual(okR.ok, true, '正确签名应通过');
+      const badR = verifyCardCallback({ type: 'webhook', config: { callbackSecret: secret } }, { 'x-callback-signature': 'deadbeef' }, body, {});
+      assert.strictEqual(badR.ok, false, '错误签名应拒绝');
+    });
+
+    await t('U0-5: verifyCardCallback 钉钉/企微 sha1 方案（通过 / 失败 / 缺签名）', () => {
+      const token = 'dt-token';
+      const ts = '1700000000', nonce = 'abc123', encrypt = 'ENCRYPTED';
+      const sig = sha1Sign(token, ts, nonce, encrypt);
+      const okR = verifyCardCallback({ type: 'dingtalk', config: { token } }, {}, {}, { msg_signature: sig, timestamp: ts, nonce, encrypt });
+      assert.strictEqual(okR.ok, true, '正确 msg_signature 应通过');
+      const badR = verifyCardCallback({ type: 'wecom', config: { token } }, {}, {}, { msg_signature: 'bad', timestamp: ts, nonce, encrypt });
+      assert.strictEqual(badR.ok, false, '错误签名应拒绝');
+      const missR = verifyCardCallback({ type: 'dingtalk', config: { token } }, {}, {}, {});
+      assert.strictEqual(missR.ok, false, '缺 msg_signature 应拒绝');
+    });
+
+    await t('U0-5: verifyCardCallback 飞书 verificationToken（通过 / 不匹配）', () => {
+      const okR = verifyCardCallback({ type: 'feishu', config: { verificationToken: 'vt-1' } }, {}, { token: 'vt-1' }, {});
+      assert.strictEqual(okR.ok, true, '令牌匹配应通过');
+      const badR = verifyCardCallback({ type: 'feishu', config: { verificationToken: 'vt-1' } }, {}, { token: 'other' }, {});
+      assert.strictEqual(badR.ok, false, '令牌不匹配应拒绝');
+    });
+
+    const mkApproval = (key, requester, status = 'pending') => {
+      db.prepare('INSERT INTO tool_approvals (confirm_key, tool_name, args_json, requester, status, created_at) VALUES (?,?,?,?,?,?)')
+        .run(key, 'danger_tool', '{}', requester, status, nowStr);
+    };
+
+    await t('U0-5: resolveCardCallback 审批记录不存在 → 404', () => {
+      const r = resolveCardCallback({ callbackData: 'no-such-key', action: 'approve' });
+      assert.strictEqual(r.ok, false);
+      assert.strictEqual(r.code, 404);
+    });
+
+    await t('U0-5: resolveCardCallback 批准 → 写终态 approved + 唤醒 registry（resumed）', () => {
+      const key = 'ut:p3:approve';
+      mkApproval(key, 'alice');
+      let resolved = null;
+      registry.register(key, { resolve: v => { resolved = v; registry.del(key); } });
+      const r = resolveCardCallback({ callbackData: key, action: 'approve', userId: 'alice-ext' });
+      assert.strictEqual(r.ok, true);
+      assert.strictEqual(r.status, 'approved');
+      assert.strictEqual(r.resumed, true, '应唤醒进程内等待');
+      assert.strictEqual(resolved, true, 'resolve 应以 true 唤醒');
+      const row = db.prepare('SELECT status, approver FROM tool_approvals WHERE confirm_key=?').get(key);
+      assert.strictEqual(row.status, 'approved');
+      assert.strictEqual(row.approver, 'alice-ext');
+    });
+
+    await t('U0-5: resolveCardCallback 幂等——非 pending 记录再次决议 → 400', () => {
+      const key = 'ut:p3:approve'; // 上例已置 approved
+      const r = resolveCardCallback({ callbackData: key, action: 'reject' });
+      assert.strictEqual(r.ok, false);
+      assert.strictEqual(r.code, 400);
+      assert.strictEqual(r.status, 'approved');
+    });
+
+    await t('U0-5: resolveCardCallback 归属校验——决议人与发起人不一致 → 403', () => {
+      const chId = db.prepare(`INSERT INTO channels (name, type, config, enabled, created_by, created_at, updated_at) VALUES (?,?,?,?,?,?,?)`)
+        .run('归属校验渠道', 'wecom', '', 1, 'admin', nowStr, nowStr).lastInsertRowid;
+      db.prepare('INSERT INTO user_channel_bindings (username, channel_id, channel_user_id, channel_user_name, created_at, updated_at) VALUES (?,?,?,?,?,?)')
+        .run('bob', chId, 'bob-ext', 'Bob', nowStr, nowStr);
+      const key = 'ut:p3:owner';
+      mkApproval(key, 'alice'); // 发起人是 alice，但渠道身份映射到 bob
+      const r = resolveCardCallback({ callbackData: key, action: 'approve', userId: 'bob-ext', channelId: chId });
+      assert.strictEqual(r.ok, false);
+      assert.strictEqual(r.code, 403, '归属不一致应 403');
+      const row = db.prepare('SELECT status FROM tool_approvals WHERE confirm_key=?').get(key);
+      assert.strictEqual(row.status, 'pending', '被拒后不应改写审批状态');
+      // 同一身份映射到发起人本人时放行
+      db.prepare('UPDATE user_channel_bindings SET username=? WHERE channel_id=? AND channel_user_id=?').run('alice', chId, 'bob-ext');
+      const r2 = resolveCardCallback({ callbackData: key, action: 'reject', userId: 'bob-ext', channelId: chId });
+      assert.strictEqual(r2.ok, true, '身份映射回发起人本人应放行');
+      assert.strictEqual(r2.status, 'rejected');
+      db.prepare('DELETE FROM user_channel_bindings WHERE channel_id=?').run(chId);
+      db.prepare('DELETE FROM channels WHERE id=?').run(chId);
+    });
+
+    await t('U0-5: sendCardResult 结果回发（inbox 降级写入通知）', async () => {
+      const r = await sendCardResult('inbox', 'admin', { status: 'approved', toolName: 'danger_tool', confirmKey: 'k', reason: 'ok' });
+      assert.strictEqual(r.ok, true);
+    });
+
+    db.prepare("DELETE FROM tool_approvals WHERE confirm_key LIKE 'ut:p3:%'").run();
+  }
+
   // 收尾：关闭库并清理临时目录
   try { db.close(); } catch { }
   fs.rmSync(process.env.AGENT_DATA_DIR, { recursive: true, force: true });

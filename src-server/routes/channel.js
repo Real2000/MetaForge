@@ -7,10 +7,11 @@
 const express = require('express');
 const { db, now } = require('../db');
 const { auth, adminOnly } = require('../lib/auth');
-const { normalizeInbound, send, CHANNEL_TYPES, upsertChannel, listChannels, getChannelConfig, updateCallbackStatus, toggleChannel, deleteChannel, upsertUserBinding, listUserBindings, deleteUserBinding } = require('../lib/channel');
+const { normalizeInbound, send, CHANNEL_TYPES, upsertChannel, listChannels, getChannelConfig, updateCallbackStatus, toggleChannel, deleteChannel, upsertUserBinding, listUserBindings, deleteUserBinding, resolveCardCallback, sendCardResult } = require('../lib/channel');
 const { loadSecrets } = require('../lib/secrets');
 const { upsertBind, deleteBind, listBinds, addWhitelist, removeWhitelist, listWhitelist, inbound } = require('../lib/group-context');
 const { getAdapter, listAdapterStatus } = require('../lib/im-adapters');
+const { verifyCardCallback } = require('../lib/card-callback-verify'); // U0-5 P3 回调验签
 
 const router = express.Router();
 
@@ -61,6 +62,75 @@ router.post('/event/:id', async (req, res) => {
     res.status(500).json({ code: 500, msg: '事件处理异常：' + e.message });
   }
 });
+
+// ---------------- U0-5 卡片回调（免 auth：IM 卡片按钮回调不带平台 token，
+// 安全靠渠道验签（R6）+ 决议人归属校验；必须注册在 router.use(auth) 之前） ----------------
+/** POST/GET /api/channel/card-callback —— 用户点击审批卡按钮后的回调端点
+ *  参数（query 或 body 皆可，兼容卡片的 action_url 打开与 POST 回调）：
+ *    callbackData: 卡片发送时携带的 confirm_key
+ *    action: 'approve' | 'reject'
+ *    user_id: 渠道侧用户标识（用于归属校验与结果回发）
+ *    channel / channel_id: 渠道类型或 id（用于定位验签配置）
+ *    reason?: 决议说明（可选）
+ *  流程：验签(R6) → 决议核心 resolveCardCallback(R4：写终态 + 唤醒等待) → 回发结果条(R5)
+ */
+async function handleCardCallback(req, res) {
+  try {
+    const b = (req.body && typeof req.body === 'object') ? req.body : {};
+    const q = req.query || {};
+    const pick = k => (b[k] != null && b[k] !== '') ? b[k] : (q[k] != null && q[k] !== '' ? q[k] : '');
+    const channelType = String(pick('channel') || '');
+    const channelIdRaw = pick('channel_id');
+    const callbackData = String(pick('callbackData') || '');
+    const action = String(pick('action') || '');
+    const userId = String(pick('user_id') || '');
+    const reason = String(pick('reason') || '');
+
+    if (!callbackData || !action) return res.json({ code: 400, msg: '缺少 callbackData 或 action' });
+    if (!['approve', 'reject'].includes(action)) return res.json({ code: 400, msg: 'action 应为 approve 或 reject' });
+
+    // 定位渠道（取验签配置 + 归属校验所需的 channel_id）
+    let chRow = null;
+    if (channelIdRaw) chRow = getChannelConfig(Number(channelIdRaw));
+    else if (channelType) {
+      const r0 = db.prepare('SELECT id FROM channels WHERE type=? AND enabled=1 ORDER BY id LIMIT 1').get(channelType);
+      if (r0) chRow = getChannelConfig(r0.id);
+    }
+
+    // R6 验签（未配置验签材料的渠道放行并标注 unverified——mock/未接入期不中断链路）
+    const v = verifyCardCallback(
+      { type: channelType || (chRow && chRow.type) || '', config: (chRow && chRow.config) || {} },
+      req.headers, req.body, req.query,
+    );
+    if (!v.ok) {
+      try { if (chRow) updateCallbackStatus(chRow.id, 'error', '卡片回调验签失败：' + v.reason); } catch { }
+      return res.status(401).json({ code: 401, msg: '回调验签失败：' + v.reason });
+    }
+
+    // R4 决议核心
+    const r = resolveCardCallback({ callbackData, action, userId, reason, channelId: chRow && chRow.id });
+    if (!r.ok) {
+      try { if (chRow) updateCallbackStatus(chRow.id, 'warning', r.msg); } catch { }
+      return res.json({ code: r.code, msg: r.msg, data: r.status ? { status: r.status } : undefined });
+    }
+
+    try { if (chRow) updateCallbackStatus(chRow.id, 'ok', ''); } catch { }
+
+    // R5 回发结果条（异步、静默；不影响回调响应）
+    const effType = channelType || (chRow && chRow.type) || '';
+    if (effType && effType !== 'inbox' && userId) {
+      Promise.resolve()
+        .then(() => sendCardResult(effType, userId, { status: r.status, toolName: r.toolName, confirmKey: callbackData, reason }))
+        .catch(() => { });
+    }
+
+    res.json({ code: 0, data: { confirm_key: callbackData, status: r.status, resumed: r.resumed, unverified: !!v.unverified } });
+  } catch (e) {
+    res.status(500).json({ code: 500, msg: '卡片回调处理失败：' + e.message });
+  }
+}
+router.post('/card-callback', handleCardCallback);
+router.get('/card-callback', handleCardCallback);
 
 router.use(auth);
 
@@ -297,33 +367,6 @@ router.post('/mock-dispatch', adminOnly, (req, res) => {
   };
   const verdict = inbound(model);
   res.json({ code: 0, data: { model: { ...model, raw: undefined }, verdict } });
-});
-
-// ==================== U0-5 卡片消息回调 ====================
-
-/** POST /api/channel/card-callback —— 用户点击卡片按钮后的回调端点
- *  钉钉卡片点击按钮 → 用户确认/拒绝 → 回调到此端点 → 解析决议 → 写 tool_approvals
- *  body: { channel, callbackData, action, user_id, reason? }
- *    callbackData: 卡片发送时携带的 confirm_key
- *    action: 'approve' | 'reject'
- */
-router.post('/card-callback', async (req, res) => {
-  const { channel, callbackData, action, user_id, reason } = req.body || {};
-  if (!callbackData || !action) return res.json({ code: 400, msg: '缺少 callbackData 或 action' });
-  if (!['approve', 'reject'].includes(action)) return res.json({ code: 400, msg: 'action 应为 approve 或 reject' });
-  try {
-    // 查找对应的 tool_approval 记录
-    const row = db.prepare('SELECT * FROM tool_approvals WHERE confirm_key=?').get(callbackData);
-    if (!row) return res.json({ code: 404, msg: '审批记录不存在（可能已过期或已被处理）' });
-    if (row.status !== 'pending') return res.json({ code: 400, msg: '该审批已有处理结果（' + row.status + '），无法再次操作' });
-
-    const newStatus = action === 'approve' ? 'approved' : 'rejected';
-    db.prepare('UPDATE tool_approvals SET status=?, approver=?, decision_at=?, reason=? WHERE confirm_key=? AND status="pending"')
-      .run(newStatus, user_id || 'card-user', now(), reason || '', callbackData);
-    res.json({ code: 0, data: { confirm_key: callbackData, status: newStatus } });
-  } catch (e) {
-    res.status(500).json({ code: 500, msg: '卡片回调处理失败：' + e.message });
-  }
 });
 
 // ==================== U0-5 R2 用户↔渠道身份绑定 ====================
