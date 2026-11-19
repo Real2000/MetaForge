@@ -6100,6 +6100,94 @@ function t(name, fn) {
     }
   }
 
+  console.log('【U0-2】实时语音对话：WS 通道鉴权 / 流式流水线 / 分句 TTS / 打断（barge-in）');
+  {
+    const { spawn } = require('child_process');
+    const { sign } = require('../src-server/lib/auth');
+    const WebSocket = require('ws');
+
+    const adminId = db.prepare("SELECT id FROM users WHERE username='admin'").get().id;
+    const tokOf = uid => sign({ uid, exp: Date.now() + 3600000 });
+
+    const port = 39500 + Math.floor(Math.random() * 2000);
+    const base = `http://127.0.0.1:${port}`;
+    const child = spawn(process.execPath, ['server.js'], {
+      cwd: path.join(__dirname, '..'),
+      env: { ...process.env, PORT: String(port), AGENT_DATA_DIR: process.env.AGENT_DATA_DIR, VOICE_MOCK: '1' },
+      stdio: 'ignore',
+    });
+    const mkWs = uid => {
+      const msgs = []; const bins = [];
+      const ws = new WebSocket(`ws://127.0.0.1:${port}/api/voice-ws`, { headers: { Cookie: 'ap_token=' + tokOf(uid) } });
+      ws.on('message', (d, isBin) => { if (isBin) bins.push(Buffer.from(d)); else { try { msgs.push(JSON.parse(String(d))); } catch { } } });
+      return { ws, msgs, bins };
+    };
+    const waitMsg = async (cli, pred, ms = 8000) => { const t0 = Date.now(); while (Date.now() - t0 < ms) { const i = cli.msgs.findIndex(pred); if (i >= 0) return cli.msgs.splice(i, 1)[0]; await new Promise(r => setTimeout(r, 50)); } return null; };
+    const waitBin = async (cli, n, ms = 8000) => { const t0 = Date.now(); while (Date.now() - t0 < ms) { if (cli.bins.length >= n) return true; await new Promise(r => setTimeout(r, 50)); } return false; };
+    const wsend = (cli, obj) => cli.ws.send(JSON.stringify(obj));
+
+    let c1 = null;
+    try {
+      await t('U0-2：未认证语音 WS 握手 401', async () => {
+        let up = false;
+        for (let i = 0; i < 60 && !up; i++) { await new Promise(r => setTimeout(r, 250)); try { up = (await fetch(base + '/api/health')).ok; } catch { } }
+        assert.ok(up, 'U0-2 子进程服务应在 15s 内就绪');
+        const bad = new WebSocket(`ws://127.0.0.1:${port}/api/voice-ws`);
+        const code = await new Promise(res => { bad.on('unexpected-response', (req, resp) => res(resp && resp.statusCode)); bad.on('error', () => res('net-error')); bad.on('open', () => res('opened')); setTimeout(() => res('timeout'), 4000); });
+        assert.strictEqual(code, 401, '无凭据语音 WS 握手应 401（实际 ' + code + '）');
+        try { bad.terminate(); } catch { }
+      });
+
+      await t('U0-2：一轮流水线（音频上行→asr-final→reply-delta→分句 tts-segment+音频帧→done）', async () => {
+        c1 = mkWs(adminId);
+        await new Promise(r => c1.ws.on('open', r));
+        wsend(c1, { type: 'start', format: 'wav' });
+        assert.ok(await waitMsg(c1, m => m.type === 'state' && m.state === 'listening'), 'start 后应进入 listening');
+        // 未收到音频即 utterance-end：应报错而非启动流水线
+        wsend(c1, { type: 'utterance-end' });
+        const e0 = await waitMsg(c1, m => m.type === 'error');
+        assert.ok(e0 && /音频/.test(e0.msg), '无音频即结束应报错：' + JSON.stringify(e0));
+        // 上行两个音频分片
+        c1.ws.send(Buffer.from([0, 1, 2, 3, 4, 5]), { binary: true });
+        c1.ws.send(Buffer.from([6, 7, 8, 9]), { binary: true });
+        wsend(c1, { type: 'utterance-end' });
+        const fin = await waitMsg(c1, m => m.type === 'asr-final');
+        assert.ok(fin && fin.text, '应收到 asr-final 文本：' + JSON.stringify(fin));
+        const d1 = await waitMsg(c1, m => m.type === 'reply-delta');
+        assert.ok(d1 && d1.text, '应收到 reply-delta 增量');
+        const seg = await waitMsg(c1, m => m.type === 'tts-segment');
+        assert.ok(seg && seg.seq === 0 && seg.bytes > 0, '应收到 tts-segment（seq=0，含字节数）：' + JSON.stringify(seg));
+        assert.ok(await waitBin(c1, 1), '应收到二进制音频帧');
+        const done = await waitMsg(c1, m => m.type === 'done');
+        assert.ok(done && typeof done.full === 'string' && done.full.length > 0, '应收到 done 与全文：' + JSON.stringify(done));
+        await waitMsg(c1, m => m.type === 'state' && m.state === 'listening'); // 收尾：回到倾听态
+      });
+
+      await t('U0-2：打断（barge-in）——speaking 期间 interrupt 生效并回到 listening', async () => {
+        c1.msgs.length = 0; // 清掉上一轮遗留状态帧，避免误匹配
+        wsend(c1, { type: 'start', format: 'wav' });
+        assert.ok(await waitMsg(c1, m => m.type === 'state' && m.state === 'listening'), '新一轮应进入 listening');
+        c1.ws.send(Buffer.from([1, 2, 3, 4]), { binary: true });
+        wsend(c1, { type: 'utterance-end' });
+        assert.ok(await waitMsg(c1, m => m.type === 'state' && m.state === 'speaking', 8000), '应进入 speaking');
+        wsend(c1, { type: 'interrupt' });
+        assert.ok(await waitMsg(c1, m => m.type === 'interrupted'), 'interrupt 应回 interrupted 确认');
+        assert.ok(await waitMsg(c1, m => m.type === 'state' && m.state === 'listening', 8000), '打断后应回到 listening');
+        await new Promise(r => setTimeout(r, 250));
+        assert.ok(!c1.msgs.some(m => m.type === 'done'), '打断后本轮不应再产出 done');
+      });
+
+      await t('U0-2：stop 结束会话 + 连接关闭', async () => {
+        const closed = new Promise(res => { c1.ws.on('close', () => res(true)); setTimeout(() => res(false), 4000); });
+        wsend(c1, { type: 'stop' });
+        assert.ok(await closed, 'stop 后连接应关闭');
+      });
+    } finally {
+      try { child.kill('SIGTERM'); } catch { }
+      try { child.kill('SIGKILL'); } catch { }
+    }
+  }
+
   console.log('【U1-8】SDK 正式发布：TS/Python 客户端行为 / 真实端到端 / 下载端点 / 规范契约');
   {
     const { AgentPlatform, AgentPlatformError } = require('../sdk/typescript/index.js');

@@ -169,11 +169,16 @@ const server = app.listen(PORT, () => {
 const { attachCanvasCollab } = require('./src-server/lib/canvas-collab');
 const canvasCollabHandle = attachCanvasCollab(server);
 
+// U0-2 实时语音对话：WS 语音通道（/api/voice-ws，upgrade 时经 HttpOnly Cookie 鉴权）
+const { attachVoiceStream } = require('./src-server/lib/voice-stream');
+const voiceStreamHandle = attachVoiceStream(server);
+
 // 优雅停机（2026-10-20 P1）：SIGTERM/SIGINT 时停止接新连接、等待存量请求收尾、数据库落盘
 // 悬挂的 SSE 长连接由 5 秒兜底强退处理，避免卡死重启流程
 function shutdown(signal) {
   console.log(`\n[server] 收到 ${signal}，优雅停机中（停止接新连接，等待请求收尾）…`);
   try { canvasCollabHandle.close(); } catch { } // U1-7：先断 WS 协作长连接，防 server.close 等待它悬挂至 5s 强退
+  try { voiceStreamHandle.close(); } catch { } // U0-2：再断 WS 语音长连接（同上）
   server.close(() => {
     try { db.close(); console.log('[server] 数据库已落盘关闭'); } catch { }
     console.log('[server] 停机完成');
