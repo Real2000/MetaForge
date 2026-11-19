@@ -7788,6 +7788,73 @@ print('PY_OK')
       assert.ok(/integrity_check/.test(sh), '应对副本做完整性校验');
       assert.ok(/AGENT_DB_READONLY/.test(sh), '应提示通过 AGENT_DB_READONLY 启用读写分离');
     });
+
+    // ---------------- U2-1 / N7-P4 信创 DAL 方言层 ----------------
+    await t('U2-1/N7-P4: SQL 方言 —— 默认 sqlite 恒等，未知方言回退 sqlite', () => {
+      const d = require(path.join(__dirname, '..', 'src-server', 'lib', 'sql-dialect'));
+      assert.ok(d.dialects().includes('sqlite') && d.dialects().includes('dm') && d.dialects().includes('kingbase'), '应含三种方言');
+      const sql = "SELECT datetime('now','localtime') AS t";
+      assert.strictEqual(d.translate(sql, 'sqlite').sql, sql, 'sqlite 方言应恒等转换');
+      assert.strictEqual(d.translate(sql, 'unknown-dialect').sql, sql, '未知方言应回退 sqlite 恒等');
+    });
+
+    await t('U2-1/N7-P4: SQL 方言 —— 达梦映射（CURRENT_TIMESTAMP / IDENTITY / COALESCE / 引号）', () => {
+      const d = require(path.join(__dirname, '..', 'src-server', 'lib', 'sql-dialect'));
+      assert.strictEqual(d.translate("SELECT datetime('now','localtime')", 'dm').sql, 'SELECT CURRENT_TIMESTAMP');
+      assert.strictEqual(d.translate("SELECT datetime('now')", 'dm').sql, 'SELECT CURRENT_TIMESTAMP');
+      assert.strictEqual(d.translate('id INTEGER PRIMARY KEY AUTOINCREMENT', 'dm').sql, 'id INT IDENTITY(1,1) PRIMARY KEY');
+      assert.strictEqual(d.translate('SELECT IFNULL(a,0)', 'dm').sql, 'SELECT COALESCE(a,0)');
+      assert.strictEqual(d.translate('SELECT `col` FROM t', 'dm').sql, 'SELECT "col" FROM t');
+    });
+
+    await t('U2-1/N7-P4: SQL 方言 —— 金仓映射（SERIAL / ON CONFLICT DO NOTHING）', () => {
+      const d = require(path.join(__dirname, '..', 'src-server', 'lib', 'sql-dialect'));
+      assert.strictEqual(d.translate('id INTEGER PRIMARY KEY AUTOINCREMENT', 'kingbase').sql, 'id SERIAL PRIMARY KEY');
+      const r = d.translate('INSERT OR IGNORE INTO t (a) VALUES (1)', 'kingbase');
+      assert.ok(/^INSERT INTO t \(a\) VALUES \(1\) ON CONFLICT DO NOTHING$/.test(r.sql), '金仓 INSERT OR IGNORE 应转 ON CONFLICT DO NOTHING，实际：' + r.sql);
+    });
+
+    await t('U2-1/N7-P4: SQL 方言 —— 未映射构造产出 warning 不静默', () => {
+      const d = require(path.join(__dirname, '..', 'src-server', 'lib', 'sql-dialect'));
+      const r = d.translate("SELECT strftime('%Y', created_at) FROM t", 'dm');
+      assert.ok(r.warnings.some(w => /strftime/.test(w)), 'strftime 未映射应告警');
+      const r2 = d.translate('INSERT OR REPLACE INTO t VALUES (1)', 'kingbase');
+      assert.ok(r2.warnings.some(w => /ON CONFLICT/.test(w)), 'INSERT OR REPLACE 应告警需人工改写');
+    });
+
+    await t('U2-1/N7-P4: 数据库连接抽象 —— 驱动可用性与 sqlite 直连', () => {
+      const drv = require(path.join(__dirname, '..', 'src-server', 'lib', 'db-driver'));
+      const list = drv.listDrivers();
+      const byName = Object.fromEntries(list.map(x => [x.name, x]));
+      assert.ok(byName.sqlite && byName.sqlite.available === true, 'sqlite 驱动应可用');
+      assert.ok(byName.dm && byName.kingbase, '应包含 dm / kingbase 驱动定义');
+      assert.strictEqual(drv.isAvailable('sqlite'), true, 'isAvailable(sqlite) 应为 true');
+      // sqlite 直连（内存库）验证
+      const conn = drv.createDriver('sqlite').connect({ path: ':memory:' });
+      assert.strictEqual(conn.prepare('SELECT 1 AS ok').get().ok, 1, 'sqlite 驱动应可直连查询');
+      conn.close();
+    });
+
+    await t('U2-1/N7-P4: 数据库连接抽象 —— 缺驱动给可读错误并提示回退', () => {
+      const drv = require(path.join(__dirname, '..', 'src-server', 'lib', 'db-driver'));
+      // 本机未安装 dmdb / pg，应抛出可读错误（含依赖名与回退提示），不崩溃
+      if (!drv.isAvailable('dm')) {
+        assert.throws(() => drv.createDriver('dm').connect({}), /未安装|dmdb|sqlite/i, 'dm 缺驱动应抛可读错误');
+      }
+      assert.throws(() => drv.createDriver('nope').connect({}), /未知数据库驱动/, '未知驱动应抛错');
+      // 方言绑定：createDriver('kingbase').translate 应绑定 kingbase 方言
+      const t2 = drv.createDriver('kingbase').translate('id INTEGER PRIMARY KEY AUTOINCREMENT');
+      assert.strictEqual(t2.dialect, 'kingbase', 'createDriver 应绑定方言');
+    });
+
+    await t('U2-1/N7-P4: 配置项 db_driver / sql_dialect 默认 sqlite', () => {
+      const cfg = require(path.join(__dirname, '..', 'src-server', 'lib', 'config'));
+      const defs = Object.fromEntries(cfg.CONFIG_DEFS.map(d => [d.key, d]));
+      assert.ok(defs.db_driver && defs.db_driver.default === 'sqlite', 'db_driver 默认应为 sqlite');
+      assert.ok(defs.sql_dialect && defs.sql_dialect.default === 'sqlite', 'sql_dialect 默认应为 sqlite');
+      assert.deepStrictEqual(defs.sql_dialect.options, ['sqlite', 'dm', 'kingbase'], 'sql_dialect 选项应含三方言');
+      assert.ok(defs.db_password && defs.db_password.sensitive === true, 'db_password 应为敏感项');
+    });
   }
 
   // 收尾：关闭库并清理临时目录

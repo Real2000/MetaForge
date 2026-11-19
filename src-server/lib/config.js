@@ -53,6 +53,14 @@ const CONFIG_DEFS = [
   { key: 'queue_driver', label: '任务队列驱动', group: 'system', type: 'string', env: 'QUEUE_DRIVER', default: 'memory', options: ['memory', 'redis'], desc: 'memory=进程内队列（默认，单进程）；redis=外置 BullMQ 队列（多进程/多节点横向扩展，需已装 bullmq/ioredis 并配好 redis_url）' },
   { key: 'redis_url', label: 'Redis 连接串', group: 'system', type: 'string', env: 'REDIS_URL', default: '', desc: 'redis 驱动使用的 Redis 连接串（如 redis://127.0.0.1:6379）；留空用默认地址' },
   { key: 'deploy_mode', label: '部署模式', group: 'system', type: 'string', env: 'DEPLOY_MODE', default: 'single', options: ['single', 'cluster'], desc: 'single=单进程（默认）；cluster=多进程/多节点（启用选主租约锁，调度 tick 与内存队列仅 leader 执行）' },
+  // ---- 信创数据库（N7 / U2-1 / P4） ----
+  { key: 'db_driver', label: '数据库驱动', group: 'system', type: 'string', env: 'AGENT_DB_DRIVER', default: 'sqlite', options: ['sqlite', 'dm', 'kingbase'], desc: 'sqlite=内置（默认）；dm=达梦 DM8（需 dmdb）；kingbase=人大金仓（需 pg）' },
+  { key: 'sql_dialect', label: 'SQL 方言', group: 'system', type: 'string', env: 'SQL_DIALECT', default: 'sqlite', options: ['sqlite', 'dm', 'kingbase'], desc: 'SQL 方言适配目标；默认 sqlite 恒等转换，切信创库时同步设为 dm/kingbase' },
+  { key: 'db_host', label: '数据库主机', group: 'system', type: 'string', env: 'AGENT_DB_HOST', default: '', desc: '信创库主机（sqlite 驱动忽略）' },
+  { key: 'db_port', label: '数据库端口', group: 'system', type: 'number', env: 'AGENT_DB_PORT', default: 0, desc: '信创库端口（sqlite 驱动忽略；金仓默认 54321，达梦默认 5236）' },
+  { key: 'db_user', label: '数据库账号', group: 'system', type: 'string', env: 'AGENT_DB_USER', default: '', desc: '信创库账号（sqlite 驱动忽略）' },
+  { key: 'db_password', label: '数据库口令', group: 'system', type: 'string', env: 'AGENT_DB_PASSWORD', default: '', sensitive: true, desc: '信创库口令，密文存储，回显仅显示末 4 位' },
+  { key: 'db_name', label: '数据库名', group: 'system', type: 'string', env: 'AGENT_DB_NAME', default: '', desc: '信创库库名（sqlite 驱动忽略）' },
 ];
 
 /* ---------- 运行时配置 ---------- */
