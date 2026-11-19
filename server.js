@@ -4,6 +4,47 @@
  * 后台：数据看板 / 智能体管理 / 用户管理 / 知识库管理 / 接入管理 / 模型接入 / 安全合规 / 用量与配额 / 系统监控 / 运营监控
  */
 
+// U2-1 / N7-P2 集群引导：WEB_CONCURRENCY>1 时用 Node cluster 派生多 worker，主进程不监听端口。
+// 未设置或 =1 时保持单进程行为不变；PM2 环境（存在 pm_id）由 PM2 负责多实例，此处不重复派生。
+const cluster = require('node:cluster');
+const WEB_CONCURRENCY = Math.max(1, parseInt(process.env.WEB_CONCURRENCY || '1', 10) || 1);
+if (WEB_CONCURRENCY > 1 && !process.env.pm_id && cluster.isPrimary) {
+  console.log(`[cluster] 主进程启动，派生 ${WEB_CONCURRENCY} 个 worker（WEB_CONCURRENCY=${WEB_CONCURRENCY}）`);
+  // U2-1 / N7-P2：fork 前先在本进程完成一次数据库初始化与迁移，避免多 worker 并发执行
+  // 「先查列→再 ALTER」内联迁移导致的 duplicate column 竞争（如 sessions.active_branch）。
+  try { require('./src-server/db'); console.log('[cluster] 主进程已完成数据库初始化与迁移，开始派生 worker'); }
+  catch (e) { console.error('[cluster] 主进程预迁移失败（worker 将自行迁移）:', e && e.message); }
+  let shuttingDown = false;
+  const live = new Set();
+  const spawn = () => {
+    const w = cluster.fork();
+    live.add(w.id);
+    w.on('exit', () => {
+      live.delete(w.id);
+      if (shuttingDown && live.size === 0) process.exit(0); // 全部 worker 退出后主进程随之退出，避免留下空壳
+    });
+    return w;
+  };
+  for (let i = 0; i < WEB_CONCURRENCY; i++) spawn();
+  cluster.on('exit', (worker, code, signal) => {
+    if (shuttingDown) { console.warn(`[cluster] worker ${worker.process.pid} 已退出（停机中，不再重启）`); return; }
+    if (!worker.exitedAfterDisconnect) {
+      console.warn(`[cluster] worker ${worker.process.pid} 退出（code=${code} signal=${signal}），自动重启`);
+      spawn();
+    }
+  });
+  // 主进程收到终止信号 → 停止派生并通知全部 worker 优雅停机，自身在 worker 全部退出后退出
+  const shutdownPrimary = (sig) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`[cluster] 主进程收到 ${sig}，停止派生并终止全部 worker…`);
+    for (const id in cluster.workers) { try { cluster.workers[id].kill(sig); } catch { } }
+    setTimeout(() => process.exit(0), 8000).unref(); // 兜底：worker 未及时退出时强制结束
+  };
+  for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => shutdownPrimary(sig));
+  return; // 主进程不加载应用、不监听端口
+}
+
 // P2-23 OTEL 外部追踪（必须在所有模块加载前初始化；OTEL_ENABLED=1 时生效）
 if (process.env.OTEL_ENABLED === '1') {
   try { require('./src-server/lib/opentelemetry'); } catch { }
@@ -160,6 +201,10 @@ const server = app.listen(PORT, () => {
   console.log('  默认账号:  admin（首次登录强制改密）');
   console.log('             demo（首次登录强制改密）');
   console.log(`  当前版本:  ${editionBanner()}`); // V2.2 #8：License 验签后横幅（专业版/企业版含到期信息，降级时展示原因）
+  if (WEB_CONCURRENCY > 1 || process.env.pm_id) {
+    const { isClusterMode } = require('./src-server/lib/cluster-lock');
+    console.log(`  运行模式:  集群（worker=${process.pid}${process.env.pm_id != null ? ` pm_id=${process.env.pm_id}` : ''}，选主=${isClusterMode() ? '启用' : '关闭'}）`);
+  }
   console.log('==============================================');
   startScheduler();
   setTimeout(checkExpiryNotice, 60 * 1000).unref(); // V2.2 #8：License 到期提醒（启动 1 分钟后首查）
@@ -178,6 +223,8 @@ const voiceStreamHandle = attachVoiceStream(server);
 // 悬挂的 SSE 长连接由 5 秒兜底强退处理，避免卡死重启流程
 function shutdown(signal) {
   console.log(`\n[server] 收到 ${signal}，优雅停机中（停止接新连接，等待请求收尾）…`);
+  // U2-1 / N7-P2：主动释放集群领导权，使其他进程/重启实例可立即接管调度（无需等待租约 TTL 过期）
+  try { require('./src-server/lib/cluster-lock').release(require('./src-server/lib/cluster-lock').LOCK_NAME); } catch { }
   try { canvasCollabHandle.close(); } catch { } // U1-7：先断 WS 协作长连接，防 server.close 等待它悬挂至 5s 强退
   try { voiceStreamHandle.close(); } catch { } // U0-2：再断 WS 语音长连接（同上）
   server.close(() => {

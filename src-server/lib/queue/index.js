@@ -71,6 +71,8 @@ function cleanupHistory(retention) { return _getDriver().cleanupHistory(retentio
 function startWorkers() { return _getDriver().startWorkers(); }
 /** 停止 worker（优雅退出） */
 async function stopWorkers() { return _getDriver().stopWorkers(); }
+/** U2-1/N7-P2：触发一次队列排空（内存驱动为主动拉取 pending 任务；Redis 驱动无此概念，返回 undefined） */
+function drain() { const d = _getDriver(); return d.drain ? d.drain() : undefined; }
 
 /** 驱动运行信息（健康检查/监控用） */
 function driverInfo() {
@@ -80,5 +82,5 @@ function driverInfo() {
 
 module.exports = {
   register, enqueue, getJob, queueStats, cleanupHistory,
-  startWorkers, stopWorkers, driverInfo, REGISTRY,
+  startWorkers, stopWorkers, drain, driverInfo, REGISTRY,
 };

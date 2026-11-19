@@ -246,6 +246,15 @@ const ALL_MIGRATIONS = [
   { id: 67, name: 'agent_memories.source - 来源', table: 'agent_memories', column: 'source', def: "TEXT DEFAULT 'chat'" },
   { id: 68, name: 'agent_memories.summary - 摘要', table: 'agent_memories', column: 'summary', def: "TEXT DEFAULT ''" },
   { id: 69, name: 'agent_memories.summary_source - 摘要来源', table: 'agent_memories', column: 'summary_source', def: "TEXT DEFAULT ''" },
+  // === N7-P2 集群化（U2-1） ===
+  { id: 70, name: 'task_queue.worker_id - 处理进程标识', table: 'task_queue', column: 'worker_id', def: 'TEXT DEFAULT NULL' },
+  { id: 71, name: 'task_queue.locked_at - 锁定时间', table: 'task_queue', column: 'locked_at', def: 'TEXT DEFAULT NULL' },
+  { id: 72, name: 'cluster_locks - 集群选主租约锁', table: 'cluster_locks', createSql: `CREATE TABLE IF NOT EXISTS cluster_locks (
+    name TEXT PRIMARY KEY,      -- 锁名（如 cluster-leader）
+    owner TEXT NOT NULL,        -- 持有者标识（hostname:pid）
+    acquired_at INTEGER NOT NULL, -- 获取时间（epoch ms）
+    expires_at INTEGER NOT NULL   -- 过期时间（epoch ms，需持有者续租）
+  );` },
 ];
 
 module.exports = {

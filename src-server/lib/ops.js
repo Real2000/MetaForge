@@ -246,24 +246,28 @@ function checkDeptBudgets() {
   }
 }
 
-function startOps() {
+function startOps(guard) {
+  // U2-1 / N7-P2：可选 guard —— 集群下传入「是否 leader」判断，非 leader 进程的定时触发直接跳过（不重复备份/清理）。
+  // 不传 guard 时等价于恒真，单进程路径行为与引入前完全一致。
+  const allow = typeof guard === 'function' ? guard : () => true;
+  const run = (job, fn) => { if (allow()) dailyOps(job, fn); };
   // 启动 60 秒后先跑一轮（首次部署即有备份），此后每 30 分钟检查跨日触发
-  setTimeout(() => { dailyOps('backup', dailyBackup); dailyOps('uploads', cleanupUploads); dailyOps('logs', archiveLogs); }, 60000);
+  setTimeout(() => { run('backup', dailyBackup); run('uploads', cleanupUploads); run('logs', archiveLogs); }, 60000);
   setInterval(() => {
-    dailyOps('backup', dailyBackup);
-    dailyOps('uploads', cleanupUploads);
-    dailyOps('logs', archiveLogs);
+    run('backup', dailyBackup);
+    run('uploads', cleanupUploads);
+    run('logs', archiveLogs);
   }, 30 * 60000);
   console.log(`[ops] 运维任务已启动（每日备份保留 ${KEEP_BACKUPS} 份 / 产物保留 ${UPLOAD_TTL_DAYS} 天 / 日志保留 ${LOG_TTL_DAYS} 天 / 记忆摘要已开启 / 评测回归已开启）`);
   // U0-8：启动后 2 分钟跑第一轮摘要，后每 2 小时检查
-  setTimeout(() => dailyOps('digest', digestMemories), 120000);
-  setInterval(() => dailyOps('digest', digestMemories), 120 * 60000);
+  setTimeout(() => run('digest', digestMemories), 120000);
+  setInterval(() => run('digest', digestMemories), 120 * 60000);
   // U1-5：启动后 3 分钟跑第一轮评测回归，后每 4 小时检查
-  setTimeout(() => dailyOps('eval', runEvalRegression), 180000);
-  setInterval(() => dailyOps('eval', runEvalRegression), 240 * 60000);
+  setTimeout(() => run('eval', runEvalRegression), 180000);
+  setInterval(() => run('eval', runEvalRegression), 240 * 60000);
   // U1-6：部门超预算告警（与每日备份同批检查，每日一次；升档幂等在 checkDeptBudgets 内部）
-  setTimeout(() => dailyOps('deptBudget', checkDeptBudgets), 240000);
-  setInterval(() => dailyOps('deptBudget', checkDeptBudgets), 30 * 60000);
+  setTimeout(() => run('deptBudget', checkDeptBudgets), 240000);
+  setInterval(() => run('deptBudget', checkDeptBudgets), 30 * 60000);
 }
 
 module.exports = { dailyBackup, cleanupUploads, archiveLogs, digestMemories, runEvalRegression, checkDeptBudgets, startOps };

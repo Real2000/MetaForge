@@ -52,6 +52,7 @@ const CONFIG_DEFS = [
   // ---- 队列（N7 / U2-1） ----
   { key: 'queue_driver', label: '任务队列驱动', group: 'system', type: 'string', env: 'QUEUE_DRIVER', default: 'memory', options: ['memory', 'redis'], desc: 'memory=进程内队列（默认，单进程）；redis=外置 BullMQ 队列（多进程/多节点横向扩展，需已装 bullmq/ioredis 并配好 redis_url）' },
   { key: 'redis_url', label: 'Redis 连接串', group: 'system', type: 'string', env: 'REDIS_URL', default: '', desc: 'redis 驱动使用的 Redis 连接串（如 redis://127.0.0.1:6379）；留空用默认地址' },
+  { key: 'deploy_mode', label: '部署模式', group: 'system', type: 'string', env: 'DEPLOY_MODE', default: 'single', options: ['single', 'cluster'], desc: 'single=单进程（默认）；cluster=多进程/多节点（启用选主租约锁，调度 tick 与内存队列仅 leader 执行）' },
 ];
 
 /* ---------- 运行时配置 ---------- */

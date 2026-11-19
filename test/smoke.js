@@ -7625,6 +7625,104 @@ print('PY_OK')
     db.prepare("DELETE FROM task_queue WHERE name='n7_noop'").run();
   }
 
+  console.log('【U2-1 / N7】P2 集群选主与多进程（DB 租约锁 / 调度让位 / PM2 配置）');
+  {
+    const { db } = require('../src-server/db');
+    const lock = require('../src-server/lib/cluster-lock');
+    const q = require('../src-server/lib/queue');
+
+    await t('U2-1/N7-P2: cluster_locks 表与 task_queue 新列已就绪', () => {
+      const t1 = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='cluster_locks'").get();
+      assert.ok(t1, 'cluster_locks 表应存在');
+      const cols = db.prepare('PRAGMA table_info(task_queue)').all().map(c => c.name);
+      assert.ok(cols.includes('worker_id'), 'task_queue.worker_id 应存在');
+      assert.ok(cols.includes('locked_at'), 'task_queue.locked_at 应存在');
+    });
+
+    await t('U2-1/N7-P2: 选主租约 —— 单进程恒 leader；集群下唯一持有；过期可接管；释放限持有者', () => {
+      delete process.env.CLUSTER_MODE; delete process.env.WEB_CONCURRENCY; lock._resetClusterModeCache();
+      assert.strictEqual(lock.isClusterMode(), false, '默认应为单进程模式');
+      assert.strictEqual(lock.isLeader('any'), true, '非集群模式恒为 leader（零回归）');
+
+      process.env.CLUSTER_MODE = '1'; lock._resetClusterModeCache();
+      try {
+        assert.strictEqual(lock.isClusterMode(), true);
+        lock.release('UT', 'A'); lock.release('UT', 'B'); // 清残留
+        assert.strictEqual(lock.acquire('UT', 60000, 'A'), true, 'A 首取成功');
+        assert.strictEqual(lock.isLeader('UT', 'A'), true);
+        assert.strictEqual(lock.acquire('UT', 60000, 'B'), false, 'B 在租约期内应让位');
+        assert.strictEqual(lock.isLeader('UT', 'B'), false);
+        assert.strictEqual(lock.renew('UT', 60000, 'A'), true, 'A 续租成功');
+        lock.acquire('UT', -1, 'A'); // A 将租约置为已过期（结果已过期，故返回 false）
+        assert.strictEqual(lock.isLeader('UT', 'A'), false, 'A 租约已过期');
+        assert.strictEqual(lock.acquire('UT', 60000, 'B'), true, 'B 过期后可接管');
+        assert.strictEqual(lock.release('UT', 'A'), false, 'A 已非持有者，释放无效');
+        assert.strictEqual(lock.release('UT', 'B'), true, 'B 释放成功');
+        assert.strictEqual(lock.info('UT'), null, '释放后记录应清空');
+        assert.match(lock.ownerId(), /^.+:\d+$/, '持有者标识应为 host:pid 形式');
+      } finally {
+        delete process.env.CLUSTER_MODE; lock._resetClusterModeCache();
+        lock.release('UT', 'A'); lock.release('UT', 'B');
+      }
+    });
+
+    await t('U2-1/N7-P2: 集群模式下内存 worker 仅 leader 消费（非 leader drain 让位）', async () => {
+      lock.release(lock.LOCK_NAME); // 清残留，确保无 leader
+      process.env.CLUSTER_MODE = '1'; lock._resetClusterModeCache();
+      try {
+        q.register('n7p2_gate', async () => ({ ok: true }));
+        const jobId = q.enqueue('n7p2_gate', {});
+        await new Promise(r => setTimeout(r, 60)); // 等 setImmediate 触发（应被门控）
+        assert.strictEqual(q.getJob(jobId).status, 'pending', '非 leader 进程不应消费队列');
+        assert.ok(lock.acquire(lock.LOCK_NAME, 60000), '当前进程取得领导权');
+        q.drain();
+        for (let i = 0; i < 50 && q.getJob(jobId).status !== 'success'; i++) await new Promise(r => setTimeout(r, 20));
+        assert.strictEqual(q.getJob(jobId).status, 'success', 'leader 排空后应处理成功');
+        const row = q.getJob(jobId);
+        assert.ok(row.worker_id, '运行时应记录 worker_id（处理进程标识）');
+      } finally {
+        delete process.env.CLUSTER_MODE; lock._resetClusterModeCache();
+        lock.release(lock.LOCK_NAME);
+        db.prepare("DELETE FROM task_queue WHERE name='n7p2_gate'").run();
+      }
+    });
+
+    await t('U2-1/N7-P2: 配置项 deploy_mode 默认 single', () => {
+      const cfg = require('../src-server/lib/config');
+      assert.strictEqual(cfg.get('deploy_mode'), 'single', 'deploy_mode 默认应为 single');
+    });
+
+    await t('U2-1/N7-P2: 调度/运维/服务端集群门控与集群派生（源码断言）', () => {
+      const sched = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'lib', 'scheduler.js'), 'utf8');
+      assert.ok(/clusterLock\.acquire\(LEADER_LOCK/.test(sched), '调度 tick 应经选主 acquire 门控');
+      assert.ok(/ops\.startOps\(\(\)\s*=>/.test(sched), '应给 ops 传 leader guard');
+      const opsSrc = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'lib', 'ops.js'), 'utf8');
+      assert.ok(/function startOps\(guard\)/.test(opsSrc), 'ops.startOps 应接受 guard 参数');
+      const srv = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
+      assert.ok(/WEB_CONCURRENCY/.test(srv) && /cluster\.fork/.test(srv), 'server.js 应支持 WEB_CONCURRENCY 集群派生');
+      assert.ok(/cluster-lock'\)\.release/.test(srv), '优雅停机应释放领导权');
+      // U2-1/N7-P2 修复：主进程 fork 前先完成一次数据库迁移（消除多 worker 并发迁移竞争）
+      assert.ok(/require\('\.\/src-server\/db'\)/.test(srv), '集群主进程应预加载 db 完成迁移');
+      // U2-1/N7-P2 修复：主进程收到终止信号后停止自动重启，并在 worker 全部退出后自行退出
+      assert.ok(/shuttingDown/.test(srv) && /停止派生/.test(srv), '主进程停机应停止派生 worker');
+      // U2-1/N7-P2 修复：db.js 集中吞掉并发迁移的 duplicate column 幂等错误 + busy_timeout 等待锁
+      const dbSrc = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'db.js'), 'utf8');
+      assert.ok(/busy_timeout/.test(dbSrc), 'db.js 应设置 busy_timeout 缓解并发写锁竞争');
+      assert.ok(/duplicate column name/i.test(dbSrc), 'db.js 应容错并发 ALTER 的 duplicate column 错误');
+    });
+
+    await t('U2-1/N7-P2: ecosystem.config.js 提供 web 集群 + 队列 worker', () => {
+      const eco = require(path.join(__dirname, '..', 'ecosystem.config.js'));
+      const names = eco.apps.map(a => a.name);
+      assert.ok(names.includes('agent-web') && names.includes('agent-queue-worker'), '应含 web 与 worker 两个应用');
+      const web = eco.apps.find(a => a.name === 'agent-web');
+      assert.strictEqual(web.exec_mode, 'cluster', 'web 应为 cluster 模式');
+      assert.ok(Number(web.instances) >= 1, 'web instances 应 ≥1');
+      const wk = eco.apps.find(a => a.name === 'agent-queue-worker');
+      assert.strictEqual(wk.exec_mode, 'fork', 'worker 应为 fork 模式');
+    });
+  }
+
   // 收尾：关闭库并清理临时目录
   try { db.close(); } catch { }
   fs.rmSync(process.env.AGENT_DATA_DIR, { recursive: true, force: true });

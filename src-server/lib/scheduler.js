@@ -9,8 +9,15 @@ const ops = require('./ops');
 const { addUsage, checkQuota } = require('./quota'); // P5.31 记归属者配额；P5.33 审查修复（F3）执行前配额闸门
 const { canView } = require('./agent-access'); // P5.34（审查 F8）：执行期复查智能体可见性
 const { register, enqueue } = require('./task-queue'); // U2-1 任务队列
+const clusterLock = require('./cluster-lock'); // U2-1 / N7-P2 集群选主租约锁
 
 const fireMarks = new Map(); // task_id -> last fired ts
+
+// U2-1 / N7-P2：集群下「调度 tick」与「运维定时任务」仅由 leader 进程执行，避免多进程重复触发。
+// 非集群模式（默认）下 CLUSTER=false，所有门控短路为「放行」，行为与引入前完全一致。
+const CLUSTER = clusterLock.isClusterMode();
+const LEADER_LOCK = clusterLock.LOCK_NAME;
+const LOCK_TTL = clusterLock.DEFAULT_TTL_MS;
 
 // U2-1 / N7-P1：注册 cron 任务处理器到 task-queue（模块加载即注册，供 API 进程与独立 worker 进程共用）。
 // 原先注册在 startScheduler() 内且用 global 守卫；抽到顶层后，worker.js 只需 require 本模块即可消费 'cron-task'，
@@ -98,6 +105,11 @@ function startScheduler() {
   // U2-1：'cron-task' 已在模块顶层注册（见上），此处仅保留守卫以兼容旧调用
   if (!global.__cronTaskRegistered) global.__cronTaskRegistered = true;
   const tick = async () => {
+    // U2-1 / N7-P2：集群模式下，非 leader 进程让位（同时完成领导权续租）
+    if (CLUSTER && !clusterLock.acquire(LEADER_LOCK, LOCK_TTL)) {
+      if (!global.__schedStandbyLogged) { console.log('[scheduler] 非 leader 进程，调度让位（由 leader 执行 tick）'); global.__schedStandbyLogged = true; }
+      return;
+    }
     try {
       const tasks = db.prepare('SELECT * FROM tasks WHERE enabled=1 AND exec_type=?').all('cron');
       for (const t of tasks) {
@@ -110,13 +122,17 @@ function startScheduler() {
           enqueue('cron-task', { taskId: t.id });
         }
       }
+      // 集群模式下由 leader 兜底排空内存队列（非 leader 进程入队的任务在此被处理）
+      if (CLUSTER) { try { const q = require('./task-queue'); if (q.drain) q.drain(); } catch { /* 排空失败不影响扫描 */ } }
     } catch (e) {
       console.error('[scheduler] 扫描异常：', e.message);
     }
   };
   tick();
   setInterval(tick, 30000);
-  ops.startOps(); // P0 运维：每日备份 + 产物清理 + 日志归档（内置，无外部依赖）
+  // P0 运维：每日备份 + 产物清理 + 日志归档（内置，无外部依赖）
+  // U2-1 / N7-P2：集群下仅 leader 执行运维定时任务（guard 在每次触发时复查领导权，避免重复备份/清理）
+  ops.startOps(() => !CLUSTER || clusterLock.isLeader(LEADER_LOCK));
   console.log('[scheduler] 定时任务调度器已启动（30s 扫描）');
 }
 

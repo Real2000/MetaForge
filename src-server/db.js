@@ -11,7 +11,24 @@ const DATA_DIR = process.env.AGENT_DATA_DIR || path.join(__dirname, '..', 'data'
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
 const db = new Database(path.join(DATA_DIR, 'platform.db'));
+// U2-1 / N7-P2：集群多进程共用同一 SQLite 库，并发写（启动迁移/写入）时等待锁释放而非立即 SQLITE_BUSY 崩溃。
+// 单进程下无锁竞争，此设置无任何行为影响。
+db.pragma('busy_timeout = 5000');
 db.pragma('journal_mode = WAL');
+
+// U2-1 / N7-P2：集群多进程并发执行内联迁移「先查列→再 ALTER」时，两进程可能同时判定列不存在，
+// 后到达者会抛 "duplicate column name"（列已被另一进程添加）。此处集中吞掉该幂等错误，
+// 使迁移在并发启动（WEB_CONCURRENCY / PM2 多实例）下收敛一致，且不掩盖其他 SQL 错误。
+{
+  const _rawExec = db.exec.bind(db);
+  db.exec = (sql) => {
+    try { return _rawExec(sql); }
+    catch (e) {
+      if (e && /duplicate column name/i.test(String(e.message || ''))) return undefined;
+      throw e;
+    }
+  };
+}
 
 // 2026-10-28 向量库升级：LanceDB 嵌入式向量数据库（零部署，磁盘持久化）
 // LanceDB 数据目录 & 初始化连接在 retriever.js 中按需创建（兼容无向量库的场景）

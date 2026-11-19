@@ -11,6 +11,7 @@
  * 集群注意：进程内队列不支持多进程共享，PM2 cluster 下需由 P2 选主锁保证仅单实例执行。
  */
 const { db, now } = require('../../db');
+const clusterLock = require('../cluster-lock'); // U2-1 / N7-P2 集群选主（跨进程仅 leader 处理队列）
 const crypto = require('crypto');
 
 const TASK_HISTORY_KEEP_DAYS = 7;
@@ -38,11 +39,14 @@ function create(registry) {
 
   /** 处理队首任务（进程内串行；集群下由调用方保证单实例） */
   async function processQueue() {
+    // U2-1 / N7-P2：集群模式下内存 worker 仅 leader 执行，避免多进程重复处理同一条 pending 任务。
+    // 非集群模式 isLeader 恒为 true，行为与引入前一致（不读写锁表）。
+    if (!clusterLock.isLeader(clusterLock.LOCK_NAME)) return;
     const job = db.prepare(`SELECT * FROM task_queue WHERE status='pending' AND (scheduled_at IS NULL OR scheduled_at <= datetime('now','localtime')) ORDER BY priority DESC, id ASC LIMIT 1`).get();
     if (!job) return;
     const entry = registry.get(job.name);
     if (!entry) { db.prepare(`UPDATE task_queue SET status='failed' WHERE id=?`).run(job.id); return; }
-    db.prepare(`UPDATE task_queue SET status='running', started_at=datetime('now','localtime') WHERE id=?`).run(job.id);
+    db.prepare(`UPDATE task_queue SET status='running', started_at=datetime('now','localtime'), worker_id=?, locked_at=datetime('now','localtime') WHERE id=?`).run(clusterLock.ownerId(), job.id);
     try {
       let payload = null;
       try { payload = JSON.parse(job.payload || '{}'); } catch { payload = {}; }
@@ -87,7 +91,7 @@ function create(registry) {
   function startWorkers() { /* no-op */ }
   function stopWorkers() { /* no-op */ }
 
-  return { name: 'memory', enqueue, getJob, queueStats, cleanupHistory, processQueue, startWorkers, stopWorkers };
+  return { name: 'memory', enqueue, getJob, queueStats, cleanupHistory, processQueue, drain: processQueue, startWorkers, stopWorkers };
 }
 
 module.exports = { create, MAX_RETRIES, TASK_HISTORY_KEEP_DAYS };
