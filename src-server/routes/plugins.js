@@ -103,7 +103,7 @@ router.post('/:id/test', adminOnly, async (req, res) => {
     const result = await runIsolated({
       code: p.entry,
       args: typeof args === 'string' ? JSON.parse(args) : args,
-      timeout: 30000,
+      timeoutMs: 30000,
       runtime: p.runtime || 'node',
     });
     res.json({ code: 0, data: result, msg: '试运行成功' });

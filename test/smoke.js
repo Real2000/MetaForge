@@ -7886,6 +7886,52 @@ print('PY_OK')
       assert.ok(/offline-install\.sh/.test(md), '应说明离线安装脚本用法');
       assert.ok(/AGENT_DB_READONLY/.test(md), '应说明读写分离可选启用');
     });
+
+    // ---------------- U2-8 / N8 开源运营 ----------------
+    await t('U2-8/N8: README 已脱敏（无真实内网/公网端点）', () => {
+      const md = fs.readFileSync(path.join(__dirname, '..', 'README.md'), 'utf8');
+      assert.ok(!/117\.173\.129\.98|61\.188\.36\.255|sagalcc\.cn|10\.20\.128\.28/.test(md), 'README 不应含真实内网/公网端点');
+    });
+
+    await t('U2-8/N8: 存在 CONTRIBUTING.md 与 SECURITY.md', () => {
+      const c = path.join(__dirname, '..', 'CONTRIBUTING.md');
+      const s = path.join(__dirname, '..', 'SECURITY.md');
+      assert.ok(fs.existsSync(c), 'CONTRIBUTING.md 应存在');
+      assert.ok(fs.existsSync(s), 'SECURITY.md 应存在');
+      assert.ok(/npm test/.test(fs.readFileSync(c, 'utf8')), '贡献指南应要求 npm test 全绿');
+      assert.ok(/漏洞|vulnerability/i.test(fs.readFileSync(s, 'utf8')), '安全政策应说明漏洞披露');
+    });
+
+    await t('U2-8/N8: GitHub Actions CI 工作流就位', () => {
+      const y = path.join(__dirname, '..', '.github', 'workflows', 'ci.yml');
+      assert.ok(fs.existsSync(y), '.github/workflows/ci.yml 应存在');
+      const s = fs.readFileSync(y, 'utf8');
+      assert.ok(/npm ci/.test(s), 'CI 应执行 npm ci');
+      assert.ok(/npm test/.test(s), 'CI 应执行 npm test');
+      assert.ok(/pull_request/.test(s), 'CI 应在 PR 时触发');
+    });
+
+    await t('U2-8/N8: docs/PLUGIN_SDK.md 插件 SDK 文档就位', () => {
+      const p = path.join(__dirname, '..', 'docs', 'PLUGIN_SDK.md');
+      assert.ok(fs.existsSync(p), 'docs/PLUGIN_SDK.md 应存在');
+      const md = fs.readFileSync(p, 'utf8');
+      assert.ok(/PLUGIN_ARGS/.test(md), '应说明插件入参注入契约 globalThis.PLUGIN_ARGS');
+      assert.ok(/\/api\/plugins\/install/.test(md), '应说明插件安装接口');
+    });
+
+    await t('U2-8/U2-3: 插件工具入参注入沙箱并回传 stdout', async () => {
+      const entry = 'const a=globalThis.PLUGIN_ARGS||{};console.log("echo:"+(a.city||"none"));';
+      const info = db.prepare("INSERT INTO plugins (plugin_id,name,type,entry,icon,description,version,author,runtime,settings_schema,enabled,installed_by,installed_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,1,?,datetime('now'),datetime('now'))")
+        .run('n8_echo_' + Date.now(), 'N8 Echo', 'tool', entry, 'x', '', '1.0.0', 'test', 'node', '{}', 'test');
+      const { loadPlugin, unloadPlugin } = require('../src-server/lib/plugin-loader');
+      const { TOOL_DEFS } = require('../src-server/lib/tools');
+      const p = db.prepare('SELECT * FROM plugins WHERE id=?').get(info.lastInsertRowid);
+      assert.ok(loadPlugin(p), '插件应加载成功并注册到 TOOL_DEFS');
+      const out = String(await TOOL_DEFS[p.plugin_id].run({ city: '上海' }, {}));
+      assert.ok(/echo:上海/.test(out), '插件应读到注入的入参，实际：' + out);
+      unloadPlugin(p.plugin_id);
+      db.prepare('DELETE FROM plugins WHERE id=?').run(p.id);
+    });
   }
 
   // 收尾：关闭库并清理临时目录

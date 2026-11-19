@@ -366,7 +366,7 @@ agent-platform/
 - **平台集成**：接入管理中 Dify 卡片已指向本机实例；已配置控制台凭据，「重新同步」执行**真同步**（console API 拉取应用清单 + 自动获取每个应用的 Service API Key），同步的应用在前台可直接对话（真实转发 Dify `/v1/chat-messages`，SSE 流式透传，支持多轮 conversation）
 - **模型链路**（2026-10-09 打通，双层）：Dify 已安装 openai_api_compatible 插件，配置了两个模型——
   - `agent-1-公司制度问答助手` → 指向本平台 `/openapi/v1`（Dify 应用调用的"模型"就是平台智能体，含知识库检索增强，演示"平台作为 OpenAI 兼容后端"）
-  - `dsv4` → 直连 TokenGateway 公网网关（`http://117.173.129.98:3002/v1`，昇腾 384 算力真实模型）
+  - `dsv4` → 直连 TokenGateway 公网网关（`http://<TokenGateway 网关地址>/v1`，昇腾 384 算力真实模型）
   - 两条链路均为真实模型输出：Dify 应用 → 平台 openapi → 平台智能体 → TG → dsv4
 - **说明**：向量库 weaviate 镜像源已改为国内代理（daocloud）；Dify 内使用模型需在其「集成 → 模型供应商」配置 API Key（可填你的 TokenGateway 网关地址）
 
@@ -376,7 +376,7 @@ agent-platform/
   - `GET /openapi/v1/models` 列出全部已发布智能体
   - `POST /openapi/v1/chat/completions` 对话（`model` 填 `agent-{id}-{名称}`，支持 `stream` 流式与阻塞两种模式；支持 CORS，Bearer 鉴权；输入经敏感词检测，输出自动脱敏）
 - **分享链接**：后台「智能体管理 → 分享」开启后生成免登录链接 `/share/{token}`，支持 iframe 嵌入任意网页；对话同样经安全合规检测，独立 share_sessions 存储
-- **模型接入**：已配置「TokenGateway 自有算力网关」供应商并**设为默认**（`http://117.173.129.98:3002/v1`，密钥自 gateway.db admin-key 导入，白名单已含 dsv4）——**2026-10-09 全站真实模型已打通**：平台对话/Dify 应用/分享页/API 调用全部经 TG 网关路由到 dsv4（DeepSeek-V4，昇腾 384 算力，按 Token 计费，用量在 TG 侧落账）。智能体配置的 qwen-plus 等模型名不在默认供应商清单时自动回退到其首个可用模型（llm.js）。glm-5.1 / deepseek-r1 渠道在 TG 服务器暂禁用，启用后在「模型接入 → 同步模型」补充即可。
+- **模型接入**：已配置「TokenGateway 自有算力网关」供应商并**设为默认**（`http://<TokenGateway 网关地址>/v1`，密钥自 gateway.db admin-key 导入，白名单已含 dsv4）——**2026-10-09 全站真实模型已打通**：平台对话/Dify 应用/分享页/API 调用全部经 TG 网关路由到 dsv4（DeepSeek-V4，昇腾 384 算力，按 Token 计费，用量在 TG 侧落账）。智能体配置的 qwen-plus 等模型名不在默认供应商清单时自动回退到其首个可用模型（llm.js）。glm-5.1 / deepseek-r1 渠道在 TG 服务器暂禁用，启用后在「模型接入 → 同步模型」补充即可。
 
 > AI生成
 ## 外部平台：扣子（Coze）真纳管（2026-10-10 上线）
@@ -607,16 +607,16 @@ agent-platform/
 
 1. **stock_quote 网络层根治（UND_ERR_SOCKET）**：全局 fetch（undici）连接池复用 stale socket 对短 keep-alive 行情 CDN 产生竞态（独立进程直调正常、服务进程偶发失败）。改为 `node:https + agent:false`（每次全新连接）+ 腾讯 qt.gtimg.cn（GBK 解码）双数据源；验收中主源失败自动切备用源成功——双源机制实战验证通过。
 2. **提示词反模式修复 ×4**：早报主播（搜索 ≤2 轮 + 播报硬性）；文档排版（简单文档直接生成不确认）；全能助手/诗意海报（绘画请求必须直接调 image_gen、严禁只给文字/先搜索参考）。
-3. **外部依赖诊断（非平台代码问题）**：image_gen 全部供应商失败——紫光云 404（未配置生图模型却被尝试，探索式设计，无碍）；TG 网关（sagalcc.cn:3002）存活（/v1/models 正常、QwenImage/QwenImage-Ascend 均已注册），但直连生图接口 15s 超时 → **昇腾算力生图通道当前不可用**（connect timeout/分区不匹配）。需在 TokenGateway/昇腾侧恢复，平台链路本身正常，恢复后即通。
+3. **外部依赖诊断（非平台代码问题）**：image_gen 全部供应商失败——紫光云 404（未配置生图模型却被尝试，探索式设计，无碍）；TG 网关（<TokenGateway 网关地址>）存活（/v1/models 正常、QwenImage/QwenImage-Ascend 均已注册），但直连生图接口 15s 超时 → **昇腾算力生图通道当前不可用**（connect timeout/分区不匹配）。需在 TokenGateway/昇腾侧恢复，平台链路本身正常，恢复后即通。
 4. **运维改进**：重启后必须核对 `lsof -i :3210` 监听进程与源文件 mtime（本次发现并消除"旧进程响应 health 造成新代码未生效"的隐患）；后台 registry 路径 `.temp/background-registry-20261022-132253-4869-15457.tsv`。
 
 > AI生成
 
-> **🔧 生图故障根因诊断（2026-10-22 用户侧 TokenGateway）**：三层排查——① Agent 平台 image_gen 链路正常（工具正确调用、错误透传清晰）；② 昇腾生图服务 **61.188.36.255:52801 正常**（TCP 连通 + POST /v1/images/generations 快速返回 HTTP 400，服务存活）；③ **故障在 TokenGateway 网关渠道路由**：QwenImage-Ascend → connect timeout（指向不通渠道）、QwenImage → 分区不匹配（渠道分区/端点配置与昇腾接口不符）。对照本地部署快照（TokenGateway_20261009/data/gateway.db）：QwenImage 正确配置应为 channel type=image、base_url=http://61.188.36.255:52801、upstream_name=./Qwen-Image-2512、per_image 计费。**修复入口**：昇腾 384 平台（127.0.0.1:3001/384）模型管理 → 渠道配置核对/修正 QwenImage 端点并连通测试；平台「模型接入」页添加生图模型会校验失败属正常（该页只管理对话 chat/completions 模型，生图不经过模型清单）。
+> **🔧 生图故障根因诊断（2026-10-22 用户侧 TokenGateway）**：三层排查——① Agent 平台 image_gen 链路正常（工具正确调用、错误透传清晰）；② 昇腾生图服务 **<昇腾生图服务地址> 正常**（TCP 连通 + POST /v1/images/generations 快速返回 HTTP 400，服务存活）；③ **故障在 TokenGateway 网关渠道路由**：QwenImage-Ascend → connect timeout（指向不通渠道）、QwenImage → 分区不匹配（渠道分区/端点配置与昇腾接口不符）。对照本地部署快照（TokenGateway_20261009/data/gateway.db）：QwenImage 正确配置应为 channel type=image、base_url=http://<昇腾生图服务地址>、upstream_name=./Qwen-Image-2512、per_image 计费。**修复入口**：昇腾 384 平台（127.0.0.1:3001/384）模型管理 → 渠道配置核对/修正 QwenImage 端点并连通测试；平台「模型接入」页添加生图模型会校验失败属正常（该页只管理对话 chat/completions 模型，生图不经过模型清单）。
 
 > AI生成
 
-> **✅ 生图故障解决（2026-10-22 晚，配合用户 384 平台核查）**：决定性诊断——网关直调 `model=QwenImage-Ascend` **0.01 秒成功返回真实图片**，而 `model=QwenImage` 在网关路由到 9 条内网（10.20.128.28:180xx）不可达渠道（connect timeout）+ 分区不匹配（384 平台内网连通测试 9/9 通，但网关从公网访问内网地址必然超时）。修复：**平台 skills.js 生图模型候选改为 `['QwenImage-Ascend', 'QwenImage']` 优先 Ascend 名称**（网关实测该名称路由命中可达渠道）；实测诗意海报工厂端到端出图成功（模型 QwenImage-Ascend，720x1280，图片落盘可访问）。用户侧根治建议（可选）：384 平台把 QwenImage-Ascend 渠道 base_url 改为公网可达地址（61.188.36.255:52801）或让网关可达内网。
+> **✅ 生图故障解决（2026-10-22 晚，配合用户 384 平台核查）**：决定性诊断——网关直调 `model=QwenImage-Ascend` **0.01 秒成功返回真实图片**，而 `model=QwenImage` 在网关路由到 9 条内网（<内网渠道地址>）不可达渠道（connect timeout）+ 分区不匹配（384 平台内网连通测试 9/9 通，但网关从公网访问内网地址必然超时）。修复：**平台 skills.js 生图模型候选改为 `['QwenImage-Ascend', 'QwenImage']` 优先 Ascend 名称**（网关实测该名称路由命中可达渠道）；实测诗意海报工厂端到端出图成功（模型 QwenImage-Ascend，720x1280，图片落盘可访问）。用户侧根治建议（可选）：384 平台把 QwenImage-Ascend 渠道 base_url 改为公网可达地址（<昇腾生图服务地址>）或让网关可达内网。
 
 > AI生成
 

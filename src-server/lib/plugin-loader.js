@@ -66,7 +66,7 @@ function loadPlugin(pluginOrId) {
           const result = await runIsolated({
             code: p.entry,
             args,
-            timeout: 30000,
+            timeoutMs: 30000,
             runtime: p.runtime || 'node',
           });
           return String(result.stdout || result.output || '插件执行完成，无返回');

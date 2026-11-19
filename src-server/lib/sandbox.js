@@ -69,13 +69,15 @@ if (typeof process !== 'undefined') {
 }
 
 /**
- * 隔离执行 JS：runIsolated({ code, timeoutMs, memMb, netAllow, owner, agentId, sessionId })
+ * 隔离执行 JS：runIsolated({ code, args, timeoutMs, memMb, netAllow, owner, agentId, sessionId })
+ * args 若提供，将以 JSON 注入子进程全局 globalThis.PLUGIN_ARGS（供插件工具读取调用入参）
  * 返回 { status, stdout, stderr, durationMs, artifacts, runId }；永不 reject。
  */
 async function runIsolated(opts) {
   const {
     code = '', timeoutMs = DEFAULT_TIMEOUT_MS, memMb = DEFAULT_MEM_MB,
     netAllow = DEFAULT_NET_ALLOW, owner = '', agentId = null, sessionId = null,
+    args = undefined,
   } = opts || {};
   if (!String(code).trim()) return { status: 'denied', stderr: '代码为空', stdout: '', artifacts: [] };
 
@@ -91,7 +93,10 @@ async function runIsolated(opts) {
   const scriptFile = path.join(workDir, 'main.js');
   let killed = false;
   try {
-    fs.writeFileSync(scriptFile, buildPrelude(netAllow) + '\n' + code, 'utf8');
+    // 入参注入：仅当显式传入 args 时（插件工具），以全局常量方式提供给被隔离代码；
+    // 其他调用方不传 args → 行为与既有一致（零回归）。
+    const argPrelude = args === undefined ? '' : 'globalThis.PLUGIN_ARGS = ' + JSON.stringify(args) + ';\n';
+    fs.writeFileSync(scriptFile, buildPrelude(netAllow) + '\n' + argPrelude + code, 'utf8');
   } catch (e) {
     db.prepare('UPDATE sandbox_runs SET status=?, stderr_excerpt=?, created_at=? WHERE id=?').run('failed', '写入脚本失败: ' + e.message, now(), runId);
     return { status: 'failed', stderr: '写入脚本失败: ' + e.message, stdout: '', artifacts: [], runId };
