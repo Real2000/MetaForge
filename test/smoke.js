@@ -7721,6 +7721,73 @@ print('PY_OK')
       const wk = eco.apps.find(a => a.name === 'agent-queue-worker');
       assert.strictEqual(wk.exec_mode, 'fork', 'worker 应为 fork 模式');
     });
+
+    // ---------------- U2-1 / N7-P3 读写分离 DAL 与 litestream ----------------
+    await t('U2-1/N7-P3: 未配置 AGENT_DB_READONLY 时只读连接回退主库（行为等同现状）', () => {
+      const orig = process.env.AGENT_DB_READONLY;
+      delete process.env.AGENT_DB_READONLY;
+      try {
+        const dbRead = require(path.join(__dirname, '..', 'src-server', 'lib', 'db-read'));
+        assert.strictEqual(dbRead.hasReplica(), false, '未配置时 hasReplica 应为 false');
+        assert.strictEqual(dbRead.getReadDb(db), db, '未配置副本时 getReadDb 应返回主库连接');
+        assert.strictEqual(dbRead.status().mode, 'main-fallback', '状态应为回退主库');
+      } finally { if (orig !== undefined) process.env.AGENT_DB_READONLY = orig; }
+    });
+
+    await t('U2-1/N7-P3: 配置副本后读写分离生效（读走副本 / 副本只读拒写）', async () => {
+      const Database = require('better-sqlite3');
+      const replicaPath = path.join(process.env.AGENT_DATA_DIR, 'platform-replica.db');
+      // 用主库做一致性快照生成副本，并切成自包含单文件（便于 readonly 打开）
+      await db.backup(replicaPath);
+      const r0 = new Database(replicaPath); r0.pragma('journal_mode = DELETE'); r0.close();
+      const orig = process.env.AGENT_DB_READONLY;
+      process.env.AGENT_DB_READONLY = replicaPath;
+      try {
+        const dbRead = require(path.join(__dirname, '..', 'src-server', 'lib', 'db-read'));
+        dbRead.closeReadDb(); // 路径变更后重开
+        assert.ok(dbRead.hasReplica(), '副本文件存在时 hasReplica 应为 true');
+        assert.strictEqual(dbRead.status().mode, 'replica', '状态应为只读副本模式');
+        const conn = dbRead.getReadDb(db);
+        assert.notStrictEqual(conn, db, '配置副本后读连接应指向副本而非主库');
+        assert.strictEqual(conn.prepare('SELECT 1 AS ok').get().ok, 1, '副本应可读');
+        let writeRejected = false;
+        try { conn.prepare('CREATE TABLE __probe__(id INTEGER)').run(); } catch { writeRejected = true; }
+        assert.ok(writeRejected, '只读副本连接应拒绝写入');
+      } finally {
+        require(path.join(__dirname, '..', 'src-server', 'lib', 'db-read')).closeReadDb();
+        if (orig !== undefined) process.env.AGENT_DB_READONLY = orig; else delete process.env.AGENT_DB_READONLY;
+        try { fs.rmSync(replicaPath, { force: true }); } catch { }
+      }
+    });
+
+    await t('U2-1/N7-P3: db.js 导出 dbRead 门面（未配置副本时委托主库）', () => {
+      const orig = process.env.AGENT_DB_READONLY;
+      delete process.env.AGENT_DB_READONLY;
+      try {
+        const mod = require(path.join(__dirname, '..', 'src-server', 'db'));
+        assert.ok(mod.dbRead, 'db.js 应导出 dbRead');
+        const row = mod.dbRead.prepare('SELECT 1 AS ok').get();
+        assert.strictEqual(row.ok, 1, '未配置副本时 dbRead 委托主库查询应可用');
+      } finally { if (orig !== undefined) process.env.AGENT_DB_READONLY = orig; }
+    });
+
+    await t('U2-1/N7-P3: litestream.yml 提供主库→副本同步配置', () => {
+      const ymlPath = path.join(__dirname, '..', 'deploy', 'litestream.yml');
+      assert.ok(fs.existsSync(ymlPath), 'deploy/litestream.yml 应存在');
+      const y = fs.readFileSync(ymlPath, 'utf8');
+      assert.ok(/dbs:/.test(y) && /path:.*platform\.db/.test(y), '应含主库 dbs/path 配置');
+      assert.ok(/type:\s*file/.test(y), '应含本地文件副本');
+      assert.ok(/replica\b|\/replica/.test(y), '应指向只读副本目录');
+    });
+
+    await t('U2-1/N7-P3: replica-bootstrap.sh 具备初始化与完整性校验', () => {
+      const shPath = path.join(__dirname, '..', 'scripts', 'replica-bootstrap.sh');
+      assert.ok(fs.existsSync(shPath), 'scripts/replica-bootstrap.sh 应存在');
+      const sh = fs.readFileSync(shPath, 'utf8');
+      assert.ok(/\.backup|backup\(/.test(sh), '应使用一致性快照生成副本');
+      assert.ok(/integrity_check/.test(sh), '应对副本做完整性校验');
+      assert.ok(/AGENT_DB_READONLY/.test(sh), '应提示通过 AGENT_DB_READONLY 启用读写分离');
+    });
   }
 
   // 收尾：关闭库并清理临时目录

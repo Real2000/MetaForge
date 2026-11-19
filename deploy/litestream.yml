@@ -1,0 +1,36 @@
+# U2-1 / N7-P3 读写分离 —— litestream 持续同步（主库 → 只读副本 / 对象存储）
+#
+# 用途：把主库 platform.db 的 WAL 增量实时同步到本地只读副本或对象存储，
+#       配合 AGENT_DB_READONLY 指向本地副本，实现「读走副本、写走主库」的读写分离。
+#
+# 使用：
+#   1) 替换下方 path / replica 路径为实际部署路径（或改用环境变量）；
+#   2) 启动：litestream replicate -config deploy/litestream.yml
+#   3) 首次初始化本地副本：bash scripts/replica-bootstrap.sh
+#   4) 应用侧设置：export AGENT_DB_READONLY=/var/lib/agent-platform/replica/platform.db
+#
+# 注意：
+#   - S3/OSS 凭证请经环境变量注入（勿写死在仓库）：LITESTREAM_ACCESS_KEY_ID / LITESTREAM_SECRET_ACCESS_KEY；
+#   - 读写分离存在秒级同步延迟，「写后立即读」的强一致场景必须走主库，切勿读副本。
+
+dbs:
+  # ---------- 主库（被同步源） ----------
+  - path: /var/lib/agent-platform/data/platform.db
+
+    replicas:
+      # ---------- 本地只读副本（供 AGENT_DB_READONLY 使用） ----------
+      - type: file
+        path: /var/lib/agent-platform/replica
+        retention: 168h
+        sync-interval: 10s
+
+      # ---------- 对象存储副本（异地容灾，可选；不需要时可整段删除） ----------
+      - type: s3
+        bucket: agent-platform-backup
+        path: agent-platform/platform.db
+        region: cn-north-1
+        endpoint: https://oss-cn-north-1.aliyuncs.com   # 非 AWS 对象存储时填写，AWS 可删除此行
+        access-key-id: ${LITESTREAM_ACCESS_KEY_ID}
+        secret-access-key: ${LITESTREAM_SECRET_ACCESS_KEY}
+        retention: 720h
+        sync-interval: 10s

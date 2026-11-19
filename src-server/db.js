@@ -1571,7 +1571,16 @@ function deleteCheckpoint(sessionId) {
   db.prepare('DELETE FROM checkpoints WHERE session_id=?').run(sessionId);
 }
 
-module.exports = { db, hashPwd, hashPwdAsync, verifyPwd, now, daysAgo, tableEntities, tableEntityRelations, upsertCheckpoint, getCheckpoint, deleteCheckpoint };
+// U2-1 / N7-P3 读写分离：只读连接门面。未配置 AGENT_DB_READONLY（或副本缺失）时委托主库，行为等同现状。
+// 用法：const { dbRead } = require('./db'); dbRead.prepare('SELECT ...').all()  —— 仅用于允许轻微延迟的只读查询。
+const dbRead = new Proxy({}, {
+  get(_t, prop) {
+    const target = require('./lib/db-read').getReadDb(db);
+    const v = target[prop];
+    return typeof v === 'function' ? v.bind(target) : v;
+  },
+});
+module.exports = { db, dbRead, hashPwd, hashPwdAsync, verifyPwd, now, daysAgo, tableEntities, tableEntityRelations, upsertCheckpoint, getCheckpoint, deleteCheckpoint };
 
 // ---------- P1-4 修复 2026-11-09：ENCRYPTION_KEY 自动初始化（secrets 表建表后幂等注入） ----------
 // 若 secrets 表中尚无 ENCRYPTION_KEY，自动生成 32 字节（64 hex）随机密钥写入。
