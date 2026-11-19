@@ -7022,6 +7022,91 @@ print('PY_OK')
     try { deleteChannel(chId); } catch { }
   }
 
+  console.log('【U0-1③ / N4】P3 素材上传 + 安全模式 AES（解密回环 / 安全模式整链路 / 素材接口）');
+  {
+    const crypto = require('crypto');
+    const { db } = require('../src-server/db');
+    const { upsertChannel, deleteChannel } = require('../src-server/lib/channel');
+    const mp = require('../src-server/lib/im-wechat-mp');
+
+    // 43 位 EncodingAESKey → base64 补 '=' 得 32 字节
+    const aesKey = crypto.randomBytes(32).toString('base64').slice(0, 43);
+
+    // 测试用加密（复刻微信安全模式：random16 + msgLen4(BE) + msg + appid，PKCS7 补齐到 32 边界）
+    function wechatEncrypt(msg, appid) {
+      const key = Buffer.from(aesKey + '=', 'base64');
+      const iv = key.slice(0, 16);
+      const msgBuf = Buffer.from(msg, 'utf8');
+      const lenBuf = Buffer.alloc(4); lenBuf.writeUInt32BE(msgBuf.length, 0);
+      let buf = Buffer.concat([crypto.randomBytes(16), lenBuf, msgBuf, Buffer.from(appid, 'utf8')]);
+      const pad = 32 - (buf.length % 32);
+      buf = Buffer.concat([buf, Buffer.alloc(pad, pad)]);
+      const cipher = crypto.createCipheriv('aes-256-cbc', key, iv);
+      cipher.setAutoPadding(false);
+      return Buffer.concat([cipher.update(buf), cipher.final()]).toString('base64');
+    }
+
+    await t('U0-1③/N4-P3: decryptMessage 解密回环（还原 msg + appid）', () => {
+      const enc = wechatEncrypt('你好，安全模式', 'wxappid001');
+      const r = mp.decryptMessage(aesKey, enc);
+      assert.strictEqual(r.msg, '你好，安全模式');
+      assert.strictEqual(r.appid, 'wxappid001');
+    });
+
+    // 安全模式渠道
+    const modeCh = upsertChannel({ name: '测试公众号-安全模式', type: 'wechat-mp', config: { appId: 'wx-mode', appSecret: '', token: 'mode-token', encodingAESKey: aesKey } });
+
+    await t('U0-1③/N4-P3: handleWechatMpEvent 安全模式整链路（msg_signature 验签 + AES 解密 + 归一化）', () => {
+      const inner = `<xml><ToUserName><![CDATA[gh_mode]]></ToUserName><FromUserName><![CDATA[openid_mode]]></FromUserName><CreateTime>1700000003</CreateTime><MsgType><![CDATA[text]]></MsgType><Content><![CDATA[加密来信]]></Content><MsgId>mode_1</MsgId></xml>`;
+      const enc = wechatEncrypt(inner, 'wx-mode');
+      const ts = '1700000003', nonce = 'nsec';
+      const sig = mp.computeSignature('mode-token', ts, nonce, enc);
+      const body = `<xml><Encrypt><![CDATA[${enc}]]></Encrypt></xml>`;
+      const r = mp.handleWechatMpEvent(modeCh.id, { msg_signature: sig, timestamp: ts, nonce }, body);
+      assert.strictEqual(r.message.channel, 'wechat-mp');
+      assert.strictEqual(r.message.text, '加密来信');
+      assert.strictEqual(r.reply.toUser, 'openid_mode');
+    });
+
+    await t('U0-1③/N4-P3: 安全模式错误 msg_signature → 拒绝', () => {
+      const inner = `<xml><FromUserName><![CDATA[o]]></FromUserName><MsgType><![CDATA[text]]></MsgType><Content><![CDATA[x]]></Content></xml>`;
+      const enc = wechatEncrypt(inner, 'wx-mode');
+      const body = `<xml><Encrypt><![CDATA[${enc}]]></Encrypt></xml>`;
+      const r = mp.handleWechatMpEvent(modeCh.id, { msg_signature: 'wrong', timestamp: '1', nonce: '2' }, body);
+      assert.ok(r.error, '错误 msg_signature 应拒绝');
+    });
+
+    await t('U0-1③/N4-P3: uploadMedia 上传成功返回 media_id（stub fetch）', async () => {
+      const upCh = upsertChannel({ name: '测试公众号-素材', type: 'wechat-mp', config: { appId: 'wx-up', appSecret: 'upsec', token: 't' } });
+      const realFetch = global.fetch;
+      global.fetch = async (url) => {
+        if (String(url).includes('/cgi-bin/token')) return { json: async () => ({ access_token: 'UPTK', expires_in: 7200 }) };
+        if (String(url).includes('/cgi-bin/media/upload')) return { json: async () => ({ media_id: 'MID_1', expires_in: 259200 }) };
+        return { json: async () => ({}) };
+      };
+      try {
+        const r = await mp.uploadMedia(upCh.id, 'image', Buffer.from('fake-image-bytes'), 'a.png');
+        assert.ok(r.ok && r.mediaId === 'MID_1', '应返回 media_id');
+        assert.strictEqual(r.expiresIn, 259200);
+      } finally { global.fetch = realFetch; try { deleteChannel(upCh.id); } catch { } }
+    });
+
+    await t('U0-1③/N4-P3: uploadMedia 未配置凭证 → {ok:false, mock}（不请求）', async () => {
+      const noCredCh = upsertChannel({ name: '测试公众号-无凭证', type: 'wechat-mp', config: { appId: '', appSecret: '', token: 't' } });
+      const realFetch = global.fetch;
+      let hits = 0;
+      global.fetch = async () => { hits++; return { json: async () => ({}) }; };
+      try {
+        const r = await mp.uploadMedia(noCredCh.id, 'image', Buffer.from('x'), 'a.png');
+        assert.strictEqual(r.ok, false);
+        assert.ok(r.mock, '应标注 mock');
+        assert.strictEqual(hits, 0, '未配置凭证不应发起网络请求');
+      } finally { global.fetch = realFetch; try { deleteChannel(noCredCh.id); } catch { } }
+    });
+
+    try { deleteChannel(modeCh.id); } catch { }
+  }
+
   // 收尾：关闭库并清理临时目录
   try { db.close(); } catch { }
   fs.rmSync(process.env.AGENT_DATA_DIR, { recursive: true, force: true });
