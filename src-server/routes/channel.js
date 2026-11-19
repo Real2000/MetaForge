@@ -58,6 +58,16 @@ router.post('/event/:id', xmlParser, async (req, res) => {
     const msg = result.message;
     const audit = auditInbound(msg);
     const verdict = inbound(msg);
+    // N6 / U2-4：路由命中 → 异步派发端侧远控（不阻塞被动回复 5s 窗口）。
+    // 先回包/回 XML，再在 setImmediate 中执行解析→身份反查→设备路由→入队(带 channel_msg_id)。
+    if (verdict.ok) {
+      const dispatch = require('../lib/remote-dispatch');
+      const _msg = msg, _auditId = audit.id, _chId = ch.id, _bind = verdict.bind, _text = verdict.text;
+      setImmediate(() => {
+        dispatch.handleInbound({ msg: _msg, text: _text, auditId: _auditId, channelId: _chId, bind: _bind })
+          .catch(e => console.error('[remote-dispatch] 失败：', e.message));
+      });
+    }
     // 公众号：被动回复 XML（≤5s 硬超时，微信最多重试 3 次）
     // 双通道约定：路由命中 → 立即回占位（长耗时任务不阻塞 5s 窗口）；
     //            真正的结果由业务执行方经 pushAsyncResult()（客服接口，48h 窗口）异步回推。

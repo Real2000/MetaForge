@@ -7362,6 +7362,188 @@ print('PY_OK')
     });
   }
 
+  console.log('【U2-4 / N6】端侧网关微信远控（受限远控路由）');
+  {
+    const { db, now } = require('../src-server/db');
+    const rd = require('../src-server/lib/remote-dispatch');
+    const { upsertChannel, upsertUserBinding, auditInbound } = require('../src-server/lib/channel');
+    const channelMod = require('../src-server/lib/channel');
+
+    // 造渠道（feishu）与绑定关系
+    const ch = upsertChannel({ name: 'N6测试渠道', type: 'feishu', config: { appId: 'cli_n6', appSecret: '' } });
+    const chId = ch.id;
+
+    function mkDevice(username, token, { name = '测试机', online = true, highRisk = 0, isDefault = 1 } = {}) {
+      db.prepare('INSERT INTO localbridge_devices (username,device_token,device_name,platform,is_default,last_seen,created_at,allow_high_risk) VALUES (?,?,?,?,?,?,?,?)')
+        .run(username, token, name, 'macOS', isDefault, online ? now() : '2020-01-01T00:00:00', now(), highRisk);
+      return db.prepare('SELECT * FROM localbridge_devices WHERE device_token=?').get(token);
+    }
+
+    await t('U2-4/N6: parseRemoteCommand 常见指令 → 合法白名单 op', () => {
+      const c1 = rd.parseRemoteCommand('建文件夹 项目A');
+      assert.strictEqual(c1.ok, true); assert.strictEqual(c1.op, 'mkdir'); assert.strictEqual(c1.params.target, '项目A');
+      const c2 = rd.parseRemoteCommand('列目录 Desktop');
+      assert.strictEqual(c2.op, 'list_dir'); assert.strictEqual(c2.params.target, 'Desktop');
+      const c3 = rd.parseRemoteCommand('截图');
+      assert.strictEqual(c3.op, 'screenshot');
+      const c4 = rd.parseRemoteCommand('读文件 a.md');
+      assert.strictEqual(c4.op, 'file_read'); assert.strictEqual(c4.params.path, 'a.md');
+      const c5 = rd.parseRemoteCommand('窗口列表');
+      assert.strictEqual(c5.op, 'window_list');
+    });
+
+    await t('U2-4/N6: parseRemoteCommand 非法/越权 → 拒绝（越白名单/绝对路径/穿越）', () => {
+      const bad1 = rd.parseRemoteCommand('帮我看看桌面上有什么');
+      assert.strictEqual(bad1.ok, false); assert.ok(bad1.reply, '应回友好提示');
+      const bad2 = rd.parseRemoteCommand('读文件 /etc/passwd');
+      assert.strictEqual(bad2.ok, false); assert.ok(/不合法/.test(bad2.reply), '绝对路径应拒绝');
+      const bad3 = rd.parseRemoteCommand('列目录 ../../secrets');
+      assert.strictEqual(bad3.ok, false);
+      // 规则产物必须恒在白名单内
+      for (const r of rd.RULES) {
+        const { OPS_WHITELIST } = require('../src-server/routes/localbridge');
+        assert.ok(OPS_WHITELIST.includes(r.op), `规则 op「${r.op}」应在白名单内`);
+      }
+    });
+
+    await t('U2-4/N6: 身份反查 —— 未绑定用户被拒（不产生任务）', async () => {
+      const calls = []; const origSend = channelMod.send;
+      channelMod.send = async (to, m) => { calls.push({ to, m }); return { ok: true }; };
+      try {
+        const before = db.prepare('SELECT COUNT(*) c FROM localbridge_tasks').get().c;
+        const r = await rd.handleInbound({
+          msg: { channel: 'feishu', sender: { id: 'unbound_openid' } }, text: '建文件夹 X',
+          auditId: null, channelId: chId, bind: { channel_id: chId },
+        });
+        assert.strictEqual(r.ok, false); assert.strictEqual(r.reason, 'unbound');
+        const after = db.prepare('SELECT COUNT(*) c FROM localbridge_tasks').get().c;
+        assert.strictEqual(after, before, '未绑定用户不应入队任务');
+        assert.ok(calls.length >= 1 && /绑定/.test(calls[0].m.content), '应回绑定引导');
+      } finally { channelMod.send = origSend; }
+    });
+
+    await t('U2-4/N6: 设备路由 —— 无设备引导 / 离线引导 / 在线放行', async () => {
+      upsertUserBinding({ username: 'n6_nod', channelId: chId, channelUserId: 'openid_nod' });
+      const origSend = channelMod.send; channelMod.send = async () => ({ ok: true });
+      try {
+        // 无设备
+        const r1 = await rd.handleInbound({ msg: { channel: 'feishu', sender: { id: 'openid_nod' } }, text: '截图', auditId: null, channelId: chId, bind: { channel_id: chId } });
+        assert.strictEqual(r1.reason, 'no-device');
+      } finally { channelMod.send = origSend; }
+
+      // 离线
+      upsertUserBinding({ username: 'n6_off', channelId: chId, channelUserId: 'openid_off' });
+      mkDevice('n6_off', 'tok-n6-off-000000000000', { online: false });
+      const origSend2 = channelMod.send; channelMod.send = async () => ({ ok: true });
+      try {
+        const r2 = await rd.handleInbound({ msg: { channel: 'feishu', sender: { id: 'openid_off' } }, text: '截图', auditId: null, channelId: chId, bind: { channel_id: chId } });
+        assert.strictEqual(r2.reason, 'offline');
+      } finally { channelMod.send = origSend2; }
+    });
+
+    await t('U2-4/N6: 入队关联 —— localbridge_tasks.channel_msg_id 非空且等于审计 id', async () => {
+      upsertUserBinding({ username: 'n6_ok', channelId: chId, channelUserId: 'openid_ok' });
+      const dev = mkDevice('n6_ok', 'tok-n6-ok-000000000000', { online: true });
+      const audit = auditInbound({ channel: 'feishu', sender: { id: 'openid_ok' }, chat: { id: 'fs_c1', type: 'single' }, text: '建文件夹 A', attachments: [], ts: Date.now(), raw: {}, eventId: 'ut:n6:enq' });
+      const origSend = channelMod.send; channelMod.send = async () => ({ ok: true });
+      try {
+        const r = await rd.handleInbound({ msg: { channel: 'feishu', sender: { id: 'openid_ok' } }, text: '建文件夹 A', auditId: audit.id, channelId: chId, bind: { channel_id: chId } });
+        assert.strictEqual(r.ok, true);
+        const row = db.prepare('SELECT * FROM localbridge_tasks WHERE id=?').get(r.taskId);
+        assert.ok(row.channel_msg_id, 'channel_msg_id 应非空');
+        assert.strictEqual(row.channel_msg_id, audit.id, 'channel_msg_id 应等于审计 id');
+        assert.strictEqual(row.device_id, dev.id);
+        assert.strictEqual(row.op, 'mkdir');
+      } finally { channelMod.send = origSend; }
+    });
+
+    await t('U2-4/N6: 高危闸 —— 未开 allow_high_risk 时 file_write 被拒；开启后放行', async () => {
+      upsertUserBinding({ username: 'n6_hr', channelId: chId, channelUserId: 'openid_hr' });
+      const dev = mkDevice('n6_hr', 'tok-n6-hr-000000000000', { online: true, highRisk: 0 });
+      const origSend = channelMod.send; channelMod.send = async () => ({ ok: true });
+      try {
+        const r1 = await rd.handleInbound({ msg: { channel: 'feishu', sender: { id: 'openid_hr' } }, text: '写文件 a.txt 内容: hi', auditId: null, channelId: chId, bind: { channel_id: chId } });
+        assert.strictEqual(r1.ok, false); assert.strictEqual(r1.reason, 'high-risk-blocked');
+        // 开启后放行
+        db.prepare('UPDATE localbridge_devices SET allow_high_risk=1 WHERE id=?').run(dev.id);
+        const r2 = await rd.handleInbound({ msg: { channel: 'feishu', sender: { id: 'openid_hr' } }, text: '写文件 a.txt 内容: hi', auditId: null, channelId: chId, bind: { channel_id: chId } });
+        assert.strictEqual(r2.ok, true); assert.strictEqual(r2.op, 'file_write');
+      } finally { channelMod.send = origSend; }
+    });
+
+    await t('U2-4/N6: formatResultForChannel —— 文件类 op 结果可读化（非 JSON.stringify）', () => {
+      const a = rd.formatResultForChannel('list_dir', { ok: true, data: { items: [{ name: 'a.txt', type: 'file' }, { name: 'doc', type: 'dir' }] } });
+      assert.ok(a.content.includes('a.txt') && a.content.includes('doc'), '应列出条目名');
+      const b = rd.formatResultForChannel('mkdir', { ok: true, data: { path: 'Desktop/A', existed: false } });
+      assert.ok(b.content.includes('Desktop/A'), '应回路径');
+      const c = rd.formatResultForChannel('file_read', { ok: true, data: { content: 'hello world' } });
+      assert.ok(c.content.includes('hello world'));
+      const d = rd.formatResultForChannel('screenshot', { ok: true, data: { url: 'http://x/y.png' } });
+      assert.ok(d.content.includes('http://x/y.png'));
+      const e = rd.formatResultForChannel('notify', { ok: false, error: '设备拒绝' });
+      assert.ok(e.content.includes('设备拒绝'));
+    });
+
+    await t('U2-4/N6: 端到端(mock) —— 入站派发→入队→桥/result→渠道回传被调用且内容正确', async () => {
+      upsertUserBinding({ username: 'n6_e2e', channelId: chId, channelUserId: 'openid_e2e' });
+      const token = 'tok-n6-e2e-000000000000';
+      mkDevice('n6_e2e', token, { online: true });
+      const model = { channel: 'feishu', sender: { id: 'openid_e2e' }, chat: { id: 'fs_e2e', type: 'single' }, text: '列目录', attachments: [], ts: Date.now(), raw: {}, eventId: 'ut:n6:e2e' };
+      const audit = auditInbound(model);
+
+      const calls = []; const origSend = channelMod.send;
+      channelMod.send = async (to, m) => { calls.push({ to, m }); return { ok: true }; };
+      let server;
+      try {
+        // ① 入站派发（模拟 routes/channel.js 的 setImmediate 调用）
+        const disp = await rd.handleInbound({ msg: model, text: '列目录', auditId: audit.id, channelId: chId, bind: { channel_id: chId } });
+        assert.strictEqual(disp.ok, true);
+        const task = db.prepare('SELECT * FROM localbridge_tasks WHERE id=?').get(disp.taskId);
+        assert.strictEqual(task.status, 'pending');
+        assert.strictEqual(task.channel_msg_id, audit.id);
+
+        // ② 模拟桥 daemon POST /result 回推
+        const express = require('express');
+        const { router: lbRouter } = require('../src-server/routes/localbridge');
+        const app = express(); app.use(express.json()); app.use('/api/localbridge', lbRouter);
+        await new Promise(r => { server = app.listen(0, '127.0.0.1', r); });
+        const base = `http://127.0.0.1:${server.address().port}`;
+        calls.length = 0; // 只看回传阶段的调用
+        const resp = await fetch(base + '/api/localbridge/result', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'x-device-token': token },
+          body: JSON.stringify({ task_id: task.id, result: { ok: true, data: { items: [{ name: 'report.pdf', type: 'file' }, { name: 'images', type: 'dir' }] } } }),
+        });
+        assert.strictEqual(resp.status, 200);
+        const row = db.prepare('SELECT * FROM localbridge_tasks WHERE id=?').get(task.id);
+        assert.strictEqual(row.status, 'done', '桥回推后任务应为 done');
+        // ③ 断言回传被调用、渠道/接收人/内容正确
+        assert.ok(calls.length >= 1, '应触发渠道回传');
+        const ret = calls[calls.length - 1];
+        assert.strictEqual(ret.to.channel, 'feishu');
+        assert.deepStrictEqual(ret.to.receivers, ['openid_e2e']);
+        assert.ok(ret.m.content.includes('report.pdf') && ret.m.content.includes('images'), '回传内容应含目录条目');
+      } finally {
+        if (server) await new Promise(r => server.close(r));
+        channelMod.send = origSend;
+      }
+    });
+
+    await t('U2-4/N6: routes/channel.js 已在 verdict.ok 后 setImmediate 派发远控', () => {
+      const src = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'routes', 'channel.js'), 'utf8');
+      assert.ok(src.includes("require('../lib/remote-dispatch')"), '应引用 remote-dispatch');
+      assert.ok(/setImmediate\([\s\S]{0,200}handleInbound/.test(src), '应在 setImmediate 中调用 handleInbound');
+    });
+
+    // 清理本块造的数据
+    db.prepare("DELETE FROM localbridge_tasks WHERE username LIKE 'n6_%'").run();
+    db.prepare("DELETE FROM localbridge_devices WHERE username LIKE 'n6_%'").run();
+    db.prepare("DELETE FROM user_channel_bindings WHERE channel_id=?").run(chId);
+    db.prepare("DELETE FROM channel_bound_chats WHERE channel_id=?").run(chId);
+    db.prepare('DELETE FROM channels WHERE id=?').run(chId);
+    db.prepare("DELETE FROM channel_messages WHERE event_id LIKE 'ut:n6:%'").run();
+  }
+
   // 收尾：关闭库并清理临时目录
   try { db.close(); } catch { }
   fs.rmSync(process.env.AGENT_DATA_DIR, { recursive: true, force: true });

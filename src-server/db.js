@@ -1635,6 +1635,18 @@ db.exec(`CREATE TABLE IF NOT EXISTS localbridge_tasks (
   } catch (e) { console.error('[db] U2-4 迁移失败（不阻塞）：', e.message); }
 }
 
+// ================== N6 / U2-4 端侧网关微信远控：localbridge_devices 加高危开关 ==================
+// 服务端高危 op 总闸（键鼠/clipboard_write/file_write）；与桥端开关构成双层。默认关闭。
+{
+  try {
+    const devCols = db.prepare('PRAGMA table_info(localbridge_devices)').all().map(c => c.name);
+    if (!devCols.includes('allow_high_risk')) {
+      db.exec('ALTER TABLE localbridge_devices ADD COLUMN allow_high_risk INTEGER DEFAULT 0');
+      console.log('[db] localbridge_devices 表已迁移：新增 allow_high_risk 字段（N6/U2-4）');
+    }
+  } catch (e) { console.error('[db] N6/U2-4 迁移失败（不阻塞）：', e.message); }
+}
+
 // ---------------- P1-4 分层记忆v1：agent_memories 增加 type/confidence/source/summary 字段（2026-11-11）----------------
 {
   const cols = db.prepare('PRAGMA table_info(agent_memories)').all().map(r => r.name);

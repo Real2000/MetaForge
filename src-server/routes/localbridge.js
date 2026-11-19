@@ -137,18 +137,15 @@ router.post('/result', deviceAuth, async (req, res) => {
   if (!t || t.device_id !== req.device.id) return res.status(404).json({ code: 404, msg: '任务不存在' });
   db.prepare(`UPDATE localbridge_tasks SET status=?, result=?, updated_at=? WHERE id=?`)
     .run(result && result.ok ? 'done' : 'failed', JSON.stringify(result || {}).slice(0, 8000), now(), t.id);
-  // U2-4 Phase 2：结果回传渠道。如果该任务关联了 channel_msg_id，通过 channel.js send 回推结果
+  // U2-4 Phase 2 / N6：结果回传渠道。如果该任务关联了 channel_msg_id，通过 channel.js send 回推结果
   if (t.channel_msg_id) {
     try {
       const { send } = require('../lib/channel');
+      const { formatResultForChannel } = require('../lib/remote-dispatch'); // 结果可读化（文件类 op 转人类可读）
       const msgRow = db.prepare('SELECT * FROM channel_messages WHERE id=?').get(t.channel_msg_id);
       if (msgRow && msgRow.channel && msgRow.channel !== 'inbox') {
-        const opLabel = t.op === 'list_dir' ? '文件列表' : t.op === 'file_read' ? '文件内容' : t.op;
-        const summary = result && result.ok ? `✅「${opLabel}」执行成功` : `❌「${opLabel}」执行失败`;
-        await send({ channel: msgRow.channel, receivers: [msgRow.sender_id] }, {
-          title: summary,
-          content: `${summary}\n\n${result && result.data ? JSON.stringify(result.data, null, 2).slice(0, 3000) : result && result.result ? String(result.result).slice(0, 3000) : '（无输出）'}`,
-        });
+        const out = formatResultForChannel(t.op, result || {});
+        await send({ channel: msgRow.channel, receivers: [msgRow.sender_id] }, { title: out.title, content: out.content });
       }
     } catch (e) {
       console.error('[localbridge] 渠道回传失败：', e.message);
@@ -172,6 +169,17 @@ router.post('/devices/:id/default', auth, (req, res) => {
   db.prepare('UPDATE localbridge_devices SET is_default=0 WHERE username=?').run(req.user.username);
   db.prepare('UPDATE localbridge_devices SET is_default=1 WHERE id=?').run(d.id);
   res.json({ code: 0 });
+});
+
+// N6 / U2-4：高危远控开关（键鼠/clipboard_write/file_write）——设备级总闸，默认关闭
+router.post('/devices/:id/high-risk', auth, (req, res) => {
+  const d = db.prepare('SELECT * FROM localbridge_devices WHERE id=? AND username=?').get(Number(req.params.id), req.user.username);
+  if (!d) return res.status(404).json({ code: 404, msg: '设备不存在' });
+  const enable = req.body && (req.body.enable === true || req.body.enable === 1 || req.body.enable === '1');
+  db.prepare('UPDATE localbridge_devices SET allow_high_risk=? WHERE id=?').run(enable ? 1 : 0, d.id);
+  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
+    .run(req.user.username, enable ? '开启高危远控' : '关闭高危远控', `设备${d.device_name}#${d.id}`, req.ip, now());
+  res.json({ code: 0, data: { id: d.id, allow_high_risk: enable ? 1 : 0 } });
 });
 
 router.delete('/devices/:id', auth, (req, res) => {
