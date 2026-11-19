@@ -336,9 +336,9 @@ async function retrieve(query, kbId = null, topN = 5, threshold = 0.01, opts = {
       const annParsed = annRows.map(r => parseVec(r.embedding));
       if (annParsed.some(p => p.engine === 'B3')) {
         const q = await bgeEmbed([query]);
-        if (q) return rerankAndSlice(query, finish(annRows, annBm25, annParsed.map(p => p.v), new Float32Array(q[0]), 'B3', RERANK_CANDIDATES, threshold, vecWeight, qTerms), topN, opts);
+        if (q) return rerankAndSlice(query, finish(annRows, annBm25, annParsed.map(p => p.v), new Float32Array(q[0]), 'B3', RERANK_CANDIDATES, threshold, vecWeight, qTerms), topN, opts, kbId);
       }
-      return rerankAndSlice(query, finish(annRows, annBm25, annParsed.map(p => p.v), embed(query), 'H', RERANK_CANDIDATES, threshold, vecWeight, qTerms), topN, opts);
+      return rerankAndSlice(query, finish(annRows, annBm25, annParsed.map(p => p.v), embed(query), 'H', RERANK_CANDIDATES, threshold, vecWeight, qTerms), topN, opts, kbId);
     }
   }
 
@@ -349,7 +349,7 @@ async function retrieve(query, kbId = null, topN = 5, threshold = 0.01, opts = {
   if (parsed.every(p => p.engine === 'B3')) {
     // 全部已有 bge 缓存，查询向量走网关（失败则整体降级本地重算）
     const q = await bgeEmbed([query]);
-    if (q) return rerankAndSlice(query, finish(rows, bm25, parsed.map(p => p.v), new Float32Array(q[0]), engine, RERANK_CANDIDATES, threshold, vecWeight, qTerms), topN, opts);
+    if (q) return rerankAndSlice(query, finish(rows, bm25, parsed.map(p => p.v), new Float32Array(q[0]), engine, RERANK_CANDIDATES, threshold, vecWeight, qTerms), topN, opts, kbId);
   }
   const missIdx = rows.map((_, i) => i).filter(i => parsed[i].engine !== 'B3');
   if (missIdx.length) {
@@ -360,7 +360,7 @@ async function retrieve(query, kbId = null, topN = 5, threshold = 0.01, opts = {
         try { upd.run('B3:' + JSON.stringify(got[k + 1]), rows[idx].id); } catch { }
         parsed[idx] = { v: new Float32Array(got[k + 1]), engine: 'B3' };
       });
-      return rerankAndSlice(query, finish(rows, bm25, parsed.map(p => p.v), new Float32Array(got[0]), engine, RERANK_CANDIDATES, threshold, vecWeight, qTerms), topN, opts);
+      return rerankAndSlice(query, finish(rows, bm25, parsed.map(p => p.v), new Float32Array(got[0]), engine, RERANK_CANDIDATES, threshold, vecWeight, qTerms), topN, opts, kbId);
     }
   }
 
@@ -373,11 +373,11 @@ async function retrieve(query, kbId = null, topN = 5, threshold = 0.01, opts = {
     try { upd.run('H:' + JSON.stringify([...v]), r.id); } catch { }
     return v;
   });
-  return rerankAndSlice(query, finish(rows, bm25, vecs, qVec, engine, RERANK_CANDIDATES, threshold, vecWeight, qTerms), topN, opts);
+  return rerankAndSlice(query, finish(rows, bm25, vecs, qVec, engine, RERANK_CANDIDATES, threshold, vecWeight, qTerms), topN, opts, kbId);
 }
 
 /** Rerank 重排（优先）→ 如果不可用/被关闭/失败，退回 RRF 排名前 topN 条。opts.rerankEnabled=false 跳过重排，opts.rerankModel 指定模型 */
-async function rerankAndSlice(query, rrfResults, topN, opts = {}) {
+async function rerankAndSlice(query, rrfResults, topN, opts = {}, kbId = null) {
   if (!rrfResults || !rrfResults.length) return [];
   if (opts.rerankEnabled === false) return attachChapterContext(attachParentContext(rrfResults.slice(0, topN)));
   try {
