@@ -12,6 +12,15 @@ const { register, enqueue } = require('./task-queue'); // U2-1 任务队列
 
 const fireMarks = new Map(); // task_id -> last fired ts
 
+// U2-1 / N7-P1：注册 cron 任务处理器到 task-queue（模块加载即注册，供 API 进程与独立 worker 进程共用）。
+// 原先注册在 startScheduler() 内且用 global 守卫；抽到顶层后，worker.js 只需 require 本模块即可消费 'cron-task'，
+// 无需启动 30s 扫描 tick。register 对同名重复注册会抛错，模块缓存保证只执行一次。
+register('cron-task', async (payload) => {
+  const task = db.prepare('SELECT * FROM tasks WHERE id=?').get(payload.taskId);
+  if (!task) throw new Error('任务不存在');
+  return await runTask(task);
+});
+
 /** P5.34（审查 F8）：自动停用任务并通知归属者（配额耗尽/主体失效等场景共用）
  *  P5.34b（Y3）：outputMsg 只传原因短语（不再自带「任务已自动停用：」前缀），通知模板统一拼装 */
 function disableTask(task, reason, title) {
@@ -86,15 +95,8 @@ async function runTask(task) {
 }
 
 function startScheduler() {
-  // U2-1：注册 cron 任务处理器到 task-queue（后续可切换为 Redis 后端）
-  if (!global.__cronTaskRegistered) {
-    register('cron-task', async (payload) => {
-      const task = db.prepare('SELECT * FROM tasks WHERE id=?').get(payload.taskId);
-      if (!task) throw new Error('任务不存在');
-      return await runTask(task);
-    });
-    global.__cronTaskRegistered = true;
-  }
+  // U2-1：'cron-task' 已在模块顶层注册（见上），此处仅保留守卫以兼容旧调用
+  if (!global.__cronTaskRegistered) global.__cronTaskRegistered = true;
   const tick = async () => {
     try {
       const tasks = db.prepare('SELECT * FROM tasks WHERE enabled=1 AND exec_type=?').all('cron');

@@ -7544,6 +7544,87 @@ print('PY_OK')
     db.prepare("DELETE FROM channel_messages WHERE event_id LIKE 'ut:n6:%'").run();
   }
 
+  console.log('【U2-1 / N7】P1 任务队列驱动抽象（memory 默认 / redis 可选 / 缺依赖回退）');
+  {
+    const { db, now } = require('../src-server/db');
+    const q = require('../src-server/lib/queue');
+    const legacy = require('../src-server/lib/task-queue');
+
+    await t('U2-1/N7-P1: 默认驱动为 memory，且注册表含 cron-task 等既有任务类型', () => {
+      const info = q.driverInfo();
+      assert.strictEqual(info.driver, 'memory', '未配置 QUEUE_DRIVER 时应为内存驱动');
+      assert.strictEqual(info.error, null, '默认不应有降级错误');
+      assert.ok(Array.isArray(info.registered), 'registered 应为数组');
+      assert.ok(info.registered.includes('cron-task'), 'scheduler 的 cron-task 应已注册');
+    });
+
+    await t('U2-1/N7-P1: 兼容转发 —— task-queue 出口与 queue/index 门面一致', () => {
+      assert.strictEqual(legacy.enqueue, q.enqueue, 'enqueue 应为同一函数');
+      assert.strictEqual(legacy.register, q.register, 'register 应为同一函数');
+      for (const k of ['register', 'enqueue', 'getJob', 'queueStats', 'cleanupHistory', 'driverInfo']) {
+        assert.strictEqual(typeof legacy[k], 'function', `task-queue.${k} 应可用`);
+      }
+    });
+
+    await t('U2-1/N7-P1: 内存驱动闭环 enqueue→执行→getJob(success)→queueStats', async () => {
+      q.register('n7_noop', async (payload) => ({ echo: payload.x }));
+      const jobId = q.enqueue('n7_noop', { x: 42 });
+      assert.ok(jobId, 'enqueue 应返回 jobId');
+      // 轮询等待进程内 setImmediate 处理完成
+      let row = null;
+      for (let i = 0; i < 50; i++) {
+        row = q.getJob(jobId);
+        if (row && row.status === 'success') break;
+        await new Promise(r => setTimeout(r, 20));
+      }
+      assert.strictEqual(row.status, 'success', '内存驱动应执行成功');
+      assert.deepStrictEqual(JSON.parse(row.result), { echo: 42 }, '结果应被持久化');
+      const stats = q.queueStats();
+      assert.ok(stats && typeof stats.success === 'number' && stats.success >= 1, 'queueStats 应统计 success');
+    });
+
+    await t('U2-1/N7-P1: enqueue 未注册任务类型 → 抛错（与旧实现一致）', () => {
+      assert.throws(() => q.enqueue('n7_not_registered', {}), /未注册的任务类型/);
+    });
+
+    await t('U2-1/N7-P1: cleanupHistory 清理超过保留期的历史任务', () => {
+      const jobId = 'n7-old-' + Date.now();
+      db.prepare(`INSERT INTO task_queue (job_id,name,payload,status,priority,max_retries,retry_count,delay_ms,created_at,scheduled_at,finished_at) VALUES (?,?,?,?,?,?,0,?,?,?,?)`)
+        .run(jobId, 'n7_noop', '{}', 'success', 0, 3, 0, now(), now(), '2020-01-01 00:00:00');
+      const before = q.getJob(jobId);
+      assert.ok(before, '过期任务应先存在');
+      q.cleanupHistory();
+      assert.strictEqual(q.getJob(jobId), undefined, '过期历史任务应被清理');
+    });
+
+    await t('U2-1/N7-P1: redis 驱动缺依赖 —— available=false 且 create 抛可读错误', () => {
+      const rd = require('../src-server/lib/queue/redis-driver');
+      assert.strictEqual(rd.available(), false, '未安装 bullmq 时 available 应为 false');
+      assert.throws(() => rd.create(new Map()), /bullmq/, 'create 应抛含 bullmq 的可读错误');
+    });
+
+    await t('U2-1/N7-P1: QUEUE_DRIVER=redis 但缺依赖 → 回退内存驱动并记录降级原因（子进程隔离验证）', () => {
+      const { execFileSync } = require('child_process');
+      const tmpDir = path.join(__dirname, '..', '.temp', 'n7-subproc-' + Date.now());
+      fs.mkdirSync(tmpDir, { recursive: true });
+      try {
+        const root = path.join(__dirname, '..');
+        const script = `process.env.AGENT_DATA_DIR=${JSON.stringify(tmpDir)};process.env.QUEUE_DRIVER='redis';const q=require(${JSON.stringify(path.join(root, 'src-server', 'lib', 'queue'))});process.stdout.write('__N7JSON__'+JSON.stringify(q.driverInfo())+'__N7JSON__');`;
+        const out = execFileSync(process.execPath, ['-e', script], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+        const m = out.match(/__N7JSON__(.*?)__N7JSON__/s);
+        assert.ok(m, '应取得子进程驱动信息');
+        const info = JSON.parse(m[1]);
+        assert.strictEqual(info.driver, 'memory(fallback)', '指定 redis 但缺依赖应回退内存驱动');
+        assert.ok(info.error && /bullmq/.test(info.error), '降级原因应含 bullmq');
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    // 清理本块造的数据
+    db.prepare("DELETE FROM task_queue WHERE name='n7_noop'").run();
+  }
+
   // 收尾：关闭库并清理临时目录
   try { db.close(); } catch { }
   fs.rmSync(process.env.AGENT_DATA_DIR, { recursive: true, force: true });

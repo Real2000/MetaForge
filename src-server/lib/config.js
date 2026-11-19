@@ -49,6 +49,9 @@ const CONFIG_DEFS = [
   { key: 'llm_timeout_ms', label: 'LLM 超时（毫秒）', group: 'llm', type: 'number', env: 'LLM_TIMEOUT_MS', default: 60000, desc: 'LLM 接口调用超时（含重试）' },
   // ---- 系统 ----
   { key: 'page_size', label: '默认分页大小', group: 'system', type: 'number', default: 20, desc: '列表页默认每页条数' },
+  // ---- 队列（N7 / U2-1） ----
+  { key: 'queue_driver', label: '任务队列驱动', group: 'system', type: 'string', env: 'QUEUE_DRIVER', default: 'memory', options: ['memory', 'redis'], desc: 'memory=进程内队列（默认，单进程）；redis=外置 BullMQ 队列（多进程/多节点横向扩展，需已装 bullmq/ioredis 并配好 redis_url）' },
+  { key: 'redis_url', label: 'Redis 连接串', group: 'system', type: 'string', env: 'REDIS_URL', default: '', desc: 'redis 驱动使用的 Redis 连接串（如 redis://127.0.0.1:6379）；留空用默认地址' },
 ];
 
 /* ---------- 运行时配置 ---------- */

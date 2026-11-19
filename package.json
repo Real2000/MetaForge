@@ -34,5 +34,9 @@
   "devDependencies": {
     "autocannon": "^9.0.0",
     "commander": "^15.1.0"
+  },
+  "optionalDependencies": {
+    "bullmq": "^5.34.0",
+    "ioredis": "^5.4.1"
   }
 }
