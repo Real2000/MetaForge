@@ -7855,6 +7855,37 @@ print('PY_OK')
       assert.deepStrictEqual(defs.sql_dialect.options, ['sqlite', 'dm', 'kingbase'], 'sql_dialect 选项应含三方言');
       assert.ok(defs.db_password && defs.db_password.sensitive === true, 'db_password 应为敏感项');
     });
+
+    // ---------------- U2-1 / N7-P5 完全离线部署包 ----------------
+    await t('U2-1/N7-P5: package-portable.sh 含全量依赖/离线缓存/litestream/license 模板', () => {
+      const p = path.join(__dirname, '..', 'scripts', 'package-portable.sh');
+      assert.ok(fs.existsSync(p), 'scripts/package-portable.sh 应存在');
+      const sh = fs.readFileSync(p, 'utf8');
+      assert.ok(/node_modules/.test(sh), '应收录 node_modules 全量');
+      assert.ok(/INCLUDE_NPM_CACHE|npm-cache/.test(sh), '应支持 npm 离线缓存');
+      assert.ok(/litestream/.test(sh), '应校验 litestream');
+      assert.ok(/license\.template\.json/.test(sh), '应生成 license 模板');
+      assert.ok(/AGENT_DATA_DIR/.test(sh), 'start.sh 应映射 AGENT_DATA_DIR（服务实际读取的变量）');
+    });
+
+    await t('U2-1/N7-P5: offline-install.sh 离线安装与自检', () => {
+      const p = path.join(__dirname, '..', 'scripts', 'offline-install.sh');
+      assert.ok(fs.existsSync(p), 'scripts/offline-install.sh 应存在');
+      const sh = fs.readFileSync(p, 'utf8');
+      assert.ok(/deploy-check\.js/.test(sh), '应调用 deploy-check 做原生模块自检');
+      assert.ok(/npm-cache/.test(sh) && /--offline/.test(sh), '应支持用离线缓存 --offline rebuild');
+      assert.ok(/litestream/.test(sh), '应检查 litestream');
+    });
+
+    await t('U2-1/N7-P5: docs/OFFLINE_DEPLOY.md 离线部署手册', () => {
+      const p = path.join(__dirname, '..', 'docs', 'OFFLINE_DEPLOY.md');
+      assert.ok(fs.existsSync(p), 'docs/OFFLINE_DEPLOY.md 应存在');
+      const md = fs.readFileSync(p, 'utf8');
+      assert.ok(/麒麟|统信/.test(md), '应覆盖麒麟/统信');
+      assert.ok(/AGENT_DATA_DIR/.test(md), '应说明数据目录环境变量');
+      assert.ok(/offline-install\.sh/.test(md), '应说明离线安装脚本用法');
+      assert.ok(/AGENT_DB_READONLY/.test(md), '应说明读写分离可选启用');
+    });
   }
 
   // 收尾：关闭库并清理临时目录
