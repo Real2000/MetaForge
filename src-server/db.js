@@ -2348,6 +2348,27 @@ db.exec('CREATE INDEX IF NOT EXISTS idx_a2a_task_id ON a2a_tasks(task_id);');
 db.exec('CREATE INDEX IF NOT EXISTS idx_a2a_status ON a2a_tasks(status);');
 console.log('[db] 创建 a2a_tasks 表（U0-6 A2A Task 审计）');
 
+// ================== a2a_api_keys 表（U2-7 Phase 3 JWS/OAuth 安全接入）==================
+// 外部机器调用方的签名密钥对：public_key 明文可分发（kid 寻址），private_key 经
+// crypto-util.encrypt（AES-256-GCM）加密落库，明文私钥永不落盘。
+db.exec(`CREATE TABLE IF NOT EXISTS a2a_api_keys (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  key_id TEXT NOT NULL UNIQUE,            -- JWS kid：公钥标识，暴露给调用方
+  name TEXT DEFAULT '',                   -- 用途/名称
+  owner TEXT DEFAULT '',                  -- 归属平台用户名（归属解析 + 计费口径）
+  org_name TEXT DEFAULT '',               -- 调用方所属组织（审计/水印联动）
+  alg TEXT DEFAULT 'RS256',               -- RS256 | ES256
+  public_key TEXT NOT NULL,               -- PEM 公钥（明文，可公开分发）
+  private_key TEXT NOT NULL,              -- PEM 私钥（crypto-util 加密后落库）
+  scopes TEXT DEFAULT 'a2a:call',         -- 授权范围（逗号分隔）
+  status INTEGER DEFAULT 1,               -- 1 启用 / 0 停用
+  expires_at TEXT DEFAULT '',             -- 密钥过期时间（空=长期）
+  created_at TEXT,
+  last_used_at TEXT
+);`);
+db.exec('CREATE INDEX IF NOT EXISTS idx_a2a_keyid ON a2a_api_keys(key_id);');
+console.log('[db] 创建 a2a_api_keys 表（U2-7 Phase 3 JWS 密钥）');
+
 // ================== U2-1 任务队列表 ==================
 // task_queue：统一任务队列持久层。当前为进程内调度（setImmediate），
 // 后续可替换为 Redis/BullMQ 后端（接口语义等价：jobId/payload/retry/priority/scheduled_at）

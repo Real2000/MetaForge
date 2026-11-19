@@ -7107,6 +7107,79 @@ print('PY_OK')
     try { deleteChannel(modeCh.id); } catch { }
   }
 
+  // ===== U2-7 Phase 3 / N5：JWS 签名 + 密钥管理 =====
+  console.log('【U2-7 / N5】Phase 3 JWS 密钥管理（生成/签发/验签/篡改拒绝/过期/未知kid/alg白名单）');
+  {
+    const jws = require('../src-server/lib/a2a-jws');
+
+    await t('U2-7/N5-P1: generateKeyPair RS256/ES256 产出 PEM 且可回环签发验签', () => {
+      for (const alg of ['RS256', 'ES256']) {
+        const { publicKey, privateKey } = jws.generateKeyPair(alg);
+        assert.ok(publicKey.includes('PUBLIC KEY'), `${alg} 应产出公钥 PEM`);
+        assert.ok(privateKey.includes('PRIVATE KEY'), `${alg} 应产出私钥 PEM`);
+        const token = jws.signJws({ sub: 'x' }, privateKey, { alg, kid: 'k1' });
+        assert.strictEqual(token.split('.').length, 3, 'compact JWS 应为三段');
+        const payload = jws.verifyJws(token, () => publicKey);
+        assert.strictEqual(payload.sub, 'x');
+      }
+    });
+
+    await t('U2-7/N5-P1: 篡改载荷 / 篡改签名 → 验签拒绝', () => {
+      const { publicKey, privateKey } = jws.generateKeyPair('RS256');
+      const token = jws.signJws({ sub: 'legit', exp: Date.now() + 60000 }, privateKey, { kid: 'k1' });
+      const [h, p, s] = token.split('.');
+      // 篡改载荷：换成另一份 payload（签名不匹配）
+      const forged = h + '.' + jws.b64url(JSON.stringify({ sub: 'attacker' })) + '.' + s;
+      assert.strictEqual(jws.verifyJws(forged, () => publicKey), null);
+      // 篡改签名：随机化签名段
+      const badSig = h + '.' + p + '.' + require('crypto').randomBytes(64).toString('base64url');
+      assert.strictEqual(jws.verifyJws(badSig, () => publicKey), null);
+    });
+
+    await t('U2-7/N5-P1: 过期 / 未生效（nbf）→ 拒绝', () => {
+      const { publicKey, privateKey } = jws.generateKeyPair('RS256');
+      const expired = jws.signJws({ sub: 'x', exp: Date.now() - 1000 }, privateKey, { kid: 'k1' });
+      assert.strictEqual(jws.verifyJws(expired, () => publicKey), null, '过期应拒绝');
+      const notYet = jws.signJws({ sub: 'x', nbf: Date.now() + 60000 }, privateKey, { kid: 'k1' });
+      assert.strictEqual(jws.verifyJws(notYet, () => publicKey), null, '未生效应拒绝');
+      // 显式 now 覆盖：在有效期内应通过
+      const valid = jws.signJws({ sub: 'x', exp: Date.now() + 60000 }, privateKey, { kid: 'k1' });
+      assert.ok(jws.verifyJws(valid, () => publicKey));
+    });
+
+    await t('U2-7/N5-P1: 未知 kid → 拒绝', () => {
+      const { publicKey, privateKey } = jws.generateKeyPair('RS256');
+      const token = jws.signJws({ sub: 'x' }, privateKey, { alg: 'RS256', kid: 'unknown' });
+      assert.strictEqual(jws.verifyJws(token, () => ''), null, '未知 kid 无可寻址公钥应拒绝');
+      // kid 解析到一个不匹配的公钥（攻击者用自己密钥签名却指向受害者 kid）→ 签名不匹配应拒绝
+      const other = jws.generateKeyPair('RS256');
+      assert.strictEqual(jws.verifyJws(token, () => other.publicKey), null, '公钥与签名不匹配应拒绝');
+    });
+
+    await t('U2-7/N5-P1: alg=none 降级攻击 → 拒绝', () => {
+      const header = jws.b64url(JSON.stringify({ alg: 'none', typ: 'JWS' }));
+      const payload = jws.b64url(JSON.stringify({ sub: 'x' }));
+      const forged = header + '.' + payload + '.';
+      assert.strictEqual(jws.verifyJws(forged, () => 'ANY-KEY'), null, 'alg=none 必须拒绝');
+    });
+
+    await t('U2-7/N5-P1: createKey 落库 + resolvePublicKey 寻址 + 私钥解密回环 + disableKey 失效', () => {
+      const k = jws.createKey({ name: '测试密钥', owner: 'alice', orgName: '组织B', alg: 'RS256' });
+      assert.ok(k.key_id.startsWith('a2ak_'));
+      assert.strictEqual(jws.resolvePublicKey(k.key_id), k.public_key, '启用中应可寻址公钥');
+      // 私钥解密回环：库内为密文，getPrivateKey 还原出可用私钥
+      const priv = jws.getPrivateKey(k.key_id);
+      const token = jws.signJws({ sub: 'alice' }, priv, { alg: 'RS256', kid: k.key_id });
+      assert.strictEqual(jws.verifyJws(token, jws.resolvePublicKey).sub, 'alice');
+      // 列出的密钥不含私钥列
+      const row = jws.listKeys().find(x => x.key_id === k.key_id);
+      assert.ok(row && row.private_key === undefined, '列表不应暴露私钥');
+      // 停用后 resolvePublicKey 立即失效
+      assert.strictEqual(jws.disableKey(k.key_id), true);
+      assert.strictEqual(jws.resolvePublicKey(k.key_id), '', '停用后不应再返回公钥');
+    });
+  }
+
   // 收尾：关闭库并清理临时目录
   try { db.close(); } catch { }
   fs.rmSync(process.env.AGENT_DATA_DIR, { recursive: true, force: true });
