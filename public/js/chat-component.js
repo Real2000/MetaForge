@@ -129,6 +129,7 @@ export function mountChat(el, opts) {
             <div class="chat-tools">
               <div class="left">
                 <button class="btn sm" id="voiceBtn" title="${t('语音输入：点击开始，再点结束（浏览器语音识别）')}" style="padding:4px 10px">🎤</button>
+                <button class="btn sm" id="voiceRtBtn" title="${t('实时语音对话：连接平台语音通道，边听边说，可随时打断')}" style="padding:4px 10px">🎧</button>
                 <button class="btn sm" id="attachBtn" title="${t('附件：上传文件（PDF/DOCX/XLSX/TXT/MD ≤8MB），Excel 自动转表格文本分析')}" style="padding:4px 10px">📎</button>
                 <button class="btn sm" id="atSkillBtn" title="${t('调用技能：在消息中插入 @技能名')}" style="padding:4px 10px">✨ ${t('技能')}</button>
                 <button class="btn sm" id="linkBtn" title="${t('应用链接：插入 URL 引用（智能体可直接抓取网页内容分析）')}" style="padding:4px 10px">🔗 ${t('链接')}</button>
@@ -209,8 +210,73 @@ export function mountChat(el, opts) {
     };
   })();
 
-  function scrollBottom() { scrollBox.scrollTop = scrollBox.scrollHeight; }
+  // 🎧 实时语音对话（2026-11-19 U0-2 P3）：连接平台 /api/voice-ws，边听边说 + 打断（barge-in）
+  (function setupRealtimeVoice() {
+    const btn = $('#voiceRtBtn');
+    if (!btn) return;
+    const VR = window.VoiceRealtime;
+    if (!VR || !VR.isSupported()) {
+      btn.disabled = true;
+      btn.title = t('当前浏览器不支持实时语音（需 Chrome/Edge，且允许麦克风）');
+      btn.style.opacity = '.45';
+      return;
+    }
+    let session = null, panel = null, replyAcc = '';
 
+    const closePanel = () => { if (panel) { panel.remove(); panel = null; } };
+    const ensurePanel = () => {
+      if (panel) return panel;
+      panel = document.createElement('div');
+      panel.className = 'voice-rt-panel';
+      panel.innerHTML = `
+        <div class="vrt-head"><span class="vrt-dot" id="vrtDot" data-state="idle"></span><span id="vrtState">${t('正在连接…')}</span></div>
+        <div class="vrt-sub" id="vrtSub"></div>
+        <div class="vrt-actions">
+          <button class="btn sm" id="vrtBarge">${t('打断')}</button>
+          <button class="btn sm" id="vrtStop">${t('结束')}</button>
+        </div>`;
+      document.body.appendChild(panel);
+      panel.querySelector('#vrtBarge').onclick = () => { if (session) session.interrupt(); };
+      panel.querySelector('#vrtStop').onclick = () => stopAll();
+      return panel;
+    };
+
+    const stopAll = () => {
+      try { if (session) session.stop(); } catch { }
+      session = null; replyAcc = '';
+      closePanel();
+      btn.textContent = '🎧';
+      btn.style.background = ''; btn.style.borderColor = '';
+    };
+
+    btn.onclick = async () => {
+      if (session) { stopAll(); return; }
+      const p = ensurePanel();
+      const sub = p.querySelector('#vrtSub');
+      try {
+        session = VR.createSession({
+          onState: (s) => {
+            const map = { idle: t('已结束'), listening: t('聆听中…'), thinking: t('思考中…'), speaking: t('播报中…（可打断）') };
+            const st = p.querySelector('#vrtState'); if (st) st.textContent = map[s] || s;
+            const dot = p.querySelector('#vrtDot'); if (dot) dot.dataset.state = s;
+          },
+          onFinal: (text) => { replyAcc = ''; sub.textContent = '🗣 ' + text; },
+          onPartial: (text) => { sub.textContent = '🗣 ' + text; },
+          onReply: (text) => { replyAcc += text; sub.textContent = '🤖 ' + replyAcc; },
+          onDone: () => { replyAcc = ''; },
+          onError: (msg) => { sub.textContent = '⚠ ' + msg; },
+        });
+        await session.start();
+        btn.textContent = '⏹';
+        btn.style.background = '#fee2e2'; btn.style.borderColor = '#ef4444';
+      } catch (e) {
+        stopAll();
+        toast('❌ ' + (e.message || t('实时语音启动失败')), 'err');
+      }
+    };
+  })();
+
+  function scrollBottom() { scrollBox.scrollTop = scrollBox.scrollHeight; }
   function renderBanner() {
     // hideTopBanner：空状态欢迎区已展示名称/描述，顶部横幅不再重复渲染
     if (opts.hideTopBanner) { $('#agentBanner').innerHTML = ''; return; }

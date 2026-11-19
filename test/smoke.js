@@ -6284,6 +6284,58 @@ function t(name, fn) {
     });
   }
 
+  console.log('【U0-2】P3 实时语音前端：保序播放队列 / VAD 判定 / 打断判定（纯逻辑）');
+  {
+    const VR = require('../public/js/voice-realtime.js');
+
+    await t('U0-2 P3：PlaybackQueue 乱序入队按 seq 保序出队', () => {
+      const q = new VR.PlaybackQueue();
+      q.push(2, { data: 'c', mime: 'audio/mpeg' });
+      q.push(0, { data: 'a', mime: 'audio/mpeg' });
+      q.push(1, { data: 'b', mime: 'audio/mpeg' });
+      assert.strictEqual(q.size, 3, '应入队 3 个分片');
+      assert.strictEqual(q.next().data, 'a', '应先出 seq=0');
+      assert.strictEqual(q.next().data, 'b', '再出 seq=1');
+      assert.strictEqual(q.next().data, 'c', '再出 seq=2');
+      assert.strictEqual(q.next(), null, '取空后应返回 null');
+      // 缺号不越序
+      const q2 = new VR.PlaybackQueue();
+      q2.push(1, { data: 'x' });
+      assert.strictEqual(q2.next(), null, '缺 seq=0 时不应越序取出');
+      q2.push(0, { data: 'y' });
+      assert.strictEqual(q2.next().data, 'y', '补齐 seq=0 后应出队');
+      assert.strictEqual(q2.next().data, 'x', '随后出 seq=1');
+      q2.push(3, { data: 'z' });
+      q2.clear();
+      assert.strictEqual(q2.size, 0, 'clear 后应为空');
+      assert.strictEqual(q2.next(), null, 'clear 后 next 为 null');
+    });
+
+    await t('U0-2 P3：vadDecide 双阈值滞回（start / end / 保持）', () => {
+      const o = { on: 0.02, off: 0.012 };
+      assert.deepStrictEqual(VR.vadDecide(false, 0.005, o), { speaking: false, event: null }, '静默应保持 false');
+      assert.deepStrictEqual(VR.vadDecide(false, 0.03, o), { speaking: true, event: 'start' }, '越过起始阈值应 start');
+      // 滞回区内不抖动
+      assert.deepStrictEqual(VR.vadDecide(true, 0.015, o), { speaking: true, event: null }, '滞回区内应保持 speaking');
+      assert.deepStrictEqual(VR.vadDecide(true, 0.01, o), { speaking: false, event: 'end' }, '低于结束阈值应 end');
+    });
+
+    await t('U0-2 P3：shouldBargeIn 仅在 speaking 且用户开口时为真', () => {
+      assert.strictEqual(VR.shouldBargeIn('speaking', true), true, '播放中用户开口应打断');
+      assert.strictEqual(VR.shouldBargeIn('speaking', false), false, '播放中无语音不打断');
+      assert.strictEqual(VR.shouldBargeIn('listening', true), false, '倾听态不打断');
+      assert.strictEqual(VR.shouldBargeIn('thinking', true), false, '思考态不打断');
+    });
+
+    await t('U0-2 P3：computeRms 计算时域能量 + Node 环境 isSupported=false', () => {
+      const silent = new Uint8Array(128).fill(128);
+      assert.strictEqual(VR.computeRms(silent), 0, '中位 128 静音应得 RMS 0');
+      const loud = new Uint8Array(128).fill(255);
+      assert.ok(VR.computeRms(loud) > 0.9, '满幅应接近 1：' + VR.computeRms(loud));
+      assert.strictEqual(VR.isSupported(), false, 'Node 环境无浏览器 API，应为 false');
+    });
+  }
+
   console.log('【U1-8】SDK 正式发布：TS/Python 客户端行为 / 真实端到端 / 下载端点 / 规范契约');
   {
     const { AgentPlatform, AgentPlatformError } = require('../sdk/typescript/index.js');
