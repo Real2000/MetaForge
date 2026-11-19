@@ -133,6 +133,12 @@ function getPrivateKey(kid) {
   return decrypt(row.private_key);
 }
 
+/** 按 kid 取密钥元信息（不含公私钥）；不存在返回 null */
+function getKeyMeta(kid) {
+  if (!kid) return null;
+  try { return db.prepare('SELECT key_id,name,owner,org_name,alg,scopes,status,expires_at FROM a2a_api_keys WHERE key_id=?').get(kid) || null; } catch { return null; }
+}
+
 /** 列出全部密钥（不含私钥列） */
 function listKeys() {
   return db.prepare('SELECT id,key_id,name,owner,org_name,alg,scopes,status,expires_at,created_at,last_used_at FROM a2a_api_keys ORDER BY id DESC').all();
@@ -153,5 +159,5 @@ module.exports = {
   ALLOWED_ALGS,
   b64url, b64urlDecode,
   generateKeyPair, signJws, verifyJws,
-  createKey, resolvePublicKey, getPrivateKey, listKeys, disableKey, touchKey,
+  createKey, resolvePublicKey, getPrivateKey, listKeys, disableKey, touchKey, getKeyMeta,
 };

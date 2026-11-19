@@ -7237,6 +7237,131 @@ print('PY_OK')
     });
   }
 
+  // ===== U2-7 Phase 3 / N5：三通道鉴权 + scope + 归属审计（HTTP 集成）=====
+  console.log('【U2-7 / N5】Phase 3 A2A 三通道鉴权（平台/JWS/OAuth）+ scope + 归属审计');
+  {
+    const jws = require('../src-server/lib/a2a-jws');
+    const oauth = require('../src-server/lib/a2a-oauth');
+    const { sign } = require('../src-server/lib/auth');
+    const { db } = require('../src-server/db');
+    const { a2aAuth, requireScope } = require('../src-server/routes/a2a');
+
+    const mockRes = () => {
+      const r = { statusCode: 200, body: null };
+      r.status = c => { r.statusCode = c; return r; };
+      r.json = b => { r.body = b; return r; };
+      return r;
+    };
+
+    await t('U2-7/N5-P3: a2aAuth ①平台 token → req.user（向后兼容）', () => {
+      db.prepare("INSERT OR IGNORE INTO users (id,username,password,nickname,role,status,created_at) VALUES (9001,'n5tester','x','N5T','admin',1,?)")
+        .run(new Date().toISOString());
+      const ptoken = sign({ uid: 9001, exp: Date.now() + 60000 });
+      const req = { headers: { authorization: 'Bearer ' + ptoken } };
+      let called = false;
+      a2aAuth(req, mockRes(), () => { called = true; });
+      assert.ok(called, '平台 token 应放行');
+      assert.strictEqual(req.user.username, 'n5tester');
+      assert.strictEqual(req.authMethod, 'platform');
+    });
+
+    await t('U2-7/N5-P3: a2aAuth ②JWS 直签 → req.a2aCaller（归属取自密钥元信息）', () => {
+      const k = jws.createKey({ name: '直签', owner: 'dave', orgName: '组织D', scopes: 'a2a:call,a2a:read' });
+      const jwsToken = jws.signJws({ iss: k.key_id, sub: k.key_id, exp: Date.now() + 60000 }, k.private_key, { alg: 'RS256', kid: k.key_id });
+      const req = { headers: { authorization: 'Bearer ' + jwsToken } };
+      let called = false;
+      a2aAuth(req, mockRes(), () => { called = true; });
+      assert.ok(called, 'JWS 直签应放行');
+      assert.strictEqual(req.a2aCaller.method, 'jws');
+      assert.strictEqual(req.a2aCaller.owner, 'dave');
+      assert.strictEqual(req.a2aCaller.org, '组织D');
+    });
+
+    await t('U2-7/N5-P3: a2aAuth ③OAuth 令牌 → req.a2aCaller；无效 → 401', () => {
+      const k = jws.createKey({ name: 'oauth直连', owner: 'erin', orgName: '组织E', scopes: 'a2a:call' });
+      const { access_token } = oauth.issueToken({ kid: k.key_id, org: '组织E', scopes: 'a2a:call' });
+      const req = { headers: { authorization: 'Bearer ' + access_token } };
+      let called = false;
+      a2aAuth(req, mockRes(), () => { called = true; });
+      assert.ok(called, 'OAuth 令牌应放行');
+      assert.strictEqual(req.a2aCaller.method, 'oauth');
+      assert.strictEqual(req.a2aCaller.owner, 'erin');
+
+      // 无效 token → 401
+      const bad = mockRes();
+      a2aAuth({ headers: { authorization: 'Bearer not-a-real-token' } }, bad, () => { throw new Error('不应放行'); });
+      assert.strictEqual(bad.statusCode, 401);
+    });
+
+    await t('U2-7/N5-P3: requireScope —— 平台用户不受限 / 签名方缺 scope 403 / 有 scope 放行', () => {
+      let n1 = false;
+      requireScope('a2a:read')({}, mockRes(), () => { n1 = true; });
+      assert.ok(n1, '平台用户（无 a2aCaller）应直接放行');
+
+      const r2 = mockRes();
+      requireScope('a2a:read')({ a2aCaller: { scopes: 'a2a:call' } }, r2, () => { throw new Error('缺 scope 不应放行'); });
+      assert.strictEqual(r2.statusCode, 403);
+
+      let n3 = false;
+      requireScope('a2a:call')({ a2aCaller: { scopes: 'a2a:call' } }, mockRes(), () => { n3 = true; });
+      assert.ok(n3, '有 scope 应放行');
+    });
+
+    // —— HTTP 端到端：签名调用创建任务 → created_by/meta 落库正确；scope/未认证拦截 ——
+    await t('U2-7/N5-P3: HTTP 集成 —— JWS 调用 /a2a/tasks 落库归属与审计字段；缺 scope 403；未认证 401', async () => {
+      const workflowMod = require('../src-server/lib/workflow');
+      const origRunAgent = workflowMod.runAgent;
+      workflowMod.runAgent = async () => ({ text: 'stub-output' }); // 纯本地：避免真实 LLM 调用
+      let server;
+      try {
+        const express = require('express');
+        const { authRouter } = require('../src-server/routes/a2a');
+        const app = express();
+        app.use(express.json());
+        app.use('/api/a2a', authRouter);
+        await new Promise(resolve => { server = app.listen(0, '127.0.0.1', resolve); });
+        const base = `http://127.0.0.1:${server.address().port}`;
+
+        db.prepare("INSERT INTO agents (name,status,workflow,published_workflow,created_at) VALUES ('N5测试智能体','published','{}','{}',?)")
+          .run(new Date().toISOString());
+        const agentId = db.prepare("SELECT id FROM agents WHERE name='N5测试智能体' ORDER BY id DESC LIMIT 1").get().id;
+
+        const call = (token, extra) => fetch(base + '/api/a2a/tasks', {
+          method: 'POST',
+          headers: Object.assign({ 'content-type': 'application/json' }, token ? { authorization: 'Bearer ' + token } : {}),
+          body: JSON.stringify(Object.assign({ agent_id: agentId, input: { message: 'hi' } }, extra || {})),
+        });
+
+        // ① JWS 直签（owner=frank）→ 通过 + 审计字段
+        const k = jws.createKey({ name: '集成直签', owner: 'frank', orgName: '组织F', scopes: 'a2a:call' });
+        const jwsToken = jws.signJws({ iss: k.key_id, sub: k.key_id, exp: Date.now() + 60000 }, k.private_key, { alg: 'RS256', kid: k.key_id });
+        const resp = await call(jwsToken);
+        assert.strictEqual(resp.status, 200);
+        const body = await resp.json();
+        assert.strictEqual(body.code, 0);
+        const row = db.prepare('SELECT * FROM a2a_tasks WHERE task_id=?').get(body.data.task_id);
+        assert.strictEqual(row.created_by, 'frank', '归属应为密钥 owner');
+        const meta = JSON.parse(row.meta);
+        assert.strictEqual(meta.auth_method, 'jws');
+        assert.strictEqual(meta.caller_kid, k.key_id);
+        assert.strictEqual(meta.caller_org, '组织F');
+
+        // ② 仅 a2a:read 的密钥 → 缺 a2a:call → 403
+        const k2 = jws.createKey({ name: '只读', owner: 'grace', scopes: 'a2a:read' });
+        const jws2 = jws.signJws({ iss: k2.key_id, sub: k2.key_id, exp: Date.now() + 60000 }, k2.private_key, { alg: 'RS256', kid: k2.key_id });
+        const resp2 = await call(jws2);
+        assert.strictEqual(resp2.status, 403);
+
+        // ③ 未认证 → 401
+        const resp3 = await call('');
+        assert.strictEqual(resp3.status, 401);
+      } finally {
+        if (server) await new Promise(r => server.close(r));
+        workflowMod.runAgent = origRunAgent;
+      }
+    });
+  }
+
   // 收尾：关闭库并清理临时目录
   try { db.close(); } catch { }
   fs.rmSync(process.env.AGENT_DATA_DIR, { recursive: true, force: true });

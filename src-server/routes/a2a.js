@@ -17,7 +17,7 @@
 const express = require('express');
 const { db, now } = require('../db');
 const { runAgent } = require('../lib/workflow');
-const { auth, adminOnly } = require('../lib/auth');
+const { auth, adminOnly, readToken, verify } = require('../lib/auth');
 const jws = require('../lib/a2a-jws');
 const a2aOauth = require('../lib/a2a-oauth');
 
@@ -138,26 +138,89 @@ adminRouter.post('/keys/:kid/disable', (req, res) => {
 
 /* ---------- API 认证路由 ---------- */
 
-authRouter.use(auth);
+/* U2-7 Phase 3：三通道 A2A 鉴权（平台 Bearer → JWS 直签 → OAuth 访问令牌）
+ * 向后兼容：既有平台 token 调用行为完全不变；签名调用方落地 req.a2aCaller。 */
+function a2aAuth(req, res, next) {
+  const token = readToken(req); // 复用 Bearer + HttpOnly Cookie 双通道
+  if (!token) return res.status(401).json({ code: 401, msg: '未登录或未认证' });
+
+  // ① 平台用户 token（既有通道，最高优先）
+  const payload = verify(token);
+  if (payload && payload.typ !== a2aOauth.TOKEN_TYP) {
+    const user = db.prepare('SELECT id, username, nickname, role, dept, dept_id, onboarded FROM users WHERE id=? AND status=1').get(payload.uid);
+    if (user) { req.user = user; req.authMethod = 'platform'; return next(); }
+  }
+
+  // ② JWS compact 直签（三段紧凑令牌）
+  if (token.split('.').length === 3) {
+    const p = jws.verifyJws(token, jws.resolvePublicKey);
+    if (p && p.sub && p.sub === decodeJwsKid(token) && p.exp != null) {
+      const meta = jws.getKeyMeta(p.sub);
+      if (meta && meta.status) {
+        req.a2aCaller = { kid: p.sub, owner: meta.owner || p.sub, org: meta.org_name || '', scopes: meta.scopes || 'a2a:call', method: 'jws' };
+        req.authMethod = 'jws';
+        jws.touchKey(p.sub);
+        return next();
+      }
+    }
+  }
+
+  // ③ OAuth 访问令牌
+  const at = a2aOauth.verifyA2aToken(token);
+  if (at) {
+    const meta = jws.getKeyMeta(at.sub);
+    req.a2aCaller = { kid: at.sub, owner: (meta && meta.owner) || at.sub, org: at.org || '', scopes: at.scope || 'a2a:call', method: 'oauth' };
+    req.authMethod = 'oauth';
+    return next();
+  }
+
+  return res.status(401).json({ code: 401, msg: '未认证或签名无效' });
+}
+
+/** 从 compact JWS 中解出 header.kid（用于直签通道校验 sub 与 kid 一致） */
+function decodeJwsKid(token) {
+  try {
+    return JSON.parse(Buffer.from(String(token).split('.')[0], 'base64url').toString()).kid || '';
+  } catch { return ''; }
+}
+
+/** 签名调用方的 scope 校验（平台用户不受限） */
+function requireScope(need) {
+  return (req, res, next) => {
+    if (!req.a2aCaller) return next();
+    if (!a2aOauth.hasScope(req.a2aCaller.scopes, need)) {
+      return res.status(403).json({ code: 403, msg: `缺少 scope：${need}` });
+    }
+    next();
+  };
+}
+
+authRouter.use(a2aAuth);
 
 // 单个智能体的 Agent Card
-authRouter.get('/a2a/agents/:id/card', (req, res) => {
+authRouter.get('/agents/:id/card', requireScope('a2a:read'), (req, res) => {
   const agent = db.prepare('SELECT * FROM agents WHERE id=? AND status=?').get(req.params.id, 'published');
   if (!agent) return res.json({ code: 404, msg: '智能体不存在或未发布' });
   res.json({ code: 0, data: buildAgentCard(agent) });
 });
 
 // 创建任务（A2A Task）
-authRouter.post('/a2a/tasks', async (req, res) => {
+authRouter.post('/tasks', requireScope('a2a:call'), async (req, res) => {
   const { agent_id, input, session_id, metadata } = req.body || {};
   if (!agent_id) return res.json({ code: 400, msg: '请指定 agent_id' });
   const agent = db.prepare('SELECT * FROM agents WHERE id=? AND status=?').get(agent_id, 'published');
   if (!agent) return res.json({ code: 404, msg: '智能体不存在或未发布' });
   const taskId = 'a2a-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6);
+  // 归属解析：平台用户用其用户名；签名调用方用密钥归属
+  const createdBy = (req.user && req.user.username) || (req.a2aCaller && req.a2aCaller.owner) || 'a2a-client';
+  const meta = Object.assign({}, metadata || {}, {
+    auth_method: req.authMethod || 'platform',
+    ...(req.a2aCaller ? { caller_kid: req.a2aCaller.kid, caller_org: req.a2aCaller.org } : {}),
+  });
   // 记录 A2A 任务 start
   db.prepare(`INSERT INTO a2a_tasks (task_id, agent_id, agent_name, input, status, meta, created_by, created_at, updated_at)
     VALUES (?,?,?,?,'submitted',?,?,?,?)`)
-    .run(taskId, agent_id, agent.name, JSON.stringify(input || ''), JSON.stringify(metadata || {}), req.user.username || 'a2a-client', now(), now());
+    .run(taskId, agent_id, agent.name, JSON.stringify(input || ''), JSON.stringify(meta), createdBy, now(), now());
   // 返回 task_id，执行异步
   res.json({ code: 0, data: { task_id: taskId, status: 'submitted' } });
   // 异步执行
@@ -172,22 +235,27 @@ authRouter.post('/a2a/tasks', async (req, res) => {
 });
 
 // 查询任务状态
-authRouter.get('/a2a/tasks/:id', (req, res) => {
+authRouter.get('/tasks/:id', (req, res) => {
   const task = db.prepare('SELECT * FROM a2a_tasks WHERE task_id=?').get(req.params.id);
   if (!task) return res.json({ code: 404, msg: '任务不存在' });
+  // 签名调用方仅可查看自身创建的任务
+  if (req.a2aCaller && task.created_by !== req.a2aCaller.owner) {
+    return res.status(403).json({ code: 403, msg: '无权查看该任务' });
+  }
   res.json({ code: 0, data: task });
 });
 
 // 列出任务
-authRouter.get('/a2a/tasks', (req, res) => {
+authRouter.get('/tasks', (req, res) => {
   const { status, page = 1, pageSize = 50 } = req.query;
   let sql = 'SELECT * FROM a2a_tasks WHERE 1=1';
   const args = [];
   if (status) { sql += ' AND status=?'; args.push(status); }
+  if (req.a2aCaller) { sql += ' AND created_by=?'; args.push(req.a2aCaller.owner); } // 签名调用方仅见自身任务
   sql += ' ORDER BY id DESC LIMIT ? OFFSET ?';
   args.push(+pageSize, (+page - 1) * +pageSize);
   const rows = db.prepare(sql).all(...args);
   res.json({ code: 0, data: { list: rows, page: +page, pageSize: +pageSize } });
 });
 
-module.exports = { publicRouter, authRouter, adminRouter };
+module.exports = { publicRouter, authRouter, adminRouter, a2aAuth, requireScope, decodeJwsKid };
