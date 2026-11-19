@@ -7180,6 +7180,63 @@ print('PY_OK')
     });
   }
 
+  // ===== U2-7 Phase 3 / N5：OAuth client_credentials 令牌交换 =====
+  console.log('【U2-7 / N5】Phase 3 OAuth 令牌交换（断言验签/签发令牌/iss校验/过期/停用/scope）');
+  {
+    const jws = require('../src-server/lib/a2a-jws');
+    const oauth = require('../src-server/lib/a2a-oauth');
+
+    await t('U2-7/N5-P2: 有效 client_assertion → 换发访问令牌，verifyA2aToken 可解析', () => {
+      const k = jws.createKey({ name: 'OAuth测试', owner: 'bob', orgName: '组织C', alg: 'RS256', scopes: 'a2a:call,a2a:read' });
+      const aud = 'http://localhost:3210/api/a2a/oauth/token';
+      const assertion = jws.signJws(
+        { iss: k.key_id, sub: k.key_id, aud, exp: Date.now() + 300000 },
+        k.private_key, { alg: 'RS256', kid: k.key_id });
+      const r = oauth.exchangeClientCredentials({ assertion, expectedAud: aud });
+      assert.ok(r.access_token, '应返回 access_token');
+      assert.strictEqual(r.token_type, 'Bearer');
+      assert.strictEqual(r.scope, 'a2a:call,a2a:read');
+      const p = oauth.verifyA2aToken(r.access_token);
+      assert.ok(p && p.typ === 'a2a_token');
+      assert.strictEqual(p.sub, k.key_id);
+      assert.strictEqual(p.org, '组织C');
+    });
+
+    await t('U2-7/N5-P2: 篡改断言 / iss≠kid / 过期 / 停用密钥 → invalid_client', () => {
+      const k = jws.createKey({ name: 'OAuth拒绝', owner: 'carol', alg: 'ES256' });
+      const aud = 'http://localhost:3210/api/a2a/oauth/token';
+      const good = jws.signJws({ iss: k.key_id, sub: k.key_id, aud, exp: Date.now() + 300000 }, k.private_key, { alg: 'ES256', kid: k.key_id });
+
+      // 篡改：改末位签名字符
+      const tampered = good.slice(0, -2) + (good.slice(-2, -1) === 'A' ? 'B' : 'A') + good.slice(-1);
+      assert.strictEqual(oauth.exchangeClientCredentials({ assertion: tampered, expectedAud: aud }).error, 'invalid_client');
+
+      // iss 不等于 kid
+      const badIss = jws.signJws({ iss: 'other', sub: k.key_id, aud, exp: Date.now() + 300000 }, k.private_key, { alg: 'ES256', kid: k.key_id });
+      assert.strictEqual(oauth.exchangeClientCredentials({ assertion: badIss, expectedAud: aud }).error, 'invalid_client');
+
+      // 过期
+      const expired = jws.signJws({ iss: k.key_id, sub: k.key_id, aud, exp: Date.now() - 1000 }, k.private_key, { alg: 'ES256', kid: k.key_id });
+      assert.strictEqual(oauth.exchangeClientCredentials({ assertion: expired, expectedAud: aud }).error, 'invalid_client');
+
+      // aud 不匹配
+      const badAud = jws.signJws({ iss: k.key_id, sub: k.key_id, aud: 'https://evil.example/token', exp: Date.now() + 300000 }, k.private_key, { alg: 'ES256', kid: k.key_id });
+      assert.strictEqual(oauth.exchangeClientCredentials({ assertion: badAud, expectedAud: aud }).error, 'invalid_client');
+
+      // 停用后失效
+      assert.strictEqual(oauth.exchangeClientCredentials({ assertion: good, expectedAud: aud }).access_token != null, true);
+      jws.disableKey(k.key_id);
+      assert.strictEqual(oauth.exchangeClientCredentials({ assertion: good, expectedAud: aud }).error, 'invalid_client');
+    });
+
+    await t('U2-7/N5-P2: hasScope 判定（含通配）', () => {
+      assert.strictEqual(oauth.hasScope('a2a:call,a2a:read', 'a2a:read'), true);
+      assert.strictEqual(oauth.hasScope('a2a:call', 'a2a:read'), false);
+      assert.strictEqual(oauth.hasScope('*', 'a2a:read'), true);
+      assert.strictEqual(oauth.hasScope('', 'a2a:call'), false);
+    });
+  }
+
   // 收尾：关闭库并清理临时目录
   try { db.close(); } catch { }
   fs.rmSync(process.env.AGENT_DATA_DIR, { recursive: true, force: true });

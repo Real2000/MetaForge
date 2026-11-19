@@ -17,12 +17,14 @@
 const express = require('express');
 const { db, now } = require('../db');
 const { runAgent } = require('../lib/workflow');
+const { auth, adminOnly } = require('../lib/auth');
+const jws = require('../lib/a2a-jws');
+const a2aOauth = require('../lib/a2a-oauth');
 
 // 免 auth：/.well-known/agent-card.json 公开
 const publicRouter = express.Router();
 const authRouter = express.Router();
-
-const { auth } = require('../lib/auth');
+const adminRouter = express.Router(); // U2-7 Phase 3：密钥管理（平台 auth + adminOnly）
 
 /* ---------- Task 八态 ---------- */
 const TASK_STATES = ['submitted', 'working', 'input_required', 'completed', 'failed', 'canceled', 'input-required'];
@@ -86,6 +88,54 @@ publicRouter.get('/.well-known/agent-card.json', (req, res) => {
   });
 });
 
+/* ---------- U2-7 Phase 3：OAuth client_credentials 令牌端点（RFC 7523 private_key_jwt） ----------
+ * 挂在 publicRouter（自身以 client_assertion 鉴权）；单独挂 body 解析器——server.js 中
+ * express.json() 注册在 publicRouter 之后，此处需自带解析。 */
+publicRouter.post('/api/a2a/oauth/token',
+  express.json({ limit: '1mb' }), express.urlencoded({ extended: false, limit: '1mb' }),
+  (req, res) => {
+    const { grant_type, client_assertion, client_assertion_type } = req.body || {};
+    if (grant_type !== 'client_credentials') {
+      return res.status(400).json({ error: 'unsupported_grant_type' });
+    }
+    if (client_assertion_type !== a2aOauth.ASSERTION_TYPE) {
+      return res.status(400).json({ error: 'invalid_request', error_description: 'client_assertion_type 非法' });
+    }
+    const self = req.protocol + '://' + (req.headers.host || '') + String(req.originalUrl || '').split('?')[0];
+    const r = a2aOauth.exchangeClientCredentials({
+      assertion: client_assertion,
+      expectedAud: process.env.A2A_TOKEN_AUDIENCE || self,
+    });
+    if (r.error) return res.status(401).json({ error: r.error, error_description: r.error_description });
+    res.json(r);
+  });
+
+/* ---------- U2-7 Phase 3：密钥管理路由（平台管理员） ---------- */
+
+adminRouter.use(auth, adminOnly);
+
+// 列出密钥（不含私钥）
+adminRouter.get('/keys', (req, res) => {
+  res.json({ code: 0, data: { list: jws.listKeys() } });
+});
+
+// 新建密钥：私钥仅此响应返回一次
+adminRouter.post('/keys', (req, res) => {
+  const { name, owner, org_name, alg, scopes, expires_at } = req.body || {};
+  if (alg && !jws.ALLOWED_ALGS.includes(alg)) return res.json({ code: 400, msg: '不支持的算法（仅 RS256/ES256）' });
+  const k = jws.createKey({
+    name: name || '', owner: owner || req.user.username || '', orgName: org_name || '',
+    alg: alg || 'RS256', scopes: scopes || 'a2a:call', expiresAt: expires_at || '',
+  });
+  res.json({ code: 0, data: k, msg: '私钥仅返回一次，请妥善保存' });
+});
+
+// 停用密钥
+adminRouter.post('/keys/:kid/disable', (req, res) => {
+  const ok = jws.disableKey(req.params.kid);
+  res.json({ code: ok ? 0 : 404, msg: ok ? '已停用' : '密钥不存在' });
+});
+
 /* ---------- API 认证路由 ---------- */
 
 authRouter.use(auth);
@@ -140,4 +190,4 @@ authRouter.get('/a2a/tasks', (req, res) => {
   res.json({ code: 0, data: { list: rows, page: +page, pageSize: +pageSize } });
 });
 
-module.exports = { publicRouter, authRouter };
+module.exports = { publicRouter, authRouter, adminRouter };

@@ -16,8 +16,9 @@ const fs = require('fs');
 
 const app = express();
 // U0-6 A2A Agent Card 公开发现端点（必须在任何鉴权中间件之前注册）
-const { publicRouter, authRouter } = require('./src-server/routes/a2a');
+const { publicRouter, authRouter, adminRouter } = require('./src-server/routes/a2a');
 app.use(publicRouter); // /.well-known/agent-card.json 公开访问
+app.use('/api/a2a/admin', adminRouter); // U2-7 Phase 3：密钥管理（平台管理员）
 app.use('/api/a2a', authRouter); // /api/a2a/* 需认证
 const PORT = process.env.PORT || 3210;
 
