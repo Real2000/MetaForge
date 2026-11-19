@@ -6125,6 +6125,11 @@ function t(name, fn) {
     const waitMsg = async (cli, pred, ms = 8000) => { const t0 = Date.now(); while (Date.now() - t0 < ms) { const i = cli.msgs.findIndex(pred); if (i >= 0) return cli.msgs.splice(i, 1)[0]; await new Promise(r => setTimeout(r, 50)); } return null; };
     const waitBin = async (cli, n, ms = 8000) => { const t0 = Date.now(); while (Date.now() - t0 < ms) { if (cli.bins.length >= n) return true; await new Promise(r => setTimeout(r, 50)); } return false; };
     const wsend = (cli, obj) => cli.ws.send(JSON.stringify(obj));
+    const jfetch = async (p, opts = {}, tok) => {
+      const r = await fetch(base + p, { ...opts, headers: { 'Content-Type': 'application/json', ...(tok ? { Authorization: 'Bearer ' + tok } : {}) } });
+      let j = null; try { j = await r.json(); } catch { }
+      return { status: r.status, j };
+    };
 
     let c1 = null;
     try {
@@ -6182,10 +6187,101 @@ function t(name, fn) {
         wsend(c1, { type: 'stop' });
         assert.ok(await closed, 'stop 后连接应关闭');
       });
+
+      await t('U0-2 P2：语音供应商流式字段经配置 API 持久化 / 非法值拒绝 / 默认 batch', async () => {
+        const created = [];
+        try {
+          // 带 stream_type=http-chunk 创建
+          const cr = await jfetch('/api/voice-providers', { method: 'POST', body: JSON.stringify({ name: 'U02流式供应商', type: 'stt', base_url: 'http://127.0.0.1:1', api_key: 'k', stream_type: 'http-chunk', stream_endpoint: 'http://127.0.0.1:1/asr-stream' }) }, tokOf(adminId));
+          assert.ok(cr.j && cr.j.code === 0, '创建应成功：' + JSON.stringify(cr.j).slice(0, 120));
+          created.push(cr.j.data.id);
+          // 未指定 stream_type：应默认 batch
+          const cr2 = await jfetch('/api/voice-providers', { method: 'POST', body: JSON.stringify({ name: 'U02默认供应商', type: 'stt' }) }, tokOf(adminId));
+          assert.ok(cr2.j && cr2.j.code === 0, '默认创建应成功');
+          created.push(cr2.j.data.id);
+          // 非法 stream_type：应拒绝
+          const bad = await jfetch('/api/voice-providers', { method: 'POST', body: JSON.stringify({ name: 'U02非法', stream_type: 'nope' }) }, tokOf(adminId));
+          assert.ok(bad.j && bad.j.code === 400, '非法 stream_type 应返回 400：' + JSON.stringify(bad.j));
+          // 回读校验持久化
+          const list = await jfetch('/api/voice-providers?type=stt', {}, tokOf(adminId));
+          assert.ok(list.j && list.j.code === 0, '列表应成功');
+          const row = (list.j.data || []).find(x => x.id === cr.j.data.id);
+          assert.ok(row, '应能查到刚创建的供应商');
+          assert.strictEqual(row.stream_type, 'http-chunk', 'stream_type 应持久化为 http-chunk');
+          assert.strictEqual(row.stream_endpoint, 'http://127.0.0.1:1/asr-stream', 'stream_endpoint 应持久化');
+          const row2 = (list.j.data || []).find(x => x.id === cr2.j.data.id);
+          assert.strictEqual(row2.stream_type, 'batch', '未指定时应默认 batch');
+        } finally {
+          for (const id of created) await jfetch('/api/voice-providers/' + id, { method: 'DELETE' }, tokOf(adminId));
+        }
+      });
     } finally {
       try { child.kill('SIGTERM'); } catch { }
       try { child.kill('SIGKILL'); } catch { }
     }
+  }
+
+  console.log('【U0-2】P2 供应商流式适配位：voice_providers 流式字段 + ASR 适配位（未配置走 batch）');
+  {
+    const { effectiveStreamMode, createAsrStream, STREAM_MODES } = require('../src-server/lib/stt');
+
+    await t('U0-2 P2：voice_providers 具备 stream_type/stream_endpoint 列（默认 batch / 空串）', () => {
+      const cols = db.prepare('PRAGMA table_info(voice_providers)').all().map(c => c.name);
+      assert.ok(cols.includes('stream_type'), '应含 stream_type 列');
+      assert.ok(cols.includes('stream_endpoint'), '应含 stream_endpoint 列');
+      const info = db.prepare("INSERT INTO voice_providers (name,type,created_at,updated_at) VALUES ('U02P2列测','stt',datetime('now','localtime'),datetime('now','localtime'))").run();
+      const row = db.prepare('SELECT * FROM voice_providers WHERE id=?').get(info.lastInsertRowid);
+      assert.strictEqual(row.stream_type, 'batch', 'stream_type 默认应为 batch');
+      assert.strictEqual(row.stream_endpoint, '', 'stream_endpoint 默认应为空串');
+      db.prepare('DELETE FROM voice_providers WHERE id=?').run(info.lastInsertRowid);
+    });
+
+    await t('U0-2 P2：effectiveStreamMode 判定（batch 默认 / ws / http-chunk / 非法归 batch）', () => {
+      assert.deepStrictEqual(STREAM_MODES, ['batch', 'ws', 'http-chunk']);
+      assert.strictEqual(effectiveStreamMode(null), 'batch', 'null → batch');
+      assert.strictEqual(effectiveStreamMode({}), 'batch', '无字段 → batch');
+      assert.strictEqual(effectiveStreamMode({ stream_type: 'ws' }), 'ws');
+      assert.strictEqual(effectiveStreamMode({ stream_type: 'http-chunk' }), 'http-chunk');
+      assert.strictEqual(effectiveStreamMode({ stream_type: 'bogus' }), 'batch', '非法值应归 batch');
+    });
+
+    await t('U0-2 P2：createAsrStream 批式降级链——push+end 优雅返回（永不 reject）', async () => {
+      // 暂停已配置的 OpenAI 兼容回退供应商，避免触网；本用例只验证适配位语义
+      const saved = db.prepare('SELECT id FROM providers WHERE configured=1').all();
+      db.prepare('UPDATE providers SET configured=0 WHERE configured=1').run();
+      try {
+        const asr = createAsrStream({ provider: -1, format: 'wav', language: 'zh' }); // 指定不存在的供应商 → 走 batch
+        assert.strictEqual(asr.mode, 'batch', '未配置流式供应商应走 batch');
+        asr.push(Buffer.from([1, 2, 3, 4]));
+        asr.push(Buffer.from([5, 6]));
+        assert.strictEqual(asr.bytes, 6, '应正确累计缓冲字节数');
+        const r = await asr.end();
+        assert.strictEqual(typeof r.ok, 'boolean', 'end() 应返回 ok 布尔，不得抛错');
+        assert.strictEqual(r.mode, 'batch');
+        assert.strictEqual(r.partial, false, '批式降级不产生 partial');
+      } finally {
+        for (const s of saved) db.prepare('UPDATE providers SET configured=1 WHERE id=?').run(s.id);
+      }
+    });
+
+    await t('U0-2 P2：createAsrStream 流式适配位——声明 http-chunk 的供应商走适配位（当前降级批式并标 degraded）', async () => {
+      const saved = db.prepare('SELECT id FROM providers WHERE configured=1').all();
+      db.prepare('UPDATE providers SET configured=0 WHERE configured=1').run();
+      const info = db.prepare("INSERT INTO voice_providers (name,type,base_url,api_key,endpoint,stream_type,stream_endpoint,configured,is_default,created_at,updated_at) VALUES ('U02P2流式','stt','http://127.0.0.1:1','k','','http-chunk','http://127.0.0.1:1/asr',1,0,datetime('now','localtime'),datetime('now','localtime'))").run();
+      const id = info.lastInsertRowid;
+      try {
+        const asr = createAsrStream({ provider: id, format: 'wav', language: 'zh' });
+        assert.strictEqual(asr.mode, 'http-chunk', '应识别为流式适配位');
+        asr.push(Buffer.from([9, 9, 9, 9]));
+        const r = await asr.end();
+        assert.strictEqual(typeof r.ok, 'boolean', 'end() 应返回 ok 布尔');
+        assert.strictEqual(r.mode, 'http-chunk');
+        assert.strictEqual(r.degraded, true, '流式供应商当前回落批式应标 degraded=true');
+      } finally {
+        db.prepare('DELETE FROM voice_providers WHERE id=?').run(id);
+        for (const s of saved) db.prepare('UPDATE providers SET configured=1 WHERE id=?').run(s.id);
+      }
+    });
   }
 
   console.log('【U1-8】SDK 正式发布：TS/Python 客户端行为 / 真实端到端 / 下载端点 / 规范契约');

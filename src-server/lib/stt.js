@@ -94,6 +94,76 @@ async function whisperSTT(buf, provider) {
   return { ok: false, error: '响应中未找到识别文本', provider: provider.name };
 }
 
+// ================== U0-2（N3-P2）流式 ASR 适配位 ==================
+
+/** 支持的流式模式：batch=走降级批式；ws/http-chunk=流式适配位（待供应商协议接入） */
+const STREAM_MODES = ['batch', 'ws', 'http-chunk'];
+
+/** 判定供应商生效的流式模式（未配置/非法值一律归 batch） */
+function effectiveStreamMode(provider) {
+  const m = provider && provider.stream_type;
+  return STREAM_MODES.includes(m) ? m : 'batch';
+}
+
+/** 选取 STT 供应商行（按指定 ID 或默认优先，含 stream_type）；无则 null */
+function pickSttProvider(providerId) {
+  try {
+    if (providerId) return db.prepare("SELECT * FROM voice_providers WHERE id=? AND type IN ('stt','both')").get(+providerId) || null;
+    return db.prepare("SELECT * FROM voice_providers WHERE type IN ('stt','both') AND configured=1 ORDER BY is_default DESC, id ASC").get() || null;
+  } catch { return null; }
+}
+
+/**
+ * 创建一路流式 ASR 适配位会话（U0-2 N3-P2）。
+ *
+ *   const asr = createAsrStream({ format, language });   // 自动选取供应商
+ *   asr.push(chunkBuf);                                   // 喂入音频分片（可多次）
+ *   const r = await asr.end();                            // { ok, text?, mode, degraded, partial }
+ *
+ * 语义：
+ *   - 永不 reject（与 stt() 一致），失败返回 { ok:false }。
+ *   - stream_type 为 batch（默认）时：缓冲全部分片后整段复用 stt() 批式识别，partial=false。
+ *   - stream_type 为 ws/http-chunk 且配置了 stream_endpoint 时：视为「适配位就绪」，
+ *     但真实流式传输协议待供应商确定后接入，当前统一回落批式以保证链路可用，
+ *     并以 degraded=true 标注（凭证/协议到位后仅需在此分支接入流式实现）。
+ *
+ * @param {object}   [opts]
+ * @param {number}   [opts.provider]   - 指定 voice_providers 供应商 ID
+ * @param {string}   [opts.format]     - 音频格式
+ * @param {string}   [opts.language]   - 语言（默认 'zh'）
+ * @param {function} [opts.onPartial]  - 流式 partial 回调（batch 模式不触发）
+ */
+function createAsrStream({ provider, format, language, onPartial } = {}) {
+  const p = pickSttProvider(provider);
+  const mode = effectiveStreamMode(p);
+  const streamDeclared = mode !== 'batch' && !!(p && p.stream_endpoint);
+  let chunks = [];
+  let bytes = 0;
+  let cancelled = false;
+  return {
+    mode,
+    provider: p ? p.name : null,
+    /** 当前缓冲字节数 */
+    get bytes() { return bytes; },
+    /** 喂入音频分片（流式模式可据实回吐 partial；batch 模式仅缓冲） */
+    push(buf) {
+      if (cancelled || !buf) return;
+      const b = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
+      chunks.push(b); bytes += b.length;
+    },
+    /** 结束一轮并取识别结果（永不 reject） */
+    async end() {
+      if (cancelled) return { ok: false, error: '已取消', mode, cancelled: true };
+      const audio = Buffer.concat(chunks);
+      chunks = []; bytes = 0;
+      const r = await stt({ audio, format, language, provider });
+      return { ...r, mode, degraded: streamDeclared, partial: false, provider: p ? p.name : undefined };
+    },
+    /** 取消（放弃本路识别） */
+    cancel() { cancelled = true; chunks = []; bytes = 0; },
+  };
+}
+
 /** 猜测音频文件格式（根据魔数或默认 wav） */
 function guessExt(buf) {
   if (!buf || buf.length < 4) return 'wav';
@@ -120,4 +190,4 @@ function guessExt(buf) {
  *   recorder.stop();  // 停止录音，触发上传
  */
 
-module.exports = { stt, whisperSTT, guessExt };
+module.exports = { stt, whisperSTT, guessExt, STREAM_MODES, effectiveStreamMode, pickSttProvider, createAsrStream };

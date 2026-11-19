@@ -44,7 +44,7 @@ const path = require('path');
 const fs = require('fs');
 const { db, now } = require('../db');
 const { verify, readToken } = require('./auth');
-const { stt } = require('./stt');
+const { createAsrStream } = require('./stt');
 const { genTTS } = require('./skills');
 const { chat } = require('./llm');
 
@@ -187,7 +187,10 @@ function handleConn(ws, user) {
       if (MOCK) {
         asrText = '请介绍一下你能做什么';
       } else {
-        const r = await stt({ audio, format: s.format, language: 'zh' });
+        // ASR 经流式适配位（U0-2 P2）：未配置流式供应商时走「整段批式」降级链
+        const asr = createAsrStream({ format: s.format, language: 'zh' });
+        asr.push(audio);
+        const r = await asr.end();
         if (!r.ok) { sendJson(ws, { type: 'error', msg: '语音识别失败：' + (r.error || '未知错误') }); return; }
         asrText = String(r.text || '').trim();
       }

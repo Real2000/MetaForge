@@ -11,6 +11,9 @@ const { auth, adminOnly } = require('../lib/auth');
 const router = express.Router();
 router.use(auth, adminOnly);
 
+// U0-2（N3-P2）流式适配位：供应商流式能力可选值
+const STREAM_TYPES = ['batch', 'ws', 'http-chunk'];
+
 // 获取全部语音供应商
 router.get('/', (req, res) => {
   const { type } = req.query;
@@ -24,14 +27,16 @@ router.get('/', (req, res) => {
 
 // 创建语音供应商
 router.post('/', (req, res) => {
-  const { name, type, base_url, api_key, endpoint, model_name, voices, languages, rate_options, is_default, remark } = req.body || {};
+  const { name, type, base_url, api_key, endpoint, model_name, voices, languages, rate_options, is_default, remark, stream_type, stream_endpoint } = req.body || {};
   if (!name) return res.json({ code: 400, msg: '名称不能为空' });
-  const info = db.prepare(`INSERT INTO voice_providers (name,type,base_url,api_key,endpoint,model_name,voices,languages,rate_options,configured,is_default,remark,created_at,updated_at)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+  const st = (stream_type === undefined || stream_type === null || stream_type === '') ? 'batch' : stream_type;
+  if (!STREAM_TYPES.includes(st)) return res.json({ code: 400, msg: `stream_type 非法（应为 ${STREAM_TYPES.join(' / ')}）` });
+  const info = db.prepare(`INSERT INTO voice_providers (name,type,base_url,api_key,endpoint,model_name,voices,languages,rate_options,configured,is_default,remark,stream_type,stream_endpoint,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
     .run(
       name, type || 'both', base_url || '', api_key || '', endpoint || '', model_name || '',
       JSON.stringify(voices || []), JSON.stringify(languages || []), JSON.stringify(rate_options || []),
-      (base_url && api_key) ? 1 : 0, is_default ? 1 : 0, remark || '', now(), now()
+      (base_url && api_key) ? 1 : 0, is_default ? 1 : 0, remark || '', st, stream_endpoint || '', now(), now()
     );
   db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
     .run(req.user.username, '创建语音供应商', name, req.ip, now());
@@ -42,17 +47,23 @@ router.post('/', (req, res) => {
 router.put('/:id', (req, res) => {
   const old = db.prepare('SELECT * FROM voice_providers WHERE id=?').get(req.params.id);
   if (!old) return res.json({ code: 404, msg: '语音供应商不存在' });
-  const { name, type, base_url, api_key, endpoint, model_name, voices, languages, rate_options, is_default, remark } = req.body || {};
+  const { name, type, base_url, api_key, endpoint, model_name, voices, languages, rate_options, is_default, remark, stream_type, stream_endpoint } = req.body || {};
   const keyIn = typeof api_key === 'string' ? api_key.trim() : '';
   const nextKey = keyIn && !keyIn.includes('****') ? api_key : old.api_key;
   const configured = (base_url || old.base_url) && nextKey ? 1 : old.configured;
-  db.prepare(`UPDATE voice_providers SET name=?,type=?,base_url=?,api_key=?,endpoint=?,model_name=?,voices=?,languages=?,rate_options=?,configured=?,is_default=?,remark=?,updated_at=? WHERE id=?`)
+  let nextStreamType = old.stream_type || 'batch';
+  if (stream_type !== undefined && stream_type !== null && stream_type !== '') {
+    if (!STREAM_TYPES.includes(stream_type)) return res.json({ code: 400, msg: `stream_type 非法（应为 ${STREAM_TYPES.join(' / ')}）` });
+    nextStreamType = stream_type;
+  }
+  db.prepare(`UPDATE voice_providers SET name=?,type=?,base_url=?,api_key=?,endpoint=?,model_name=?,voices=?,languages=?,rate_options=?,configured=?,is_default=?,remark=?,stream_type=?,stream_endpoint=?,updated_at=? WHERE id=?`)
     .run(
       name || old.name, type || old.type, base_url ?? old.base_url, nextKey, endpoint ?? old.endpoint,
       model_name ?? old.model_name, JSON.stringify(voices || JSON.parse(old.voices || '[]')),
       JSON.stringify(languages || JSON.parse(old.languages || '[]')),
       JSON.stringify(rate_options || JSON.parse(old.rate_options || '[]')),
-      configured, is_default !== undefined ? (is_default ? 1 : 0) : old.is_default, remark ?? old.remark, now(), old.id
+      configured, is_default !== undefined ? (is_default ? 1 : 0) : old.is_default, remark ?? old.remark,
+      nextStreamType, stream_endpoint ?? old.stream_endpoint, now(), old.id
     );
   res.json({ code: 0 });
 });

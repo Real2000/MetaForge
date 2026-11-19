@@ -2229,6 +2229,9 @@ db.exec(`CREATE TABLE IF NOT EXISTS voice_providers (
   updated_at TEXT
 );`);
 console.log('[db] 创建 voice_providers 表（P2-20 语音供应商）');
+// U0-2（N3-P2）流式适配位：增补流式能力字段（未配置默认 batch，走「VAD 分段批式」降级链；凭证到位后改配置即切流式）
+try { db.exec("ALTER TABLE voice_providers ADD COLUMN stream_type TEXT DEFAULT 'batch'"); } catch { }
+try { db.exec("ALTER TABLE voice_providers ADD COLUMN stream_endpoint TEXT DEFAULT ''"); } catch { }
 
 // U0-3 FTS5 全文索引虚拟表（2026-11-13 迁移）：kb_chunks 内容列的全文本搜索支持
 // FTS5 是 SQLite 内置模块、无需额外依赖；absent 不存储正文（仅存行号用 content=表名; content_rowid=id 关联原表）
