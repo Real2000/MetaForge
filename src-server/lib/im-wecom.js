@@ -78,6 +78,50 @@ async function wecomSend(channelId, to, message) {
   } catch (e) { return { ok: false, error: '企微服务不可达：' + e.message }; }
 }
 
+// ---------------- 出站：发交互卡片（U0-5 P1，msgtype=template_card） ----------------
+/** wecomSendCard(channelId, to, message)：message = { title, content, card }
+ *  card = { buttons:[{text,action,url}], callbackData }（见 lib/card-render.js）
+ *  template_card 需 agentid：优先 to.agentid，其次渠道 config.agentId
+ *  语义保证：本函数永不 reject（凭证缺失/网络失败一律降级站内信或返回 { ok:false }） */
+async function wecomSendCard(channelId, to, message) {
+  const card = message?.card || {};
+  const title = String(message?.title || '').trim();
+  const content = String(message?.content || '').trim();
+  const buttons = Array.isArray(card.buttons) ? card.buttons : [];
+  if (!title && !content && !buttons.length) return { ok: false, error: '卡片内容不能为空' };
+  let token = null;
+  try { token = await wecomAccessToken(channelId); } catch (e) { return { ok: false, error: '企微凭证获取失败：' + e.message }; }
+  if (!token) {
+    // mock 模式：降级站内信
+    const { sendInbox } = require('./channel');
+    const btnText = buttons.map(b => `[${b.text}]`).join(' / ');
+    sendInbox('*', { title: `企微渠道（${channelId}）未配置凭证`, content: `卡片已降级：${title ? '【' + title + '】' : ''}${content}${btnText ? ' 按钮：' + btnText : ''}` });
+    return { ok: true, degraded: true, mock: true };
+  }
+  try {
+    const { renderWecomCard } = require('./card-render');
+    const ch = getChannelConfig(channelId);
+    const agentid = to.agentid || ch?.config?.agentId;
+    const payload = {
+      touser: to.receiverType === 'chat' ? '' : (to.receiver || '@all'),
+      msgtype: 'template_card',
+      agentid,
+      template_card: renderWecomCard(card, { title, content }),
+      enable_duplicate_check: 0,
+    };
+    if (to.receiverType === 'chat') payload.chatid = to.receiver;
+    const r = await fetch('https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=' + encodeURIComponent(token), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(8000),
+    });
+    const j = await r.json();
+    if (j.errcode !== 0) return { ok: false, error: '企微卡片发送失败：' + (j.errmsg || '未知错误') };
+    return { ok: true, messageId: String(j.msgid || '') };
+  } catch (e) { return { ok: false, error: '企微服务不可达：' + e.message }; }
+}
+
 // ---------------- XML 解析辅助（企微回调用 XML，最小化实现） ----------------
 function parseXml(xml) {
   const obj = {};
@@ -144,4 +188,4 @@ function sha1(str) {
   return crypto.createHash('sha1').update(str).digest('hex');
 }
 
-module.exports = { wecomAccessToken, wecomSend, handleWecomEvent };
+module.exports = { wecomAccessToken, wecomSend, wecomSendCard, handleWecomEvent };

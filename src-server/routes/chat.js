@@ -23,8 +23,9 @@ const router = express.Router();
 // 挂 router 导出会引发 workflow→chat 循环依赖）；此处引用，文件尾透传导出（smoke 单测沿用 chat.js 入口）
 const { resolveKbFilter } = require('../lib/kb-metadata');
 
-// P5.25 工具确认等待队列（模块级）：stream 请求注册等待 → /confirm 决议路由跨请求唤醒
-const toolConfirmRegistry = new Map(); // key → { resolve, username, expires }
+// P5.25 工具确认等待队列（U0-5 P1 抽到 lib/tool-confirm-registry）：stream 请求注册等待 →
+// 前端 /confirm 与 IM 卡片回调 /card-callback 两条决议路径共用同一份注册表跨请求唤醒
+const toolConfirmRegistry = require('../lib/tool-confirm-registry'); // { register, get, del, resolveByKey }
 router.use(auth);
 
 /** 生成用户问题建议（3 条追问）。失败返回空数组，不影响对话主流程 */
@@ -527,8 +528,7 @@ router.post('/confirm', (req, res) => {
   const entry = toolConfirmRegistry.get(key);
   if (!entry) return res.status(404).json({ code: 404, msg: '确认请求不存在或已处理（可能已超时）' });
   if (entry.username !== req.user.username) return res.status(403).json({ code: 403, msg: '仅发起对话的用户可确认' });
-  entry.finalizeApproval?.(approve === true ? 'approved' : 'rejected', req.user.username, reason);
-  entry.resolve(approve === true);
+  toolConfirmRegistry.resolveByKey(key, approve === true, req.user.username, reason);
   res.json({ code: 0, msg: approve === true ? '已批准执行' : '已拒绝执行' });
 });
 
@@ -1114,10 +1114,10 @@ router.post('/stream', async (req, res) => {
         db.prepare('UPDATE tool_approvals SET status=?, approver=?, decision_at=?, reason=? WHERE confirm_key=? AND status="pending"')
           .run(status, approver || '', now(), String(reason || '').slice(0, 200), toolKey);
       };
-      const timer = setTimeout(() => { toolConfirmRegistry.delete(toolKey); finalizeApproval('expired'); resolve('timeout'); }, 120000);
+      const timer = setTimeout(() => { toolConfirmRegistry.del(toolKey); finalizeApproval('expired'); resolve('timeout'); }, 120000);
       // P5.29：用户停止生成时立即结束确认等待（否则主循环会卡到 120s 超时才落库 partial）
-      abortCleanups.push(() => { clearTimeout(timer); toolConfirmRegistry.delete(toolKey); finalizeApproval('expired'); resolve('stopped'); });
-      toolConfirmRegistry.set(toolKey, { resolve: v => { clearTimeout(timer); toolConfirmRegistry.delete(toolKey); resolve(v); }, finalizeApproval, username: req.user.username, expires: Date.now() + 120000 });
+      abortCleanups.push(() => { clearTimeout(timer); toolConfirmRegistry.del(toolKey); finalizeApproval('expired'); resolve('stopped'); });
+      toolConfirmRegistry.register(toolKey, { resolve: v => { clearTimeout(timer); toolConfirmRegistry.del(toolKey); resolve(v); }, finalizeApproval, username: req.user.username, expires: Date.now() + 120000 });
       send('tool_confirm', { key: toolKey, name, args: argsJson });
     });
     const executeTool = async (name, argsJson) => {

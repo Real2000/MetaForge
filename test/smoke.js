@@ -6309,7 +6309,104 @@ print('PY_OK')
     });
   }
 
-  // 收尾：关闭库并清理临时目录
+  console.log('【U0-5】P1 卡片发送侧与共享审批等待注册表');
+  {
+    const cardRender = require('../src-server/lib/card-render');
+    const registry = require('../src-server/lib/tool-confirm-registry');
+    const { db } = require('../src-server/db');
+
+    await t('U0-5: normalizeButtons 兼容 {text,value} 与 {text,action,url} 两种按钮形态', () => {
+      const legacy = cardRender.normalizeButtons({ buttons: [{ text: '同意', value: 'https://x/ok' }] });
+      assert.strictEqual(legacy.length, 1);
+      assert.strictEqual(legacy[0].url, 'https://x/ok', '旧 value 应兜底为 url');
+      const modern = cardRender.normalizeButtons({ buttons: [{ text: '拒绝', action: 'reject' }, { text: '' }] });
+      assert.strictEqual(modern.length, 1, '空文本按钮应被过滤');
+      assert.strictEqual(modern[0].action, 'reject');
+    });
+
+    await t('U0-5: renderCardBody 三渠道分派 + 未知渠道返回 null（调用方降级）', () => {
+      const card = { buttons: [{ text: '同意', action: 'approve', url: 'https://x/a' }], callbackData: 'k1' };
+      const msg = { title: '审批', content: '请审批' };
+      assert.strictEqual(cardRender.renderCardBody('dingtalk', card, msg).msgtype, 'action_card');
+      const fs = cardRender.renderCardBody('feishu', card, msg);
+      assert.ok(Array.isArray(fs.elements) && fs.elements.some(e => e.tag === 'action'), '飞书卡片应含 action 元素');
+      const fsBtn = fs.elements.find(e => e.tag === 'action').actions[0];
+      assert.deepStrictEqual(fsBtn.value, { key: 'k1', action: 'approve' }, '飞书按钮 value 应携 callbackData+action');
+      const wc = cardRender.renderCardBody('wecom', card, msg);
+      assert.strictEqual(wc.card_type, 'button_interaction');
+      assert.strictEqual(wc.button_list[0].key, 'k1|approve', '企微按钮 key 应为 callbackData|action');
+      assert.strictEqual(cardRender.renderCardBody('unknown', card, msg), null, '未知渠道应返回 null');
+    });
+
+    await t('U0-5: tool-confirm-registry register/get/has/size/del 生命周期', () => {
+      const k = 'ut:sess:1:tool';
+      assert.strictEqual(registry.has(k), false);
+      registry.register(k, { resolve: () => {} });
+      assert.strictEqual(registry.has(k), true);
+      assert.ok(registry.get(k), 'get 应返回条目');
+      assert.ok(registry.size() >= 1);
+      registry.del(k);
+      assert.strictEqual(registry.has(k), false);
+    });
+
+    await t('U0-5: resolveByKey 写终态 + 唤醒 + 移出（approve→approved，否则 rejected）', () => {
+      const calls = [];
+      const k = 'ut:sess:2:tool';
+      // 真实契约：调用方 resolve 内部负责 clearTimeout + 自删（与 chat.js 一致），
+      // registry.resolveByKey 只负责 finalize + resolve，不自行移除
+      registry.register(k, { resolve: v => { calls.push(['resolve', v]); registry.del(k); }, finalizeApproval: (st, who) => calls.push(['finalize', st, who]) });
+      const hit = registry.resolveByKey(k, true, 'admin', 'ok');
+      assert.strictEqual(hit, true);
+      assert.deepStrictEqual(calls[0], ['finalize', 'approved', 'admin']);
+      assert.deepStrictEqual(calls[1], ['resolve', true]);
+      assert.strictEqual(registry.has(k), false, 'resolve 自删后应移出注册表');
+      // 幂等：再次决议返回 false（已移出）
+      assert.strictEqual(registry.resolveByKey(k, false, 'admin'), false);
+      // rejected 语义
+      const k2 = 'ut:sess:3:tool';
+      let st2 = '';
+      registry.register(k2, { resolve: () => { registry.del(k2); }, finalizeApproval: s => { st2 = s; } });
+      registry.resolveByKey(k2, false, 'admin');
+      assert.strictEqual(st2, 'rejected');
+    });
+
+    await t('U0-5: resolveByKey 未命中返回 false（不误唤醒）', () => {
+      assert.strictEqual(registry.resolveByKey('ut:not-exist', true, 'admin'), false);
+    });
+
+    await t('U0-5: im-adapters 已为 feishu/wecom 注册 sendCard', () => {
+      const { adapters } = require('../src-server/lib/im-adapters');
+      assert.strictEqual(typeof adapters.feishu.sendCard, 'function', '飞书应暴露 sendCard');
+      assert.strictEqual(typeof adapters.wecom.sendCard, 'function', '企微应暴露 sendCard');
+    });
+
+    await t('U0-5: channel.sendCard 分派——inbox/未知渠道降级站内信、接收人为空报错', async () => {
+      const { sendCard } = require('../src-server/lib/channel');
+      const card = { buttons: [{ text: '同意', action: 'approve' }], callbackData: 'k2' };
+      const msg = { title: 'T', content: 'C' };
+      const inboxR = await sendCard('inbox', ['admin'], 'T', card, msg);
+      assert.ok(inboxR.ok && inboxR.degraded, 'inbox 应降级');
+      const unknownR = await sendCard('slack', ['u1'], 'T', card, msg);
+      assert.ok(unknownR.ok && unknownR.degraded, '未知渠道应降级');
+      const noRecv = await sendCard('dingtalk', [], 'T', card, msg);
+      assert.strictEqual(noRecv.ok, false, '接收人为空应报错');
+    });
+
+    await t('U0-5: channel.sendCard wecom/feishu 未配置渠道时降级（无启用 channels 行）', async () => {
+      const { sendCard } = require('../src-server/lib/channel');
+      const rows = db.prepare("SELECT id, enabled FROM channels WHERE type IN ('wecom','feishu')").all();
+      db.prepare("UPDATE channels SET enabled=0 WHERE type IN ('wecom','feishu')").run();
+      try {
+        const card = { buttons: [{ text: '同意', action: 'approve' }], callbackData: 'k3' };
+        const r = await sendCard('wecom', ['u1'], 'T', card, { title: 'T', content: 'C' });
+        assert.ok(r.ok && r.degraded, '未配置企微应降级站内信');
+        const r2 = await sendCard('feishu', ['u1'], 'T', card, { title: 'T', content: 'C' });
+        assert.ok(r2.ok && r2.degraded, '未配置飞书应降级站内信');
+      } finally {
+        for (const r of rows) db.prepare('UPDATE channels SET enabled=? WHERE id=?').run(r.enabled, r.id);
+      }
+    });
+  }
 
   // 收尾：关闭库并清理临时目录
   try { db.close(); } catch { }

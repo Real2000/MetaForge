@@ -23,6 +23,7 @@ const express = require('express');
 const { db, now } = require('../db');
 const { loadSecrets } = require('./secrets');
 const { auth } = require('./auth');
+const { renderDingtalkCard } = require('./card-render'); // U0-5 P1 卡片渲染器
 
 // ---------------- ① 入站解析器（各渠道 → 统一模型） ----------------
 
@@ -210,7 +211,7 @@ async function send(to, message) {
     }
     try {
       const token = await dingAccessToken();
-      const body = buildDingCardBody(message);
+      const body = renderDingtalkCard(message.card || {}, message);
       const r = await fetch('https://oapi.dingtalk.com/topapi/message/corpconversation/asyncsend_v2?' + new URLSearchParams({ access_token: token }), {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -253,37 +254,67 @@ async function send(to, message) {
   return { ok: false, channel, error: `未知渠道：${channel}` };
 }
 
-/** 构建钉钉卡片消息体 */
-function buildDingCardBody(message) {
-  const card = message.card || {};
-  const title = String(message?.title || '').trim();
-  const content = String(message?.content || '').trim();
-  const buttons = Array.isArray(card.buttons) ? card.buttons : [];
-  const callbackData = String(card.callbackData || '');
-  const markdown = `## ${title}\n\n${content}\n` + (buttons.length ? buttons.map((b, i) => `---\n[${b.text}](${b.value || '#'})`).join('\n') : '');
-  // 钉钉 action_card 卡片
-  return {
-    msgtype: 'action_card',
-    action_card: {
-      title: title || '审批通知',
-      markdown,
-      single_title: buttons.length === 1 ? buttons[0].text : undefined,
-      single_url: buttons.length === 1 && buttons[0].value ? buttons[0].value : undefined,
-      btn_json_list: buttons.length > 1 ? buttons.map(b => ({
-        title: b.text,
-        action_url: b.value || '',
-      })) : undefined,
-    },
-  };
-}
-
-/** 卡片转渠道原生发送（当前仅降级站内信，待渠道适配就绪后启用） */
-async function sendCard(channel, receivers, title, card, message) {
-  // 当前降级站内信
-  const buttons = Array.isArray(card.buttons) ? card.buttons : [];
+/** 卡片落站内信降级（渠道未配置/未启用/未知渠道时）——兼顾待办可查与不中断发送 */
+function degradeCardToInbox(channel, receivers, title, card, message) {
+  const buttons = Array.isArray(card?.buttons) ? card.buttons : [];
   const btnText = buttons.map(b => `[${b.text}]`).join(' / ');
   sendInbox('*', { title: title || '卡片消息', content: `${message?.content || ''}\n${btnText ? '按钮：' + btnText : ''}` });
-  return { ok: true, channel: 'inbox', degraded: true, receivers, card: true };
+  return { ok: true, channel: 'inbox', degraded: true, receivers, card: true, reason: channel + ' 未配置或未启用' };
+}
+
+/**
+ * 卡片转渠道原生发送（U0-5 P1 实现）：
+ *   钉钉 → action_card（asyncsend_v2）；飞书 → interactive；企微 → template_card
+ *   语义：永不 reject——凭证缺失/未启用/未知渠道一律降级站内信
+ */
+async function sendCard(channel, receivers, title, card, message) {
+  const msg = { title, content: message?.content || '', card };
+  if (channel === 'inbox') return degradeCardToInbox(channel, receivers, title, card, message);
+  if (!receivers.length) return { ok: false, channel, error: '接收人为空' };
+
+  // ① 钉钉：工作通知 action_card
+  if (channel === 'dingtalk') {
+    const s = loadSecrets();
+    if (!s.DINGTALK_APP_KEY || !s.DINGTALK_APP_SECRET || !s.DINGTALK_AGENT_ID) {
+      return degradeCardToInbox(channel, receivers, title, card, message);
+    }
+    try {
+      const token = await dingAccessToken();
+      const body = renderDingtalkCard(card, msg);
+      const r = await fetch('https://oapi.dingtalk.com/topapi/message/corpconversation/asyncsend_v2?' + new URLSearchParams({ access_token: token }), {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ agent_id: s.DINGTALK_AGENT_ID, userid_list: receivers.slice(0, 20).join(','), msg: body }),
+        signal: AbortSignal.timeout(8000),
+      });
+      const j = await r.json();
+      if (!j || j.errcode !== 0) return { ok: false, channel, error: '钉钉卡片发送失败：' + (j?.errmsg || '未知错误') };
+      return { ok: true, channel: 'dingtalk', receivers, taskId: j.task_id };
+    } catch (e) { return { ok: false, channel, error: '钉钉服务不可达：' + e.message }; }
+  }
+
+  // ② 企微/飞书：适配器原生卡片
+  if (channel === 'wecom' || channel === 'feishu') {
+    const chRow = db.prepare('SELECT id FROM channels WHERE type=? AND enabled=1 LIMIT 1').get(channel);
+    if (!chRow) return degradeCardToInbox(channel, receivers, title, card, message);
+    try {
+      const { getAdapter } = require('./im-adapters');
+      const adapter = getAdapter(channel);
+      if (!adapter || adapter.status === 'reserved' || typeof adapter.sendCard !== 'function') {
+        return degradeCardToInbox(channel, receivers, title, card, message);
+      }
+      const to = channel === 'wecom'
+        ? { receiver: receivers[0] || '@all', receiverType: 'user' }
+        : { receiver: receivers[0] || '', receiverType: 'open_id' };
+      const r = await adapter.sendCard(chRow.id, to, msg);
+      if (r.ok) return { ok: true, channel, receivers, messageId: r.messageId, degraded: r.degraded, mock: r.mock };
+      return { ok: false, channel, error: r.error || '卡片发送失败' };
+    } catch (e) {
+      return { ok: false, channel, error: '卡片适配器执行异常：' + e.message };
+    }
+  }
+
+  // ③ 未知渠道：降级
+  return degradeCardToInbox(channel, receivers, title, card, message);
 }
 
 // ---------------- ③ P1-8 channels 表：渠道注册/配置加密/启停/回调状态 ----------------
@@ -368,7 +399,7 @@ module.exports = {
   // 入站
   normalizeInbound, parseDingtalk, parseWecom, parseFeishu, parseWebhook,
   // 出站
-  send, sendInbox,
+  send, sendInbox, sendCard,
   // P1-8 渠道注册表管理
   CHANNEL_TYPES, upsertChannel, listChannels, getChannelConfig,
   updateCallbackStatus, toggleChannel, deleteChannel,

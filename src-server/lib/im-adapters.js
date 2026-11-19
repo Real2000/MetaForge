@@ -20,6 +20,7 @@ const adapters = {
     status: 'active',
     accessToken: feishu.feishuAccessToken,
     send: feishu.feishuSend,
+    sendCard: feishu.feishuSendCard, // U0-5 P1 交互卡片
     handleEvent: feishu.handleFeishuEvent,
   },
   telegram: {
@@ -44,6 +45,7 @@ const adapters = {
     status: 'active',
     accessToken: wecom.wecomAccessToken,
     send: wecom.wecomSend,
+    sendCard: wecom.wecomSendCard, // U0-5 P1 交互卡片
     handleEvent: wecom.handleWecomEvent,
   },
 };

@@ -72,6 +72,44 @@ async function feishuSend(channelId, to, message) {
   } catch (e) { return { ok: false, error: '飞书服务不可达：' + e.message }; }
 }
 
+// ---------------- 出站：发交互卡片（U0-5 P1，msg_type=interactive） ----------------
+/** feishuSendCard(channelId, to, message)：message = { title, content, card }
+ *  card = { buttons:[{text,action,url}], callbackData }（见 lib/card-render.js）
+ *  语义保证：本函数永不 reject（凭证缺失/网络失败一律降级站内信或返回 { ok:false }） */
+async function feishuSendCard(channelId, to, message) {
+  const card = message?.card || {};
+  const title = String(message?.title || '').trim();
+  const content = String(message?.content || '').trim();
+  const buttons = Array.isArray(card.buttons) ? card.buttons : [];
+  if (!title && !content && !buttons.length) return { ok: false, error: '卡片内容不能为空' };
+  let token = null;
+  try {
+    token = await feishuAccessToken(channelId);
+  } catch (e) {
+    return { ok: false, error: '飞书凭证获取失败：' + e.message };
+  }
+  if (!token) {
+    // mock 模式：降级站内信（配置真实凭证后自动切换真发）
+    const { sendInbox } = require('./channel');
+    const btnText = buttons.map(b => `[${b.text}]`).join(' / ');
+    sendInbox('*', { title: `飞书渠道（${channelId}）未配置凭证`, content: `卡片已降级站内信：${title ? '【' + title + '】' : ''}${content}${btnText ? ' 按钮：' + btnText : ''}` });
+    return { ok: true, degraded: true, mock: true };
+  }
+  try {
+    const { renderFeishuCard } = require('./card-render');
+    const body = renderFeishuCard(card, { title, content });
+    const r = await fetch('https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=' + (to.receiverType || 'open_id'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
+      body: JSON.stringify({ receive_id: to.receiver, msg_type: 'interactive', content: JSON.stringify(body) }),
+      signal: AbortSignal.timeout(8000),
+    });
+    const j = await r.json();
+    if (j.code !== 0) return { ok: false, error: '飞书卡片发送失败：' + (j.msg || '未知错误') };
+    return { ok: true, messageId: j.data?.message_id };
+  } catch (e) { return { ok: false, error: '飞书服务不可达：' + e.message }; }
+}
+
 // ---------------- 入站：事件订阅（v2 协议） ----------------
 /** 事件回调统一入口：
  *  - url challenge（飞书配置回调地址时的验证握手）→ 返回 { challenge }
@@ -101,4 +139,4 @@ function handleFeishuEvent(channelId, headers, body) {
   return { ignored: true, type: eventType || 'unknown' };
 }
 
-module.exports = { feishuAccessToken, feishuSend, handleFeishuEvent };
+module.exports = { feishuAccessToken, feishuSend, feishuSendCard, handleFeishuEvent };
