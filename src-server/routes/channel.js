@@ -58,10 +58,13 @@ router.post('/event/:id', xmlParser, async (req, res) => {
     const msg = result.message;
     const audit = auditInbound(msg);
     const verdict = inbound(msg);
-    // 公众号：被动回复 XML（≤5s 同步返回；内容按路由结果构造）
+    // 公众号：被动回复 XML（≤5s 硬超时，微信最多重试 3 次）
+    // 双通道约定：路由命中 → 立即回占位（长耗时任务不阻塞 5s 窗口）；
+    //            真正的结果由业务执行方经 pushAsyncResult()（客服接口，48h 窗口）异步回推。
+    //            路由未命中 → 直接回提示语。
     if (result.reply) {
       let content = '';
-      if (verdict.ok) content = '正在处理，请稍候…'; // P1 占位；P2 接「客服接口异步回推」双通道
+      if (verdict.ok) content = '正在处理，请稍候…'; // 占位；长任务转异步由 pushAsyncResult 回推
       else if (verdict.reply) content = verdict.reply;
       const xml = buildPassiveReply(result.reply.toUser, result.reply.fromUser, content);
       return res.type('text/xml').send(xml);

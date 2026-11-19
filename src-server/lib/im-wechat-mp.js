@@ -158,6 +158,21 @@ async function wechatMpSendCard(channelId, to, message) {
   return { ...r, card: true, textDegraded: true };
 }
 
+/**
+ * 异步回推（双通道之「客服接口」侧，供未来 bot 消费者调用）。
+ * 场景：公众号被动回复有 5s 硬超时，长耗时智能体任务一律先回占位（buildPassiveReply），
+ *       待业务执行完毕后由本函数把结果经客服接口推送回用户。
+ * 语义与 wechatMpSend 一致：永不 reject；凭证缺失/网络失败 → {ok:false}；
+ *       超出 48h 交互窗口（45015）→ 降级站内信并标注 windowClosed。
+ * @param {number} channelId  渠道 id（定位 appId/appSecret）
+ * @param {string} openid     用户 openid（收到消息的 FromUserName）
+ * @param {string} content    回推文本
+ * @param {string} [title]    可选标题（以【标题】前置）
+ */
+async function pushAsyncResult(channelId, openid, content, title) {
+  return wechatMpSend(channelId, { receiver: openid }, { title: title || '', content });
+}
+
 // ---------------- 被动回复（≤5s 同步返回 XML） ----------------
 /** 构造被动回复 XML；content 为空时返回 'success'（微信视为不回复，用于长任务转异步） */
 function buildPassiveReply(toUser, fromUser, content) {
@@ -249,7 +264,7 @@ async function uploadMedia(channelId, type, buffer, filename) {
 }
 
 module.exports = {
-  wechatMpAccessToken, wechatMpSend, wechatMpSendCard,
+  wechatMpAccessToken, wechatMpSend, wechatMpSendCard, pushAsyncResult,
   handleWechatMpEvent, buildPassiveReply, uploadMedia,
   parseXml, computeSignature, safeEqualHex, decryptMessage, verifyUrlSignature,
 };

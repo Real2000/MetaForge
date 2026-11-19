@@ -6941,6 +6941,87 @@ print('PY_OK')
     try { deleteChannel(chId); } catch { }
   }
 
+  console.log('【U0-1③ / N4】P2 出站双通道（客服接口真发 / 窗口降级 / 凭证失败 / token 缓存）');
+  {
+    const { db } = require('../src-server/db');
+    const { upsertChannel, deleteChannel } = require('../src-server/lib/channel');
+    const mp = require('../src-server/lib/im-wechat-mp');
+
+    // 出站专用渠道（配 appId/appSecret，走真实 token 路径；fetch 由用例注入）
+    const mpCh = upsertChannel({ name: '测试公众号-出站', type: 'wechat-mp', config: { appId: 'wx-out', appSecret: 'secret-out', token: 'tok2' } });
+    const chId = mpCh.id;
+
+    const realFetch = global.fetch;
+    const stub = (handler) => { global.fetch = async (url, opt) => handler(String(url), opt); };
+
+    await t('U0-1③/N4-P2: 客服接口真发成功（token 获取 + custom/send errcode 0）', async () => {
+      let tokenHits = 0, sendHits = 0;
+      stub(async (url) => {
+        if (url.includes('/cgi-bin/token')) { tokenHits++; return { json: async () => ({ access_token: 'TK', expires_in: 7200 }) }; }
+        if (url.includes('/message/custom/send')) { sendHits++; return { json: async () => ({ errcode: 0, errmsg: 'ok' }) }; }
+        return { json: async () => ({}) };
+      });
+      try {
+        const r1 = await mp.wechatMpSend(chId, { receiver: 'openid_out' }, { content: 'hello' });
+        assert.ok(r1.ok && !r1.degraded, '真发应成功且非降级');
+        assert.strictEqual(sendHits, 1);
+        // 第二次经 pushAsyncResult（异步回推入口）：token 应命中缓存，不再请求 token 接口
+        const r2 = await mp.pushAsyncResult(chId, 'openid_out', 'again', '标题');
+        assert.ok(r2.ok);
+        assert.strictEqual(tokenHits, 1, 'access_token 应命中缓存（仅首次请求）');
+        assert.strictEqual(sendHits, 2);
+      } finally { global.fetch = realFetch; }
+    });
+
+    await t('U0-1③/N4-P2: 客服接口 45015（超 48h 窗口）→ 降级站内信 + windowClosed', async () => {
+      stub(async (url) => {
+        if (url.includes('/cgi-bin/token')) return { json: async () => ({ access_token: 'TK2', expires_in: 7200 }) };
+        if (url.includes('/message/custom/send')) return { json: async () => ({ errcode: 45015, errmsg: 'out of time' }) };
+        return { json: async () => ({}) };
+      });
+      try {
+        const r = await mp.pushAsyncResult(chId, 'openid_out', '晚到的智能体结果');
+        assert.ok(r.ok && r.degraded && r.windowClosed, '应降级且标注窗口超时');
+      } finally { global.fetch = realFetch; }
+    });
+
+    await t('U0-1③/N4-P2: 其他微信错误码 → {ok:false, error}（不静默吞错）', async () => {
+      stub(async (url) => {
+        if (url.includes('/cgi-bin/token')) return { json: async () => ({ access_token: 'TK3', expires_in: 7200 }) };
+        if (url.includes('/message/custom/send')) return { json: async () => ({ errcode: 40003, errmsg: 'invalid openid' }) };
+        return { json: async () => ({}) };
+      });
+      try {
+        const r = await mp.wechatMpSend(chId, { receiver: 'bad' }, { content: 'x' });
+        assert.strictEqual(r.ok, false);
+        assert.ok(/invalid openid/.test(r.error));
+      } finally { global.fetch = realFetch; }
+    });
+
+    await t('U0-1③/N4-P2: access_token 获取失败（appid 非法）→ {ok:false, 凭证获取失败}', async () => {
+      const chBad = upsertChannel({ name: '测试公众号-坏凭证', type: 'wechat-mp', config: { appId: 'wx-bad', appSecret: 'badsec', token: 't' } });
+      stub(async (url) => {
+        if (url.includes('/cgi-bin/token')) return { json: async () => ({ errcode: 40013, errmsg: 'invalid appid' }) };
+        return { json: async () => ({}) };
+      });
+      try {
+        const r = await mp.wechatMpSend(chBad.id, { receiver: 'o' }, { content: 'x' });
+        assert.strictEqual(r.ok, false);
+        assert.ok(/凭证获取失败/.test(r.error));
+      } finally { global.fetch = realFetch; try { deleteChannel(chBad.id); } catch { } }
+    });
+
+    await t('U0-1③/N4-P2: 网络异常 → {ok:false}（函数永不 reject）', async () => {
+      stub(async () => { throw new Error('network down'); });
+      try {
+        const r = await mp.wechatMpSend(chId, { receiver: 'o' }, { content: 'x' });
+        assert.strictEqual(r.ok, false);
+      } finally { global.fetch = realFetch; }
+    });
+
+    try { deleteChannel(chId); } catch { }
+  }
+
   // 收尾：关闭库并清理临时目录
   try { db.close(); } catch { }
   fs.rmSync(process.env.AGENT_DATA_DIR, { recursive: true, force: true });
