@@ -6408,6 +6408,54 @@ print('PY_OK')
     });
   }
 
+  console.log('【U0-5】R2 用户↔渠道身份绑定（user_channel_bindings）');
+  {
+    const { db } = require('../src-server/db');
+    const { upsertUserBinding, listUserBindings, getUserChannelBindings, deleteUserBinding } = require('../src-server/lib/channel');
+    const nowStr = new Date().toISOString().replace('T', ' ').slice(0, 19);
+    const chId = db.prepare(`INSERT INTO channels (name, type, config, enabled, created_by, created_at, updated_at) VALUES (?,?,?,?,?,?,?)`).run('测试企微', 'wecom', '', 1, 'admin', nowStr, nowStr).lastInsertRowid;
+    const chId2 = db.prepare(`INSERT INTO channels (name, type, config, enabled, created_by, created_at, updated_at) VALUES (?,?,?,?,?,?,?)`).run('测试飞书禁用', 'feishu', '', 0, 'admin', nowStr, nowStr).lastInsertRowid;
+
+    await t('U0-5: upsertUserBinding 新建 + UNIQUE(username,channel_id) 幂等更新', () => {
+      const r1 = upsertUserBinding({ username: 'ub-user', channelId: chId, channelUserId: 'cuid-1', channelUserName: '张三' });
+      assert.ok(r1.id, '应返回新行');
+      assert.strictEqual(r1.channel_user_id, 'cuid-1');
+      const r2 = upsertUserBinding({ username: 'ub-user', channelId: chId, channelUserId: 'cuid-2' });
+      assert.strictEqual(r2.id, r1.id, '同 user+channel 应更新而非新增');
+      assert.strictEqual(r2.channel_user_id, 'cuid-2');
+      const cnt = db.prepare('SELECT COUNT(*) c FROM user_channel_bindings WHERE username=? AND channel_id=?').get('ub-user', chId).c;
+      assert.strictEqual(cnt, 1, '不应产生重复行');
+    });
+
+    await t('U0-5: upsertUserBinding 参数校验（必填 / 渠道不存在）', () => {
+      assert.throws(() => upsertUserBinding({ username: '', channelId: chId, channelUserId: 'x' }), /username/);
+      assert.throws(() => upsertUserBinding({ username: 'u', channelId: chId, channelUserId: '' }), /channel_user_id/);
+      assert.throws(() => upsertUserBinding({ username: 'u', channelId: 999999, channelUserId: 'x' }), /渠道不存在/);
+    });
+
+    await t('U0-5: listUserBindings 按 username 过滤 + 联表带出渠道类型', () => {
+      const mine = listUserBindings('ub-user');
+      assert.ok(mine.length >= 1);
+      assert.ok(mine.every(b => b.username === 'ub-user'), '只返回目标用户');
+      assert.strictEqual(mine[0].channel_type, 'wecom', '应带出渠道类型');
+    });
+
+    await t('U0-5: getUserChannelBindings 仅返回已启用渠道（禁用渠道不推）', () => {
+      upsertUserBinding({ username: 'ub-user', channelId: chId2, channelUserId: 'cuid-f' }); // 禁用飞书
+      const enabled = getUserChannelBindings('ub-user');
+      assert.ok(enabled.some(b => b.channel_id === chId), '启用渠道应命中');
+      assert.ok(!enabled.some(b => b.channel_id === chId2), '禁用渠道不应命中（HITL 不推）');
+    });
+
+    await t('U0-5: deleteUserBinding 解绑', () => {
+      for (const r of listUserBindings('ub-user')) deleteUserBinding(r.id);
+      assert.strictEqual(listUserBindings('ub-user').length, 0);
+    });
+
+    db.prepare('DELETE FROM user_channel_bindings WHERE channel_id IN (?,?)').run(chId, chId2);
+    db.prepare('DELETE FROM channels WHERE id IN (?,?)').run(chId, chId2);
+  }
+
   // 收尾：关闭库并清理临时目录
   try { db.close(); } catch { }
   fs.rmSync(process.env.AGENT_DATA_DIR, { recursive: true, force: true });

@@ -1119,6 +1119,32 @@ router.post('/stream', async (req, res) => {
       abortCleanups.push(() => { clearTimeout(timer); toolConfirmRegistry.del(toolKey); finalizeApproval('expired'); resolve('stopped'); });
       toolConfirmRegistry.register(toolKey, { resolve: v => { clearTimeout(timer); toolConfirmRegistry.del(toolKey); resolve(v); }, finalizeApproval, username: req.user.username, expires: Date.now() + 120000 });
       send('tool_confirm', { key: toolKey, name, args: argsJson });
+      // U0-5 R3：向发起用户绑定的「已启用」IM 渠道异步推审批卡。
+      // 无绑定/无凭证一律静默跳过（前端 SSE 卡为兜底），失败绝不阻塞前端审批链。
+      (async () => {
+        try {
+          const { send: channelSend, getUserChannelBindings } = require('../lib/channel');
+          const binds = getUserChannelBindings(req.user.username);
+          if (!binds.length) return;
+          const base = `${req.protocol || 'http'}://${req.get ? req.get('host') : ''}`;
+          const cbUrl = act => `${base}/api/channel/card-callback?callbackData=${encodeURIComponent(toolKey)}&action=${act}`;
+          const argsPreview = String(argsJson || '').slice(0, 300) || '（无参数）';
+          for (const b of binds) {
+            await channelSend({ channel: b.channel_type, receivers: [b.channel_user_id] }, {
+              type: 'card',
+              title: `审批请求：${name}`,
+              content: argsPreview,
+              card: {
+                buttons: [
+                  { text: '批准', action: 'approve', url: cbUrl('approve') },
+                  { text: '拒绝', action: 'reject', url: cbUrl('reject') },
+                ],
+                callbackData: toolKey,
+              },
+            });
+          }
+        } catch { /* 推送失败不影响前端审批 */ }
+      })();
     });
     const executeTool = async (name, argsJson) => {
       // P5.32：MCP 工具传入挂载上下文做细粒度分级（trusted 服务器的只读工具降为 low 免确认疲劳；其余仍 high）

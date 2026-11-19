@@ -395,6 +395,48 @@ function deleteChannel(id) {
   db.prepare('DELETE FROM channels WHERE id=?').run(id);
 }
 
+// ---------------- ④ U0-5 R2 用户↔渠道身份绑定（user_channel_bindings） ----------------
+
+/** 新增/更新用户渠道绑定（UNIQUE(username, channel_id) 幂等；一个用户每渠道一个收件身份） */
+function upsertUserBinding({ username, channelId, channelUserId, channelUserName }) {
+  const u = String(username || '').trim();
+  const cid = Number(channelId);
+  const cuid = String(channelUserId || '').trim();
+  if (!u) throw new Error('username 必填');
+  if (!cid) throw new Error('channel_id 必填');
+  if (!cuid) throw new Error('channel_user_id 必填');
+  if (!db.prepare('SELECT id FROM channels WHERE id=?').get(cid)) throw new Error('渠道不存在');
+  const old = db.prepare('SELECT id FROM user_channel_bindings WHERE username=? AND channel_id=?').get(u, cid);
+  if (old) {
+    db.prepare('UPDATE user_channel_bindings SET channel_user_id=?, channel_user_name=?, updated_at=? WHERE id=?')
+      .run(cuid, String(channelUserName || '').slice(0, 120), now(), old.id);
+    return db.prepare('SELECT * FROM user_channel_bindings WHERE id=?').get(old.id);
+  }
+  const info = db.prepare(`INSERT INTO user_channel_bindings (username, channel_id, channel_user_id, channel_user_name, created_at, updated_at)
+    VALUES (?,?,?,?,?,?)`).run(u, cid, cuid, String(channelUserName || '').slice(0, 120), now(), now());
+  return db.prepare('SELECT * FROM user_channel_bindings WHERE id=?').get(info.lastInsertRowid);
+}
+
+/** 绑定列表（可按 username 过滤；联表带出渠道名/类型/启用态） */
+function listUserBindings(username) {
+  const sql = `SELECT b.*, c.name AS channel_name, c.type AS channel_type, c.enabled AS channel_enabled
+    FROM user_channel_bindings b LEFT JOIN channels c ON c.id=b.channel_id`;
+  return username
+    ? db.prepare(sql + ' WHERE b.username=? ORDER BY b.id').all(String(username))
+    : db.prepare(sql + ' ORDER BY b.id').all();
+}
+
+/** 取用户「已启用渠道」的绑定（HITL 推送用；未启用渠道不推） */
+function getUserChannelBindings(username) {
+  return db.prepare(`SELECT b.*, c.type AS channel_type FROM user_channel_bindings b
+    JOIN channels c ON c.id=b.channel_id AND c.enabled=1 WHERE b.username=?`).all(String(username));
+}
+
+/** 解绑 */
+function deleteUserBinding(id) {
+  db.prepare('DELETE FROM user_channel_bindings WHERE id=?').run(Number(id));
+}
+
 module.exports = {
   // 入站
   normalizeInbound, parseDingtalk, parseWecom, parseFeishu, parseWebhook,
@@ -403,4 +445,6 @@ module.exports = {
   // P1-8 渠道注册表管理
   CHANNEL_TYPES, upsertChannel, listChannels, getChannelConfig,
   updateCallbackStatus, toggleChannel, deleteChannel,
+  // U0-5 R2 用户↔渠道身份绑定
+  upsertUserBinding, listUserBindings, getUserChannelBindings, deleteUserBinding,
 };

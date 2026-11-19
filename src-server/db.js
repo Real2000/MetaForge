@@ -1832,6 +1832,20 @@ db.exec(`CREATE TABLE IF NOT EXISTS tool_approvals (
 );`);
 db.exec('CREATE INDEX IF NOT EXISTS idx_tool_approvals_status ON tool_approvals(status, id);');
 
+// U0-5 R2 用户↔渠道身份映射：HITL 主动推送审批卡时据此定位「推给哪个渠道的谁」
+// 一个平台用户可在多个渠道各有一个收件身份（UNIQUE(username, channel_id)）
+db.exec(`CREATE TABLE IF NOT EXISTS user_channel_bindings (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  username TEXT NOT NULL,                 -- 平台用户名（HITL 发起人）
+  channel_id INTEGER NOT NULL,            -- FK → channels.id
+  channel_user_id TEXT NOT NULL,          -- 渠道侧标识（钉钉 userid / 飞书 open_id / 企微 UserID）
+  channel_user_name TEXT DEFAULT '',
+  created_at TEXT,
+  updated_at TEXT,
+  UNIQUE(username, channel_id)
+);`);
+db.exec('CREATE INDEX IF NOT EXISTS idx_user_channel_bindings_user ON user_channel_bindings(username);');
+
 // ================== P2-1 协作房间（2026-11-13）==================
 
 // 房间表

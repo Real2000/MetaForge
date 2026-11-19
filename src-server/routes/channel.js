@@ -7,7 +7,7 @@
 const express = require('express');
 const { db, now } = require('../db');
 const { auth, adminOnly } = require('../lib/auth');
-const { normalizeInbound, send, CHANNEL_TYPES, upsertChannel, listChannels, getChannelConfig, updateCallbackStatus, toggleChannel, deleteChannel } = require('../lib/channel');
+const { normalizeInbound, send, CHANNEL_TYPES, upsertChannel, listChannels, getChannelConfig, updateCallbackStatus, toggleChannel, deleteChannel, upsertUserBinding, listUserBindings, deleteUserBinding } = require('../lib/channel');
 const { loadSecrets } = require('../lib/secrets');
 const { upsertBind, deleteBind, listBinds, addWhitelist, removeWhitelist, listWhitelist, inbound } = require('../lib/group-context');
 const { getAdapter, listAdapterStatus } = require('../lib/im-adapters');
@@ -324,6 +324,35 @@ router.post('/card-callback', async (req, res) => {
   } catch (e) {
     res.status(500).json({ code: 500, msg: '卡片回调处理失败：' + e.message });
   }
+});
+
+// ==================== U0-5 R2 用户↔渠道身份绑定 ====================
+
+/** GET /api/channel/user-bindings —— 绑定列表（?username= 过滤） */
+router.get('/user-bindings', adminOnly, (req, res) => {
+  res.json({ code: 0, data: listUserBindings(req.query.username ? String(req.query.username) : undefined) });
+});
+
+/** POST /api/channel/user-bindings/upsert —— 新增/更新绑定（username+channel_id 幂等） */
+router.post('/user-bindings/upsert', adminOnly, (req, res) => {
+  const b = req.body || {};
+  try {
+    const row = upsertUserBinding({
+      username: b.username || req.user.username,
+      channelId: b.channel_id,
+      channelUserId: b.channel_user_id,
+      channelUserName: b.channel_user_name,
+    });
+    res.json({ code: 0, data: row, msg: '已保存' });
+  } catch (e) { res.json({ code: 400, msg: e.message }); }
+});
+
+/** DELETE /api/channel/user-bindings/:id —— 解绑 */
+router.delete('/user-bindings/:id', adminOnly, (req, res) => {
+  deleteUserBinding(Number(req.params.id));
+  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
+    .run(req.user.username, '解绑用户渠道', `#${req.params.id}`, req.ip, now());
+  res.json({ code: 0, msg: '已解绑' });
 });
 
 module.exports = router;
