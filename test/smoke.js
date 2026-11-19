@@ -6165,6 +6165,8 @@ function t(name, fn) {
         assert.ok(await waitBin(c1, 1), '应收到二进制音频帧');
         const done = await waitMsg(c1, m => m.type === 'done');
         assert.ok(done && typeof done.full === 'string' && done.full.length > 0, '应收到 done 与全文：' + JSON.stringify(done));
+        assert.ok(done.ms && typeof done.ms.firstPacket === 'number' && typeof done.ms.roundTrip === 'number', 'done 应携带时延埋点 {firstPacket,roundTrip}：' + JSON.stringify(done.ms));
+        assert.ok(done.ms.roundTrip >= done.ms.firstPacket, '往返时延应不小于首包时延');
         await waitMsg(c1, m => m.type === 'state' && m.state === 'listening'); // 收尾：回到倾听态
       });
 

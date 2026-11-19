@@ -26,7 +26,7 @@
  *   {type:'reply-delta', text}                            LLM 流式文本增量（字幕同步）
  *   {type:'tts-segment', seq, mime, bytes}                随后到来的二进制音频分片描述
  *   （二进制帧）                                            TTS 音频（保序，seq 递增）
- *   {type:'done', full}                                   本轮完成
+ *   {type:'done', full, ms:{firstPacket,roundTrip}}        本轮完成（含时延埋点）
  *   {type:'interrupted'}                                  打断已生效
  *   {type:'error', msg}
  *
@@ -60,8 +60,10 @@ const PUBLIC_ROOT = path.join(__dirname, '..', '..', 'public');
 /** 活跃会话表：ws → session（供并发上限与诊断统计） */
 const sessions = new Set();
 
-/** 运行指标（P4 埋点为最小实现；此处先提供计数，便于看板/日志查询） */
-const metrics = { sessionsTotal: 0, utterances: 0, ttsSegments: 0, interrupts: 0 };
+/** 运行指标（P4 埋点）：计数 + 最近一轮时延与达标计数（首包 <2s、往返 <3s），供看板/日志查询 */
+const metrics = { sessionsTotal: 0, utterances: 0, ttsSegments: 0, interrupts: 0, firstPacketMs: null, roundTripMs: null, firstPacketOK: 0, roundTripOK: 0 };
+const FIRST_PACKET_TARGET_MS = 2000;   // V2：首包 <2s
+const ROUND_TRIP_TARGET_MS = 3000;     // V4：一轮往返 <3s
 
 /** WS upgrade 鉴权：复用 HTTP 同一套（Bearer 头 / ap_token Cookie，浏览器 WS 握手自动带 Cookie） */
 function wsUser(req) {
@@ -155,6 +157,8 @@ function handleConn(ws, user) {
   const runPipeline = async () => {
     const myRun = ++s.runId;
     const stale = () => s.runId !== myRun;
+    const t0 = Date.now();
+    let firstTtsMs = null;                            // 首包延迟（到首个 TTS 分片下发）
     s.busy = true;
     if (s.idleTimer) { clearTimeout(s.idleTimer); s.idleTimer = null; }
     const audio = Buffer.concat(s.audioChunks);
@@ -178,6 +182,7 @@ function handleConn(ws, user) {
       sendJson(ws, { type: 'tts-segment', seq, mime, bytes: buf.length });
       sendBin(ws, buf);
       metrics.ttsSegments++;
+      if (firstTtsMs == null) firstTtsMs = Date.now() - t0;   // 首包：首个分片已下发
     };
 
     try {
@@ -236,7 +241,14 @@ function handleConn(ws, user) {
       if (pending.trim()) await emitTts(pending.trim(), seq++);
       s.ac = null;
       if (stale()) return;
-      sendJson(ws, { type: 'done', full });
+      // 时延埋点（仅完整走完的一轮计）：首包 / 往返
+      const roundTripMs = Date.now() - t0;
+      const fp = firstTtsMs == null ? roundTripMs : firstTtsMs;
+      metrics.firstPacketMs = fp; metrics.roundTripMs = roundTripMs;
+      if (fp < FIRST_PACKET_TARGET_MS) metrics.firstPacketOK++;
+      if (roundTripMs < ROUND_TRIP_TARGET_MS) metrics.roundTripOK++;
+      console.log(`[voice-stream] 一轮完成：首包 ${fp}ms（目标<${FIRST_PACKET_TARGET_MS}）往返 ${roundTripMs}ms（目标<${ROUND_TRIP_TARGET_MS}）`);
+      sendJson(ws, { type: 'done', full, ms: { firstPacket: fp, roundTrip: roundTripMs } });
     } catch (e) {
       if (e && (e.name === 'AbortError' || e.aborted)) return; // 打断/重启导致的中止：静默（由消息处理确认）
       sendJson(ws, { type: 'error', msg: '语音对话失败：' + (e.message || e) });
