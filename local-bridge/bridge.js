@@ -9,14 +9,16 @@
  * 鉴权：device_token（32 位随机 hex，首次启动生成，存本机配置）
  *
  * 安全设计（多层）：
- *   1. 操作白名单：仅 mkdir / list_dir / open_app / notify 四类，**无任意命令执行**
- *   2. 路径约束：mkdir/list_dir 仅限用户主目录（$HOME）内，resolve 后前缀校验，
+ *   1. 操作白名单 + 三档权限：readonly（纯读/看）< standard（常规写，备份先行）< full（键鼠注入/终端/脚本），
+ *      op 必须落在设备档位允许集合内（服务端按档位拦截 + 桥端二次校验，防御纵深）
+ *   2. 路径约束：文件类 op 仅限用户主目录（$HOME）内，resolve 后前缀校验，
  *      拒绝 ~/Library 系统区与路径穿越（..）
  *   3. open_app 仅 `open -a <应用名>`（macOS LaunchServices，应用名经字符白名单校验，无 shell 元字符）
- *   4. 通知走 osascript display notification（固定模板，文本转义）
- *   5. 单飞任务：同一时刻最多执行 1 个任务，防并发滥用
- *   6. 全部动作写本地日志（~/Library/Logs/teleagent-bridge.log）可审计
- *   7. 服务端每 op 执行后落 op_logs（含用户/操作/参数摘要/耗时/结果状态），运营页可检索（A2 完成 2026-11-09）
+ *   4. terminal 仅白名单只读命令（execFile 不经 shell）；run_python 走 python3 -c（full 档，需显式授权）
+ *   5. 写操作（file_write/file_patch）写前自动备份到 backups/，回推 backup_id 供一键回滚（file_restore）
+ *   6. 单飞任务：同一时刻最多执行 1 个任务，防并发滥用
+ *   7. 全部动作写本地日志（~/Library/Logs/teleagent-bridge.log）可审计
+ *   8. 服务端每 op 执行后落 op_logs（含用户/操作/参数摘要/耗时/结果状态），运营页可检索（A2 完成 2026-11-09）
  *
  * 自启动：launchd（~/Library/LaunchAgents/com.teleagent.bridge.plist，KeepAlive）
  * 平台地址：默认 http://localhost:3210，安装时/配置可改
@@ -56,9 +58,26 @@ function log(...a) {
   console.log(line.trim());
 }
 
-// ---------- 操作白名单 ----------
+// ---------- 操作白名单 + 三档权限（与服务端 TIER_OPS 保持一致，客户端二次校验） ----------
 const HOME = os.homedir();
 const HOME_BLOCK_PREFIXES = [path.join(HOME, 'Library')]; // 系统区拒绝写/列
+const BACKUP_DIR = path.join(CONF_DIR, 'backups'); // D1-1：写前备份存放（file_restore 回滚源）
+
+// D1-1 三档权限（与服务端 routes/localbridge.js 的 TIER_OPS 同构；桥端为第二层防线）
+const TIER_ORDER = { readonly: 0, standard: 1, full: 2 };
+const TIER_OPS = {
+  readonly: ['list_dir', 'file_read', 'file_diff', 'clipboard_read', 'window_list', 'screenshot'],
+  standard: ['mkdir', 'open_app', 'notify', 'window_focus', 'file_write', 'file_backup', 'file_patch', 'file_restore'],
+  full: ['key_type', 'mouse_click', 'clipboard_write', 'terminal', 'run_python'],
+};
+function allowedOps(tier) {
+  const lvl = TIER_ORDER[tier] != null ? TIER_ORDER[tier] : TIER_ORDER.standard;
+  const out = new Set();
+  for (const [name, ops] of Object.entries(TIER_OPS)) if (TIER_ORDER[name] <= lvl) for (const o of ops) out.add(o);
+  return out;
+}
+// terminal 白名单命令（V1：仅只读/低风险命令，禁 shell 元字符，走 execFile 不经 shell）
+const TERMINAL_ALLOW = new Set(['ls', 'pwd', 'whoami', 'date', 'echo', 'cat', 'head', 'tail', 'wc', 'grep', 'find', 'df', 'du', 'uname', 'sw_vers', 'which', 'id', 'hostname', 'uptime', 'env']);
 
 function safeJoin(base, rel) {
   const p = path.resolve(base, String(rel || ''));
@@ -67,31 +86,80 @@ function safeJoin(base, rel) {
   return p;
 }
 
+// ---------- D1-1 备份工具 ----------
+function doBackup(target) {
+  fs.mkdirSync(BACKUP_DIR, { recursive: true });
+  const id = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+  if (fs.existsSync(target)) {
+    fs.copyFileSync(target, path.join(BACKUP_DIR, id));
+    const before = fs.statSync(target).size;
+    fs.writeFileSync(path.join(BACKUP_DIR, id + '.json'), JSON.stringify({ path: target, created_at: new Date().toISOString() }));
+    return { backup_id: id, before_bytes: before };
+  }
+  return { backup_id: null, before_bytes: 0 }; // 新建文件无需备份
+}
+/** 极简行级 diff（供 file_diff / 写操作改动清单） */
+function lineDiff(oldText, newText) {
+  const a = String(oldText || '').split('\n');
+  const b = String(newText || '').split('\n');
+  const out = [];
+  const max = Math.max(a.length, b.length);
+  for (let i = 0; i < max; i++) {
+    if (a[i] === b[i]) continue;
+    if (i < a.length && i >= b.length) out.push(`- ${a[i]}`);
+    else if (i >= a.length && i < b.length) out.push(`+ ${b[i]}`);
+    else out.push(`- ${a[i]}`, `+ ${b[i]}`);
+    if (out.length > 400) { out.push('…（差异过多，已截断）'); break; }
+  }
+  return out.join('\n');
+}
+
+/** 管道输入执行（pbcopy 等） */
+function execInput(cmd, args, input, opts = {}) {
+  return new Promise((resolve, reject) => {
+    const cp = require('child_process').spawn(cmd, args, { timeout: opts.timeout || 8000 });
+    let so = '', se = '';
+    cp.stdout.on('data', d => so += d);
+    cp.stderr.on('data', d => se += d);
+    cp.on('error', reject);
+    cp.on('close', code => code === 0 ? resolve(so) : reject(new Error((se || `退出码 ${code}`).slice(0, 200))));
+    if (input != null) cp.stdin.end(input);
+  });
+}
+/** 执行命令并回 stdout（execFile，不经 shell） */
+function execOut(cmd, args, opts = {}) {
+  return new Promise((resolve, reject) => {
+    execFile(cmd, args, { timeout: opts.timeout || 15000, maxBuffer: 4 * 1024 * 1024 }, (e, so, se) => {
+      if (e) reject(new Error((se || e.message).slice(0, 200))); else resolve(so);
+    });
+  });
+}
+
 /** 执行一个任务。返回 { ok, data } —— 白名单操作在此实现 */
-async function runOp(op, params) {
+async function runOp(op, params, opts = {}) {
   const P = params || {};
+  // D1-1：桥端二次档位校验（服务端已按档位拦截；此处为防御纵深，tier 缺省不校验）
+  if (opts.tier && !allowedOps(opts.tier).has(op)) {
+    throw new Error(`该操作「${op}」超出设备当前权限档位（${opts.tier}），已拒绝`);
+  }
   switch (op) {
     case 'mkdir': {
       const dir = safeJoin(HOME, P.target);
-      const existedBefore = fs.existsSync(dir); // 先记存在性（创建后再查恒为 true，语义不准）
+      const existedBefore = fs.existsSync(dir);
       fs.mkdirSync(dir, { recursive: true });
       return { ok: true, data: { path: dir, existed: existedBefore, created: !existedBefore } };
     }
     case 'list_dir': {
       const dir = safeJoin(HOME, P.target || '.');
       const items = fs.readdirSync(dir, { withFileTypes: true })
-        .slice(0, 300) // 上限防爆
+        .slice(0, 300)
         .map(d => ({ name: d.name, type: d.isDirectory() ? 'dir' : d.isFile() ? 'file' : 'other' }));
       return { ok: true, data: { path: dir, count: items.length, items } };
     }
     case 'open_app': {
       const app = String(P.app || '').trim();
       if (!/^[0-9a-zA-Z\u4e00-\u9fa5\s.\-（）()·]{1,60}$/.test(app)) throw new Error(`应用名含非法字符：${app}`);
-      await new Promise((resolve, reject) => {
-        execFile('open', ['-a', app], { timeout: 15000 }, (e, so, se) => {
-          if (e) reject(new Error(`打开应用失败（${(se || e.message).slice(0, 120)}）`)); else resolve(so);
-        });
-      });
+      await execOut('open', ['-a', app], { timeout: 15000 });
       return { ok: true, data: { app, opened: true } };
     }
     case 'notify': {
@@ -100,6 +168,130 @@ async function runOp(op, params) {
         execFile('osascript', ['-e', `display notification "${text}" with title "TeleAgent 智能体平台"`], { timeout: 8000 }, () => resolve());
       });
       return { ok: true, data: { notified: true } };
+    }
+    case 'screenshot': {
+      const dir = safeJoin(HOME, 'Desktop'); // 截图统一落桌面（用户主目录内）
+      const file = path.join(dir, `TeleAgent截图-${Date.now()}.png`);
+      const args = P.window ? ['-x', '-l', String(P.window).slice(0, 30), file] : ['-x', file];
+      await execOut('screencapture', args, { timeout: 15000 });
+      const bytes = fs.existsSync(file) ? fs.statSync(file).size : 0;
+      return { ok: true, data: { path: file, url: 'file://' + file, bytes, window: P.window || '' } };
+    }
+    case 'clipboard_read': {
+      const text = await execInput('pbpaste', [], null).catch(() => '');
+      return { ok: true, data: { type: P.type || 'text', text: String(text).slice(0, 20000) } };
+    }
+    case 'clipboard_write': {
+      const text = String(P.text || '').slice(0, 8000);
+      await execInput('pbcopy', [], text, { timeout: 8000 });
+      return { ok: true, data: { written: true, bytes: Buffer.byteLength(text, 'utf8') } };
+    }
+    case 'key_type': {
+      const text = String(P.text || '').slice(0, 2000).replace(/["\\]/g, '');
+      await execOut('osascript', ['-e', `tell application "System Events" to keystroke "${text}"`], { timeout: 15000 });
+      return { ok: true, data: { typed: text.length } };
+    }
+    case 'mouse_click': {
+      const x = Math.round(+P.x || 0), y = Math.round(+P.y || 0);
+      // 优先 cliclick（若安装）；否则用 python3 + Quartz（需 pyobjc）
+      try {
+        await execOut('cliclick', [`c:${x},${y}`], { timeout: 8000 });
+      } catch {
+        await execOut('python3', ['-c',
+          `import Quartz,time;e=Quartz.CGEventCreateMouseEvent(None,Quartz.kCGEventLeftMouseDown,(${x},${y}),Quartz.kCGMouseButtonLeft);Quartz.CGEventPost(Quartz.kCGHIDEventTap,e);time.sleep(0.05);e2=Quartz.CGEventCreateMouseEvent(None,Quartz.kCGEventLeftMouseUp,(${x},${y}),Quartz.kCGMouseButtonLeft);Quartz.CGEventPost(Quartz.kCGHIDEventTap,e2)`], { timeout: 10000 });
+      }
+      return { ok: true, data: { x, y, clicked: true } };
+    }
+    case 'window_list': {
+      const out = await execOut('osascript', ['-e', 'tell application "System Events" to get name of every process whose background only is false'], { timeout: 10000 }).catch(() => '');
+      const apps = String(out).split(',').map(s => s.trim()).filter(Boolean).slice(0, 100);
+      return { ok: true, data: { count: apps.length, windows: apps.map(a => ({ app: a })) } };
+    }
+    case 'window_focus': {
+      const name = String(P.window || '').trim().replace(/["\\]/g, '');
+      if (!name) throw new Error('缺少窗口/应用名');
+      await execOut('osascript', ['-e', `tell application "${name}" to activate`], { timeout: 10000 });
+      return { ok: true, data: { focused: name } };
+    }
+    case 'file_read': {
+      const file = safeJoin(HOME, P.path);
+      if (!fs.existsSync(file)) throw new Error(`文件不存在：${P.path}`);
+      const st = fs.statSync(file);
+      if (st.size > 512 * 1024) throw new Error(`文件过大（${st.size} 字节，上限 512KB）`);
+      return { ok: true, data: { path: file, bytes: st.size, content: fs.readFileSync(file, 'utf8').slice(0, 200000) } };
+    }
+    case 'file_write': {
+      const file = safeJoin(HOME, P.path);
+      const content = String(P.content || '');
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      const existed = fs.existsSync(file);
+      const oldText = existed ? fs.readFileSync(file, 'utf8') : '';
+      const bk = doBackup(file);
+      fs.writeFileSync(file, content);
+      const after = Buffer.byteLength(content, 'utf8');
+      return { ok: true, data: {
+        path: file, created: !existed, change: existed ? 'modified' : 'created',
+        backup_id: bk.backup_id, before_bytes: bk.before_bytes, after_bytes: after,
+        diff: existed ? lineDiff(oldText, content) : `+ ${content.slice(0, 2000)}`,
+      } };
+    }
+    case 'file_backup': {
+      const file = safeJoin(HOME, P.path);
+      if (!fs.existsSync(file)) throw new Error(`文件不存在：${P.path}`);
+      const bk = doBackup(file);
+      return { ok: true, data: { path: file, backup_id: bk.backup_id, before_bytes: bk.before_bytes, change: 'modified' } };
+    }
+    case 'file_diff': {
+      const file = safeJoin(HOME, P.path);
+      if (!fs.existsSync(file)) throw new Error(`文件不存在：${P.path}`);
+      const cur = fs.readFileSync(file, 'utf8');
+      const oldText = typeof P.old === 'string' ? P.old : null;
+      return { ok: true, data: { path: file, lines: cur.split('\n').length, diff: oldText != null ? lineDiff(oldText, cur) : null, content: cur.slice(0, 200000) } };
+    }
+    case 'file_patch': {
+      const file = safeJoin(HOME, P.path);
+      if (!fs.existsSync(file)) throw new Error(`文件不存在（patch 不支持新建）：${P.path}`);
+      const oldText = fs.readFileSync(file, 'utf8');
+      let newText;
+      if (typeof P.find === 'string' && P.find) {
+        if (!oldText.includes(P.find)) throw new Error('未找到待替换片段（find 不匹配），未做任何修改');
+        newText = oldText.split(P.find).join(String(P.replace != null ? P.replace : ''));
+      } else if (typeof P.append === 'string') {
+        newText = oldText + P.append;
+      } else if (typeof P.content === 'string') {
+        newText = P.content; // 整文件替换
+      } else {
+        throw new Error('patch 缺少 find/replace、append 或 content 参数');
+      }
+      const bk = doBackup(file);
+      fs.writeFileSync(file, newText);
+      return { ok: true, data: { path: file, change: 'modified', backup_id: bk.backup_id, before_bytes: bk.before_bytes, after_bytes: Buffer.byteLength(newText, 'utf8'), diff: lineDiff(oldText, newText) } };
+    }
+    case 'file_restore': {
+      const id = String(P.backup_id || '').trim();
+      if (!/^[\w-]+$/.test(id)) throw new Error('非法备份标识');
+      const bkFile = path.join(BACKUP_DIR, id);
+      const metaFile = bkFile + '.json';
+      if (!fs.existsSync(bkFile) || !fs.existsSync(metaFile)) throw new Error('备份不存在或已过期');
+      const meta = JSON.parse(fs.readFileSync(metaFile, 'utf8'));
+      const target = meta.path; // 备份元数据记录的是原始绝对路径
+      if (!(target === HOME || target.startsWith(HOME + path.sep))) throw new Error('备份目标越界，拒绝回滚');
+      fs.copyFileSync(bkFile, target);
+      return { ok: true, data: { path: target, restored: true, backup_id: id } };
+    }
+    case 'terminal': {
+      const cmd = String(P.cmd || '').trim();
+      const argv = Array.isArray(P.args) ? P.args.map(a => String(a).slice(0, 200)) : [];
+      if (!TERMINAL_ALLOW.has(cmd)) throw new Error(`命令「${cmd}」不在终端白名单内（可用：${[...TERMINAL_ALLOW].join(' ')}）`);
+      if (/[;&|`$><\n]/.test(cmd)) throw new Error('命令含非法字符');
+      const out = await execOut(cmd, argv, { timeout: 15000 });
+      return { ok: true, data: { cmd, args: argv, output: String(out).slice(0, 20000) } };
+    }
+    case 'run_python': {
+      const code = String(P.code || '').slice(0, 20000);
+      if (!code) throw new Error('缺少 code 参数');
+      const out = await execOut('python3', ['-c', code], { timeout: 30000 });
+      return { ok: true, data: { output: String(out).slice(0, 20000) } };
     }
     default:
       throw new Error(`未知操作（白名单外拒绝）：${op}`);
@@ -143,7 +335,7 @@ async function loop() {
       const task = r.data.task;
       log(`▶ 任务 #${task.id} ${task.op} ${JSON.stringify(task.params).slice(0, 120)}`);
       let result;
-      try { result = { ok: true, ...(await runOp(task.op, task.params)) }; }
+      try { result = { ok: true, ...(await runOp(task.op, task.params, { tier: task.tier })) }; }
       catch (e) { result = { ok: false, error: String(e.message || e) }; }
       log(`✔ 任务 #${task.id} 完成 ok=${result.ok}`);
       for (let i = 0; i < 2; i++) { // 回推结果（失败重试一次）

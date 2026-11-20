@@ -1673,6 +1673,35 @@ db.exec(`CREATE TABLE IF NOT EXISTS localbridge_tasks (
   } catch (e) { console.error('[db] N6/U2-4 迁移失败（不阻塞）：', e.message); }
 }
 
+// ================== D1-1 端侧执行 V1：三档权限 + 写前备份/回滚 ==================
+// permission_tier：设备级能力上限（readonly < standard < full），默认 standard（与既有可用能力对齐）。
+// localbridge_backups：写操作（file_write/file_patch）自动备份台账 + 回滚状态，供「事后改动清单/一键回滚」。
+{
+  try {
+    const devCols = db.prepare('PRAGMA table_info(localbridge_devices)').all().map(c => c.name);
+    if (!devCols.includes('permission_tier')) {
+      db.exec("ALTER TABLE localbridge_devices ADD COLUMN permission_tier TEXT DEFAULT 'standard'");
+      console.log('[db] localbridge_devices 表已迁移：新增 permission_tier 字段（D1-1）');
+    }
+  } catch (e) { console.error('[db] D1-1 迁移失败（不阻塞）：', e.message); }
+}
+db.exec(`CREATE TABLE IF NOT EXISTS localbridge_backups (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  device_id INTEGER NOT NULL,
+  username TEXT NOT NULL,
+  task_id INTEGER,                  -- 触发的 localbridge_tasks.id（回滚任务本身可为空）
+  op TEXT DEFAULT '',               -- 触发备份的写操作（file_write / file_patch / file_backup）
+  path TEXT DEFAULT '',             -- 被改动文件（相对用户主目录）
+  backup_id TEXT DEFAULT '',        -- 桥端备份标识（用于 file_restore 定位备份文件）
+  change TEXT DEFAULT '',           -- created / modified
+  before_bytes INTEGER DEFAULT 0,
+  after_bytes INTEGER DEFAULT 0,
+  status TEXT DEFAULT 'active',     -- active（可回滚）/ restored（已回滚）
+  created_at TEXT,
+  restored_at TEXT
+);`);
+db.exec('CREATE INDEX IF NOT EXISTS idx_lb_backups_dev ON localbridge_backups(device_id, created_at);');
+
 // ---------------- P1-4 分层记忆v1：agent_memories 增加 type/confidence/source/summary 字段（2026-11-11）----------------
 {
   const cols = db.prepare('PRAGMA table_info(agent_memories)').all().map(r => r.name);

@@ -2430,4 +2430,36 @@ agent-platform/
 ### 验证
 冒烟 **354/0 全绿**（349 基线 + 5 条新增：市场融合三件套——builtin_tools 动态生成含 26 项验证/违禁排除/keyed 隔离、key_configured 随登记翻转、skill_assets CRUD 字段与私有可见性回归 + tripwire 15→26 + 11 工具行为用例 9 条 + tool-keys HTTP 8 条 + 修 1 处越权断言语义化双加密环境兼容）；**浏览器实测全通过（临时 33214 端口）**：侧边栏合并单一入口 ✓、五 tab 完整 ✓、内置工具 24 卡（2 张 keyed 可配 Key 引导）✓、P3-2 新工具全展示 ✓、创建技能 E2E（24 动态工具选项→勾选 calculator→保存→卡片带我的标签+工具徽章+编辑/发布/删除/调用词四操作）✓、旧路由 #/skills 重定向 ✓、stats「共 27 项资产」✓。生产生效需重启 3210 服务。
 
+## D1-1 端侧执行 V1：三档权限闸门 + 写前备份/一键回滚（2026-11-20）
+
+对标智云 Buddy D 系列 R1 首项。目标：把端侧执行从「二元高危开关 + 4 类桥端能力」升级为「三档细粒度权限 + 全量 op 落地 + 写操作可回滚」。
+
+### 实现内容
+**① 客户端 `local-bridge/bridge.js`：补全缺失 op + 新增写/终端能力**
+- 补齐原白名单 13 op 中桥端未实现的 9 项：screenshot（screencapture）、clipboard_read/write（pbpaste/pbcopy）、key_type（osascript System Events）、mouse_click（cliclick 优先，Quartz 兜底）、window_list/window_focus（System Events）、file_read/file_write。
+- 新增 6 op：file_backup（显式备份）、file_diff（内容/差异查看）、file_patch（find/replace 或 append/content 打补丁）、file_restore（按 backup_id 回滚）、terminal（白名单只读命令，execFile 不经 shell，禁 `;&|`$><` 等元字符）、run_python（python3 -c）。
+- 写操作自动备份：file_write/file_patch 落盘前把原文件复制到 `backups/<backup_id>`，回推 backup_id/before_bytes/after_bytes/diff（行级 diff）。
+- 档位二次校验：桥端内置 TIER_OPS，poll 任务携带 `tier`，超档 op 直接拒绝（服务端为第一层，桥端为防御纵深）。
+
+**② 服务端三档权限模型（`routes/localbridge.js`，单一权威源）**
+- `TIER_ORDER` readonly < standard < full；`TIER_OPS` 三档 op 集合；`allowedOpsForTier/opAllowedForTier/opMinTier/normalizeTier` 导出。
+- 决策1 档位划分：**只读档**＝list_dir/file_read/file_diff/clipboard_read/window_list/screenshot；**标准档**＝+mkdir/open_app/notify/window_focus/file_write/file_backup/file_patch/file_restore；**全权档**＝+key_type/mouse_click/clipboard_write/terminal/run_python。
+- `OPS_WHITELIST` 由 13 → 19；`localbridge_devices.permission_tier`（默认 standard）；`GET /devices` 回传档位；新增 `POST /devices/:id/tier` 设档（非法档 400，写 op_logs）。
+- 写前备份台账 `localbridge_backups`（device/op/path/backup_id/change/before/after/status）；`/result` 回推写 op 后自动落库；`GET /backups` 列表；`POST /backups/:id/rollback` 入队 file_restore 任务并置备份 restoring（受档位约束）。
+
+**③ 决策2=A：放开 local_exec（`lib/tool-deny.js`）**
+- `AGENT_TOOL_DENY` 由 `['create_task','local_exec']` 收敛为 `['create_task']`——智能体/技能可在标准/全权档下配置本机操控工具，受「设备档位 + 执行前确认卡」双重约束。所有消费点（agents/skillassets/skills-market/存量清洗）经引用本集合自动放开，无散点修改。
+- `routes/chat.js` 子智能体执行上下文同步放开 local_exec（仅保留 create_task 禁入）；workflow.js 无人值守上下文的 `UNATTENDED_DENY` 保留 local_exec（无人类确认卡，维持最保守）。
+
+**④ 工具与渠道链路对齐**
+- `lib/tools-extra.js`：local_exec schema op enum 扩到 19、新增 find/replace/append/backup_id/cmd/args/code 参数；run 内加入档位闸门（超档回可行动提示）；新 op 参数白名单化清洗。
+- `lib/remote-dispatch.js`：`HIGH_RISK_OPS` 增 terminal/run_python；`sanitizeParams` 扩 6 个新 op；`handleInbound` 新增「③.5 档位闸」（tier-blocked）。
+- `public/js/front/devices.js`：设备表新增「权限档位」下拉（三档，改档即时生效）；新增「端侧改动与回滚」区块（备份列表 + 一键回滚，含档位说明）。
+
+### 验证
+- `npm test` 冒烟 **513/0 全绿**（508 基线 + 5 条新增 D1-1 用例：库迁移/sanitizeParams 新 op/渠道档位闸 tier-blocked/备份台账+一键回滚端到端/bridge.js 新 op 与档位校验；并同步更新 4 条受「放开 local_exec」影响的存量断言）。
+- 接口实测（临时隔离库）：`GET /devices` 回传 permission_tier、`POST /tier` 返回允许 op 集、非法档位 400。
+- 浏览器实测（临时 3999 端口 + 隔离库）：设备页无控制台错误，三档下拉（默认标准档）、备份表「可回滚 + 回滚」按钮渲染正常，排版无错乱。
+- 已知边界：客户端 `.app`/DMG 需在目标机跑 `local-bridge/build-installer.sh` 构建；key_type/mouse_click 需 macOS 辅助功能授权；run_python/terminal 属全权档，渠道路径另需设备级 allow_high_risk。
+
 > AI生成

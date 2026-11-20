@@ -1,10 +1,12 @@
 /**
- * 智能体可配置工具的违禁集（P5.34/P5.34b）
- * create_task（持久化自动执行实体）与 local_exec（外设操作）不允许配置进智能体/技能——
- * 对话链路仅首页助手服务端默认集可用且有确认卡；所有写入口（agents POST/PUT/import/copy、
- * skill_assets、存量清洗）统一引用本集合。
+ * 智能体可配置工具的违禁集（P5.34/P5.34b；D1-1 调整）
+ * create_task（持久化自动执行实体）不允许配置进智能体/技能——对话链路仅首页助手服务端默认集可用且有确认卡；
+ * 所有写入口（agents POST/PUT/import/copy、skill_assets、存量清洗）统一引用本集合。
+ *
+ * D1-1（2026-11-20，决策2=A）：**放开 local_exec**——智能体/技能可在「标准/全权档」下配置本地操控工具，
+ * 受双重约束：① 设备三档权限上限（routes/localbridge.js TIER_OPS）② 执行前确认卡（high 风险恒确认）。
  * 零依赖小模块：db.js 迁移与 tools.js 均可安全引用（避免 db ↔ tools 循环依赖）。
  */
-const AGENT_TOOL_DENY = new Set(['create_task', 'local_exec']);
+const AGENT_TOOL_DENY = new Set(['create_task']);
 
 module.exports = { AGENT_TOOL_DENY };

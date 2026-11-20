@@ -16,16 +16,19 @@
  * 解析产物绝不透传为工具调用——未知 op、绝对路径、路径穿越一律拒绝。
  */
 const { db, now } = require('../db');
-const { OPS_WHITELIST } = require('../routes/localbridge');
+const { OPS_WHITELIST, opAllowedForTier, normalizeTier, opMinTier } = require('../routes/localbridge');
 
-// 高危 op：默认关闭，需设备级 allow_high_risk 显式开启（与桥端开关构成双层）
-const HIGH_RISK_OPS = ['key_type', 'mouse_click', 'clipboard_write', 'file_write'];
+// 高危 op：默认关闭，需设备级 allow_high_risk 显式开启（与桥端档位构成双层）
+// D1-1：terminal/run_python（全权档）纳入高危——渠道无人值守路径须显式开启方可执行
+const HIGH_RISK_OPS = ['key_type', 'mouse_click', 'clipboard_write', 'file_write', 'terminal', 'run_python'];
 
 const OP_LABEL = {
   mkdir: '新建文件夹', list_dir: '列目录', open_app: '打开应用', notify: '系统通知',
   screenshot: '截图', clipboard_read: '读剪贴板', clipboard_write: '写剪贴板',
   key_type: '键盘输入', mouse_click: '鼠标点击', window_list: '窗口列表',
   window_focus: '激活窗口', file_read: '读文件', file_write: '写文件',
+  file_backup: '备份文件', file_diff: '查看差异', file_patch: '修改文件', file_restore: '回滚文件',
+  terminal: '终端命令', run_python: '运行 Python',
 };
 
 const USAGE_HINT = '暂不支持该指令。可用：建文件夹 X / 列目录 [路径] / 截图 / 读文件 X / 写文件 X 内容… / 打开应用 X / 通知 X / 窗口列表 / 读剪贴板。';
@@ -112,6 +115,39 @@ function sanitizeParams(op, raw) {
     if (!path) return { ok: false, error: '缺少文件路径' };
     params.path = path;
     params.content = String(a.content || '').slice(0, 32000);
+  } else if (op === 'file_backup') {
+    const path = String(a.path || '').slice(0, 500).trim();
+    if (isUnsafePath(path)) return { ok: false, error: '禁止绝对路径或路径穿越' };
+    if (!path) return { ok: false, error: '缺少文件路径' };
+    params.path = path;
+  } else if (op === 'file_diff') {
+    const path = String(a.path || '').slice(0, 500).trim();
+    if (isUnsafePath(path)) return { ok: false, error: '禁止绝对路径或路径穿越' };
+    if (!path) return { ok: false, error: '缺少文件路径' };
+    params.path = path;
+    if (typeof a.old === 'string') params.old = a.old.slice(0, 200000);
+  } else if (op === 'file_patch') {
+    const path = String(a.path || '').slice(0, 500).trim();
+    if (isUnsafePath(path)) return { ok: false, error: '禁止绝对路径或路径穿越' };
+    if (!path) return { ok: false, error: '缺少文件路径' };
+    params.path = path;
+    if (typeof a.find === 'string') params.find = a.find.slice(0, 20000);
+    if (typeof a.replace === 'string') params.replace = a.replace.slice(0, 20000);
+    if (typeof a.append === 'string') params.append = a.append.slice(0, 32000);
+    if (typeof a.content === 'string') params.content = a.content.slice(0, 32000);
+  } else if (op === 'file_restore') {
+    const bid = String(a.backup_id || '').slice(0, 120).trim();
+    if (!/^[\w-]+$/.test(bid)) return { ok: false, error: '缺少或非法 backup_id' };
+    params.backup_id = bid;
+  } else if (op === 'terminal') {
+    const cmd = String(a.cmd || '').slice(0, 40).trim();
+    if (!cmd) return { ok: false, error: '缺少命令' };
+    params.cmd = cmd;
+    params.args = Array.isArray(a.args) ? a.args.map(x => String(x).slice(0, 200)).slice(0, 20) : [];
+  } else if (op === 'run_python') {
+    const code = String(a.code || '').slice(0, 20000);
+    if (!code) return { ok: false, error: '缺少 code' };
+    params.code = code;
   } else {
     return { ok: false, error: `不支持的操作「${op}」` };
   }
@@ -244,7 +280,15 @@ async function handleInbound({ msg, text, auditId, channelId, bind } = {}) {
     return { ok: false, reason: 'offline', reply: rr };
   }
 
-  // ④ 高危闸（键鼠/clipboard_write/file_write 默认关闭）
+  // ③.5 D1-1 档位闸（设备级能力上限）：op 必须落在设备档位允许集合内
+  const tier = normalizeTier(dev.permission_tier);
+  if (!opAllowedForTier(parsed.op, tier)) {
+    const rr = `⛔ 操作「${OP_LABEL[parsed.op] || parsed.op}」超出设备「${dev.device_name}」当前权限档位（${tier}）。该操作需至少「${opMinTier(parsed.op)}」档，请在平台设备管理页提升档位后重试。`;
+    await sendChannelReply(channel, senderId, rr);
+    return { ok: false, reason: 'tier-blocked', reply: rr };
+  }
+
+  // ④ 高危闸（键鼠/clipboard_write/file_write/terminal/run_python 默认关闭）
   if (HIGH_RISK_OPS.includes(parsed.op) && !dev.allow_high_risk) {
     const rr = `⛔ 操作「${OP_LABEL[parsed.op] || parsed.op}」属高危操作，默认关闭。请在平台设备管理页为设备「${dev.device_name}」开启「允许高危远控」后重试。`;
     await sendChannelReply(channel, senderId, rr);

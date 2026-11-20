@@ -31,6 +31,11 @@ export async function render(box) {
     <h3 style="margin-bottom:10px">📱 ${t('已配对设备')}</h3>
     <div id="devList">${t('加载中…')}</div>
   </div>
+  <!-- D1-1 备份与回滚（端侧执行 V1） -->
+  <div class="card" style="margin-top:18px;padding:22px">
+    <h3 style="margin-bottom:10px">🛟 ${t('端侧改动与回滚')} <span class="sub">${t('本地写操作（file_write/file_patch）自动备份，可一键回滚')}</span></h3>
+    <div id="backupList">${t('加载中…')}</div>
+  </div>
   <!-- A3 桌面场景模板（2026-11-09） -->
   <div class="card" style="margin-top:18px;padding:22px">
     <h3 style="margin-bottom:10px">🚀 ${t('桌面场景模板')} <span class="sub">${t('基于本地桥能力的一键创建方案，无需任何配置即可使用')}</span></h3>
@@ -167,20 +172,31 @@ export async function render(box) {
         el.innerHTML = `<div style="padding:18px;text-align:center;color:var(--text-3);font-size:13px">${t('还没有已配对设备——安装客户端并配对后，AI 即可（经您确认）操作您的电脑')}</div>`;
         return;
       }
+      const TIER_LABEL = { readonly: '🔒 只读档', standard: '✏️ 标准档', full: '🔓 全权档' };
       el.innerHTML = `<table class="table"><thead><tr>
-        <th>${t('设备')}</th><th>${t('系统')}</th><th>${t('状态')}</th><th>${t('默认')}</th><th>${t('最近心跳')}</th><th></th>
+        <th>${t('设备')}</th><th>${t('系统')}</th><th>${t('状态')}</th><th>${t('默认')}</th><th>${t('权限档位')}</th><th>${t('最近心跳')}</th><th></th>
       </tr></thead><tbody>${rows.map(d => `
         <tr>
           <td><b>${esc(d.device_name || t('未命名'))}</b></td>
           <td style="font-size:12px;color:var(--text-3)">${esc(d.platform || '—')}</td>
           <td>${d.online ? `<span class="tag green">● ${t('在线')}</span>` : `<span class="tag gray">○ ${t('离线')}</span>`}</td>
           <td>${d.is_default ? `<span class="tag blue">${t('默认')}</span>` : ''}</td>
+          <td>
+            <select data-tier="${d.id}" class="input" style="font-size:12px;padding:3px 6px">
+              ${['readonly', 'standard', 'full'].map(tv => `<option value="${tv}" ${((d.permission_tier || 'standard') === tv) ? 'selected' : ''}>${TIER_LABEL[tv]}</option>`).join('')}
+            </select>
+          </td>
           <td style="font-size:12px;color:var(--text-3)">${esc(d.last_seen || '—')}</td>
           <td style="white-space:nowrap">
             ${d.is_default ? '' : `<button class="btn sm" data-def="${d.id}">${t('设默认')}</button> `}
             <button class="btn sm" style="color:var(--danger,#dc2626)" data-unbind="${d.id}">${t('解绑')}</button>
           </td>
-        </tr>`).join('')}</tbody></table>`;
+        </tr>`).join('')}</tbody></table>
+        <p style="font-size:12px;color:var(--text-3);margin-top:10px;line-height:1.7">${t('档位说明：只读档=查看类（列目录/读文件/截图/窗口）；标准档=常规写（建文件夹/写文件，写前自动备份）；全权档=键鼠注入/终端/运行 Python。改档即时生效。')}</p>`;
+      el.querySelectorAll('[data-tier]').forEach(sel => sel.onchange = async () => {
+        try { await api(`/localbridge/devices/${sel.dataset.tier}/tier`, { method: 'POST', body: { tier: sel.value } }); toast(t('已更新权限档位'), 'ok'); }
+        catch (e) { toast(e.message, 'err'); loadDevs(); }
+      });
       el.querySelectorAll('[data-def]').forEach(b => b.onclick = async () => {
         try { await api(`/localbridge/devices/${b.dataset.def}/default`, { method: 'POST' }); toast('已设为默认设备', 'ok'); loadDevs(); } catch (e) { toast(e.message, 'err'); }
       });
@@ -193,5 +209,37 @@ export async function render(box) {
     }
   }
   loadDevs();
-  const refresh = setInterval(() => { if (!box.isConnected) return clearInterval(refresh); loadDevs(); }, 15000);
+  loadBackups();
+  const refresh = setInterval(() => { if (!box.isConnected) return clearInterval(refresh); loadDevs(); loadBackups(); }, 15000);
+
+  async function loadBackups() {
+    const el = box.querySelector('#backupList');
+    if (!el) return;
+    try {
+      const j = await api('/localbridge/backups');
+      const rows = j.data || [];
+      if (!rows.length) {
+        el.innerHTML = `<div style="padding:16px;text-align:center;color:var(--text-3);font-size:13px">${t('暂无端侧写操作记录——AI 在您电脑上写入/修改文件后，这里会出现可回滚的备份。')}</div>`;
+        return;
+      }
+      el.innerHTML = `<table class="table"><thead><tr>
+        <th>${t('时间')}</th><th>${t('操作')}</th><th>${t('文件')}</th><th>${t('变更')}</th><th>${t('状态')}</th><th></th>
+      </tr></thead><tbody>${rows.map(b => `
+        <tr>
+          <td style="font-size:12px;color:var(--text-3)">${esc(b.created_at || '')}</td>
+          <td style="font-size:12px">${esc(b.op || '')}</td>
+          <td style="font-size:12px">${esc((b.path || '').replace(/^.*[\\/]/, '') || b.path || '')}</td>
+          <td>${b.change === 'created' ? `<span class="tag blue">${t('新建')}</span>` : `<span class="tag gray">${t('修改')}</span>`}</td>
+          <td>${b.status === 'active' ? `<span class="tag green">${t('可回滚')}</span>` : `<span class="tag gray">${esc(b.status)}</span>`}</td>
+          <td>${b.status === 'active' ? `<button class="btn sm" data-rollback="${b.id}">↩️ ${t('回滚')}</button>` : ''}</td>
+        </tr>`).join('')}</tbody></table>`;
+      el.querySelectorAll('[data-rollback]').forEach(btn => btn.onclick = async () => {
+        if (!(await confirmBox(t('确定将文件回滚到该备份版本？回滚任务将下发到对应设备执行。')))) return;
+        try { await api(`/localbridge/backups/${btn.dataset.rollback}/rollback`, { method: 'POST' }); toast(t('回滚任务已下发，稍候设备执行'), 'ok'); loadBackups(); }
+        catch (e) { toast(e.message, 'err'); }
+      });
+    } catch (e) {
+      el.innerHTML = `<div style="padding:14px;color:var(--danger,#dc2626)">${esc(e.message)}</div>`;
+    }
+  }
 }

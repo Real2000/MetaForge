@@ -414,8 +414,9 @@ async function runChildAgent(child, task, maxReply, user) {
       // P5.34b（审查 F1）：子智能体工具执行闸门——与 workflow.runAgent 的 UNATTENDED_DENY 同构。
       // 此前为 runTool 直调（无确认卡也无 deny），存量含 create_task 的子智能体在 perm=auto 下可静默造任务
       executeTool: (name, argsJson) => {
-        if (name === 'create_task' || name === 'local_exec') {
-          return `⛔ 工具 ${name} 不允许在子智能体执行上下文中调用——请直接完成当前任务，不要尝试创建新任务或操作本地设备。`;
+        // D1-1（决策2=A）：放开 local_exec——子智能体可在设备档位+确认卡约束下操作本地设备；仅保留 create_task 禁入
+        if (name === 'create_task') {
+          return `⛔ 工具 ${name} 不允许在子智能体执行上下文中调用——请直接完成当前任务，不要尝试创建新任务。`;
         }
         // V1.2 审查加固 2026-10-30：子智能体工具执行同样受元数据过滤约束（kb_search 旁路收口）
         return runTool(name, argsJson, { kbId: child.kb_id || null, mcpServers: child.mcp_servers || '[]', metadataFilter: resolveKbFilter(child, user) || undefined });

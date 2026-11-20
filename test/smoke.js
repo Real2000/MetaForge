@@ -4176,12 +4176,13 @@ function t(name, fn) {
           db.prepare("DELETE FROM tasks WHERE username='httpu1' AND name LIKE '配额验证%' OR (username='httpu1' AND name LIKE '改绑测试%')").run();
           db.prepare("DELETE FROM agents WHERE name='受限草稿智能体'").run();
         });
-        await t('HTTP：智能体保存工具白名单——create_task/local_exec 拒绝（P5.34）', async () => {
+        await t('HTTP：智能体保存工具白名单——create_task 拒绝、local_exec 放开（P5.34/D1-1）', async () => {
           const bad1 = await jfetch('/api/agents', { method: 'POST', body: JSON.stringify({ name: '注入测试A', tools: ['create_task'] }) }, tok1);
           assert.strictEqual(bad1.j && bad1.j.code, 400, 'POST 配置 create_task 应 400：' + JSON.stringify(bad1.j));
           assert.ok(String(bad1.j.msg).includes('create_task'), '错误信息应指名违禁工具');
-          const bad2 = await jfetch('/api/agents', { method: 'POST', body: JSON.stringify({ name: '注入测试B', tools: ['web_search', 'local_exec'] }) }, tok1);
-          assert.strictEqual(bad2.j && bad2.j.code, 400, 'POST 配置 local_exec 应 400');
+          // D1-1（决策2=A）：local_exec 放开——可在标准/全权档下配置（受设备档位 + 确认卡双重约束）
+          const okLe = await jfetch('/api/agents', { method: 'POST', body: JSON.stringify({ name: '注入测试B', tools: ['web_search', 'local_exec'] }) }, tok1);
+          assert.ok(okLe.j && okLe.j.code === 0, 'D1-1：POST 配置 local_exec 应放行：' + JSON.stringify(okLe.j).slice(0, 100));
           // 合法创建 → PUT 注入同样拒绝
           const ok = await jfetch('/api/agents', { method: 'POST', body: JSON.stringify({ name: '白名单正常智能体', tools: ['web_search'] }) }, tok1);
           assert.ok(ok.j && ok.j.code === 0, '常规工具应可正常创建');
@@ -4290,9 +4291,10 @@ function t(name, fn) {
           const r = await jfetch('/api/skills-market', {}, tok1);
           const bt = r.j.data.builtin_tools;
           assert.ok(Array.isArray(bt) && bt.length >= 20, `builtin_tools 应 ≥20 项（26 - 违禁 2），实际 ${bt.length}`);
-          // 违禁工具排除（AGENT_TOOL_DENY：create_task/local_exec 不进市场）
+          // 违禁工具排除（AGENT_TOOL_DENY：create_task 不进市场；D1-1 后 local_exec 放开进市场）
           const names = bt.map(x => x.name);
-          assert.ok(!names.includes('create_task') && !names.includes('local_exec'), '违禁工具（create_task/local_exec）不应出现在市场：' + names.filter(n => ['create_task', 'local_exec'].includes(n)).join(','));
+          assert.ok(!names.includes('create_task'), '违禁工具 create_task 不应出现在市场');
+          assert.ok(names.includes('local_exec'), 'D1-1：local_exec 应进入市场 builtin_tools（受档位+确认卡约束）');
           // P3-2 新增 11 工具全部在市场（工具清单单一事实来源验证）
           for (const n of ['uuid_gen', 'hash_tool', 'base64_tool', 'json_tool', 'text_count', 'date_calc', 'unit_convert', 'cron_explain', 'weather_query', 'translate_text', 'exchange_rate']) {
             assert.ok(names.includes(n), `P3-2 工具 ${n} 应出现在市场 builtin_tools`);
@@ -4928,10 +4930,10 @@ function t(name, fn) {
       assert.deepStrictEqual(bad, acc, '非数值/负值字段应按 0 容错（结果不变）');
     });
     const { validateAgentTools } = require('../src-server/lib/tools');
-    await t('validateAgentTools：create_task/local_exec 拒绝，run_code 与常规工具放行（F1②）', () => {
+    await t('validateAgentTools：create_task 拒绝、local_exec/run_code 与常规工具放行（F1② / D1-1）', () => {
       assert.strictEqual(validateAgentTools(['web_search', 'run_code', 'calculator']), null, '常规工具+run_code 应放行');
       assert.ok(String(validateAgentTools(['create_task'])).includes('create_task') && String(validateAgentTools(['create_task'])).includes('不允许'), 'create_task 应拒绝');
-      assert.ok(String(validateAgentTools(['web_search', 'local_exec'])).includes('local_exec'), 'local_exec 应拒绝');
+      assert.strictEqual(validateAgentTools(['web_search', 'local_exec']), null, 'D1-1：local_exec 应放行（受档位+确认卡约束）');
       assert.ok(String(validateAgentTools(['not_a_tool'])).includes('未知工具'), '未知工具应拒绝');
       assert.strictEqual(validateAgentTools([]), null, '空清单应放行');
     });
@@ -4989,8 +4991,8 @@ function t(name, fn) {
       db.prepare("DELETE FROM users WHERE username IN ('f8u2','f8u3')").run();
       db.prepare("DELETE FROM notifications WHERE username IN ('f8u2','f8u3')").run();
     });
-    await t('copy/技能资产白名单：违禁工具被剔除（P5.34b 审查 F2/F3）', () => {
-      // copy：源智能体含违禁工具（模拟历史注入）→ 副本剔除
+    await t('copy/技能资产白名单：违禁工具 create_task 被剔除、local_exec 保留（P5.34b / D1-1）', () => {
+      // copy：源智能体含违禁工具（模拟历史注入）→ 副本剔除 create_task；local_exec 现属合法工具（保留）
       const sysAgent = db.prepare("SELECT id FROM agents WHERE system_key='system_task_runner'").get();
       db.prepare(`INSERT INTO agents (name,description,type,category,prompt,status,source,tools,allow_copy,owner,created_at,updated_at) VALUES ('违禁源智能体','x','digital','测试','p','published','self',?,1,'httpadmin',datetime('now','localtime'),datetime('now','localtime'))`).run(JSON.stringify(['web_search', 'create_task', 'local_exec', 'not_a_tool']));
       const srcId = db.prepare("SELECT id FROM agents WHERE name='违禁源智能体'").get().id;
@@ -4998,20 +5000,21 @@ function t(name, fn) {
       // 复制 SQL 用 filter(t => TOOL_DEFS[t] && !AGENT_TOOL_DENY.has(t))
       const { TOOL_DEFS, AGENT_TOOL_DENY } = require('../src-server/lib/tools');
       const copyTools = JSON.parse(db.prepare('SELECT tools FROM agents WHERE id=?').get(srcId).tools).filter(t => TOOL_DEFS[t] && !AGENT_TOOL_DENY.has(t));
-      assert.deepStrictEqual(copyTools, ['web_search'], 'copy 过滤应只剩合法工具：' + JSON.stringify(copyTools));
+      assert.deepStrictEqual(copyTools, ['web_search', 'local_exec'], 'copy 过滤应剔除 create_task/未知工具、保留 local_exec：' + JSON.stringify(copyTools));
       // 技能资产：API 直调注入 create_task → filter 剔除（skillassets.js 同口径）
       const skillTools = ['create_task', 'web_search', 'local_exec'].filter(t => TOOL_DEFS[t] && !AGENT_TOOL_DENY.has(t));
-      assert.deepStrictEqual(skillTools, ['web_search'], '技能工具过滤应剔除违禁');
+      assert.deepStrictEqual(skillTools, ['web_search', 'local_exec'], '技能工具过滤应剔除 create_task、保留 local_exec');
       db.prepare("DELETE FROM agents WHERE name='违禁源智能体'").run();
     });
-    await t('P5.34b tripwire：runChildAgent 与 @技能/@专家并入均带违禁拒绝（F1/F4）', () => {
+    await t('P5.34b tripwire：runChildAgent 拒 create_task、@技能/@专家并入带过滤（F1/F4 / D1-1）', () => {
       const src = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'routes', 'chat.js'), 'utf8');
-      // F1：runChildAgent 的 executeTool 拒绝 create_task/local_exec
+      // F1：runChildAgent 的 executeTool 拒绝 create_task（D1-1 后仅此一项）
       const rcStart = src.indexOf('async function runChildAgent');
       const rcEnd = src.indexOf('/** ⑦ 分类器路由');
       assert.ok(rcStart > 0 && rcEnd > rcStart, 'runChildAgent 定位成功');
       const rcBlock = src.slice(rcStart, rcEnd);
-      assert.ok(rcBlock.includes("name === 'create_task' || name === 'local_exec'"), '子智能体执行应拒绝 create_task/local_exec');
+      assert.ok(rcBlock.includes("name === 'create_task'"), '子智能体执行应拒绝 create_task');
+      assert.ok(!rcBlock.includes("name === 'create_task' || name === 'local_exec'"), 'D1-1：子智能体不应再拒绝 local_exec');
       // F4：技能/专家并入处有 safeToolId 过滤
       assert.ok(src.includes('safeToolId(tid)'), '@技能/@专家并入应经 safeToolId 过滤');
     });
@@ -5660,20 +5663,40 @@ function t(name, fn) {
       // handler 前应有 1 层限流中间件（route.stack = [limiter, handler]）
       assert.strictEqual(layer.route.stack.length, 2, `/v1/models 应挂限流中间件（当前 ${layer.route.stack.length} 层，预期 limiter+handler=2）`);
     });
-    await t('P2-3 / P2-3：A1 op 扩展12个白名单+A2审计日志落op_logs', () => {
-      const { OPS_WHITELIST } = require('../src-server/routes/localbridge');
-      // A1: op 白名单应有 13 个（原 4 + 扩展 9）
-      assert.ok(OPS_WHITELIST.length >= 13, `OPS_WHITELIST 应有 ≥13 个 op（当前 ${OPS_WHITELIST.length}）`);
+    await t('P2-3 / P2-3：A1 op 扩展 + D1-1 新 op + 三档权限模型', () => {
+      const lb = require('../src-server/routes/localbridge');
+      const { OPS_WHITELIST } = lb;
+      // A1: op 白名单应有 13 个（原 4 + 扩展 9）；D1-1 追加 6 个 → 共 19
+      assert.ok(OPS_WHITELIST.length >= 19, `OPS_WHITELIST 应有 ≥19 个 op（当前 ${OPS_WHITELIST.length}）`);
       const expected = ['mkdir','list_dir','open_app','notify','screenshot','clipboard_read','clipboard_write',
-        'key_type','mouse_click','window_list','window_focus','file_read','file_write'];
+        'key_type','mouse_click','window_list','window_focus','file_read','file_write',
+        'file_backup','file_diff','file_patch','file_restore','terminal','run_python'];
       for (const e of expected) {
         assert.ok(OPS_WHITELIST.includes(e), `应包含 op「${e}」`);
       }
+      // D1-1：三档权限模型——TIER_OPS 并集应等于白名单，档位单调包含
+      const union = Object.values(lb.TIER_OPS).flat();
+      assert.deepStrictEqual([...new Set(union)].sort(), [...OPS_WHITELIST].sort(), 'TIER_OPS 并集应等于 OPS_WHITELIST');
+      // readonly ⊂ standard ⊂ full
+      assert.ok(lb.opAllowedForTier('file_read', 'readonly'), '只读档应允许 file_read');
+      assert.ok(!lb.opAllowedForTier('file_write', 'readonly'), '只读档不应允许 file_write');
+      assert.ok(lb.opAllowedForTier('file_write', 'standard'), '标准档应允许 file_write');
+      assert.ok(!lb.opAllowedForTier('key_type', 'standard'), '标准档不应允许 key_type');
+      assert.ok(lb.opAllowedForTier('key_type', 'full'), '全权档应允许 key_type');
+      assert.ok(lb.opAllowedForTier('run_python', 'full') && lb.opAllowedForTier('terminal', 'full'), '全权档应允许 run_python/terminal');
+      assert.strictEqual(lb.opMinTier('screenshot'), 'readonly', 'screenshot 最低只读档');
+      assert.strictEqual(lb.opMinTier('file_write'), 'standard', 'file_write 最低标准档');
+      assert.strictEqual(lb.opMinTier('terminal'), 'full', 'terminal 最低全权档');
+      assert.strictEqual(lb.normalizeTier('bogus'), 'standard', '非法档位回落 standard');
       // A1: tools-extra.js local_exec schema 描述应包含扩展 op 名
       const src = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'lib', 'tools-extra.js'), 'utf8');
       for (const e of ['screenshot','clipboard_read','clipboard_write','key_type','mouse_click',
           'window_list','window_focus','file_read','file_write']) {
         assert.ok(src.includes(e), `tools-extra.js schema 应包含 ${e}`);
+      }
+      // D1-1 新 op 也应出现在 schema
+      for (const e of ['file_backup','file_diff','file_patch','file_restore','terminal','run_python']) {
+        assert.ok(src.includes(e), `tools-extra.js schema 应包含 D1-1 新 op ${e}`);
       }
       // A1: local_exec schema 的 op enum 应与白名单一致
       assert.ok(src.includes("'screenshot', 'clipboard_read'"), 'schema op enum 应包含扩展 op');
@@ -7542,6 +7565,102 @@ print('PY_OK')
     db.prepare("DELETE FROM channel_bound_chats WHERE channel_id=?").run(chId);
     db.prepare('DELETE FROM channels WHERE id=?').run(chId);
     db.prepare("DELETE FROM channel_messages WHERE event_id LIKE 'ut:n6:%'").run();
+  }
+
+  console.log('【D1-1】端侧执行 V1（三档权限 / 写前备份 / 一键回滚）');
+  {
+    const { db, now } = require('../src-server/db');
+    const lb = require('../src-server/routes/localbridge');
+    const rd = require('../src-server/lib/remote-dispatch');
+    const { sign } = require('../src-server/lib/auth');
+    const channelMod = require('../src-server/lib/channel');
+
+    // 库结构：permission_tier 列 + localbridge_backups 表
+    await t('D1-1: db 迁移 —— localbridge_devices.permission_tier 与 localbridge_backups 表就位', () => {
+      const cols = db.prepare('PRAGMA table_info(localbridge_devices)').all().map(c => c.name);
+      assert.ok(cols.includes('permission_tier'), 'devices 应有 permission_tier 列');
+      const bcols = db.prepare('PRAGMA table_info(localbridge_backups)').all().map(c => c.name);
+      for (const c of ['device_id', 'username', 'op', 'path', 'backup_id', 'status', 'created_at']) {
+        assert.ok(bcols.includes(c), `backups 表应有 ${c} 列`);
+      }
+    });
+
+    await t('D1-1: sanitizeParams —— 新 op（file_patch/terminal/run_python/file_restore）清洗与越权拒绝', () => {
+      const p1 = rd.sanitizeParams('file_patch', { path: 'a.md', find: 'x', replace: 'y' });
+      assert.ok(p1.ok && p1.params.find === 'x' && p1.params.replace === 'y', 'file_patch 应保留 find/replace');
+      const p2 = rd.sanitizeParams('file_patch', { path: '/etc/passwd', find: 'x' });
+      assert.ok(!p2.ok, 'file_patch 绝对路径应拒绝');
+      const p3 = rd.sanitizeParams('terminal', { cmd: 'ls', args: ['-la'] });
+      assert.ok(p3.ok && p3.params.cmd === 'ls' && Array.isArray(p3.params.args), 'terminal 应保留 cmd/args');
+      const p4 = rd.sanitizeParams('run_python', { code: 'print(1)' });
+      assert.ok(p4.ok && p4.params.code === 'print(1)', 'run_python 应保留 code');
+      const p5 = rd.sanitizeParams('file_restore', { backup_id: 'bad id!' });
+      assert.ok(!p5.ok, 'file_restore 非法 backup_id 应拒绝');
+    });
+
+    function mkD11Device(username, tier, { highRisk = 0 } = {}) {
+      const token = 'tok-d11-' + username + '-' + Date.now();
+      db.prepare('INSERT INTO localbridge_devices (username,device_token,device_name,platform,is_default,last_seen,created_at,allow_high_risk,permission_tier) VALUES (?,?,?,?,?,?,?,?,?)')
+        .run(username, token, 'D11机', 'macOS', 1, now(), now(), highRisk, tier);
+      return db.prepare('SELECT * FROM localbridge_devices WHERE device_token=?').get(token);
+    }
+
+    await t('D1-1: 渠道远控档位闸 —— standard 档拒绝 key_type（tier-blocked）', async () => {
+      const ch = channelMod.upsertChannel({ name: 'D11渠道', type: 'feishu', config: {} });
+      channelMod.upsertUserBinding({ username: 'd11_std', channelId: ch.id, channelUserId: 'openid_d11_std' });
+      mkD11Device('d11_std', 'standard', { highRisk: 1 });
+      const origSend = channelMod.send; channelMod.send = async () => ({ ok: true });
+      try {
+        const r = await rd.handleInbound({ msg: { channel: 'feishu', sender: { id: 'openid_d11_std' } }, text: '输入 hello', auditId: null, channelId: ch.id, bind: { channel_id: ch.id } });
+        assert.strictEqual(r.ok, false); assert.strictEqual(r.reason, 'tier-blocked', '标准档 key_type 应被档位闸拦截');
+      } finally { channelMod.send = origSend; }
+      db.prepare('DELETE FROM user_channel_bindings WHERE channel_id=?').run(ch.id);
+      db.prepare('DELETE FROM channels WHERE id=?').run(ch.id);
+    });
+
+    await t('D1-1: 备份台账 + 一键回滚 —— rollback 入队 file_restore、备份置 restoring', async () => {
+      db.prepare(`INSERT INTO users (username,password,nickname,role,status,must_change_pwd,created_at) VALUES ('d11_u',?,'D11用户','user',1,0,datetime('now','localtime'))`).run('x');
+      const u = db.prepare("SELECT id FROM users WHERE username='d11_u'").get();
+      const tok = sign({ uid: u.id, exp: Date.now() + 3600000 });
+      const dev = mkD11Device('d11_u', 'standard', { highRisk: 0 });
+      const bi = db.prepare(`INSERT INTO localbridge_backups (device_id,username,task_id,op,path,backup_id,change,before_bytes,after_bytes,status,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(dev.id, 'd11_u', null, 'file_write', 'Desktop/a.txt', 'bk-123', 'modified', 10, 20, 'active', now());
+      const express = require('express');
+      const app = express(); app.use(express.json()); app.use('/api/localbridge', lb.router);
+      let server;
+      await new Promise(r => { server = app.listen(0, '127.0.0.1', r); });
+      const base = `http://127.0.0.1:${server.address().port}`;
+      try {
+        // 发起回滚
+        const resp = await fetch(base + `/api/localbridge/backups/${bi.lastInsertRowid}/rollback`, { method: 'POST', headers: { authorization: 'Bearer ' + tok } });
+        const j = await resp.json();
+        assert.strictEqual(resp.status, 200); assert.strictEqual(j.code, 0);
+        const row = db.prepare('SELECT * FROM localbridge_tasks WHERE id=?').get(j.data.task_id);
+        assert.strictEqual(row.op, 'file_restore', '应入队 file_restore 任务');
+        assert.strictEqual(JSON.parse(row.params).backup_id, 'bk-123', '任务参数应带 backup_id');
+        const bk = db.prepare('SELECT * FROM localbridge_backups WHERE id=?').get(bi.lastInsertRowid);
+        assert.strictEqual(bk.status, 'restoring', '备份应置 restoring');
+        // 备份列表
+        const list = await (await fetch(base + '/api/localbridge/backups', { headers: { authorization: 'Bearer ' + tok } })).json();
+        assert.ok(Array.isArray(list.data) && list.data.some(x => x.backup_id === 'bk-123'), '备份列表应含该备份');
+      } finally {
+        await new Promise(r => server.close(r));
+        db.prepare("DELETE FROM localbridge_tasks WHERE username='d11_u'").run();
+        db.prepare("DELETE FROM localbridge_backups WHERE username='d11_u'").run();
+        db.prepare("DELETE FROM localbridge_devices WHERE username='d11_u'").run();
+        db.prepare("DELETE FROM users WHERE username='d11_u'").run();
+      }
+    });
+
+    await t('D1-1: 客户端 bridge.js 已实现新 op 与档位二次校验', () => {
+      const bsrc = fs.readFileSync(path.join(__dirname, '..', 'local-bridge', 'bridge.js'), 'utf8');
+      for (const op of ['file_backup', 'file_diff', 'file_patch', 'file_restore', 'terminal', 'run_python']) {
+        assert.ok(bsrc.includes(`'${op}'`), `bridge.js 应实现 op ${op}`);
+      }
+      assert.ok(bsrc.includes('TIER_OPS'), 'bridge.js 应内置 TIER_OPS 做二次校验');
+      assert.ok(bsrc.includes('allowedOps(opts.tier)'), 'bridge.js runOp 应按 tier 二次校验');
+      assert.ok(bsrc.includes('doBackup'), 'bridge.js 应实现写前备份');
+    });
   }
 
   console.log('【U2-1 / N7】P1 任务队列驱动抽象（memory 默认 / redis 可选 / 缺依赖回退）');

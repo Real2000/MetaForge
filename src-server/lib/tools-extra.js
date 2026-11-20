@@ -999,27 +999,30 @@ const local_exec = {
     function: {
       name: 'local_exec',
       description: '操作用户已配对的本地电脑（需用户安装「TeleAgent 智能体平台助手」客户端并配对）。' +
-        '支持 12 种白名单操作。' +
+        '支持 19 种白名单操作（受设备三档权限上限约束：只读/标准/全权）。' +
         '文件类：mkdir（在用户主目录内创建/确认文件夹，target 为相对路径如 "Desktop/新项目"）、' +
         'list_dir（列目录，返回名称与类型）、' +
         'file_read（读主目录内文件文本内容，path 为相对主目录路径）、' +
-        'file_write（写文件至主目录内，path 为相对路径，content 为文本内容，超限自动截断）。' +
-        '截图类：screenshot（截屏，window 为空则全屏，非空则尝试截对应窗口，返回图片 URL）。' +
-        '剪贴板类：clipboard_read（读取剪贴板，type=text/html/file）、' +
-        'clipboard_write（写入文字到剪贴板，text 为写入内容）。' +
-        '键鼠类（默认关闭，需设备管理页显式开启）：key_type（模拟键盘输入，text 为输入文本）、' +
-        'mouse_click（模拟坐标点击，x/y 为屏幕坐标像素值）。' +
-        '窗口类：window_list（列出本机所有窗口、应用名与 PID）、' +
-        'window_focus（将指定窗口激活至前台，window 为窗口名或 PID）。' +
-        '通知类：notify（发送系统通知，text 为通知内容，限 200 字）。' +
-        '应用类：open_app（打开本机应用，app 为应用注册名——macOS 上中文应用常以英文名注册）。' +
-        '设备离线或未配对会明确提示。键鼠类操作要求用户已开启「允许键鼠模拟」开关（设备管理页）。',
+        'file_write（写文件至主目录内，写前自动备份并返回 backup_id/diff，超限自动截断）、' +
+        'file_backup（显式备份文件，返回 backup_id）、' +
+        'file_diff（查看文件内容/差异，可传 old 对比）、' +
+        'file_patch（按 find/replace 或 append/content 打补丁，写前自动备份）、' +
+        'file_restore（用 backup_id 回滚到备份版本）。' +
+        '截图类：screenshot（截屏，window 为空则全屏，返回图片路径）。' +
+        '剪贴板类：clipboard_read（读取剪贴板，type=text/html/file）、clipboard_write（写入文字到剪贴板）。' +
+        '键鼠类（须「全权档」）：key_type（模拟键盘输入）、mouse_click（模拟坐标点击，x/y 为屏幕坐标像素值）。' +
+        '窗口类：window_list（列出本机窗口/应用）、window_focus（将窗口激活至前台）。' +
+        '通知类：notify（发送系统通知）。应用类：open_app（打开本机应用，macOS 上中文应用常以英文名注册）。' +
+        '终端/脚本类（须「全权档」）：terminal（执行白名单只读命令，cmd 如 ls/cat，args 为参数数组）、' +
+        'run_python（执行 Python 代码，code 为源码）。' +
+        '设备离线/未配对/超出档位会明确提示。',
         parameters: {
           type: 'object',
           properties: {
             op: { type: 'string', enum: ['mkdir', 'list_dir', 'open_app', 'notify',
                 'screenshot', 'clipboard_read', 'clipboard_write', 'key_type', 'mouse_click',
-                'window_list', 'window_focus', 'file_read', 'file_write'
+                'window_list', 'window_focus', 'file_read', 'file_write',
+                'file_backup', 'file_diff', 'file_patch', 'file_restore', 'terminal', 'run_python'
               ], description: '操作类型' },
             target: { type: 'string', description: 'mkdir/list_dir 用：相对用户主目录的路径（禁止绝对路径与路径穿越）' },
             app: { type: 'string', description: 'open_app 用：应用名' },
@@ -1028,15 +1031,23 @@ const local_exec = {
             type: { type: 'string', enum: ['text', 'html', 'file'], description: 'clipboard_read 用：剪贴板数据类型，默认 text' },
             x: { type: 'number', description: 'mouse_click 用：屏幕坐标 X' },
             y: { type: 'number', description: 'mouse_click 用：屏幕坐标 Y' },
-            path: { type: 'string', description: 'file_read/file_write 用：相对主目录的路径（禁止绝对路径与路径穿越，.txt/.md 等文本文件）' },
-            content: { type: 'string', description: 'file_write 用：写入内容（超限自动截断）' },
+            path: { type: 'string', description: 'file_read/file_write/file_backup/file_diff/file_patch 用：相对主目录的路径' },
+            content: { type: 'string', description: 'file_write/file_patch 用：写入/替换内容（超限自动截断）' },
+            old: { type: 'string', description: 'file_diff 用：对比旧文本（传则返回差异）' },
+            find: { type: 'string', description: 'file_patch 用：待替换的原文片段（须唯一/可匹配）' },
+            replace: { type: 'string', description: 'file_patch 用：替换后的新片段' },
+            append: { type: 'string', description: 'file_patch 用：追加到文件末尾的内容' },
+            backup_id: { type: 'string', description: 'file_restore 用：备份标识（写操作回推的 backup_id）' },
+            cmd: { type: 'string', description: 'terminal 用：白名单命令（ls/pwd/cat/head/tail/wc/grep/find/df/du/uname/sw_vers/which/id/hostname/uptime/date/echo/whoami/env）' },
+            args: { type: 'array', items: { type: 'string' }, description: 'terminal 用：命令参数数组' },
+            code: { type: 'string', description: 'run_python 用：Python 源码' },
           },
         required: ['op'],
       },
     },
   },
   run: async (args, ctx = {}) => {
-    const { OPS_WHITELIST } = require('../routes/localbridge');
+    const { OPS_WHITELIST, opAllowedForTier, normalizeTier, opMinTier, TIER_OPS } = require('../routes/localbridge');
     const op = String(args.op || '');
     if (!OPS_WHITELIST.includes(op)) return `⛔ 不支持的操作「${op}」（白名单：${OPS_WHITELIST.join('/')}）`;
     const username = ctx.username;
@@ -1048,6 +1059,12 @@ const local_exec = {
     }
     const online = dev.last_seen && new Date(now()).getTime() - new Date(dev.last_seen).getTime() < 30000;
     if (!online) return `❌ 设备「${dev.device_name}」离线（心跳超过 30s）。请提示用户打开本机的「TeleAgent 智能体平台助手」（菜单栏 🤖 图标），确认它正在运行后重试。`;
+    // D1-1：三档权限闸门——op 必须落在设备档位允许集合内（与桥端二次校验构成双层）
+    const tier = normalizeTier(dev.permission_tier);
+    if (!opAllowedForTier(op, tier)) {
+      const min = opMinTier(op);
+      return `⛔ 操作「${op}」超出设备「${dev.device_name}」当前权限档位（${tier}）。该操作需至少「${min}」档，请提示用户到「我的设备」页提升档位后重试。`;
+    }
     // 参数白名单化清洗（防注入多余字段进桥）
     const params = {};
     if (op === 'mkdir' || op === 'list_dir') params.target = String(args.target || '').slice(0, 300);
@@ -1069,6 +1086,25 @@ const local_exec = {
       params.path = String(args.path || '').slice(0, 500);
       params.content = String(args.content || '').slice(0, 32000);
     }
+    // D1-1 新 op 参数白名单化清洗
+    if (op === 'file_backup') params.path = String(args.path || '').slice(0, 500);
+    if (op === 'file_diff') {
+      params.path = String(args.path || '').slice(0, 500);
+      if (typeof args.old === 'string') params.old = args.old.slice(0, 200000);
+    }
+    if (op === 'file_patch') {
+      params.path = String(args.path || '').slice(0, 500);
+      if (typeof args.find === 'string') params.find = args.find.slice(0, 20000);
+      if (typeof args.replace === 'string') params.replace = args.replace.slice(0, 20000);
+      if (typeof args.append === 'string') params.append = args.append.slice(0, 32000);
+      if (typeof args.content === 'string') params.content = args.content.slice(0, 32000);
+    }
+    if (op === 'file_restore') params.backup_id = String(args.backup_id || '').slice(0, 120);
+    if (op === 'terminal') {
+      params.cmd = String(args.cmd || '').slice(0, 40);
+      params.args = Array.isArray(args.args) ? args.args.map(a => String(a).slice(0, 200)).slice(0, 20) : [];
+    }
+    if (op === 'run_python') params.code = String(args.code || '').slice(0, 20000);
     // 入队
     const info = db.prepare('INSERT INTO localbridge_tasks (device_id,username,op,params,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?)')
       .run(dev.id, username, op, JSON.stringify(params), 'pending', now(), now());

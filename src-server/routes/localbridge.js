@@ -25,7 +25,35 @@ const OPS_WHITELIST = ['mkdir', 'list_dir', 'open_app', 'notify',
   // A1 本地桥 op 扩展（2026-11-09）：截图/剪贴板/键鼠/窗口/文件类，共 12 个
   'screenshot', 'clipboard_read', 'clipboard_write', 'key_type', 'mouse_click',
   'window_list', 'window_focus', 'file_read', 'file_write',
+  // D1-1 端侧执行 V1（2026-11-20）：写前备份/diff/patch/回滚 + 终端会话 + Python 运行
+  'file_backup', 'file_diff', 'file_patch', 'file_restore', 'terminal', 'run_python',
 ];
+
+// ---------------- D1-1 三档权限模型（设备级能力上限，唯一权威源） ----------------
+// readonly < standard < full：op 必须落在设备档位「累计允许集合」内。
+// 决策1（2026-11-20）：readonly=纯读/纯看；standard=常规写（备份先行）；full=键鼠注入/终端/脚本。
+const TIER_ORDER = { readonly: 0, standard: 1, full: 2 };
+const TIER_OPS = {
+  readonly: ['list_dir', 'file_read', 'file_diff', 'clipboard_read', 'window_list', 'screenshot'],
+  standard: ['mkdir', 'open_app', 'notify', 'window_focus', 'file_write', 'file_backup', 'file_patch', 'file_restore'],
+  full: ['key_type', 'mouse_click', 'clipboard_write', 'terminal', 'run_python'],
+};
+const TIERS = ['readonly', 'standard', 'full'];
+function normalizeTier(t) { return TIERS.includes(t) ? t : 'standard'; }
+/** 某档位累计允许的 op 集合（含更低档位） */
+function allowedOpsForTier(tier) {
+  const lvl = TIER_ORDER[normalizeTier(tier)];
+  const out = new Set();
+  for (const [name, ops] of Object.entries(TIER_OPS)) if (TIER_ORDER[name] <= lvl) for (const o of ops) out.add(o);
+  return out;
+}
+/** op 是否落在设备档位允许集合内 */
+function opAllowedForTier(op, tier) { return allowedOpsForTier(tier).has(String(op)); }
+/** 返回某 op 所属的最低档位（用于前端展示/提示） */
+function opMinTier(op) {
+  for (const name of ['readonly', 'standard', 'full']) if (TIER_OPS[name].includes(op)) return name;
+  return 'full';
+}
 // P2-1 修复：同配对码连续失败 3 次后锁定（防暴力枚举），并配置 IP 级别 10 次/5min 封禁
 const PAIRCODE_MAX_FAIL = 3;
 
@@ -124,7 +152,7 @@ router.post('/poll', deviceAuth, (req, res) => {
   if (task) {
     db.prepare(`UPDATE localbridge_tasks SET status='running', updated_at=? WHERE id=?`).run(now(), task.id);
     let params = {}; try { params = JSON.parse(task.params || '{}'); } catch { }
-    res.json({ code: 0, data: { task: { id: task.id, op: task.op, params } } });
+    res.json({ code: 0, data: { task: { id: task.id, op: task.op, params, tier: normalizeTier(req.device.permission_tier) } } });
   } else {
     res.json({ code: 0, data: { task: null } });
   }
@@ -137,6 +165,8 @@ router.post('/result', deviceAuth, async (req, res) => {
   if (!t || t.device_id !== req.device.id) return res.status(404).json({ code: 404, msg: '任务不存在' });
   db.prepare(`UPDATE localbridge_tasks SET status=?, result=?, updated_at=? WHERE id=?`)
     .run(result && result.ok ? 'done' : 'failed', JSON.stringify(result || {}).slice(0, 8000), now(), t.id);
+  // D1-1：写操作回推后落备份台账（供「事后改动清单 / 一键回滚」）
+  recordBackupFromResult(req.device, t, result);
   // U2-4 Phase 2 / N6：结果回传渠道。如果该任务关联了 channel_msg_id，通过 channel.js send 回推结果
   if (t.channel_msg_id) {
     try {
@@ -156,7 +186,7 @@ router.post('/result', deviceAuth, async (req, res) => {
 
 // ---------- 用户侧：设备管理 ----------
 router.get('/devices', auth, (req, res) => {
-  const rows = db.prepare(`SELECT id, device_name, platform, is_default,
+  const rows = db.prepare(`SELECT id, device_name, platform, is_default, permission_tier,
     last_seen, created_at,
     CASE WHEN datetime(last_seen) > datetime('now','localtime','-15 seconds') THEN 1 ELSE 0 END AS online
     FROM localbridge_devices WHERE username=? ORDER BY is_default DESC, id DESC`).all(req.user.username);
@@ -190,6 +220,59 @@ router.delete('/devices/:id', auth, (req, res) => {
   res.json({ code: 0 });
 });
 
+// ---------- D1-1 备份台账：写操作回推后落库（供事后改动清单 / 一键回滚） ----------
+const BACKUP_OPS = ['file_write', 'file_patch', 'file_backup'];
+function recordBackupFromResult(device, task, result) {
+  try {
+    if (!result || !result.ok) return;
+    if (!BACKUP_OPS.includes(task.op)) return;
+    const d = result.data || {};
+    if (!d.backup_id) return; // 新建文件（无覆盖）不产生备份行
+    db.prepare(`INSERT INTO localbridge_backups
+      (device_id,username,task_id,op,path,backup_id,change,before_bytes,after_bytes,status,created_at)
+      VALUES (?,?,?,?,?,?,?,?,?,'active',?)`)
+      .run(device.id, device.username, task.id, task.op, String(d.path || '').slice(0, 500), String(d.backup_id).slice(0, 120),
+        String(d.change || 'modified').slice(0, 20), Number(d.before_bytes) || 0, Number(d.after_bytes) || 0, now());
+  } catch (e) { console.error('[localbridge] 备份台账落库失败：', e.message); }
+}
+
+// ---------- D1-1 设备三档权限设置（readonly/standard/full） ----------
+router.post('/devices/:id/tier', auth, (req, res) => {
+  const d = db.prepare('SELECT * FROM localbridge_devices WHERE id=? AND username=?').get(Number(req.params.id), req.user.username);
+  if (!d) return res.status(404).json({ code: 404, msg: '设备不存在' });
+  const tier = String((req.body && req.body.tier) || '').trim();
+  if (!TIERS.includes(tier)) return res.status(400).json({ code: 400, msg: '无效的权限档位（readonly/standard/full）' });
+  db.prepare('UPDATE localbridge_devices SET permission_tier=? WHERE id=?').run(tier, d.id);
+  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
+    .run(req.user.username, '设置端侧权限档位', `设备${d.device_name}#${d.id} → ${tier}`, req.ip, now());
+  res.json({ code: 0, data: { id: d.id, permission_tier: tier, ops: [...allowedOpsForTier(tier)] } });
+});
+
+// ---------- D1-1 备份列表（事后改动清单） ----------
+router.get('/backups', auth, (req, res) => {
+  const devId = Number(req.query.device_id) || 0;
+  const rows = devId
+    ? db.prepare('SELECT * FROM localbridge_backups WHERE username=? AND device_id=? ORDER BY id DESC LIMIT 100').all(req.user.username, devId)
+    : db.prepare('SELECT * FROM localbridge_backups WHERE username=? ORDER BY id DESC LIMIT 100').all(req.user.username);
+  res.json({ code: 0, data: rows });
+});
+
+// ---------- D1-1 一键回滚（入队 file_restore 任务，写操作可回滚） ----------
+router.post('/backups/:id/rollback', auth, (req, res) => {
+  const b = db.prepare('SELECT * FROM localbridge_backups WHERE id=? AND username=?').get(Number(req.params.id), req.user.username);
+  if (!b) return res.status(404).json({ code: 404, msg: '备份记录不存在' });
+  if (b.status !== 'active') return res.status(409).json({ code: 409, msg: '该备份已回滚或不可用' });
+  const dev = db.prepare('SELECT * FROM localbridge_devices WHERE id=? AND username=?').get(b.device_id, req.user.username);
+  if (!dev) return res.status(404).json({ code: 404, msg: '设备不存在' });
+  if (!opAllowedForTier('file_restore', dev.permission_tier)) return res.status(403).json({ code: 403, msg: `设备档位（${normalizeTier(dev.permission_tier)}）不允许回滚操作，请先提升档位` });
+  const info = db.prepare('INSERT INTO localbridge_tasks (device_id,username,op,params,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?)')
+    .run(dev.id, req.user.username, 'file_restore', JSON.stringify({ backup_id: b.backup_id, path: b.path }), 'pending', now(), now());
+  db.prepare('UPDATE localbridge_backups SET status=\'restoring\', restored_at=? WHERE id=?').run(now(), b.id);
+  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
+    .run(req.user.username, '端侧一键回滚', `设备${dev.device_name}#${dev.id} 备份#${b.id} ${b.path}`, req.ip, now());
+  res.json({ code: 0, data: { task_id: info.lastInsertRowid, backup_id: b.backup_id, path: b.path } });
+});
+
 // ---------- 安装包下载（P5.27b：DMG 主分发 + zip 备用；无鉴权——下载页直接链） ----------
 const path = require('path');
 router.get('/installer', (req, res) => {
@@ -202,4 +285,4 @@ router.get('/installer', (req, res) => {
   res.download(f, file);
 });
 
-module.exports = { router, OPS_WHITELIST };
+module.exports = { router, OPS_WHITELIST, TIER_OPS, TIER_ORDER, TIERS, normalizeTier, allowedOpsForTier, opAllowedForTier, opMinTier };
