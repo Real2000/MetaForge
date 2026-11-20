@@ -2517,4 +2517,42 @@ agent-platform/
 - 临时服务、隔离库、验证截图均已清理。
 - 已知边界：`matchAssets` 为词面/标签匹配（未接向量模型，离线可用优先）；真人素材/数字人 V1 仅做标记分级，深度合规评估（授权材料核验）留待专项。
 
+## D1-4 可执行技能包 V1：manifest 规范 + secrets 隔离 + 沙箱执行 + 供应链校验（2026-11-21）
+
+**目标**：把「技能 = 提示词 + 工具（配置，非能力）」升级为「技能 = 可安装、可执行、可持有凭据的能力包」——给技能加 manifest（入口/参数/权限/依赖）、按用户隔离 secrets、沙箱执行、来源供应链校验（哈希/签名/权限声明）、版本与卸载。
+
+**① manifest 规范 + 数据模型（`src-server/db.js` + `lib/migrate.js`）**
+- `skill_assets` 扩展：`manifest`（入口 entry / 内联 entry_code / params / permissions / secrets / deps）、`runtime`、`version`、`source_url`、`package_hash`、`verified`、`enabled`。manifest 为空 `{}` 即退化为纯提示词技能（**向后兼容**，原有技能零影响）。
+- 新增 `skill_secrets`（owner×skill×name 唯一，值 AES-256-GCM 加密落盘）、`skill_runs`（技能执行审计：状态/退出码/耗时/输出摘录）。
+- 迁移注册表追加 id 73~81（列迁移 + 两新表），存量库自动升级（实测 81/81 项）。
+
+**② 技能包内核（`src-server/lib/skill-package.js`，纯逻辑零依赖）**
+- `normalizeManifest/validateManifest`：名称/版本/运行时/entry 逃逸（`..`、绝对路径）全量校验；权限声明白名单 `fs:read / fs:write / net:<domain> / env`，列表外一律拒绝。
+- `netAllowOf`：权限声明 → 沙箱网络白名单域名。
+- `permRisk/summarizePermissions`：权限风险分级（写盘+联网=high、单类=middle、只读=low）与人读摘要。
+- `contentHash/signPackage/verifySignature/verifySupplyChain`：稳定内容哈希 + HMAC-SHA256 签名（常量时间比较）+ 供应链裁决（完整性/来源可信）。
+
+**③ secrets 隔离（`src-server/lib/skill-secrets.js`）**
+- 按「用户 × 技能」隔离；`setSecret/listSecrets/getSecretsForRun/deleteSecret/purgeSkill`。
+- **明文零落库/零回显**：加密落盘、接口只回掩码（头3尾2），运行期才解密注入；`scrub` 把明文值在输出中替换为 `***`。
+
+**④ 沙箱可执行化（`src-server/lib/sandbox.js` + `lib/skill-runner.js`）**
+- `runIsolated` 扩展 `files`（包内辅助文件写入沙箱工作目录）、`globals`（注入 `SKILL_ARGS/SKILL_SECRETS`）、`mask`（输出脱敏，写审计与返回双保险），既有调用零回归。
+- `runSkill`：manifest 校验 → 权限（网络白名单）→ 按用户注入 secrets → 子进程执行 → 输出脱敏 → `skill_runs` 审计；纯提示词技能运行被拒。
+
+**⑤ 接口（`src-server/routes/skillassets.js`）**
+- `POST /install`：安装包（内联 manifest 或 http(s) JSON 地址）→ manifest 校验 → 供应链校验（哈希不符/签名失败拒绝）→ 落库（同 owner+name 覆盖=**版本升级**）。
+- `POST /:id/run`：运行可执行技能（归属或已发布可见）；`GET /:id/runs` 运行历史。
+- `GET/POST /:id/secrets`、`DELETE /:id/secrets/:name`：密钥管理（掩码回显）。
+- `DELETE /:id`：卸载并**级联清理**密钥与运行记录。
+- 市场端点 `skills-market.js` 回传 `executable/perm_risk/permissions/version` 供卡片渲染。
+
+**⑥ 前端（`public/js/front/market.js`）**
+- 技能表单加「可执行技能（manifest）」区（版本/运行时/manifest JSON）；技能卡加「可执行 vX / 风险」徽章与「▶ 运行」「🔑 密钥」入口；工具栏加「⬆ 安装技能包」（URL/内联 + 哈希/签名）；运行弹窗展示 stdout/stderr/耗时；修复技能卡详情点击（补 `data-skill`）。
+
+### 验证
+- `npm test` 冒烟 **533/0 全绿**（525 基线 + 8 条新增 D1-4 用例：库迁移/manifest 规范化·校验·entry 逃逸/权限→白名单·风险·摘要/供应链哈希·签名·篡改/secrets 隔离·掩码·落盘密文·脱敏·删除/运行器注入 SKILL_ARGS·SKILL_SECRETS·输出脱敏·审计·非可执行拒绝/HTTP 安装·运行·密钥·卸载级联闭环/前端接入契约）。
+- 后端内核自检（隔离库）：manifest 校验、哈希/签名验证、密钥掩码回显、运行注入 `key=***` 脱敏、审计落库均通过。
+- 已知边界：安装源 V1 支持内联 manifest 与 http(s) JSON 清单（zip 解包与依赖自动安装留待后续迭代，依赖仅记录不自动装）；签名采用平台密钥（`SKILL_SIGNING_KEY`）HMAC，未签名包允许安装但标记 `verified=0`；运行时 V1 仅 `node`。
+
 > AI生成

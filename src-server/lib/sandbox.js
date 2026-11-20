@@ -78,8 +78,21 @@ async function runIsolated(opts) {
     code = '', timeoutMs = DEFAULT_TIMEOUT_MS, memMb = DEFAULT_MEM_MB,
     netAllow = DEFAULT_NET_ALLOW, owner = '', agentId = null, sessionId = null,
     args = undefined,
+    // D1-4 扩展：files（包内辅助文件路径→内容，写入沙箱工作目录）、
+    // globals（注入 globalThis.X，如 SKILL_ARGS/SKILL_SECRETS）、
+    // mask（明文脱敏列表：输出中出现的值替换为 ***，防凭据回显泄露）
+    files = undefined, globals = undefined, mask = undefined,
   } = opts || {};
   if (!String(code).trim()) return { status: 'denied', stderr: '代码为空', stdout: '', artifacts: [] };
+  // 脱敏：写审计与返回前统一 scrub（防御性，双保险）
+  const scrub = (s) => {
+    let out = String(s == null ? '' : s);
+    for (const v of mask || []) {
+      const val = String(v || '');
+      if (val.length >= 4 && out.includes(val)) out = out.split(val).join('***');
+    }
+    return out;
+  };
 
   const sbxId = 'sbx-' + Date.now().toString(36) + '-' + crypto.randomBytes(3).toString('hex');
   const workDir = path.join(os.tmpdir(), sbxId);
@@ -96,7 +109,25 @@ async function runIsolated(opts) {
     // 入参注入：仅当显式传入 args 时（插件工具），以全局常量方式提供给被隔离代码；
     // 其他调用方不传 args → 行为与既有一致（零回归）。
     const argPrelude = args === undefined ? '' : 'globalThis.PLUGIN_ARGS = ' + JSON.stringify(args) + ';\n';
-    fs.writeFileSync(scriptFile, buildPrelude(netAllow) + '\n' + argPrelude + code, 'utf8');
+    // D1-4：globals 注入（如 SKILL_ARGS / SKILL_SECRETS）——独立于 PLUGIN_ARGS，互不影响
+    let globalPrelude = '';
+    if (globals && typeof globals === 'object') {
+      for (const [k, v] of Object.entries(globals)) {
+        if (!/^[A-Za-z_$][\w$]*$/.test(k)) continue;
+        globalPrelude += `globalThis.${k} = ${JSON.stringify(v)};\n`;
+      }
+    }
+    fs.writeFileSync(scriptFile, buildPrelude(netAllow) + '\n' + argPrelude + globalPrelude + code, 'utf8');
+    // D1-4：把包内辅助文件写入沙箱工作目录（仅相对路径，防逃逸；cwd 已限定为该目录）
+    if (files && typeof files === 'object') {
+      for (const [rel, content] of Object.entries(files)) {
+        const safe = String(rel).replace(/\\/g, '/');
+        if (!safe || safe.startsWith('/') || safe.split('/').includes('..')) continue;
+        const dest = path.join(workDir, safe);
+        fs.mkdirSync(path.dirname(dest), { recursive: true });
+        fs.writeFileSync(dest, String(content), 'utf8');
+      }
+    }
   } catch (e) {
     db.prepare('UPDATE sandbox_runs SET status=?, stderr_excerpt=?, created_at=? WHERE id=?').run('failed', '写入脚本失败: ' + e.message, now(), runId);
     return { status: 'failed', stderr: '写入脚本失败: ' + e.message, stdout: '', artifacts: [], runId };
@@ -126,12 +157,13 @@ async function runIsolated(opts) {
     child.on('close', (exitCode) => {
       clearTimeout(killer);
       const durationMs = Date.now() - t0;
-      // 产物收集（通过存储抽象层）
+      // 产物收集（通过存储抽象层）；排除入口与 D1-4 注入的包内文件
+      const injectedTop = new Set(Object.keys(files || {}).map(r => String(r).replace(/\\/g, '/').split('/')[0]));
       const artifacts = [];
       try {
         storage.ensureDir('sandbox');
         for (const f of fs.readdirSync(workDir)) {
-          if (f === 'main.js') continue;
+          if (f === 'main.js' || injectedTop.has(f)) continue;
           const fp = path.join(workDir, f);
           const st = fs.statSync(fp);
           if (st.isFile() && st.size <= ARTIFACT_MAX) {
@@ -144,8 +176,8 @@ async function runIsolated(opts) {
       } catch { /* 产物收集失败不影响执行结果 */ }
       // 清理一次性沙箱目录
       try { fs.rmSync(workDir, { recursive: true, force: true }); } catch { }
-      const stdout = out.join('').slice(0, OUT_LIMIT);
-      const stderr = err.join('').slice(0, OUT_LIMIT);
+      const stdout = scrub(out.join('')).slice(0, OUT_LIMIT);
+      const stderr = scrub(err.join('')).slice(0, OUT_LIMIT);
       const status = killed ? 'timeout' : (exitCode === 0 ? 'success' : 'failed');
       // P1-13 终态回写（含 node 版本）
       db.prepare('UPDATE sandbox_runs SET status=?, exit_code=?, duration_ms=?, node_version=?, artifacts=?, stdout_excerpt=?, stderr_excerpt=? WHERE id=?')

@@ -7936,6 +7936,158 @@ print('PY_OK')
     });
   }
 
+  console.log('【D1-4】可执行技能包 V1（manifest 规范 / 供应链校验 / secrets 隔离 / 沙箱执行）');
+  {
+    const { db } = require('../src-server/db');
+    const sp = require('../src-server/lib/skill-package');
+    const sec = require('../src-server/lib/skill-secrets');
+    const runner = require('../src-server/lib/skill-runner');
+    const { sign } = require('../src-server/lib/auth');
+
+    await t('D1-4: db 迁移 —— skill_assets 扩展列 + skill_secrets / skill_runs 表就位', () => {
+      const cols = db.prepare('PRAGMA table_info(skill_assets)').all().map(c => c.name);
+      for (const c of ['manifest', 'runtime', 'version', 'source_url', 'package_hash', 'verified', 'enabled']) assert.ok(cols.includes(c), `skill_assets 应有 ${c}`);
+      const ss = db.prepare('PRAGMA table_info(skill_secrets)').all().map(c => c.name);
+      for (const c of ['owner', 'skill_id', 'name', 'value']) assert.ok(ss.includes(c), `skill_secrets 应有 ${c}`);
+      const sr = db.prepare('PRAGMA table_info(skill_runs)').all().map(c => c.name);
+      for (const c of ['skill_id', 'owner', 'status', 'duration_ms', 'stdout_excerpt']) assert.ok(sr.includes(c), `skill_runs 应有 ${c}`);
+    });
+
+    await t('D1-4: manifest 规范化/校验 —— 空 manifest=纯提示词；非法 runtime/version/权限被拒；合法通过', () => {
+      const blank = sp.validateManifest('{}');
+      assert.strictEqual(blank.ok, true, '空 manifest 应合法');
+      assert.strictEqual(blank.executable, false, '空 manifest 不可执行');
+      const bad = sp.validateManifest({ name: 'x', runtime: 'python', version: 'abc', permissions: ['root'], entry_code: '1' });
+      assert.strictEqual(bad.ok, false, '非法 manifest 应被拒');
+      assert.ok(bad.errors.some(e => e.includes('runtime')), '应报 runtime 错误');
+      assert.ok(bad.errors.some(e => e.includes('version')), '应报 version 错误');
+      assert.ok(bad.errors.some(e => e.includes('权限')), '应报权限错误');
+      const good = sp.validateManifest({ name: 'demo', version: '1.2.0', entry_code: 'console.log(1)', permissions: ['net:api.example.com', 'fs:write'], secrets: ['API_KEY'] });
+      assert.strictEqual(good.ok, true, '合法 manifest 应通过');
+      assert.strictEqual(good.executable, true);
+      // entry 逃逸拒绝
+      assert.strictEqual(sp.validateManifest({ name: 'demo', entry: '../../etc/passwd' }).ok, false, 'entry 逃逸应被拒');
+    });
+
+    await t('D1-4: 权限声明 → 网络白名单 / 风险分级 / 摘要', () => {
+      assert.deepStrictEqual(sp.netAllowOf({ permissions: ['net:api.example.com', 'fs:read'] }), ['api.example.com']);
+      assert.strictEqual(sp.permRisk({ permissions: [] }), 'low');
+      assert.strictEqual(sp.permRisk({ permissions: ['fs:write'] }), 'middle');
+      assert.strictEqual(sp.permRisk({ permissions: ['fs:write', 'net:a.com'] }), 'high');
+      const s = sp.summarizePermissions({ permissions: ['fs:read'] });
+      assert.strictEqual(s[0].permission, 'fs:read');
+      assert.ok(s[0].label && s[0].risk);
+    });
+
+    await t('D1-4: 供应链校验 —— 内容哈希稳定 + 签名验证（正确/错误）+ 篡改检测', () => {
+      const m = { name: 'demo', version: '1.0.0', entry_code: 'console.log(1)', permissions: [] };
+      const h1 = sp.contentHash(m);
+      const h2 = sp.contentHash({ ...m });
+      assert.strictEqual(h1, h2, '同内容哈希应一致');
+      assert.notStrictEqual(sp.contentHash({ ...m, entry_code: 'console.log(2)' }), h1, '改代码应改哈希');
+      const key = 'k1';
+      const sig = sp.signPackage('demo', '1.0.0', h1, key);
+      assert.strictEqual(sp.verifySignature('demo', '1.0.0', h1, sig, key), true);
+      assert.strictEqual(sp.verifySignature('demo', '1.0.0', h1, 'deadbeef', key), false);
+      assert.strictEqual(sp.verifySupplyChain(m, { declaredHash: 'bad' }).integrity, false, '哈希不符应判 false');
+      assert.strictEqual(sp.verifySupplyChain(m, { declaredHash: h1 }).integrity, true);
+      assert.strictEqual(sp.verifySupplyChain(m, { declaredHash: h1, signature: sig, key }).verified, true);
+    });
+
+    await t('D1-4: secrets 隔离 —— 加密落盘 / 掩码回显 / 运行取用明文 / 输出脱敏 / 删除', () => {
+      db.prepare("INSERT INTO users (username,password,nickname,role,status,must_change_pwd,created_at) VALUES ('d14_sec','x','S','user',1,0,datetime('now','localtime'))").run();
+      const sid = Number(db.prepare("INSERT INTO skill_assets (owner,name,prompt,manifest) VALUES ('d14_sec','secsr','','{}')").run().lastInsertRowid);
+      assert.strictEqual(sec.setSecret('d14_sec', sid, 'bad name!', 'v').ok, false, '非法密钥名应被拒');
+      sec.setSecret('d14_sec', sid, 'API_KEY', 'sk-topsecret-9988');
+      const list = sec.listSecrets('d14_sec', sid);
+      assert.strictEqual(list.length, 1);
+      assert.ok(!JSON.stringify(list).includes('sk-topsecret-9988'), '列表不得回明文');
+      assert.ok(list[0].masked.includes('****'), '应掩码');
+      // 落盘密文（不等于明文）
+      const raw = db.prepare('SELECT value FROM skill_secrets WHERE owner=? AND skill_id=? AND name=?').get('d14_sec', sid, 'API_KEY').value;
+      assert.notStrictEqual(raw, 'sk-topsecret-9988', '落盘应为密文');
+      assert.strictEqual(sec.getSecretsForRun('d14_sec', sid).API_KEY, 'sk-topsecret-9988', '运行期应能解出明文');
+      assert.strictEqual(sec.scrub('x sk-topsecret-9988 y', ['sk-topsecret-9988']), 'x *** y');
+      sec.purgeSkill('d14_sec', sid);
+      assert.strictEqual(sec.listSecrets('d14_sec', sid).length, 0);
+    });
+
+    await t('D1-4: 技能运行器 —— 沙箱执行注入 SKILL_ARGS/SKILL_SECRETS 且输出脱敏 + 审计', async () => {
+      db.prepare("INSERT INTO users (username,password,nickname,role,status,must_change_pwd,created_at) VALUES ('d14_run','x','R','user',1,0,datetime('now','localtime'))").run();
+      const manifest = { name: 'runner', version: '1.0.0', entry_code: "console.log('a=' + JSON.stringify(SKILL_ARGS) + ' k=' + SKILL_SECRETS.TOKEN)", permissions: [], secrets: ['TOKEN'] };
+      const sid = Number(db.prepare("INSERT INTO skill_assets (owner,name,prompt,manifest) VALUES ('d14_run','runner','',?)").run(JSON.stringify(manifest)).lastInsertRowid);
+      sec.setSecret('d14_run', sid, 'TOKEN', 'tok-abcdef-123456');
+      const skill = db.prepare('SELECT * FROM skill_assets WHERE id=?').get(sid);
+      const out = await runner.runSkill(skill, { owner: 'd14_run', args: { n: 9 } });
+      assert.strictEqual(out.status, 'success', '应执行成功');
+      assert.ok(out.stdout.includes('"n":9'), '应注入 SKILL_ARGS');
+      assert.ok(!out.stdout.includes('tok-abcdef-123456'), '输出不得泄露密钥明文');
+      assert.ok(out.stdout.includes('***'), '输出中密钥应被脱敏为 ***');
+      const hist = runner.runHistory(sid, 'd14_run');
+      assert.ok(hist.length >= 1, '应有运行审计');
+      // 非可执行技能被拒
+      const noexec = db.prepare("INSERT INTO skill_assets (owner,name,prompt,manifest) VALUES ('d14_run','plain','p','{}')").run();
+      const r2 = await runner.runSkill(db.prepare('SELECT * FROM skill_assets WHERE id=?').get(noexec.lastInsertRowid), { owner: 'd14_run' });
+      assert.strictEqual(r2.status, 'denied', '纯提示词技能运行应被拒');
+    });
+
+    await t('D1-4: HTTP 安装/运行/密钥/卸载闭环 —— 供应链校验 + 掩码回显 + 级联清理', async () => {
+      db.prepare("INSERT INTO users (username,password,nickname,role,status,must_change_pwd,created_at) VALUES ('d14_http','x','H','user',1,0,datetime('now','localtime'))").run();
+      const u = db.prepare("SELECT id FROM users WHERE username='d14_http'").get();
+      const tok = sign({ uid: u.id, exp: Date.now() + 3600000 });
+      const express = require('express');
+      const skRouter = require('../src-server/routes/skillassets');
+      const app = express(); app.use(express.json()); app.use('/api/skillassets', skRouter);
+      let server;
+      await new Promise(r => { server = app.listen(0, '127.0.0.1', r); });
+      const base = `http://127.0.0.1:${server.address().port}`;
+      const H = { 'Content-Type': 'application/json', authorization: 'Bearer ' + tok };
+      const J = async (m, p, b) => { const r = await fetch(base + p, { method: m, headers: H, body: b ? JSON.stringify(b) : undefined }); return r.json(); };
+      try {
+        const manifest = { name: 'pkgdemo', version: '1.0.0', entry_code: "console.log('pkg ' + JSON.stringify(SKILL_ARGS))", permissions: [], secrets: ['KEY'] };
+        const goodHash = sp.contentHash(manifest);
+        // 哈希不符 → 拒绝
+        const bad = await J('POST', '/api/skillassets/install', { manifest, declaredHash: 'deadbeef' });
+        assert.strictEqual(bad.code, 400, '哈希不符应拒绝安装');
+        // 正确哈希 → 安装
+        const ins = await J('POST', '/api/skillassets/install', { manifest, declaredHash: goodHash });
+        assert.strictEqual(ins.code, 0, '安装应成功：' + ins.msg);
+        const id = ins.data.id;
+        assert.strictEqual(ins.data.integrity, true, '完整性应通过');
+        // 列表带可执行标记
+        const list = await J('GET', '/api/skillassets');
+        const row = list.data.find(x => x.id === id);
+        assert.ok(row && row.executable, '列表应标记 executable');
+        // 密钥
+        const sset = await J('POST', `/api/skillassets/${id}/secrets`, { name: 'KEY', value: 'pkg-secret-777' });
+        assert.strictEqual(sset.code, 0, '密钥保存应成功');
+        const sl = await J('GET', `/api/skillassets/${id}/secrets`);
+        assert.ok(!JSON.stringify(sl).includes('pkg-secret-777'), '密钥接口不得回明文');
+        // 运行
+        const run = await J('POST', `/api/skillassets/${id}/run`, { args: { x: 1 } });
+        assert.strictEqual(run.code, 0, '运行应成功');
+        assert.strictEqual(run.data.status, 'success');
+        assert.ok(run.data.stdout.includes('"x":1'), '应注入入参');
+        // 卸载 → 级联清理（技能不可见 + 密钥清空 + 运行记录清空）
+        await J('DELETE', `/api/skillassets/${id}`);
+        assert.strictEqual(db.prepare('SELECT COUNT(*) c FROM skill_secrets WHERE skill_id=?').get(id).c, 0, '卸载应清密钥');
+        assert.strictEqual(db.prepare('SELECT COUNT(*) c FROM skill_runs WHERE skill_id=?').get(id).c, 0, '卸载应清运行记录');
+        const list2 = await J('GET', '/api/skillassets');
+        assert.ok(!list2.data.find(x => x.id === id), '卸载后列表不应含该技能');
+      } finally { server.close(); }
+    });
+
+    await t('D1-4: 前端市场页接入 —— 安装/运行/密钥入口 + 市场端点回传可执行字段', () => {
+      const mk = fs.readFileSync(path.join(__dirname, '..', 'public', 'js', 'front', 'market.js'), 'utf8');
+      assert.ok(mk.includes('openInstall') && mk.includes('/skillassets/install'), '市场页应有安装入口');
+      assert.ok(mk.includes('openRun') && mk.includes('/run'), '市场页应有运行入口');
+      assert.ok(mk.includes('openSecrets') && mk.includes('/secrets'), '市场页应有密钥入口');
+      assert.ok(mk.includes('manifest'), '市场页应支持 manifest 编辑');
+      const sm = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'routes', 'skills-market.js'), 'utf8');
+      assert.ok(sm.includes('skill-package') && sm.includes('executable'), '市场端点应回传可执行标记');
+    });
+  }
+
   console.log('【U2-1 / N7】P1 任务队列驱动抽象（memory 默认 / redis 可选 / 缺依赖回退）');
   {
     const { db, now } = require('../src-server/db');

@@ -1243,6 +1243,9 @@ db.exec(`CREATE TABLE IF NOT EXISTS user_tool_keys (
 );`);
 // 技能资产表（2026-10-20 P3 技能资产化：可复用的「提示词+工具」组合，对话中 @技能名 调用；
 // status=1 已发布（他人可见可引用），status=0 私有（仅本人）。owner+name 唯一防重名混淆）
+// D1-4 可执行技能包（2026-11-21）：新增 manifest（入口/参数/权限/依赖规范）、version、runtime、
+// source_url/package_hash/verified（安装来源与供应链校验）、enabled（启用开关）。
+// manifest 为空 {} 时技能 = 纯提示词（向后兼容）；非空且含 entry 时技能可被沙箱执行。
 db.exec(`CREATE TABLE IF NOT EXISTS skill_assets (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   owner TEXT NOT NULL,
@@ -1252,8 +1255,40 @@ db.exec(`CREATE TABLE IF NOT EXISTS skill_assets (
   prompt TEXT DEFAULT '',
   tools TEXT DEFAULT '[]',
   status INTEGER DEFAULT 1,
+  manifest TEXT DEFAULT '{}',
+  runtime TEXT DEFAULT 'node',
+  version TEXT DEFAULT '1.0.0',
+  source_url TEXT DEFAULT '',
+  package_hash TEXT DEFAULT '',
+  verified INTEGER DEFAULT 0,
+  enabled INTEGER DEFAULT 1,
   created_at TEXT,
   UNIQUE(owner, name)
+);`);
+// D1-4 技能密钥表（按「用户 × 技能」隔离；值 AES-256-GCM 加密落盘，接口只回掩码，运行期解密注入沙箱；
+// 与全局 secrets 表（管理员画布占位符）语义分离——这里每个用户为自己的技能配置各自的凭据）
+db.exec(`CREATE TABLE IF NOT EXISTS skill_secrets (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  owner TEXT NOT NULL,
+  skill_id INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  value TEXT DEFAULT '',
+  created_at TEXT,
+  updated_at TEXT,
+  UNIQUE(owner, skill_id, name)
+);`);
+// D1-4 技能执行审计表（可执行技能每次沙箱运行落一行：状态/退出码/耗时/输出摘录；
+// 与 sandbox_runs（通用沙箱审计）互补——本表带 skill_id 归属，供技能页「运行历史」与验收统计）
+db.exec(`CREATE TABLE IF NOT EXISTS skill_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  skill_id INTEGER NOT NULL,
+  owner TEXT NOT NULL,
+  status TEXT DEFAULT 'running',
+  exit_code INTEGER DEFAULT NULL,
+  duration_ms INTEGER DEFAULT NULL,
+  stdout_excerpt TEXT DEFAULT '',
+  stderr_excerpt TEXT DEFAULT '',
+  created_at TEXT
 );`);
 // 意见反馈表（2026-10-20 帮助体系）：用户提交 → 管理员处理（回复）→ 站内信闭环通知
 // type: bug/suggest/consult；status: pending 待处理 / processed 已处理

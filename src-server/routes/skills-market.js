@@ -24,6 +24,7 @@ const { validateWorkflowV2 } = require('../lib/workflow-schema');
 const dify = require('../lib/dify');
 const coze = require('../lib/coze');
 const { requireFeature } = require('../lib/edition');
+const skillPkg = require('../lib/skill-package'); // D1-4：技能可执行标记（manifest 规范化/风险/权限摘要）
 
 const router = express.Router();
 router.use(auth);
@@ -121,14 +122,21 @@ router.get('/', async (req, res) => {
   // 二区：技能资产（我的全部 + 他人已发布——与 /api/skillassets 可见性口径一致，私有技能不进市场）
   // P3-2 融合：附 mine 标记 + 全字段（prompt/tools/status）——市场页技能资产 tab 现在承担 CRUD（原独立技能页），
   // 列表需渲染详情/编辑/删除/发布开关；私有技能仅 owner 本人可见（原 /api/skillassets 语义不变，这里多带字段）
-  const skillAssets = db.prepare('SELECT id,name,description,icon,owner,status,prompt,tools,created_at FROM skill_assets WHERE owner=? OR status=1 ORDER BY id DESC')
+  const skillAssets = db.prepare('SELECT id,name,description,icon,owner,status,prompt,tools,manifest,runtime,version,verified,created_at FROM skill_assets WHERE owner=? OR status=1 ORDER BY id DESC')
     .all(me)
     .map(s => {
       let tools = [];
       try { tools = JSON.parse(s.tools || '[]'); } catch { }
+      // D1-4：可执行技能标记（供市场卡片渲染「可执行 v版本/风险」徽章与运行/密钥入口）
+      const manifest = skillPkg.normalizeManifest(s.manifest);
       return {
         id: s.id, name: s.name, description: s.description, icon: s.icon,
         owner: s.owner, status: s.status, prompt: s.prompt, tools,
+        version: s.version, verified: s.verified,
+        executable: skillPkg.isExecutable(manifest),
+        perm_risk: skillPkg.permRisk(manifest),
+        permissions: skillPkg.summarizePermissions(manifest),
+        secret_names: manifest.secrets || [],
         created_at: s.created_at,
         owned_by_me: s.owner === me, mine: s.owner === me,
         favorited: favSet.has(`skill_asset:${s.id}`),

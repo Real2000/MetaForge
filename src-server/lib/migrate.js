@@ -255,6 +255,35 @@ const ALL_MIGRATIONS = [
     acquired_at INTEGER NOT NULL, -- 获取时间（epoch ms）
     expires_at INTEGER NOT NULL   -- 过期时间（epoch ms，需持有者续租）
   );` },
+  // === D1-4 可执行技能包（2026-11-21）===
+  { id: 73, name: 'skill_assets.manifest - 技能 manifest（入口/参数/权限/依赖）', table: 'skill_assets', column: 'manifest', def: "TEXT DEFAULT '{}'" },
+  { id: 74, name: 'skill_assets.runtime - 运行时（node）', table: 'skill_assets', column: 'runtime', def: "TEXT DEFAULT 'node'" },
+  { id: 75, name: 'skill_assets.version - 技能版本', table: 'skill_assets', column: 'version', def: "TEXT DEFAULT '1.0.0'" },
+  { id: 76, name: 'skill_assets.source_url - 安装来源', table: 'skill_assets', column: 'source_url', def: "TEXT DEFAULT ''" },
+  { id: 77, name: 'skill_assets.package_hash - 包内容哈希（供应链校验）', table: 'skill_assets', column: 'package_hash', def: "TEXT DEFAULT ''" },
+  { id: 78, name: 'skill_assets.verified - 供应链校验结果', table: 'skill_assets', column: 'verified', def: 'INTEGER DEFAULT 0' },
+  { id: 79, name: 'skill_assets.enabled - 启用开关', table: 'skill_assets', column: 'enabled', def: 'INTEGER DEFAULT 1' },
+  { id: 80, name: 'skill_secrets - 技能密钥（按用户×技能隔离）', createSql: `CREATE TABLE IF NOT EXISTS skill_secrets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner TEXT NOT NULL,
+    skill_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    value TEXT DEFAULT '',
+    created_at TEXT,
+    updated_at TEXT,
+    UNIQUE(owner, skill_id, name)
+  );` },
+  { id: 81, name: 'skill_runs - 技能执行审计', createSql: `CREATE TABLE IF NOT EXISTS skill_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    skill_id INTEGER NOT NULL,
+    owner TEXT NOT NULL,
+    status TEXT DEFAULT 'running',
+    exit_code INTEGER DEFAULT NULL,
+    duration_ms INTEGER DEFAULT NULL,
+    stdout_excerpt TEXT DEFAULT '',
+    stderr_excerpt TEXT DEFAULT '',
+    created_at TEXT
+  );` },
 ];
 
 module.exports = {

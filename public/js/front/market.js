@@ -79,6 +79,7 @@ export async function render(el) {
       <span class="mk-chip" id="mkMineChip" style="display:none">⭐ ${t('仅看我的')}</span>
       <span class="mk-chip" id="mkFavChip">☆ ${t('仅看收藏')}</span>
       <input class="input" id="mkKw" placeholder="🔍 ${t('搜索名称或描述')}" style="width:200px">
+      <button class="btn" id="mkInstallPkg">⬆ ${t('安装技能包')}</button>
       <button class="btn primary" id="mkAddSkill">＋ ${t('创建技能')}</button>
     </div>
   </div>
@@ -139,11 +140,34 @@ export async function render(el) {
           <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-top:14px">
             <input type="checkbox" id="fStatus" ${(isNew || row.status) ? 'checked' : ''}> ${t('发布（他人可见可 @ 引用；关闭则仅自己可见）')}
           </label>
+          <details style="margin-top:14px;border:1px dashed #cbd5e1;border-radius:10px;padding:10px">
+            <summary style="cursor:pointer;font-size:13px;font-weight:600">⚙️ ${t('可执行技能（manifest：入口/参数/权限/依赖）— 留空则为纯提示词技能')}</summary>
+            <div class="sk-form">
+              <div style="display:flex;gap:10px;margin-top:10px">
+                <div style="flex:0 0 130px">
+                  <label>${t('版本')}</label>
+                  <input class="input" id="fVersion" value="${esc(row?.version || '1.0.0')}" placeholder="1.0.0">
+                </div>
+                <div style="flex:0 0 130px">
+                  <label>${t('运行时')}</label>
+                  <select class="input" id="fRuntime"><option value="node">node</option></select>
+                </div>
+              </div>
+              <label>${t('manifest JSON（entry 入口文件 / entry_code 内联代码 / permissions 权限 / secrets 密钥名 / params 参数）')}</label>
+              <textarea id="fManifest" rows="8" placeholder='{"name":"demo","version":"1.0.0","entry_code":"console.log(SKILL_ARGS)","permissions":["net:api.example.com"],"secrets":["API_KEY"]}'>${esc(row?.manifest && Object.keys(row.manifest).length ? JSON.stringify(row.manifest, null, 2) : '')}</textarea>
+              <div style="font-size:11px;color:var(--text-3);margin-top:4px">${t('权限仅支持 fs:read / fs:write / net:<域名> / env；运行时密钥请在卡片「🔑 密钥」中按本技能配置（加密存储，掩码回显）。')}</div>
+            </div>
+          </details>
         </div>`,
       foot: `<button class="btn" data-cancel>${t('取消')}</button><button class="btn primary" data-save>${t('保存')}</button>`,
       onMount(mask, close) {
         mask.querySelector('[data-cancel]').onclick = close;
         mask.querySelector('[data-save]').onclick = async () => {
+          const manifestRaw = mask.querySelector('#fManifest').value.trim();
+          let manifest = {};
+          if (manifestRaw) {
+            try { manifest = JSON.parse(manifestRaw); } catch { return toast(t('manifest 不是合法 JSON，请检查'), 'err'); }
+          }
           const body = {
             name: mask.querySelector('#fName').value.trim(),
             icon: mask.querySelector('#fIcon').value.trim() || '✨',
@@ -151,9 +175,13 @@ export async function render(el) {
             prompt: mask.querySelector('#fPrompt').value.trim(),
             tools: [...mask.querySelectorAll('#fTools input:checked')].map(x => x.value),
             status: mask.querySelector('#fStatus').checked ? 1 : 0,
+            manifest,
+            runtime: mask.querySelector('#fRuntime').value,
+            version: mask.querySelector('#fVersion').value.trim() || '1.0.0',
           };
           if (!body.name) return toast(t('技能名称不能为空'), 'err');
-          if (!body.prompt) return toast(t('提示词不能为空——技能的核心是提示词'), 'err');
+          const executable = !!(manifest && (manifest.entry || manifest.entry_code));
+          if (!body.prompt && !executable) return toast(t('提示词不能为空——技能的核心是提示词（或提供可执行 manifest）'), 'err');
           try {
             if (isNew) await api('/skillassets', { method: 'POST', body });
             else await api(`/skillassets/${row.id}`, { method: 'PUT', body });
@@ -167,26 +195,168 @@ export async function render(el) {
 
   /** 技能详情弹窗（含工具徽章/提示词全文/复制调用词/编辑入口） */
   function openSkillDetail(s) {
+    const perms = s.permissions || [];
     modal({
       title: `${s.icon || '✨'} ${esc(s.name)}`,
       body: `
         <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px">
           <span class="tag ${s.mine ? 'blue' : 'gray'}">${s.mine ? t('我的技能') : `${t('来自')} ${esc(s.owner)}`}</span>
           <span class="tag ${s.status ? 'green' : 'gray'}">${s.status ? t('已发布') : t('私有')}</span>
+          ${s.executable ? `<span class="tag purple">${t('可执行')} v${esc(s.version || '1.0.0')}</span>` : ''}
+          ${s.executable ? perms.map(p => `<span class="tag ${RISK_TAG[p.risk] || 'gray'}">${esc(p.permission)}</span>`).join('') : ''}
           ${s.tools?.map(x => `<span class="tag purple">${TOOL_ICON[x] || '🔧'} ${esc(x)}</span>`).join('')}
         </div>
         ${s.description ? `<div style="font-size:13px;color:var(--text-3);margin-bottom:12px">${esc(s.description)}</div>` : ''}
         <div style="font-size:12px;color:var(--text-3);margin-bottom:6px">📝 ${t('提示词')}：</div>
         <div style="font-size:13px;line-height:1.8;color:var(--text);padding:12px;background:#f8faff;border-radius:10px;white-space:pre-wrap;max-height:260px;overflow:auto">${esc(s.prompt || '')}</div>
         <div style="margin-top:14px;padding:10px 12px;background:#fff7e6;border-radius:10px;font-size:12px;color:#92700c">
-          💡 ${t('在对话输入框输入')} <b>@${esc(s.name)}</b>（${t('或点输入区的「✨ 技能」按钮选择')}）${t('即可调用本技能')}
+          💡 ${t('在对话输入框输入')} <b>@${esc(s.name)}</b>（${t('或点输入区的「✨ 技能」按钮选择')}）${t('即可调用本技能')}${s.executable ? `；${t('可执行技能也可点「▶ 运行」直接执行')}` : ''}
         </div>`,
-      foot: `<button class="btn" data-copy>⧉ ${t('复制调用词')}</button>${s.mine ? `<button class="btn" data-edit>${t('编辑')}</button>` : ''}<button class="btn primary" data-close>${t('关闭')}</button>`,
+      foot: `<button class="btn" data-copy>⧉ ${t('复制调用词')}</button>${s.executable ? `<button class="btn" data-run>▶ ${t('运行')}</button>` : ''}${s.mine && s.executable ? `<button class="btn" data-secrets>🔑 ${t('密钥')}</button>` : ''}${s.mine ? `<button class="btn" data-edit>${t('编辑')}</button>` : ''}<button class="btn primary" data-close>${t('关闭')}</button>`,
       onMount(mask, close) {
         mask.querySelector('[data-close]').onclick = close;
         mask.querySelector('[data-copy]').onclick = () => { copyMention(s.name); };
         const ed = mask.querySelector('[data-edit]');
         if (ed) ed.onclick = () => { close(); openSkillForm(s); };
+        const rn = mask.querySelector('[data-run]');
+        if (rn) rn.onclick = () => { close(); openRun(s); };
+        const sk = mask.querySelector('[data-secrets]');
+        if (sk) sk.onclick = () => { close(); openSecrets(s); };
+      },
+    });
+  }
+
+  /* ---------------- D1-4：可执行技能包（安装 / 密钥 / 运行） ---------------- */
+
+  const RISK_TAG = { low: 'green', middle: 'orange', high: 'red' };
+
+  /** 安装技能包（inline manifest 或 URL）——供应链校验（哈希/签名）后落库 */
+  function openInstall() {
+    modal({
+      title: t('⬆ 安装技能包'),
+      wide: true,
+      body: `
+        <div class="sk-form">
+          <label>${t('安装地址（http(s) 指向 JSON 安装清单；留空则用下方内联 manifest）')}</label>
+          <input class="input" id="iUrl" placeholder="https://example.com/skill.json">
+          <label>${t('内联 manifest JSON（url 为空时使用；应含 name/version/entry|entry_code）')}</label>
+          <textarea id="iManifest" rows="7" placeholder='{"name":"demo","version":"1.0.0","entry_code":"console.log(SKILL_ARGS)","permissions":[],"secrets":["API_KEY"]}'></textarea>
+          <div style="display:flex;gap:10px">
+            <div style="flex:1"><label>${t('声明的内容哈希（可选，供应链完整性校验）')}</label><input class="input" id="iHash" placeholder="${t('sha256 hex（留空则记录实算哈希）')}"></div>
+            <div style="flex:1"><label>${t('包签名（可选，HMAC 校验来源可信）')}</label><input class="input" id="iSig" placeholder="${t('签名留空 = 未签名')}"></div>
+          </div>
+        </div>`,
+      foot: `<button class="btn" data-cancel>${t('取消')}</button><button class="btn primary" data-install>${t('校验并安装')}</button>`,
+      onMount(mask, close) {
+        mask.querySelector('[data-cancel]').onclick = close;
+        mask.querySelector('[data-install]').onclick = async () => {
+          const url = mask.querySelector('#iUrl').value.trim();
+          const mRaw = mask.querySelector('#iManifest').value.trim();
+          let manifest;
+          if (mRaw) { try { manifest = JSON.parse(mRaw); } catch { return toast(t('manifest 不是合法 JSON'), 'err'); } }
+          if (!url && !manifest) return toast(t('请填写安装地址或内联 manifest'), 'err');
+          try {
+            const j = await api('/skillassets/install', { method: 'POST', body: {
+              url: url || undefined, manifest,
+              declaredHash: mask.querySelector('#iHash').value.trim() || undefined,
+              signature: mask.querySelector('#iSig').value.trim() || undefined,
+            } });
+            close(); toast(`${j.msg}（v${j.data.version} · ${t('风险')} ${j.data.risk} · ${j.data.verified ? t('已校验') : t('未签名')}）`);
+            if (j.data.notes?.length) console.warn('[install]', j.data.notes.join('; '));
+            load();
+          } catch (e) { toast(e.message, 'err'); }
+        };
+      },
+    });
+  }
+
+  /** 运行可执行技能（输入参数 JSON → 沙箱执行 → 展示输出） */
+  function openRun(s) {
+    modal({
+      title: `▶ ${t('运行技能')}：${esc(s.name)}`,
+      wide: true,
+      body: `
+        <div class="sk-form">
+          <div style="font-size:12px;color:var(--text-3);margin-bottom:6px">
+            ${t('权限')}：${(s.permissions || []).map(p => `<span class="tag ${RISK_TAG[p.risk] || 'gray'}">${esc(p.permission)}</span>`).join('') || `<span class="tag gray">${t('无特殊权限')}</span>`}
+            ${s.secret_names?.length ? `<span style="margin-left:6px">🔑 ${t('需要密钥')}：${s.secret_names.map(esc).join('、')}</span>` : ''}
+          </div>
+          <label>${t('入参（JSON，注入 SKILL_ARGS）')}</label>
+          <textarea id="rArgs" rows="4" placeholder='{"q":"hello"}'>{}</textarea>
+          <div id="rOut" style="margin-top:10px"></div>
+        </div>`,
+      foot: `<button class="btn" data-close>${t('关闭')}</button><button class="btn primary" data-run>▶ ${t('运行')}</button>`,
+      onMount(mask, close) {
+        mask.querySelector('[data-close]').onclick = close;
+        const out = mask.querySelector('#rOut');
+        mask.querySelector('[data-run]').onclick = async () => {
+          let args = {};
+          try { args = JSON.parse(mask.querySelector('#rArgs').value.trim() || '{}'); } catch { return toast(t('入参不是合法 JSON'), 'err'); }
+          out.innerHTML = `<div style="font-size:12px;color:var(--text-3)">${t('执行中…')}</div>`;
+          try {
+            const j = await api(`/skillassets/${s.id}/run`, { method: 'POST', body: { args } });
+            const d = j.data || {};
+            const ok = d.status === 'success';
+            out.innerHTML = `
+              <div style="font-size:12px;margin-bottom:6px">${t('状态')}：<span class="tag ${ok ? 'green' : 'orange'}">${esc(d.status || '-')}</span>
+                ${d.durationMs != null ? `<span class="tag gray">${d.durationMs}ms</span>` : ''}
+                <span class="tag ${RISK_TAG[d.risk] || 'gray'}">${t('风险')} ${esc(d.risk || '-')}</span></div>
+              <div style="font-size:12px;color:var(--text-3);margin-bottom:4px">stdout：</div>
+              <pre style="background:#0f172a;color:#e2e8f0;border-radius:10px;padding:10px;max-height:220px;overflow:auto;font-size:12px;white-space:pre-wrap">${esc(d.stdout || '') || t('（空）')}</pre>
+              ${d.stderr ? `<div style="font-size:12px;color:#dc2626;margin:6px 0 4px">stderr：</div><pre style="background:#fef2f2;color:#991b1b;border-radius:10px;padding:10px;max-height:160px;overflow:auto;font-size:12px;white-space:pre-wrap">${esc(d.stderr)}</pre>` : ''}`;
+            toast(ok ? t('执行成功') : t('执行结束（见输出）'), ok ? 'ok' : 'err');
+          } catch (e) {
+            out.innerHTML = `<div style="color:#dc2626;font-size:13px">${esc(e.message)}</div>`;
+          }
+        };
+      },
+    });
+  }
+
+  /** 技能密钥面板（按本技能隔离；加密存储、掩码回显） */
+  async function openSecrets(s) {
+    let list = [];
+    try { const j = await api(`/skillassets/${s.id}/secrets`); list = j.data || []; }
+    catch (e) { return toast(e.message, 'err'); }
+    const renderList = () => list.map(it => `
+      <div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px dashed #e5e7eb">
+        <span class="tag blue" style="font-size:11px">${esc(it.name)}</span>
+        <code style="font-size:12px;color:var(--text-3)">${esc(it.masked || '****')}</code>
+        <span style="flex:1"></span>
+        <button class="btn sm" style="color:#dc2626" data-delkey="${esc(it.name)}">${t('删除')}</button>
+      </div>`).join('') || `<div style="font-size:12px;color:var(--text-3)">${t('尚未配置密钥')}</div>`;
+    modal({
+      title: `🔑 ${esc(s.name)} ${t('密钥')}`,
+      body: `
+        <div id="secList">${renderList()}</div>
+        <div class="sk-form" style="margin-top:12px">
+          <label>${t('密钥名（字母/下划线开头）')}</label>
+          <input class="input" id="secName" placeholder="API_KEY" value="${esc((s.secret_names || [])[0] || '')}">
+          <label>${t('密钥值（加密存储，仅掩码回显，运行期注入 SKILL_SECRETS）')}</label>
+          <input class="input" id="secVal" type="password" placeholder="••••••••">
+        </div>`,
+      foot: `<button class="btn" data-close>${t('关闭')}</button><button class="btn primary" data-save>${t('保存密钥')}</button>`,
+      onMount(mask, close) {
+        mask.querySelector('[data-close]').onclick = close;
+        const bindDel = () => mask.querySelectorAll('[data-delkey]').forEach(b => b.onclick = async () => {
+          try { await api(`/skillassets/${s.id}/secrets/${encodeURIComponent(b.dataset.delkey)}`, { method: 'DELETE' });
+            list = list.filter(x => x.name !== b.dataset.delkey); mask.querySelector('#secList').innerHTML = renderList(); bindDel();
+            toast(t('已删除'));
+          } catch (e) { toast(e.message, 'err'); }
+        });
+        bindDel();
+        mask.querySelector('[data-save]').onclick = async () => {
+          const name = mask.querySelector('#secName').value.trim();
+          const value = mask.querySelector('#secVal').value;
+          if (!name || !value) return toast(t('密钥名与值均不能为空'), 'err');
+          try {
+            await api(`/skillassets/${s.id}/secrets`, { method: 'POST', body: { name, value } });
+            mask.querySelector('#secVal').value = '';
+            const j = await api(`/skillassets/${s.id}/secrets`); list = j.data || [];
+            mask.querySelector('#secList').innerHTML = renderList(); bindDel();
+            toast(t('密钥已保存'));
+          } catch (e) { toast(e.message, 'err'); }
+        };
       },
     });
   }
@@ -283,15 +453,18 @@ return `<div class="agent-card" data-plugin-id="plat_${x.platform_type}_${x.app_
       }
       if (x._t === 'skill_asset') {
         // P3-2 融合：技能卡在市场浏览基础上叠加 CRUD（我的：编辑/删除/发布开关 + 详情 + 复制调用词）
-        return `<div class="agent-card" data-plugin-id="skill_${x.id}">
+        // D1-4：可执行技能加「可执行 v版本/风险」徽章 + 运行/密钥入口
+        return `<div class="agent-card" data-plugin-id="skill_${x.id}" data-skill="${x.id}">
           ${starHTML('skill_asset', x.id, inFav('skill_asset', x.id))}
           <div class="a-ava" style="background:linear-gradient(135deg,#059669,#0d9488)">${esc(x.icon || '✨')}</div>
           <div class="a-info">
-            <div class="mk-name">${esc(x.name)} ${x.owned_by_me ? `<span class="tag blue">${t('我的')}</span>` : `<span class="tag gray">${esc(x.owner)}</span>`}${x.owned_by_me && !x.status ? `<span class="tag orange">${t('私有')}</span>` : ''}</div>
+            <div class="mk-name">${esc(x.name)} ${x.owned_by_me ? `<span class="tag blue">${t('我的')}</span>` : `<span class="tag gray">${esc(x.owner)}</span>`}${x.executable ? `<span class="tag purple">${t('可执行')} v${esc(x.version || '1.0.0')}</span>` : ''}${x.executable && x.perm_risk && x.perm_risk !== 'low' ? `<span class="tag ${RISK_TAG[x.perm_risk] || 'orange'}">${t('风险')} ${esc(x.perm_risk)}</span>` : ''}${x.owned_by_me && !x.status ? `<span class="tag orange">${t('私有')}</span>` : ''}</div>
             <div class="a-desc">${esc(x.description || t('提示词 + 工具组合技能'))}</div>
-            <div class="sk-tools">${(x.tools || []).map(tl => `<span class="tag purple" style="font-size:10px">${TOOL_ICON[tl] || '🔧'} ${esc(tl)}</span>`).join('') || `<span style="font-size:11px;color:#c0c4cc">${t('纯提示词技能')}</span>`}</div>
+            <div class="sk-tools">${(x.tools || []).map(tl => `<span class="tag purple" style="font-size:10px">${TOOL_ICON[tl] || '🔧'} ${esc(tl)}</span>`).join('') || ''}${x.executable && !(x.tools || []).length ? `<span style="font-size:11px;color:#c0c4cc">${t('可执行技能包')}</span>` : (!x.executable ? `<span style="font-size:11px;color:#c0c4cc">${t('纯提示词技能')}</span>` : '')}</div>
             <div class="mk-cardbtn">
               <button class="btn sm" data-copy="${x.id}">⧉ ${t('调用词')}</button>
+              ${x.executable ? `<button class="btn sm" data-run="${x.id}">▶ ${t('运行')}</button>` : ''}
+              ${x.owned_by_me && x.executable ? `<button class="btn sm" data-secrets="${x.id}">🔑 ${t('密钥')}</button>` : ''}
               ${x.owned_by_me ? `<button class="btn sm" data-edit="${x.id}">${t('编辑')}</button><button class="btn sm" data-publish="${x.id}">${x.status ? t('下架') : t('发布')}</button><button class="btn sm" style="color:#dc2626" data-del="${x.id}">${t('删除')}</button>` : `<button class="btn sm primary" data-clone="skill_asset:${x.id}">⧉ ${t('克隆为我的智能体')}</button>`}
             </div>
           </div>
@@ -366,16 +539,18 @@ return `<div class="agent-card" data-plugin-id="plat_${x.platform_type}_${x.app_
       }
     });
 
-    // P3-2 融合：技能卡 CRUD 交互（复制调用词 / 编辑 / 发布开关 / 删除 / 详情）
+    // P3-2 融合：技能卡 CRUD 交互（复制调用词 / 编辑 / 发布开关 / 删除 / 详情）；D1-4 加运行/密钥
     const skillOf = (id) => data.skill_assets.find(s => s.id === +id);
     grid.querySelectorAll('.agent-card[data-skill]').forEach(card => {
       card.onclick = e => {
-        if (e.target.closest('[data-copy]') || e.target.closest('[data-edit]') || e.target.closest('[data-del]') || e.target.closest('[data-publish]') || e.target.closest('[data-clone]') || e.target.closest('.mk-star')) return;
+        if (e.target.closest('[data-copy]') || e.target.closest('[data-edit]') || e.target.closest('[data-del]') || e.target.closest('[data-publish]') || e.target.closest('[data-clone]') || e.target.closest('[data-run]') || e.target.closest('[data-secrets]') || e.target.closest('.mk-star')) return;
         openSkillDetail(skillOf(card.dataset.skill));
       };
     });
     grid.querySelectorAll('[data-copy]').forEach(b => b.onclick = e => { e.stopPropagation(); copyMention(skillOf(b.dataset.copy)?.name || ''); });
     grid.querySelectorAll('[data-edit]').forEach(b => b.onclick = e => { e.stopPropagation(); openSkillForm(skillOf(b.dataset.edit)); });
+    grid.querySelectorAll('[data-run]').forEach(b => b.onclick = e => { e.stopPropagation(); openRun(skillOf(b.dataset.run)); });
+    grid.querySelectorAll('[data-secrets]').forEach(b => b.onclick = e => { e.stopPropagation(); openSecrets(skillOf(b.dataset.secrets)); });
     grid.querySelectorAll('[data-publish]').forEach(b => b.onclick = async e => {
       e.stopPropagation();
       const s = skillOf(b.dataset.publish);
@@ -449,6 +624,8 @@ return `<div class="agent-card" data-plugin-id="plat_${x.platform_type}_${x.app_
   kwInput.oninput = () => { kw = kwInput.value.trim(); renderGrid(); };
   // P3-2 融合：创建技能入口（原独立技能页 #addBtn，现在市场页承担 CRUD）
   el.querySelector('#mkAddSkill').onclick = () => openSkillForm(null);
+  // D1-4：安装技能包入口
+  el.querySelector('#mkInstallPkg').onclick = () => openInstall();
 
   await load();          // 主端点：本地四区（首屏快，F5）
   loadPlatforms();       // 异构清单异步加载（不 await，不阻塞首屏；结果按当前 tab 决定是否重绘）
