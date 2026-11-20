@@ -22,6 +22,9 @@ const router = express.Router();
 // V1.2 审查加固 2026-10-30：resolveKbFilter 迁至 lib/kb-metadata.js（chat/share/openapi/workflow 四链路共用；
 // 挂 router 导出会引发 workflow→chat 循环依赖）；此处引用，文件尾透传导出（smoke 单测沿用 chat.js 入口）
 const { resolveKbFilter } = require('../lib/kb-metadata');
+// D1-2 专家团式并行编排：任务图校验/分层/并发执行/单节点重跑（纯逻辑，可测试）
+const orchestrator = require('../lib/orchestrator');
+const { validateTaskGraph, runTaskGraph } = orchestrator;
 
 // P5.25 工具确认等待队列（U0-5 P1 抽到 lib/tool-confirm-registry）：stream 请求注册等待 →
 // 前端 /confirm 与 IM 卡片回调 /card-callback 两条决议路径共用同一份注册表跨请求唤醒
@@ -454,6 +457,60 @@ async function classifyIntent(input, agent, childTools) {
     const c = childTools.find(t => +t.child.id === +j.agent_id);
     return c ? { child: c.child, confidence: conf, reason: j.reason || '' } : null;
   } catch { return null; }
+}
+
+/** ⑧ D1-2 专家团编排（2026-11-20）：让编排器产出「任务图 JSON」——节点=子智能体/验证，depends_on 表达依赖 */
+async function planTaskGraph(agent, childTools, userInput, history) {
+  const list = childTools.map(c => `- agent_id=${c.child.id}（${c.child.name}）：${(c.child.description || '专业子智能体').slice(0, 80)}`).join('\n');
+  const hist = (history || []).slice(-4).map(h => `${h.role}: ${String(h.content || '').slice(0, 200)}`).join('\n');
+  const sys = `你是专家团编排器。把用户的复杂任务拆解为「任务图 JSON」，由多个子智能体分工并尽可能并行完成，最后安排一个验证节点验收。
+只输出 JSON，不要任何解释文字，也不要 markdown 代码围栏。
+JSON 结构示例：
+{"nodes":[
+  {"id":"n1","type":"agent","agent_id":<子智能体id>,"task":"交给该子智能体的完整、自包含任务描述","depends_on":[]},
+  {"id":"n2","type":"agent","agent_id":<子智能体id>,"task":"...","depends_on":["n1"]},
+  {"id":"verify","type":"verify","task":"验收：核对上游产出是否完整、正确并满足用户需求，列明问题与建议","depends_on":["n1","n2"]}
+]}
+规则：
+- depends_on 写它依赖的节点 id；无依赖的节点会并行执行，有依赖的等待上游完成。
+- 恰好包含 1 个 type="verify" 的验证节点，且它依赖所有产出节点。
+- 只能使用下方列出的子智能体；不得编造 agent_id。
+- 节点总数 2~8；任务简单就不要强行拆分。
+- 任务描述要自包含（下游节点会同时收到上游产出）。`;
+  const usr = `可选子智能体：\n${list}\n\n${hist ? '近期对话：\n' + hist + '\n\n' : ''}用户任务：${String(userInput).slice(0, 1500)}`;
+  const r = await chatOnce([
+    { role: 'system', content: sys },
+    { role: 'user', content: usr },
+  ], { model: agent.model, temperature: 0.2, max_reply: 1200, agentName: '任务图编排' });
+  const m = /\{[\s\S]*\}/.exec(r.full || '');
+  if (!m) throw new Error('编排器未返回任务图 JSON');
+  return JSON.parse(m[0]);
+}
+
+/** 验证节点执行器：用主模型对上游产出做验收，输出结论/问题清单/建议 */
+async function runVerifyNode(agent, node, ctx) {
+  const sys = `你是验收官。根据「原始任务」「验收要求」与「上游产出」，逐条核对是否满足要求。输出：① 结论（通过/不通过）② 存在的问题或缺口清单 ③ 可行的改进建议。简洁务实，不要复述原文，不要提及"节点""编排"等内部术语。`;
+  const usr = `原始任务：${String(ctx.input || '').slice(0, 1000)}\n\n验收要求：${node.task || '核对上游产出是否完整、正确、满足用户需求'}\n\n上游产出：\n${ctx.deps || '（无）'}`;
+  const r = await chatOnce([
+    { role: 'system', content: sys },
+    { role: 'user', content: usr },
+  ], { model: agent.model, temperature: 0.2, max_reply: 800, agentName: '验收节点' });
+  return r.full || '';
+}
+
+/** 汇总器：把各节点产出与验证结论整合为对用户的最终答复 */
+async function synthesizeOrchestration(agent, input, runResult, graph) {
+  const parts = graph.nodes.map(n => {
+    const s = runResult.nodes[n.id] || {};
+    return `【${n.id}｜${n.title || n.task?.slice(0, 16) || n.type}】(${s.status || '未知'})\n${s.status === 'done' ? (s.output || '') : (s.error || s.output || '无产出')}`;
+  });
+  const sys = `你是编排汇总器。把各子智能体的产出与验证结论整合为对用户的最终答复：结构清晰、去重、突出结论与可执行建议；验证发现的问题要如实说明。直接输出最终答复，不要提及"节点""编排""子智能体"等内部术语。`;
+  const usr = `用户任务：${String(input).slice(0, 800)}\n\n各环节产出：\n${parts.join('\n\n').slice(0, 6000)}`;
+  const r = await chatOnce([
+    { role: 'system', content: sys },
+    { role: 'user', content: usr },
+  ], { model: agent.model, temperature: 0.4, max_reply: agent.max_reply || 2048, agentName: agent.name });
+  return r.full || '';
 }
 
 router.post('/sessions', (req, res) => {
@@ -1102,6 +1159,63 @@ router.post('/stream', async (req, res) => {
         }
       }
     }
+    // ⑧ D1-2 专家团式并行编排：routing_mode='orchestrate' 时先产出任务图 JSON → 校验（环/悬空/验证节点必填）
+    //   → 按图并行执行（并发上限/超时/重试）→ 汇总结论；计划不可用则回退主模型 function calling 编排（不破坏存量）
+    let orchestrateGen = null;
+    if (agent?.routing_mode === 'orchestrate' && childTools.length && (chatInput.trim() || input)) {
+      const childIds = childTools.map(t => t.child.id);
+      const childMap = new Map(childTools.map(t => [t.child.id, t.child]));
+      const orchInput = chatInput.trim() || input;
+      let spec = null, planErr = '';
+      try { spec = await planTaskGraph(agent, childTools, orchInput, history); }
+      catch (e) { planErr = e.message; }
+      const v = spec ? validateTaskGraph(spec, { allowedAgentIds: childIds }) : { ok: false, errors: ['编排计划生成失败' + (planErr ? '：' + planErr : '')] };
+      if (!v.ok) {
+        send('notice', { msg: `🧩 专家团编排不可用（${(v.errors || [])[0] || '未知原因'}），已回退主模型编排` });
+      } else {
+        orchestrateGen = (async function* () {
+          send('notice', { msg: `🧩 专家团并行编排：${v.graph.nodes.length} 节点 / ${v.levels.length} 层（同层并行）` });
+          const t0 = Date.now();
+          const runInfo = db.prepare(`INSERT INTO orchestration_runs (agent_id,session_id,username,status,graph,started_at) VALUES (?,?,?,?,?,?)`)
+            .run(agent.id, session_id || null, req.user.username, 'running', JSON.stringify(v.graph), now());
+          const runId = runInfo.lastInsertRowid;
+          const nodeLogs = {};
+          const evTag = evt => `${evt.title || evt.nodeId}（${evt.type === 'verify' ? '验收' : '子智能体#' + evt.agent_id}）`;
+          const onEvent = evt => {
+            if (evt.event === 'nodeStart') send('tool', { name: evTag(evt), status: 'executing' });
+            else if (evt.event === 'nodeDone') send('tool', { name: evTag(evt), status: evt.ok ? 'finished' : 'failed', result: (evt.preview || '').slice(0, 120) });
+            else if (evt.event === 'nodeBlocked') send('tool', { name: `${evt.title || evt.nodeId}`, status: 'finished', result: '上游未成功，已跳过' });
+          };
+          const runAgent = (node, ctx) => {
+            const child = childMap.get(node.agent_id);
+            if (!child) throw new Error(`子智能体 #${node.agent_id} 不存在`);
+            const task = node.task + (ctx.deps ? `\n\n【上游产出】\n${ctx.deps}` : '');
+            return runChildAgent(child, task, agent?.max_reply, req.user).then(t => ({ text: t }));
+          };
+          const runVerify = (node, ctx) => runVerifyNode(agent, node, { ...ctx, input: orchInput }).then(t => ({ text: t }));
+          let runResult;
+          try {
+            runResult = await runTaskGraph(v.graph, {
+              runAgent, runVerify, input: orchInput, onEvent,
+              onNodeState: (id, st) => { nodeLogs[id] = { status: st.status, error: st.error, retries: st.retries, durationMs: st.durationMs, tokens: st.tokens }; },
+            });
+          } catch (e) {
+            db.prepare(`UPDATE orchestration_runs SET status='error', error=?, node_logs=?, total_duration_ms=?, finished_at=? WHERE id=?`)
+              .run(String(e.message || e).slice(0, 500), JSON.stringify(nodeLogs), Date.now() - t0, now(), runId);
+            throw e;
+          }
+          let final = '';
+          try { final = await synthesizeOrchestration(agent, orchInput, runResult, v.graph); }
+          catch (e) { final = '（汇总失败，以下为各环节产出）\n' + String(e.message || e); }
+          const summary = orchestrator.summarizeRun(runResult);
+          const out = final + `\n\n> 🧩 专家团编排：${summary.total} 节点 / ${summary.levels} 层 / ${summary.done} 成功${summary.failed ? ' · ' + summary.failed + ' 失败' : ''} · 并行度 ${Math.round(summary.parallelRatio * 100)}% · 耗时 ${(summary.durationMs / 1000).toFixed(1)}s`;
+          db.prepare(`UPDATE orchestration_runs SET status=?, node_logs=?, result=?, total_tokens=?, total_duration_ms=?, finished_at=? WHERE id=?`)
+            .run(runResult.ok ? 'success' : 'partial', JSON.stringify(runResult.nodes), out.slice(0, 8000), runResult.totalTokens, summary.durationMs, now(), runId);
+          yield { delta: out };
+          return { full: out, model: agent.model, provider: 'orchestrate' };
+        })();
+      }
+    }
     // P5.25 对话权限闸门（图 2 语义）：「默认权限」下 medium/high 风险工具执行前需用户确认——
     // SSE 推 tool_confirm 事件 → 前端在消息流中弹确认卡 → 用户批准/拒绝 → POST /api/chat/confirm 决议唤醒等待；
     // 「全自动执行」（perm='auto'）全部放行；low 风险永不拦截（确认疲劳无意义）；120s 未决议按拒绝处理防会话悬挂
@@ -1209,7 +1323,7 @@ router.post('/stream', async (req, res) => {
         }
       } catch (e) { console.warn('[route] auto route exception:', e.message); }
     }
-    const gen = workflowGen || classifierGen || chat(messages, {
+    const gen = workflowGen || classifierGen || orchestrateGen || chat(messages, {
       model: model || agent?.model,
       username: req.user.username, // P3：用户自有模型优先路由（自带 Key 只为选中的模型买单）
       temperature: agent?.temperature,
@@ -1505,5 +1619,52 @@ router.post('/stt', auth, sttUpload.single('audio'), async (req, res) => {
   }
 });
 
+// ===== D1-2 专家团编排：运行查询 + 单节点重跑（失败可重跑单节点）=====
+function loadOrchestration(id, user) {
+  const row = db.prepare('SELECT * FROM orchestration_runs WHERE id=?').get(id);
+  if (!row) return { err: { code: 404, msg: '编排运行不存在' } };
+  if (row.username && row.username !== user.username && user.role !== 'admin') return { err: { code: 403, msg: '无权访问该编排运行' } };
+  return { row };
+}
+
+router.get('/orchestrations/:id', (req, res) => {
+  const { row, err } = loadOrchestration(req.params.id, req.user);
+  if (err) return res.json(err);
+  let graph = null, nodes = null;
+  try { graph = JSON.parse(row.graph || 'null'); } catch { }
+  try { nodes = JSON.parse(row.node_logs || 'null'); } catch { }
+  res.json({ code: 0, data: { ...row, graph, nodes } });
+});
+
+router.post('/orchestrations/:id/rerun-node', async (req, res) => {
+  try {
+    const { row, err } = loadOrchestration(req.params.id, req.user);
+    if (err) return res.json(err);
+    const nodeId = String((req.body || {}).node_id || '').trim();
+    if (!nodeId) return res.json({ code: 400, msg: '缺少 node_id' });
+    const agent = db.prepare('SELECT * FROM agents WHERE id=?').get(row.agent_id);
+    if (!agent) return res.json({ code: 404, msg: '智能体不存在' });
+    let graph = null; try { graph = JSON.parse(row.graph || 'null'); } catch { }
+    if (!graph || !Array.isArray(graph.nodes)) return res.json({ code: 400, msg: '任务图缺失，无法重跑' });
+    let nodes = {}; try { nodes = JSON.parse(row.node_logs || '{}') || {}; } catch { }
+    const childTools = buildChildTools(agent.child_ids);
+    const childMap = new Map(childTools.map(t => [t.child.id, t.child]));
+    const input = String((req.body || {}).input || '');
+    const runAgent = (node, ctx) => {
+      const child = childMap.get(node.agent_id);
+      if (!child) throw new Error(`子智能体 #${node.agent_id} 不存在或未发布`);
+      const task = node.task + (ctx.deps ? `\n\n【上游产出】\n${ctx.deps}` : '');
+      return runChildAgent(child, task, agent.max_reply, req.user).then(t => ({ text: t }));
+    };
+    const runVerify = (node, ctx) => runVerifyNode(agent, node, { ...ctx, input }).then(t => ({ text: t }));
+    const st = await orchestrator.rerunNode(graph, nodes, nodeId, { runAgent, runVerify, input, timeoutMs: orchestrator.DEFAULT_TIMEOUT_MS, retry: 1 });
+    db.prepare('UPDATE orchestration_runs SET node_logs=? WHERE id=?').run(JSON.stringify(nodes), row.id);
+    res.json({ code: 0, data: { node: st }, msg: `节点 ${nodeId} 已重跑：${st.status}` });
+  } catch (e) {
+    res.json({ code: 500, msg: '重跑失败：' + (e.message || e) });
+  }
+});
+
 module.exports = router;
 module.exports.resolveKbFilter = resolveKbFilter;
+module.exports.buildChildTools = buildChildTools; // D1-2：编排单节点重跑复用子智能体工具构造

@@ -7663,6 +7663,161 @@ print('PY_OK')
     });
   }
 
+  console.log('【D1-2】专家团式并行编排 V1（任务图校验 / 拓扑分层 / 并发执行 / 单节点重跑）');
+  {
+    const { db, now } = require('../src-server/db');
+    const orch = require('../src-server/lib/orchestrator');
+    const { sign } = require('../src-server/lib/auth');
+
+    await t('D1-2: db 迁移 —— orchestration_runs 表就位（含 graph/node_logs/result/total_tokens）', () => {
+      const cols = db.prepare('PRAGMA table_info(orchestration_runs)').all().map(c => c.name);
+      for (const c of ['agent_id', 'session_id', 'username', 'status', 'graph', 'node_logs', 'result', 'total_tokens', 'total_duration_ms', 'started_at', 'finished_at']) {
+        assert.ok(cols.includes(c), `orchestration_runs 应有 ${c} 列`);
+      }
+    });
+
+    await t('D1-2: validateTaskGraph —— 合法图通过并分层；非法图（环/悬空/缺验证/未挂载）被拒', () => {
+      const ok = orch.validateTaskGraph({ nodes: [
+        { id: 'a', type: 'agent', agent_id: 2, task: '任务A', depends_on: [] },
+        { id: 'b', type: 'agent', agent_id: 2, task: '任务B', depends_on: [] },
+        { id: 'v', type: 'verify', task: '验收', depends_on: ['a', 'b'] },
+      ] }, { allowedAgentIds: [2] });
+      assert.ok(ok.ok, '合法任务图应通过：' + JSON.stringify(ok.errors));
+      assert.deepStrictEqual(ok.levels, [['a', 'b'], ['v']], '应分两层：a/b 并行、v 其后');
+
+      const cyc = orch.validateTaskGraph({ nodes: [
+        { id: 'a', type: 'agent', agent_id: 2, task: 't', depends_on: ['b'] },
+        { id: 'b', type: 'agent', agent_id: 2, task: 't', depends_on: ['a'] },
+        { id: 'v', type: 'verify', task: 'v', depends_on: [] },
+      ] }, { allowedAgentIds: [2] });
+      assert.ok(!cyc.ok && cyc.errors.some(e => e.includes('环')), '环形依赖应被拒');
+
+      const dangle = orch.validateTaskGraph({ nodes: [
+        { id: 'a', type: 'agent', agent_id: 2, task: 't', depends_on: ['zzz'] },
+        { id: 'v', type: 'verify', task: 'v', depends_on: [] },
+      ] }, { allowedAgentIds: [2] });
+      assert.ok(!dangle.ok && dangle.errors.some(e => e.includes('悬空')), '悬空依赖应被拒');
+
+      const noVerify = orch.validateTaskGraph({ nodes: [
+        { id: 'a', type: 'agent', agent_id: 2, task: 't', depends_on: [] },
+      ] }, { allowedAgentIds: [2] });
+      assert.ok(!noVerify.ok && noVerify.errors.some(e => e.includes('验证节点')), '缺少验证节点应被拒');
+
+      const unknown = orch.validateTaskGraph({ nodes: [
+        { id: 'a', type: 'agent', agent_id: 99, task: 't', depends_on: [] },
+        { id: 'v', type: 'verify', task: 'v', depends_on: ['a'] },
+      ] }, { allowedAgentIds: [2] });
+      assert.ok(!unknown.ok && unknown.errors.some(e => e.includes('未挂载')), '引用未挂载子智能体应被拒');
+    });
+
+    await t('D1-2: runTaskGraph —— 按层并行执行（依赖次序正确）+ 成本汇总', async () => {
+      const seq = [];
+      let inflight = 0, peak = 0;
+      const graph = { nodes: [
+        { id: 'a', type: 'agent', agent_id: 1, task: 'A', depends_on: [] },
+        { id: 'b', type: 'agent', agent_id: 1, task: 'B', depends_on: [] },
+        { id: 'c', type: 'agent', agent_id: 1, task: 'C', depends_on: ['a', 'b'] },
+        { id: 'v', type: 'verify', task: 'V', depends_on: ['c'] },
+      ] };
+      const res = await orch.runTaskGraph(graph, {
+        maxConcurrency: 4,
+        runAgent: async (n) => { inflight++; peak = Math.max(peak, inflight); await new Promise(r => setTimeout(r, 15)); inflight--; seq.push(n.id); return { text: 'out-' + n.id, tokens: 5 }; },
+        runVerify: async (n) => { seq.push(n.id); return { text: 'verify-ok', tokens: 2 }; },
+      });
+      assert.ok(res.ok, '全部节点应成功');
+      assert.ok(seq.indexOf('c') > seq.indexOf('a') && seq.indexOf('c') > seq.indexOf('b'), 'c 应在 a/b 之后执行');
+      assert.strictEqual(seq[seq.length - 1], 'v', '验证节点最后执行');
+      assert.ok(peak >= 2, `应出现并行执行（峰值并发 ${peak} ≥ 2）`);
+      assert.strictEqual(res.nodes.v.status, 'done');
+      assert.strictEqual(res.totalTokens, 17, '用量汇总应为 3×5(产出) + 2(验证) = 17');
+      const sum = orch.summarizeRun(res);
+      assert.strictEqual(sum.total, 4);
+      assert.ok(sum.levels === 3, '应分 3 层（a/b 层、c 层、v 层）');
+      assert.ok(sum.parallelRatio > 0, '并行度应大于 0');
+    });
+
+    await t('D1-2: 失败阻断 + 单节点重跑 —— 失败节点下游 blocked，rerunNode 可单独修复', async () => {
+      const graph = { nodes: [
+        { id: 'a', type: 'agent', agent_id: 1, task: 'A', depends_on: [] },
+        { id: 'b', type: 'agent', agent_id: 1, task: 'B', depends_on: ['a'] },
+        { id: 'v', type: 'verify', task: 'V', depends_on: ['b'] },
+      ] };
+      const rf = await orch.runTaskGraph(graph, {
+        retry: 0,
+        runAgent: async (n) => { if (n.id === 'a') throw new Error('boom-a'); return { text: 'ok' }; },
+        runVerify: async () => ({ text: 'v' }),
+      });
+      assert.strictEqual(rf.nodes.a.status, 'failed', 'a 应失败');
+      assert.strictEqual(rf.nodes.b.status, 'blocked', 'b 应因上游失败被阻断');
+      assert.strictEqual(rf.nodes.v.status, 'blocked', '验证节点应因上游阻断');
+      assert.strictEqual(rf.ok, false, '整体应非成功');
+      // 修复后单节点重跑
+      const st = await orch.rerunNode(graph, rf.nodes, 'a', { retry: 0, runAgent: async () => ({ text: 'fixed-a' }) });
+      assert.strictEqual(st.status, 'done', '重跑后 a 应成功');
+      assert.strictEqual(st.output, 'fixed-a', '重跑应回写新产出');
+    });
+
+    await t('D1-2: 超时保护 —— 慢节点超时后标记失败（可重跑）', async () => {
+      const graph = { nodes: [
+        { id: 'a', type: 'agent', agent_id: 1, task: 'A', depends_on: [] },
+        { id: 'v', type: 'verify', task: 'V', depends_on: ['a'] },
+      ] };
+      const rf = await orch.runTaskGraph(graph, {
+        retry: 0, timeoutMs: 300,
+        runAgent: async () => { await new Promise(r => setTimeout(r, 1200)); return { text: 'late' }; },
+        runVerify: async () => ({ text: 'v' }),
+      });
+      assert.strictEqual(rf.nodes.a.status, 'failed', '超时节点应失败');
+      assert.ok(/超时/.test(rf.nodes.a.error), '错误信息应提示超时：' + rf.nodes.a.error);
+    });
+
+    await t('D1-2: HTTP 查询/重跑接口 —— 归属校验 + 缺参拒绝 + 不存在 404', async () => {
+      db.prepare(`INSERT INTO users (username,password,nickname,role,status,must_change_pwd,created_at) VALUES ('d12_owner',?,'D12主','user',1,0,datetime('now','localtime'))`).run('x');
+      const uo = db.prepare("SELECT id FROM users WHERE username='d12_owner'").get();
+      const to = sign({ uid: uo.id, exp: Date.now() + 3600000 });
+      const ri = db.prepare(`INSERT INTO orchestration_runs (agent_id,session_id,username,status,graph,node_logs,result,started_at) VALUES (?,?,?,?,?,?,?,?)`)
+        .run(1, null, 'd12_owner', 'partial', JSON.stringify({ nodes: [{ id: 'a', type: 'agent', agent_id: 1, task: 't', depends_on: [] }, { id: 'v', type: 'verify', task: 'v', depends_on: ['a'] }] }), JSON.stringify({ a: { status: 'failed' } }), '结果', now());
+      const express = require('express');
+      const chatRouter = require('../src-server/routes/chat');
+      const app = express(); app.use(express.json()); app.use('/api/chat', chatRouter);
+      let server;
+      await new Promise(r => { server = app.listen(0, '127.0.0.1', r); });
+      const base = `http://127.0.0.1:${server.address().port}`;
+      try {
+        const g = await (await fetch(base + `/api/chat/orchestrations/${ri.lastInsertRowid}`, { headers: { authorization: 'Bearer ' + to } })).json();
+        assert.ok(g.code === 0 && g.data.graph && g.data.graph.nodes.length === 2, '应返回解析后的任务图');
+        assert.strictEqual(g.data.nodes.a.status, 'failed', '应返回节点状态');
+        // 缺 node_id → 400
+        const noNode = await (await fetch(base + `/api/chat/orchestrations/${ri.lastInsertRowid}/rerun-node`, { method: 'POST', headers: { 'Content-Type': 'application/json', authorization: 'Bearer ' + to }, body: '{}' })).json();
+        assert.strictEqual(noNode.code, 400, '缺 node_id 应 400');
+        // 不存在 → 404
+        const nf = await (await fetch(base + '/api/chat/orchestrations/99999999', { headers: { authorization: 'Bearer ' + to } })).json();
+        assert.strictEqual(nf.code, 404, '不存在应 404');
+        // 越权：另一用户访问 → 403
+        db.prepare(`INSERT INTO users (username,password,nickname,role,status,must_change_pwd,created_at) VALUES ('d12_other',?,'D12客','user',1,0,datetime('now','localtime'))`).run('x');
+        const u2 = db.prepare("SELECT id FROM users WHERE username='d12_other'").get();
+        const t2 = sign({ uid: u2.id, exp: Date.now() + 3600000 });
+        const forbid = await (await fetch(base + `/api/chat/orchestrations/${ri.lastInsertRowid}`, { headers: { authorization: 'Bearer ' + t2 } })).json();
+        assert.strictEqual(forbid.code, 403, '非归属用户应 403');
+      } finally {
+        await new Promise(r => server.close(r));
+        db.prepare('DELETE FROM orchestration_runs WHERE id=?').run(ri.lastInsertRowid);
+        db.prepare("DELETE FROM users WHERE username IN ('d12_owner','d12_other')").run();
+      }
+    });
+
+    await t('D1-2: 路由模式放开 + 前端选项 + 客户端契约就位', () => {
+      const asrc = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'routes', 'agents.js'), 'utf8');
+      assert.ok(asrc.includes("'workflow', 'orchestrate'"), 'agents.js 应放开 orchestrate 路由模式');
+      const csrc = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'routes', 'chat.js'), 'utf8');
+      assert.ok(csrc.includes("routing_mode === 'orchestrate'"), 'chat.js 应有 orchestrate 编排分支');
+      assert.ok(csrc.includes('validateTaskGraph') && csrc.includes('runTaskGraph'), 'chat.js 应接入任务图校验与执行');
+      const ssrc = fs.readFileSync(path.join(__dirname, '..', 'public', 'js', 'admin', 'studio.js'), 'utf8');
+      assert.ok(ssrc.includes('value="orchestrate"'), 'studio.js 应有专家团并行编排选项');
+      assert.ok(typeof orch.validateTaskGraph === 'function' && typeof orch.rerunNode === 'function' && typeof orch.planLevels === 'function', 'orchestrator 应导出核心函数');
+    });
+  }
+
   console.log('【U2-1 / N7】P1 任务队列驱动抽象（memory 默认 / redis 可选 / 缺依赖回退）');
   {
     const { db, now } = require('../src-server/db');

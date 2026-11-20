@@ -82,8 +82,8 @@ export async function render(el, params) {
     suggest_enabled: cfg.suggest_enabled === 0 ? 0 : 1,
     variables: (() => { try { return JSON.parse(cfg.variables || '[]'); } catch { return []; } })(),
     child_ids: (() => { try { return JSON.parse(cfg.child_ids || '[]').map(Number); } catch { return []; } })(),
-    // ⑦ 路由模式（2026-10-22 P3）：function 主模型编排（默认）/ classifier 分类器直达 / workflow 画布工作流（P5）
-    routing_mode: ['function', 'classifier', 'workflow'].includes(cfg.routing_mode) ? cfg.routing_mode : 'function',
+    // ⑦ 路由模式（2026-10-22 P3）：function 主模型编排（默认）/ classifier 分类器直达 / workflow 画布工作流（P5）/ orchestrate 专家团并行编排（D1-2）
+    routing_mode: ['function', 'classifier', 'workflow', 'orchestrate'].includes(cfg.routing_mode) ? cfg.routing_mode : 'function',
     // P5 画布工作流：{nodes,edges,viewport}（V2）
     workflow: (() => { try { return JSON.parse(cfg.workflow || 'null'); } catch { return null; } })(),
     // P5.1：编辑模式独立字段（form/canvas；不再依赖 routing_mode 推断）
@@ -343,6 +343,10 @@ export async function render(el, params) {
               <label style="flex:1;display:flex;gap:6px;align-items:flex-start;padding:8px 10px;border:1px solid var(--border,#e5e7eb);border-radius:8px;cursor:pointer;background:var(--card,#fff)">
                 <input type="radio" name="rtMode" value="workflow" ${S.routing_mode === 'workflow' ? 'checked' : ''}>
                 <span><b>🎨 ${t('画布工作流')}</b><br><span style="font-size:11px;color:var(--text-3,#9ca3af)">${t('按画布编排的节点图执行（切换到「画布模式」搭建流程，含分支/工具/子智能体节点）')}</span></span>
+              </label>
+              <label style="flex:1;display:flex;gap:6px;align-items:flex-start;padding:8px 10px;border:1px solid var(--border,#e5e7eb);border-radius:8px;cursor:pointer;background:var(--card,#fff)">
+                <input type="radio" name="rtMode" value="orchestrate" ${S.routing_mode === 'orchestrate' ? 'checked' : ''}>
+                <span><b>🧩 ${t('专家团并行编排')}</b><br><span style="font-size:11px;color:var(--text-3,#9ca3af)">${t('自动把任务拆成任务图，多个子智能体并行执行 + 验证节点验收（D1-2），复杂任务更快更稳')}</span></span>
               </label>
             </div>
           </div>

@@ -155,8 +155,8 @@ function parseBody(b) {
     suggest_enabled: b.suggest_enabled === false || b.suggest_enabled === 0 ? 0 : 1,
     variables: JSON.stringify(variables.filter(v => v && v.name)),
     child_ids: JSON.stringify([...new Set(childIds)]),
-    // ⑦ 路由模式（2026-10-22 P3）：function 主模型 function calling 编排（默认）/ classifier 分类器直达子智能体
-    routing_mode: ['function', 'classifier', 'workflow'].includes(b.routing_mode) ? b.routing_mode : 'function',
+    // ⑦ 路由模式（2026-10-22 P3）：function 主模型 function calling 编排（默认）/ classifier 分类器直达子智能体 / orchestrate 专家团并行编排（D1-2）
+    routing_mode: ['function', 'classifier', 'workflow', 'orchestrate'].includes(b.routing_mode) ? b.routing_mode : 'function',
     // P5.34：工具白名单校验结果（null=通过；非 null 时路由返回 400）
     tool_error: toolDeny,
     // P5.1 画布编排 V2：workflow JSON（{nodes:[{id:"node_N",type,position,data}],edges:[{id,source,target,sourceHandle}]}）；null/空串清除

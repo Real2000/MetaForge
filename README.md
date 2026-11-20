@@ -2462,4 +2462,30 @@ agent-platform/
 - 浏览器实测（临时 3999 端口 + 隔离库）：设备页无控制台错误，三档下拉（默认标准档）、备份表「可回滚 + 回滚」按钮渲染正常，排版无错乱。
 - 已知边界：客户端 `.app`/DMG 需在目标机跑 `local-bridge/build-installer.sh` 构建；key_type/mouse_click 需 macOS 辅助功能授权；run_python/terminal 属全权档，渠道路径另需设备级 allow_high_risk。
 
+## D1-2 专家团式并行编排 V1：任务图 + 并行执行 + 验证节点 + 单节点重跑（2026-11-20）
+
+**目标**：把画布 DAG Runner 的状态/重试/超时/成本语义搬到「多智能体编排」层，从「主模型串行 function calling 调子智能体」升级为「任务图驱动、按层并行、带验收」。
+
+**① 编排内核（`src-server/lib/orchestrator.js`，纯逻辑可测）**
+- `validateTaskGraph(spec, {allowedAgentIds, requireVerify})`：结构/id 唯一/悬空依赖/环（Kahn）/子智能体归属校验，**验证节点必填**（至少 1 个 `type="verify"`）。
+- `planLevels(nodes)`：拓扑分层，同层节点彼此无依赖、可并行。
+- `runTaskGraph(graph, {runAgent, runVerify, maxConcurrency, timeoutMs, retry, onEvent, onNodeState})`：按层并行（受限 worker 池，默认并发上限 4）；节点级超时（下限 500ms，默认 120s）+ 指数退避重试（≤3 次）；上游失败/阻断的下游节点标记 `blocked`、不执行；汇总 tokens/cost/耗时。
+- `rerunNode(graph, runState, nodeId, opts)`：**失败可重跑单节点**——仅重跑指定节点并就地回写其状态。
+- `summarizeRun`：节点状态统计 + 并行度（1 − 层数/节点数）+ 耗时/成本。
+
+**② 对话编排链路（`src-server/routes/chat.js`）**
+- 新增路由模式 `routing_mode='orchestrate'`：先由编排器产出**任务图 JSON**（`planTaskGraph`）→ `validateTaskGraph` 校验 → 合法则按图并行执行 → `synthesizeOrchestration` 汇总结论（含验收发现的问题）；计划缺失/校验失败/无子智能体时**回退主模型 function calling 编排**，不破坏存量链路。
+- 节点事件经 SSE `tool` 通道实时推送（`子智能体#id`/`验收` 的执行中/完成态）；结果附「节点数/层数/成功数/并行度/耗时」尾注。
+- 编排运行落库 `orchestration_runs`（agent/session/username/status/graph/node_logs/result/tokens/duration），支撑复盘与重跑。
+- 新增接口：`GET /api/chat/orchestrations/:id`（返回解析后的任务图与节点状态，归属校验）；`POST /api/chat/orchestrations/:id/rerun-node`（`{node_id, input?}`，单节点重跑并回写 node_logs）。
+
+**③ 配置与前端**
+- `routes/agents.js`：`routing_mode` 白名单放开 `orchestrate`。
+- `public/js/admin/studio.js`：子智能体编排区新增「🧩 专家团并行编排」选项。
+
+### 验证
+- `npm test` 冒烟 **520/0 全绿**（513 基线 + 7 条新增 D1-2 用例：库迁移/validateTaskGraph 环·悬空·缺验证·未挂载/按层并行与成本汇总/失败阻断+单节点重跑/超时保护/HTTP 查询与重跑接口归属校验·缺参·404/路由模式与前端选项契约）。
+- 运行时接线实测（临时 3971 端口 + 隔离库）：`/api/health` 200；`/api/chat/orchestrations/1` 未认证 401（路由已注册、鉴权生效）；启动日志无错误。
+- 已知边界：节点用量按文本长度估算（子智能体执行器暂只回文本，未回 token/成本真实值）；`rerun-node` 重跑不自动级联重跑下游 blocked 节点（V1 语义：单节点独立重跑）；编排模式需智能体已挂载 ≥1 个已发布子智能体。
+
 > AI生成

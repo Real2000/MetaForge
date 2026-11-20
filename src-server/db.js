@@ -1059,6 +1059,25 @@ db.exec(`CREATE INDEX IF NOT EXISTS idx_wf_runs_agent ON workflow_runs(agent_id,
     console.log('[db] workflow_runs 表已迁移：新增 node_checkpoint 字段（U1-3 工作流断点恢复）');
   }
 }
+// D1-2 专家团式并行编排 V1（2026-11-20）：编排运行台账——存任务图（graph）、节点状态/日志（node_logs）、
+// 汇总结论（result）与耗时成本统计，支撑「失败可重跑单节点」与前端可视化复盘。
+db.exec(`CREATE TABLE IF NOT EXISTS orchestration_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  agent_id INTEGER NOT NULL,
+  session_id INTEGER,
+  username TEXT DEFAULT '',
+  status TEXT DEFAULT 'running',
+  graph TEXT,
+  node_logs TEXT,
+  result TEXT,
+  total_tokens INTEGER DEFAULT 0,
+  total_duration_ms INTEGER DEFAULT 0,
+  error TEXT,
+  started_at TEXT,
+  finished_at TEXT
+);`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_orch_runs_agent ON orchestration_runs(agent_id, id DESC);`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_orch_runs_session ON orchestration_runs(session_id, id DESC);`);
 // P5.8 差异化能力 #11：tasks 表支持 Webhook 触发（exec_type='webhook' + webhook_token 路由鉴权）
 {
   const taskCols = db.prepare('PRAGMA table_info(tasks)').all().map(c => c.name);
