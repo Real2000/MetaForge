@@ -2488,4 +2488,33 @@ agent-platform/
 - 运行时接线实测（临时 3971 端口 + 隔离库）：`/api/health` 200；`/api/chat/orchestrations/1` 未认证 401（路由已注册、鉴权生效）；启动日志无错误。
 - 已知边界：节点用量按文本长度估算（子智能体执行器暂只回文本，未回 token/成本真实值）；`rerun-node` 重跑不自动级联重跑下游 blocked 节点（V1 语义：单节点独立重跑）；编排模式需智能体已挂载 ≥1 个已发布子智能体。
 
+## D1-3 创作资产 V1：项目 / 素材库 / 分镜 三件套 + 复用匹配（2026-11-20）
+
+**目标**：从「每次从零生成」升级为「素材可沉淀、分镜可复用」——新增 projects/assets/shots 三表，生成时优先引用已有资产，复用现有 media 存储与 image/video 技能链路。
+
+**① 三件套数据模型（`src-server/db.js`）**
+- `projects`：创作项目（名称/描述/kind=video·image·mixed/status/owner/space_id/meta）。
+- `assets`：素材库（`url` 直接指向现有 media 存储 `public/uploads/*`；source=generated·uploaded·imported；tags；`real_person`/`digital_human` 合规标记）；可挂项目（project_id）或全局（NULL）。
+- `shots`：分镜（seq/title/description/prompt/`asset_id` 引用素材/kind/duration/status）；`asset_id` 非空即「复用已有素材」，是复用率口径的核心。
+
+**② 复用与合规模块（`src-server/lib/creation.js`，纯逻辑）**
+- `tokenize/normTags/assetReuseScore/matchAssets`：中英混合分词（拉丁词 + CJK bigram，零外部依赖）对名称/提示词/标签做重叠打分，生成时**优先引用已有资产**。
+- `reuseStats`：复用率 = 引用素材的分镜数 / 分镜总数（验收口径：第二个作品 ≥ 50%）。
+- `complianceOf`：真人素材/数字人分级（真人+数字人 P0、单类 P1、无 OK），给出评估动作建议。
+
+**③ 接口（`src-server/routes/creation.js`，挂载 `/api/creation`，全路由 JWT 鉴权 + owner 归属隔离）**
+- 项目：`GET/POST /projects`、`GET/PUT/DELETE /projects/:id`（删项目级联删分镜、素材回归全局）。
+- 素材：`GET/POST /assets`、`PUT/DELETE /assets/:id`、`POST /assets/import`（登记生成物 `/uploads/*` 或 http(s) 链接，拒其它协议；删素材自动解除分镜引用）。
+- 分镜：`GET/POST /shots`、`PUT/DELETE /shots/:id`、`POST /shots/:id/attach`（复用指定素材，校验同项目/全局归属）。
+- 编排辅助：`POST /shots/:id/resolve`（按提示词匹配——命中即复用、否则返回需生成）、`POST /projects/:id/match-assets`、`GET /projects/:id/stats`（复用率）。
+
+**④ 前端（`public/js/front/creation.js` + `app.js` 路由/导航）**
+- 创作资产页：项目卡片（素材/分镜/复用计数）→ 详情（复用率统计 + 素材网格 + 分镜表）；新建项目、登记素材、新增分镜、优先复用、挂载素材、删除均闭环；真人/数字人合规打标。
+
+### 验证
+- `npm test` 冒烟 **525/0 全绿**（520 基线 + 5 条新增 D1-3 用例：三表迁移/复用匹配排序与类型过滤/reuseStats·complianceOf/HTTP 三件套 CRUD 闭环含优先复用·复用率·归属 403·删素材解除引用/前端路由接入）。
+- 浏览器实测（临时 3972 端口 + 隔离库，播种管理员账号）：创作资产页无控制台错误；新建项目 → 登记素材（海边日落）→ 新增分镜（夕阳下的海边小镇）→「优先复用」命中素材并把分镜置 generated，复用率显示 **100%**；页面排版无错乱。
+- 临时服务、隔离库、验证截图均已清理。
+- 已知边界：`matchAssets` 为词面/标签匹配（未接向量模型，离线可用优先）；真人素材/数字人 V1 仅做标记分级，深度合规评估（授权材料核验）留待专项。
+
 > AI生成

@@ -7818,6 +7818,124 @@ print('PY_OK')
     });
   }
 
+  console.log('【D1-3】创作资产 V1（项目 / 素材库 / 分镜 三件套 + 复用匹配 + 复用率）');
+  {
+    const { db, now } = require('../src-server/db');
+    const creation = require('../src-server/lib/creation');
+    const { sign } = require('../src-server/lib/auth');
+
+    await t('D1-3: db 迁移 —— projects / assets / shots 三表就位', () => {
+      const p = db.prepare('PRAGMA table_info(projects)').all().map(c => c.name);
+      const a = db.prepare('PRAGMA table_info(assets)').all().map(c => c.name);
+      const s = db.prepare('PRAGMA table_info(shots)').all().map(c => c.name);
+      for (const c of ['name', 'kind', 'owner', 'status', 'meta']) assert.ok(p.includes(c), `projects 应有 ${c}`);
+      for (const c of ['project_id', 'kind', 'url', 'source', 'prompt', 'tags', 'real_person', 'digital_human', 'owner']) assert.ok(a.includes(c), `assets 应有 ${c}`);
+      for (const c of ['project_id', 'seq', 'prompt', 'asset_id', 'status', 'duration']) assert.ok(s.includes(c), `shots 应有 ${c}`);
+    });
+
+    await t('D1-3: 复用匹配 —— matchAssets 按标签/提示词重叠打分并排序', () => {
+      const assets = [
+        { id: 1, name: '海边日落', prompt: 'a seaside sunset', tags: ['海边', '日落'] },
+        { id: 2, name: '森林清晨', prompt: 'forest morning mist', tags: ['森林'] },
+        { id: 3, name: '城市夜景', prompt: 'city night', tags: ['城市'] },
+      ];
+      const r = creation.matchAssets(assets, '夕阳下的海边小镇', { limit: 3, minScore: 1 });
+      assert.ok(r.length >= 1, '应命中至少一条');
+      assert.strictEqual(r[0].asset.id, 1, '海边/日落素材应排第一');
+      // 无重叠 → 空
+      assert.strictEqual(creation.matchAssets(assets, 'quantum computing', { minScore: 1 }).length, 0);
+      // 类型过滤
+      const filtered = creation.matchAssets([{ id: 4, kind: 'audio', name: '海边', tags: ['海边'] }], '海边', { kinds: ['image'] });
+      assert.strictEqual(filtered.length, 0, 'kind 过滤应排除音频');
+    });
+
+    await t('D1-3: reuseStats / complianceOf —— 复用率口径 + 真人/数字人合规分级', () => {
+      const st = creation.reuseStats([{ asset_id: 1 }, { asset_id: null }, { asset_id: 2 }, { asset_id: null }]);
+      assert.strictEqual(st.total, 4); assert.strictEqual(st.reused, 2); assert.strictEqual(st.rate, 0.5);
+      assert.strictEqual(creation.reuseStats([]).rate, 0);
+      assert.strictEqual(creation.complianceOf({}).level, 'OK');
+      assert.strictEqual(creation.complianceOf({ real_person: 1 }).level, 'P1');
+      assert.strictEqual(creation.complianceOf({ digital_human: 1 }).level, 'P1');
+      assert.strictEqual(creation.complianceOf({ real_person: 1, digital_human: 1 }).level, 'P0');
+    });
+
+    await t('D1-3: HTTP 三件套 CRUD 闭环 —— 项目/素材/分镜 + 优先复用 + 复用率 + 归属校验', async () => {
+      db.prepare(`INSERT INTO users (username,password,nickname,role,status,must_change_pwd,created_at) VALUES ('d13_u',?,'D13','user',1,0,datetime('now','localtime'))`).run('x');
+      const u = db.prepare("SELECT id FROM users WHERE username='d13_u'").get();
+      const tok = sign({ uid: u.id, exp: Date.now() + 3600000 });
+      const express = require('express');
+      const creationRouter = require('../src-server/routes/creation');
+      const app = express(); app.use(express.json()); app.use('/api/creation', creationRouter);
+      let server;
+      await new Promise(r => { server = app.listen(0, '127.0.0.1', r); });
+      const base = `http://127.0.0.1:${server.address().port}`;
+      const H = { 'Content-Type': 'application/json', authorization: 'Bearer ' + tok };
+      const J = async (m, p, b) => (await fetch(base + p, { method: m, headers: H, body: b ? JSON.stringify(b) : undefined })).json();
+      try {
+        // 项目 CRUD
+        const pj = await J('POST', '/api/creation/projects', { name: '我的短片', kind: 'video' });
+        assert.ok(pj.code === 0 && pj.data.id, '创建项目应成功');
+        const pid = pj.data.id;
+        await J('PUT', `/api/creation/projects/${pid}`, { description: '测试项目' });
+        // 素材：登记生成物 URL（复用 media 存储路径）
+        const a1 = await J('POST', '/api/creation/assets/import', { project_id: pid, url: '/uploads/gen-images/sunset.png', kind: 'image', name: '海边日落', tags: '海边,日落' });
+        assert.ok(a1.code === 0, '登记素材应成功：' + JSON.stringify(a1).slice(0, 80));
+        const a2 = await J('POST', '/api/creation/assets/import', { project_id: pid, url: '/uploads/gen-images/forest.png', kind: 'image', name: '森林', tags: '森林' });
+        // 非法 URL 拒绝
+        const badUrl = await J('POST', '/api/creation/assets/import', { url: 'ftp://evil/x.png' });
+        assert.strictEqual(badUrl.code, 400, '非 http/uploads 协议应拒绝');
+        // 分镜：两个待生成分镜
+        const s1 = await J('POST', '/api/creation/shots', { project_id: pid, title: '开场', prompt: '夕阳下的海边小镇' });
+        const s2 = await J('POST', '/api/creation/shots', { project_id: pid, title: '中景', prompt: '茂密的森林清晨' });
+        const s3 = await J('POST', '/api/creation/shots', { project_id: pid, title: '结尾', prompt: '量子计算机芯片特写' });
+        assert.ok(s1.code === 0 && s2.code === 0 && s3.code === 0, '创建分镜应成功');
+        // 优先复用：s1 命中海边素材、s2 命中森林素材、s3 无匹配
+        const r1 = await J('POST', `/api/creation/shots/${s1.data.id}/resolve`, {});
+        assert.ok(r1.data.reused && r1.data.asset.id === a1.data.id, 's1 应复用海边素材');
+        const r2 = await J('POST', `/api/creation/shots/${s2.data.id}/resolve`, {});
+        assert.ok(r2.data.reused && r2.data.asset.id === a2.data.id, 's2 应复用森林素材');
+        const r3 = await J('POST', `/api/creation/shots/${s3.data.id}/resolve`, {});
+        assert.ok(!r3.data.reused && r3.data.need_generate, 's3 无匹配应提示需生成');
+        // 复用率：3 分镜中 2 复用 → 66.7% ≥ 50%（模拟「第二个作品」复用达标）
+        const stat = await J('GET', `/api/creation/projects/${pid}/stats`, null);
+        assert.strictEqual(stat.data.total, 3); assert.strictEqual(stat.data.reused, 2);
+        assert.ok(stat.data.rate >= 0.5, `复用率应 ≥ 50%，实际 ${stat.data.rate}`);
+        // 项目详情聚合
+        const detail = await J('GET', `/api/creation/projects/${pid}`, null);
+        assert.strictEqual(detail.data.assets.length, 2); assert.strictEqual(detail.data.shots.length, 3);
+        // 删除素材 → 引用它的分镜解除引用
+        await J('DELETE', `/api/creation/assets/${a1.data.id}`, null);
+        const s1after = db.prepare('SELECT asset_id FROM shots WHERE id=?').get(s1.data.id);
+        assert.strictEqual(s1after.asset_id, null, '删除素材后分镜应解除引用');
+        // 归属校验：另一用户不可见/不可改
+        db.prepare(`INSERT INTO users (username,password,nickname,role,status,must_change_pwd,created_at) VALUES ('d13_other',?,'O','user',1,0,datetime('now','localtime'))`).run('x');
+        const u2 = db.prepare("SELECT id FROM users WHERE username='d13_other'").get();
+        const tok2 = sign({ uid: u2.id, exp: Date.now() + 3600000 });
+        const forbid = (await fetch(base + `/api/creation/projects/${pid}`, { headers: { authorization: 'Bearer ' + tok2 } })).json();
+        const fj = await forbid;
+        assert.strictEqual(fj.code, 403, '非归属用户访问项目应 403');
+        // 项目删除级联分镜、素材回归全局
+        await J('DELETE', `/api/creation/projects/${pid}`, null);
+        assert.strictEqual(db.prepare('SELECT COUNT(*) c FROM shots WHERE project_id=?').get(pid).c, 0, '删项目应级联删分镜');
+        assert.strictEqual(db.prepare('SELECT COUNT(*) c FROM assets WHERE project_id IS NULL AND owner=?').get('d13_u').c >= 1, true, '素材应回归全局素材库');
+      } finally {
+        await new Promise(r => server.close(r));
+        db.prepare("DELETE FROM shots WHERE project_id IN (SELECT id FROM projects WHERE owner='d13_u')").run();
+        db.prepare("DELETE FROM assets WHERE owner='d13_u'").run();
+        db.prepare("DELETE FROM projects WHERE owner='d13_u'").run();
+        db.prepare("DELETE FROM users WHERE username IN ('d13_u','d13_other')").run();
+      }
+    });
+
+    await t('D1-3: 前端页面与路由接入就位（创作资产页 + 导航入口）', () => {
+      const app = fs.readFileSync(path.join(__dirname, '..', 'public', 'js', 'app.js'), 'utf8');
+      assert.ok(app.includes("'/creation'") && app.includes("front/creation.js"), 'app.js 应注册 /creation 路由');
+      assert.ok(app.includes("#/creation"), '导航应含创作资产入口');
+      const pg = fs.readFileSync(path.join(__dirname, '..', 'public', 'js', 'front', 'creation.js'), 'utf8');
+      assert.ok(pg.includes('/creation/projects') && pg.includes('/creation/shots'), '页面应调用创作资产接口');
+    });
+  }
+
   console.log('【U2-1 / N7】P1 任务队列驱动抽象（memory 默认 / redis 可选 / 缺依赖回退）');
   {
     const { db, now } = require('../src-server/db');

@@ -1078,6 +1078,59 @@ db.exec(`CREATE TABLE IF NOT EXISTS orchestration_runs (
 );`);
 db.exec(`CREATE INDEX IF NOT EXISTS idx_orch_runs_agent ON orchestration_runs(agent_id, id DESC);`);
 db.exec(`CREATE INDEX IF NOT EXISTS idx_orch_runs_session ON orchestration_runs(session_id, id DESC);`);
+// D1-3 创作资产 V1（2026-11-20）：素材库 + 项目 + 分镜三件套。
+//  - projects：创作项目（视频/图文/混合），聚合分镜与素材
+//  - assets：素材库（生成物/上传物，url 复用现有 media 存储 public/uploads/*），可挂项目或全局
+//  - shots：分镜（引用 asset_id 表示复用已有素材→二手作品复用率口径）
+db.exec(`CREATE TABLE IF NOT EXISTS projects (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  description TEXT DEFAULT '',
+  kind TEXT DEFAULT 'video',
+  cover TEXT DEFAULT '',
+  owner TEXT DEFAULT '',
+  space_id INTEGER DEFAULT 0,
+  status TEXT DEFAULT 'draft',
+  meta TEXT DEFAULT '{}',
+  created_at TEXT,
+  updated_at TEXT
+);`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_projects_owner ON projects(owner, id DESC);`);
+db.exec(`CREATE TABLE IF NOT EXISTS assets (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER DEFAULT NULL,
+  kind TEXT DEFAULT 'image',
+  name TEXT DEFAULT '',
+  url TEXT DEFAULT '',
+  thumb TEXT DEFAULT '',
+  source TEXT DEFAULT 'generated',
+  prompt TEXT DEFAULT '',
+  tags TEXT DEFAULT '[]',
+  real_person INTEGER DEFAULT 0,
+  digital_human INTEGER DEFAULT 0,
+  meta TEXT DEFAULT '{}',
+  owner TEXT DEFAULT '',
+  space_id INTEGER DEFAULT 0,
+  created_at TEXT
+);`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_assets_project ON assets(project_id, id DESC);`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_assets_owner ON assets(owner, id DESC);`);
+db.exec(`CREATE TABLE IF NOT EXISTS shots (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL,
+  seq INTEGER DEFAULT 0,
+  title TEXT DEFAULT '',
+  description TEXT DEFAULT '',
+  prompt TEXT DEFAULT '',
+  asset_id INTEGER DEFAULT NULL,
+  kind TEXT DEFAULT 'image',
+  duration REAL DEFAULT 0,
+  status TEXT DEFAULT 'draft',
+  meta TEXT DEFAULT '{}',
+  created_at TEXT,
+  updated_at TEXT
+);`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_shots_project ON shots(project_id, seq);`);
 // P5.8 差异化能力 #11：tasks 表支持 Webhook 触发（exec_type='webhook' + webhook_token 路由鉴权）
 {
   const taskCols = db.prepare('PRAGMA table_info(tasks)').all().map(c => c.name);

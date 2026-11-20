@@ -22,6 +22,7 @@ const routes = {
   '/models': { page: () => import('./front/models.js'), layout: 'front', title: '我的模型' },
   '/chat': { page: () => import('./front/chat.js'), layout: 'chat', title: '智能体对话' },
   '/knowledge': { page: () => import('./front/knowledge.js'), layout: 'front', title: '知识库' },
+  '/creation': { page: () => import('./front/creation.js'), layout: 'front', title: '创作资产' }, // D1-3 项目/素材库/分镜三件套
   '/tasks': { page: () => import('./front/tasks.js'), layout: 'front', title: '任务管理' },
   '/help': { page: () => import('./front/help.js'), layout: 'front', title: '帮助中心' },
   '/pricing': { page: () => import('./front/pricing.js'), layout: 'none', title: '套餐与定价', public: true },
@@ -57,6 +58,7 @@ const frontNav = [
   { href: '#/skills-market', ic: '🛒', label: '技能市场' }, // P3-2 融合：原「技能」「技能市场」两入口合为一（技能 CRUD 在市场页技能资产 tab）
   { href: '#/models', ic: '🧩', label: '我的模型' },
   { href: '#/knowledge', ic: '📚', label: '知识库' },
+  { href: '#/creation', ic: '🎨', label: '创作资产' }, // D1-3
   { href: '#/tasks', ic: '⏰', label: '任务管理' },
   { href: '#/devices', ic: '🖥️', label: '我的设备' },
   { href: '#/insights', ic: '📈', label: '使用分析' },
