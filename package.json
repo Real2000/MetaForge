@@ -15,6 +15,14 @@
     "sqlite"
   ],
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Real2000/MetaForge.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Real2000/MetaForge/issues"
+  },
+  "homepage": "https://github.com/Real2000/MetaForge#readme",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
