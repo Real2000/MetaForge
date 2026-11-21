@@ -408,6 +408,15 @@ const ALL_MIGRATIONS = [
     answers TEXT DEFAULT '{}', score INTEGER DEFAULT 0, level TEXT DEFAULT 'low', decision TEXT DEFAULT 'approve',
     reasons TEXT DEFAULT '[]', note TEXT DEFAULT '', created_at TEXT
   );` },
+  // === D3-2 经验自进化 V1（2026-11-21）===
+  { id: 101, name: 'agent_experience - 专家×任务类型可靠度聚合', table: 'agent_experience', createSql: `CREATE TABLE IF NOT EXISTS agent_experience (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id INTEGER NOT NULL, task_type TEXT NOT NULL,
+    runs INTEGER DEFAULT 0, success INTEGER DEFAULT 0, failed INTEGER DEFAULT 0,
+    first_runs INTEGER DEFAULT 0, first_success INTEGER DEFAULT 0,
+    repeat_runs INTEGER DEFAULT 0, repeat_success INTEGER DEFAULT 0,
+    total_duration_ms INTEGER DEFAULT 0, last_status TEXT DEFAULT '', last_at TEXT, updated_at TEXT
+  );` },
 ];
 
 module.exports = {

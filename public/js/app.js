@@ -49,6 +49,7 @@ const routes = {
   '/admin/quota': { page: () => import('./admin/quota.js'), layout: 'admin', title: '用量与配额', admin: true },
   '/admin/bridge': { page: () => import('./admin/bridge.js'), layout: 'admin', title: '桌面端升级', admin: true }, // D2-3 桌面端升级通道
   '/admin/model3d': { page: () => import('./admin/model3d.js'), layout: 'admin', title: '3D 与数字人', admin: true }, // D3-1 3D 资产与数字人合规
+  '/admin/experience': { page: () => import('./admin/experience.js'), layout: 'admin', title: '经验自进化', admin: true }, // D3-2 专家×任务类型可靠度
   '/admin/feedback': { page: () => import('./admin/feedback.js'), layout: 'admin', title: '意见反馈', admin: true },
   '/admin/quality': { page: () => import('./admin/quality.js'), layout: 'admin', title: '对话质量', admin: true },
   '/admin/biz': { page: () => import('./admin/biz.js'), layout: 'admin', title: '商业化管理', admin: true },
@@ -87,6 +88,7 @@ const adminNav = [
   { href: '#/admin/quota', ic: '💳', label: '用量与配额' },
   { href: '#/admin/bridge', ic: '🛰️', label: '桌面端升级' }, // D2-3
   { href: '#/admin/model3d', ic: '🧊', label: '3D 与数字人' }, // D3-1
+  { href: '#/admin/experience', ic: '🧠', label: '经验自进化' }, // D3-2
   { href: '#/admin/monitor', ic: '📡', label: '系统监控' },
   { href: '#/admin/operation', ic: '📈', label: '运营监控' },
   { href: '#/admin/feedback', ic: '💬', label: '意见反馈' },

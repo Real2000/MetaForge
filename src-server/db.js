@@ -2764,6 +2764,26 @@ db.exec(`CREATE TABLE IF NOT EXISTS dh_assessments (
 );`);
 db.exec('CREATE INDEX IF NOT EXISTS idx_dh_assess_project ON dh_assessments(project_id, id DESC);');
 db.exec('CREATE INDEX IF NOT EXISTS idx_dh_assess_asset ON dh_assessments(asset_id, id DESC);');
+// D3-2 经验自进化 V1（2026-11-21）：按「专家 × 任务类型」聚合可靠度——编排（D1-2）随使用积累经验，
+// 后续同类任务优先选用高分专家；首跑/复跑分桶用于「二次成功率提升」验收指标（evolutionStats）。
+db.exec(`CREATE TABLE IF NOT EXISTS agent_experience (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  agent_id INTEGER NOT NULL,
+  task_type TEXT NOT NULL,
+  runs INTEGER DEFAULT 0,
+  success INTEGER DEFAULT 0,
+  failed INTEGER DEFAULT 0,
+  first_runs INTEGER DEFAULT 0,
+  first_success INTEGER DEFAULT 0,
+  repeat_runs INTEGER DEFAULT 0,
+  repeat_success INTEGER DEFAULT 0,
+  total_duration_ms INTEGER DEFAULT 0,
+  last_status TEXT DEFAULT '',
+  last_at TEXT,
+  updated_at TEXT
+);`);
+db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_exp_pair ON agent_experience(agent_id, task_type);');
+db.exec('CREATE INDEX IF NOT EXISTS idx_agent_exp_type ON agent_experience(task_type);');
 
 // P1-17 版本化迁移框架（2026-11-13）：执行 _migrations 注册表中尚未登记的列迁移
 // 新迁移直接在该框架中追加，逐步替代 db.js 内联 ALTER TABLE 块

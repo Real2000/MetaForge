@@ -26,6 +26,9 @@ const { resolveKbFilter } = require('../lib/kb-metadata');
 // D1-2 专家团式并行编排：任务图校验/分层/并发执行/单节点重跑（纯逻辑，可测试）
 const orchestrator = require('../lib/orchestrator');
 const { validateTaskGraph, runTaskGraph } = orchestrator;
+// D3-2 经验自进化：专家×任务类型可靠度聚合 + 编排优选（纯逻辑；记录回写复用 experience 路由的 recordRun）
+const experience = require('../lib/experience');
+const experienceRoutes = require('./experience');
 
 // P5.25 工具确认等待队列（U0-5 P1 抽到 lib/tool-confirm-registry）：stream 请求注册等待 →
 // 前端 /confirm 与 IM 卡片回调 /card-callback 两条决议路径共用同一份注册表跨请求唤醒
@@ -464,6 +467,15 @@ async function classifyIntent(input, agent, childTools) {
 async function planTaskGraph(agent, childTools, userInput, history) {
   const list = childTools.map(c => `- agent_id=${c.child.id}（${c.child.name}）：${(c.child.description || '专业子智能体').slice(0, 80)}`).join('\n');
   const hist = (history || []).slice(-4).map(h => `${h.role}: ${String(h.content || '').slice(0, 200)}`).join('\n');
+  // D3-2 经验自进化：按用户任务的归类，给出各候选专家的历史可靠度提示，引导编排器优先高分专家
+  //（读取失败不阻断编排——经验只是"增益"，非"依赖"）
+  let hint = '';
+  try {
+    const taskType = experience.classifyTask(userInput);
+    const agents = childTools.map(c => ({ id: c.child.id, name: c.child.name }));
+    const records = db.prepare('SELECT * FROM agent_experience').all();
+    hint = experience.experienceHint(experience.rankAgents(agents, records, taskType));
+  } catch { /* 经验读取失败不影响编排 */ }
   const sys = `你是专家团编排器。把用户的复杂任务拆解为「任务图 JSON」，由多个子智能体分工并尽可能并行完成，最后安排一个验证节点验收。
 只输出 JSON，不要任何解释文字，也不要 markdown 代码围栏。
 JSON 结构示例：
@@ -476,9 +488,10 @@ JSON 结构示例：
 - depends_on 写它依赖的节点 id；无依赖的节点会并行执行，有依赖的等待上游完成。
 - 恰好包含 1 个 type="verify" 的验证节点，且它依赖所有产出节点。
 - 只能使用下方列出的子智能体；不得编造 agent_id。
+- 若下方提供「历史经验参考」，在能力相当的情况下优先选用可靠度更高的子智能体（样本偏少者仅供参考，不要因单次记录就否定某专家）。
 - 节点总数 2~8；任务简单就不要强行拆分。
 - 任务描述要自包含（下游节点会同时收到上游产出）。`;
-  const usr = `可选子智能体：\n${list}\n\n${hist ? '近期对话：\n' + hist + '\n\n' : ''}用户任务：${String(userInput).slice(0, 1500)}`;
+  const usr = `可选子智能体：\n${list}\n\n${hint ? hint + '\n\n' : ''}${hist ? '近期对话：\n' + hist + '\n\n' : ''}用户任务：${String(userInput).slice(0, 1500)}`;
   const r = await chatOnce([
     { role: 'system', content: sys },
     { role: 'user', content: usr },
@@ -1227,6 +1240,16 @@ router.post('/stream', async (req, res) => {
               .run(String(e.message || e).slice(0, 500), JSON.stringify(nodeLogs), Date.now() - t0, now(), runId);
             throw e;
           }
+          // D3-2 经验自进化：把各子智能体节点的产出结果回写为经验（按节点任务归类累积「专家×任务类型」可靠度）；
+          // 回写失败不影响编排结果——经验是增益，非依赖
+          try {
+            for (const n of v.graph.nodes) {
+              if (n.type !== 'agent' || n.agent_id == null) continue;
+              const st = runResult.nodes[n.id];
+              if (!st || (st.status !== 'done' && st.status !== 'failed')) continue;
+              experienceRoutes.recordRun({ agent_id: n.agent_id, task_text: n.task, success: st.status === 'done', duration_ms: st.durationMs || 0 });
+            }
+          } catch { /* 经验回写失败不影响编排结果 */ }
           let final = '';
           try { final = await synthesizeOrchestration(agent, orchInput, runResult, v.graph); }
           catch (e) { final = '（汇总失败，以下为各环节产出）\n' + String(e.message || e); }

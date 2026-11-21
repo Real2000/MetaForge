@@ -9166,6 +9166,121 @@ print('PY_OK')
     });
   }
 
+  console.log('【D3-2】经验自进化（任务类型归类 / 贝叶斯可靠度 / 专家优选 / 自进化验收指标）');
+  {
+    const exp = require('../src-server/lib/experience');
+
+    await t('D3-2: 经验内核——任务类型归类 + 贝叶斯可靠度 + 首跑/复跑分桶', async () => {
+      // 任务类型归类（中英关键词，多命中去最高分；无命中归 general）
+      assert.strictEqual(exp.classifyTask('帮我写一段 Python 代码并调试'), 'code');
+      assert.strictEqual(exp.classifyTask('please translate this'), 'translation');
+      assert.strictEqual(exp.classifyTask('帮我做一份市场调研报告'), 'research');
+      assert.strictEqual(exp.classifyTask(''), 'general');
+      assert.strictEqual(exp.classifyTask('随便聊聊'), 'general');
+      assert.ok(exp.allTypes().some(x => x.key === 'code') && exp.allTypes().some(x => x.key === 'general'));
+      // 可靠度：贝叶斯平滑（样本少向先验 0.5 收缩；1 次偶然成功≠满分）
+      assert.strictEqual(exp.reliability(0, 0), 50);
+      assert.strictEqual(exp.reliability(1, 1), 66.7);
+      assert.strictEqual(exp.reliability(10, 10), 91.7);
+      assert.ok(exp.reliability(1, 1) < exp.reliability(10, 10), '样本越多越接近真实成功率');
+      // 首跑/复跑分桶：同一（专家×类型）第 1 次=首跑，其后=复跑
+      const r1 = exp.applyRun({}, { success: true, durationMs: 100 });
+      assert.deepStrictEqual({ runs: r1.runs, first_runs: r1.first_runs, first_success: r1.first_success, repeat_runs: r1.repeat_runs }, { runs: 1, first_runs: 1, first_success: 1, repeat_runs: 0 });
+      const r2 = exp.applyRun({ ...r1, task_type: 'code' }, { success: false, durationMs: 200 });
+      assert.deepStrictEqual({ runs: r2.runs, success: r2.success, failed: r2.failed, first_runs: r2.first_runs, repeat_runs: r2.repeat_runs, repeat_success: r2.repeat_success, total_duration_ms: r2.total_duration_ms },
+        { runs: 2, success: 1, failed: 1, first_runs: 1, repeat_runs: 1, repeat_success: 0, total_duration_ms: 300 });
+      const norm = exp.normalizeRecord({ agent_id: 7, task_type: 'code', runs: 4, success: 3, total_duration_ms: 400 });
+      assert.strictEqual(norm.type_label, '代码开发');
+      assert.strictEqual(norm.successRate, 75); assert.strictEqual(norm.avgDurationMs, 100);
+      assert.strictEqual(norm.confidence, true, '样本≥3 视为可采信');
+    });
+
+    await t('D3-2: 专家优选排序 + 经验提示构造（样本不足不误伤）', async () => {
+      const agents = [{ id: 1, name: 'A' }, { id: 2, name: 'B' }, { id: 3, name: 'C' }];
+      const records = [
+        { agent_id: 1, task_type: 'code', runs: 10, success: 10 },
+        { agent_id: 2, task_type: 'code', runs: 5, success: 1 },
+        { agent_id: 1, task_type: 'writing', runs: 2, success: 2 }, // 跨类型不应干扰 code 排序
+      ];
+      const ranked = exp.rankAgents(agents, records, 'code');
+      assert.strictEqual(ranked[0].agent_id, 1, '高分专家排第一');
+      assert.strictEqual(ranked[0].experienced, true);
+      assert.strictEqual(ranked[ranked.length - 1].agent_id, 2, '低分专家排最后');
+      const c = ranked.find(x => x.agent_id === 3);
+      assert.strictEqual(c.experienced, false);
+      assert.strictEqual(c.reliability, 50, '无经验者中性分 50');
+      assert.strictEqual(ranked[0].type_label, '代码开发', '排行带类型标签（供前端展示）');
+      const hint = exp.experienceHint(ranked);
+      assert.ok(/历史经验参考/.test(hint) && /agent_id=1/.test(hint), '提示文本含经验参考与高分专家');
+      assert.strictEqual(exp.experienceHint(exp.rankAgents(agents, [], 'code')), '', '无任何经验时提示为空（不干扰原提示词）');
+    });
+
+    await t('D3-2: 自进化验收指标——同类任务二次成功率提升 ≥ 15pp', async () => {
+      assert.strictEqual(exp.TARGET_LIFT, 15);
+      // 合计：首跑 3/4=75%，复跑 4/4=100% → 整体 +25pp 达标；代码类 50%→100% 提升 +50pp
+      const ev = exp.evolutionStats([
+        { task_type: 'code', first_runs: 2, first_success: 1, repeat_runs: 4, repeat_success: 4 },
+        { task_type: 'writing', first_runs: 2, first_success: 2, repeat_runs: 0, repeat_success: 0 },
+      ]);
+      assert.strictEqual(ev.firstRate, 75); assert.strictEqual(ev.repeatRate, 100);
+      assert.strictEqual(ev.delta, 25); assert.strictEqual(ev.meetsTarget, true);
+      assert.strictEqual(ev.firstRuns, 4); assert.strictEqual(ev.repeatRuns, 4);
+      assert.ok(ev.byType.some(x => x.task_type === 'code' && x.delta === 50));
+      // 无复跑数据 → 无法比较，不达标（不臆造结论）
+      const ev2 = exp.evolutionStats([{ task_type: 'code', first_runs: 3, first_success: 3, repeat_runs: 0, repeat_success: 0 }]);
+      assert.strictEqual(ev2.delta, null); assert.strictEqual(ev2.meetsTarget, false);
+      // 复跑更差 → 负提升，不达标
+      const ev3 = exp.evolutionStats([{ task_type: 'code', first_runs: 2, first_success: 2, repeat_runs: 2, repeat_success: 1 }]);
+      assert.strictEqual(ev3.delta, -50); assert.strictEqual(ev3.meetsTarget, false);
+      const ov = exp.overview([{ agent_id: 1, task_type: 'code', runs: 3, success: 2 }, { agent_id: 2, task_type: 'code', runs: 1, success: 1 }]);
+      assert.strictEqual(ov.pairs, 2); assert.strictEqual(ov.agents, 2); assert.strictEqual(ov.totalRuns, 4); assert.strictEqual(ov.successRate, 75);
+    });
+
+    await t('D3-2: HTTP —— 经验记录（首跑/复跑）/查询/排行/指标/清空/权限', async () => {
+      const express = require('express');
+      const expRouter = require('../src-server/routes/experience');
+      const { sign } = require('../src-server/lib/auth');
+      db.prepare("INSERT INTO users (username,password,nickname,role,status,must_change_pwd,created_at) VALUES ('d32u1','x','U','user',1,0,datetime('now','localtime'))").run();
+      db.prepare("INSERT INTO users (username,password,nickname,role,status,must_change_pwd,created_at) VALUES ('d32adm','x','A','admin',1,0,datetime('now','localtime'))").run();
+      const tok = sign({ uid: db.prepare("SELECT id FROM users WHERE username='d32u1'").get().id, exp: Date.now() + 3600000 });
+      const tAdmin = sign({ uid: db.prepare("SELECT id FROM users WHERE username='d32adm'").get().id, exp: Date.now() + 3600000 });
+      db.prepare("INSERT INTO agents (name,description,prompt,status,created_at,updated_at) VALUES ('D32专家','写代码','p','published',datetime('now','localtime'),datetime('now','localtime'))").run();
+      const aid = db.prepare("SELECT id FROM agents WHERE name='D32专家'").get().id;
+      db.prepare('DELETE FROM agent_experience').run(); // 干净基线（本库隔离）
+      const app = express(); app.use(express.json()); app.use('/api/experience', expRouter);
+      let server; await new Promise(r => { server = app.listen(0, '127.0.0.1', r); });
+      const base = `http://127.0.0.1:${server.address().port}`;
+      const J = async (p, opts, tk) => (await fetch(base + p, { ...(opts || {}), headers: { 'Content-Type': 'application/json', ...(tk ? { authorization: 'Bearer ' + tk } : {}) } })).json();
+      try {
+        assert.strictEqual((await fetch(base + '/api/experience/records')).status, 401, '未认证 401');
+        assert.ok((await J('/api/experience/task-types', {}, tok)).data.types.some(x => x.key === 'code'));
+        // 首跑
+        const rec1 = await J('/api/experience/record', { method: 'POST', body: JSON.stringify({ agent_id: aid, task_text: '写一段代码', success: true, duration_ms: 50 }) }, tok);
+        assert.strictEqual(rec1.code, 0); assert.strictEqual(rec1.data.task_type, 'code');
+        assert.strictEqual(rec1.data.runs, 1); assert.strictEqual(rec1.data.isFirst, true);
+        // 复跑（同类型）→ isFirst=false，repeat 分桶
+        const rec2 = await J('/api/experience/record', { method: 'POST', body: JSON.stringify({ agent_id: aid, task_text: '调试代码', success: true }) }, tok);
+        assert.strictEqual(rec2.data.runs, 2); assert.strictEqual(rec2.data.isFirst, false);
+        // 失败一次
+        const rec3 = await J('/api/experience/record', { method: 'POST', body: JSON.stringify({ agent_id: aid, task_type: 'code', success: false }) }, tok);
+        assert.strictEqual(rec3.data.runs, 3); assert.strictEqual(rec3.data.success, 2); assert.strictEqual(rec3.data.failed, 1);
+        assert.strictEqual((await J('/api/experience/record', { method: 'POST', body: JSON.stringify({ agent_id: 0, success: true }) }, tok)).code, 400, '非法 agent_id 400');
+        const recs = await J('/api/experience/records?task_type=code', {}, tok);
+        assert.ok(recs.data.length >= 1 && recs.overview.totalRuns >= 3);
+        const rank = await J('/api/experience/agents?task_type=code&agent_ids=' + aid, {}, tok);
+        assert.strictEqual(rank.data[0].agent_id, aid); assert.strictEqual(rank.data[0].experienced, true);
+        const imp = await J('/api/experience/improvement', {}, tok);
+        assert.ok(imp.data && 'delta' in imp.data && imp.data.firstRuns >= 1, '自进化指标含首跑分桶');
+        const stats = await J('/api/experience/stats', {}, tok);
+        assert.ok(stats.data.overview.totalRuns >= 3 && Array.isArray(stats.data.top));
+        // 清空：非管理员 403，管理员成功
+        assert.strictEqual((await J('/api/experience/reset', { method: 'POST' }, tok)).code, 403, '非管理员 403');
+        assert.strictEqual((await J('/api/experience/reset', { method: 'POST' }, tAdmin)).code, 0);
+        assert.strictEqual((await J('/api/experience/records', {}, tok)).data.length, 0, '清空后无记录');
+      } finally { server.close(); }
+    });
+  }
+
   try { db.close(); } catch { }
   fs.rmSync(process.env.AGENT_DATA_DIR, { recursive: true, force: true });
   console.log('\n———————————————');

@@ -165,6 +165,8 @@ app.use('/api/browser', require('./src-server/routes/browser'));
 app.use('/api/creation', require('./src-server/routes/creation'));
 // D3-1 3D 与数字人 V1（2026-11-21）：3D 资产生成/导出 + 数字人合规评估
 app.use('/api/model3d', require('./src-server/routes/model3d'));
+// D3-2 经验自进化 V1（2026-11-21）：专家×任务类型可靠度聚合 + 编排优选 + 自进化验收指标
+app.use('/api/experience', require('./src-server/routes/experience'));
 // D2-1 代码索引与仓库语义检索（2026-11-21）：只读检索 + 补丁 propose/apply/rollback
 app.use('/api/code', require('./src-server/routes/code'));
 // P3 MCP Server（2026-10-22 ⑤）：已发布智能体暴露为 MCP 工具（Streamable HTTP + Bearer 令牌；管理端 /api/mcp-server）
