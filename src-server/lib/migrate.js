@@ -443,6 +443,8 @@ const ALL_MIGRATIONS = [
     meets_success INTEGER DEFAULT 0, meets_intervention INTEGER DEFAULT 0,
     cases TEXT DEFAULT '[]', created_by TEXT DEFAULT '', created_at TEXT
   );` },
+
+  { id: 108, name: 'eval_baselines.intervened - 需人工介入用例数（显著性检验原始计数）', table: 'eval_baselines', column: 'intervened', def: 'INTEGER DEFAULT 0' },
 ];
 
 module.exports = {

@@ -8,6 +8,7 @@
  *  - 发布基线：POST /baselines（采集/登记一条基线）、GET /baselines、GET /baselines/:id、
  *              DELETE /baselines/:id
  *  - 指标总览：/metrics；发布历史关联基线：/releases/:agentId
+ *  - 多版本趋势（V2）：/trend（套件按版本序列 + 逐点回退/显著性 + 趋势摘要）
  *
  * 读接口要求 JWT 认证（router.use(auth)）；写/删基线为管理员操作（adminOnly）。
  * 基线是发布治理数据（系统级可比基线），不按用户隔离。
@@ -110,6 +111,13 @@ router.delete('/baselines/:id', adminOnly, (req, res) => {
 /** 指标总览（各套件最新基线达标状态 + 回退数） */
 router.get('/metrics', (req, res) => {
   res.json({ code: 0, data: evalSuite.overview() });
+});
+
+/** 多版本趋势（某套件按版本序列的三指标走势 + 逐点回退/显著性 + 趋势摘要） */
+router.get('/trend', (req, res) => {
+  const suite = String(req.query.suite || '').trim();
+  if (!suite) return res.json({ code: 400, msg: '请提供 suite' });
+  res.json({ code: 0, data: evalSuite.suiteTrend({ suite, suite_type: req.query.suite_type, limit: req.query.limit }) });
 });
 
 /** 智能体发布历史 + 每次发布关联的基线（可对比基线视图） */

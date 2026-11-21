@@ -9566,6 +9566,87 @@ print('PY_OK')
     });
   }
 
+  console.log('【D3-4 增强】多版本趋势图 + 统计显著性检验（两比例 z 检验）');
+  {
+    const es = require('../src-server/lib/eval-suite');
+
+    await t('D3-4 增强: 统计内核——erf/正态双尾 p / 两比例 z 检验 / 显著性结论', async () => {
+      // 正态双尾 p：|z|=1.96 → p≈0.05；z=0 → p≈1
+      const p196 = es.normalTwoTailP(1.96);
+      assert.ok(Math.abs(p196 - 0.05) < 0.01, `normalTwoTailP(1.96)=${p196}`);
+      assert.ok(es.normalTwoTailP(0) > 0.99, 'z=0 → p≈1');
+      // 显著提升 / 显著回退
+      const up = es.proportionZTest(90, 100, 60, 100);
+      assert.strictEqual(up.significant, true); assert.strictEqual(up.direction, 'up');
+      assert.ok(up.z > 0 && up.p < 0.05 && up.smallSample === false);
+      const down = es.proportionZTest(60, 100, 90, 100);
+      assert.strictEqual(down.significant, true); assert.strictEqual(down.direction, 'down');
+      // 小差 → 不显著
+      const ns = es.proportionZTest(50, 100, 48, 100);
+      assert.strictEqual(ns.significant, false); assert.strictEqual(ns.direction, 'up');
+      // 样本不足（任一组 < 5）→ 不判显著
+      const ss = es.proportionZTest(2, 3, 1, 3);
+      assert.strictEqual(ss.smallSample, true); assert.strictEqual(ss.significant, false); assert.strictEqual(ss.p, null);
+      // 结论映射：improved / regressed / no_change / insufficient
+      assert.strictEqual(es.significance({ passed: 90, total: 100, intervened: 5 }, { passed: 60, total: 100, intervened: 5 }).verdict, 'improved');
+      assert.strictEqual(es.significance({ passed: 60, total: 100, intervened: 5 }, { passed: 90, total: 100, intervened: 5 }).verdict, 'regressed');
+      assert.strictEqual(es.significance({ passed: 50, total: 100, intervened: 5 }, { passed: 49, total: 100, intervened: 5 }).verdict, 'no_change');
+      assert.strictEqual(es.significance({ passed: 2, total: 3, intervened: 0 }, { passed: 1, total: 3, intervened: 0 }).verdict, 'insufficient');
+      assert.strictEqual(es.significance({ passed: 1, total: 5, intervened: 0 }, null).first, true);
+      // 口径说明
+      assert.strictEqual(es.metricDefinitions().significance.alpha, 0.05);
+      assert.ok(es.ALPHA === 0.05 && es.MIN_SAMPLE === 5);
+    });
+
+    await t('D3-4 增强: 多版本趋势——序列排序/逐点回退与显著性/趋势摘要', async () => {
+      db.prepare('DELETE FROM eval_baselines').run();
+      const mk = (pass, total, iv = 0) => { const a = []; for (let i = 0; i < total; i++) a.push({ id: 'c' + i, score: i < pass ? 1 : 0, steps: 2, intervened: i >= total - iv }); return a; };
+      const v1 = es.createBaseline({ suite: 'd34-trend', suite_type: 'builtin', label: 'v1', cases: mk(90, 100) });
+      const v2 = es.createBaseline({ suite: 'd34-trend', suite_type: 'builtin', label: 'v2', cases: mk(70, 100, 20) });
+      const v3 = es.createBaseline({ suite: 'd34-trend', suite_type: 'builtin', label: 'v3', cases: mk(85, 100, 5) });
+      assert.strictEqual(v1.metrics.successRate, 90); assert.strictEqual(v1.metrics.intervened, 0);
+      assert.strictEqual(v2.significance.verdict, 'regressed', 'v2（70% vs 90%）显著回退');
+      assert.strictEqual(v3.significance.verdict, 'improved', 'v3（85% vs 70%）显著提升');
+      const tr = es.suiteTrend({ suite: 'd34-trend' });
+      assert.strictEqual(tr.count, 3);
+      assert.deepStrictEqual(tr.points.map(p => p.label), ['v1', 'v2', 'v3'], '按时间正序');
+      assert.strictEqual(tr.points[0].verdict.first, true);
+      assert.strictEqual(tr.summary.netSuccess, -5, '90 → 85');
+      assert.strictEqual(tr.summary.regressions, 1, 'v2 回退');
+      assert.strictEqual(tr.summary.significantRegressions, 1);
+      assert.strictEqual(tr.summary.significantImprovements, 1);
+      assert.strictEqual(tr.summary.direction, 'down');
+      // 空/不存在套件
+      assert.strictEqual(es.suiteTrend({ suite: '' }).count, 0);
+      assert.strictEqual(es.suiteTrend({ suite: 'no-such-suite' }).points.length, 0);
+    });
+
+    await t('D3-4 增强: HTTP /trend —— 多版本趋势 + 口径 + 权限', async () => {
+      const express = require('express');
+      const evRouter = require('../src-server/routes/eval');
+      const { sign } = require('../src-server/lib/auth');
+      for (const [u, r] of [['d34u1', 'user'], ['d34adm', 'admin']]) {
+        if (!db.prepare('SELECT id FROM users WHERE username=?').get(u)) {
+          db.prepare("INSERT INTO users (username,password,nickname,role,status,must_change_pwd,created_at) VALUES (?,?,?,?,1,0,datetime('now','localtime'))").run(u, 'x', u, r);
+        }
+      }
+      const tok = sign({ uid: db.prepare("SELECT id FROM users WHERE username='d34u1'").get().id, exp: Date.now() + 3600000 });
+      const app = express(); app.use(express.json()); app.use('/api/eval', evRouter);
+      let server; await new Promise(r => { server = app.listen(0, '127.0.0.1', r); });
+      const base = `http://127.0.0.1:${server.address().port}`;
+      const J = async (p, tk) => (await fetch(base + p, { headers: { ...(tk ? { authorization: 'Bearer ' + tk } : {}) } })).json();
+      try {
+        assert.strictEqual((await fetch(base + '/api/eval/trend?suite=x')).status, 401, '未认证 401');
+        const tr = await J('/api/eval/trend?suite=d34-trend&suite_type=builtin', tok);
+        assert.strictEqual(tr.code, 0); assert.strictEqual(tr.data.count, 3);
+        assert.ok(tr.data.points[2].significance && tr.data.points[2].significance.verdict === 'improved');
+        assert.strictEqual((await J('/api/eval/trend?suite=', tok)).code, 400, '缺 suite 400');
+        const cfg = await J('/api/eval/config', tok);
+        assert.ok(cfg.data.significance && cfg.data.significance.alpha === 0.05 && /z/.test(cfg.data.significance.method));
+      } finally { server.close(); }
+    });
+  }
+
   try { db.close(); } catch { }
   fs.rmSync(process.env.AGENT_DATA_DIR, { recursive: true, force: true });
   console.log('\n———————————————');

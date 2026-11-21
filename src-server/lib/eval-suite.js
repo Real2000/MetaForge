@@ -129,6 +129,66 @@ function compareVerdict(diff) {
   return { ok, first: false, reasons };
 }
 
+/* ==================== 统计显著性（V2 增强：零依赖两比例 z 检验） ==================== */
+
+/** 误差函数 erf（Abramowitz & Stegun 7.1.26 近似，最大误差 ~1.5e-7） */
+function erf(x) {
+  const sign = x < 0 ? -1 : 1;
+  const ax = Math.abs(x);
+  const t = 1 / (1 + 0.3275911 * ax);
+  const y = 1 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-ax * ax);
+  return sign * y;
+}
+
+/** 标准正态双尾 p 值：P(|Z| > |z|) = 2·(1 − Φ(|z|)) */
+function normalTwoTailP(z) {
+  const az = Math.abs(Number(z) || 0);
+  const cdf = 0.5 * (1 + erf(az / Math.SQRT2));
+  return Math.max(0, Math.min(1, 2 * (1 - cdf)));
+}
+
+const ALPHA = 0.05;      // 显著性水平（双尾）
+const MIN_SAMPLE = 5;    // 每组最小样本量，低于则「样本不足」不做显著性判断
+
+/**
+ * 两比例 z 检验（pooled，双尾）。比较两组「成功数/总数」比例差异是否统计显著。
+ * @param {number} x1 组1 成功数   @param {number} n1 组1 总数（当前基线）
+ * @param {number} x2 组2 成功数   @param {number} n2 组2 总数（上一基线）
+ * @returns {{z:number|null, p:number|null, significant:boolean, alpha:number, smallSample:boolean, direction:'up'|'down'|'flat'|'unknown', se:number|null}}
+ */
+function proportionZTest(x1, n1, x2, n2, alpha = ALPHA) {
+  const N1 = Number(n1) || 0, N2 = Number(n2) || 0, X1 = Number(x1) || 0, X2 = Number(x2) || 0;
+  if (N1 < MIN_SAMPLE || N2 < MIN_SAMPLE) {
+    return { z: null, p: null, significant: false, alpha, smallSample: true, direction: 'unknown', se: null };
+  }
+  const pPool = (X1 + X2) / (N1 + N2);
+  const se = Math.sqrt(pPool * (1 - pPool) * (1 / N1 + 1 / N2));
+  if (se <= 0) return { z: null, p: null, significant: false, alpha, smallSample: false, direction: 'unknown', se: 0 };
+  const z = (X1 / N1 - X2 / N2) / se;      // 正 = 当前比例更高
+  const p = normalTwoTailP(z);
+  return {
+    z: Math.round(z * 1000) / 1000, p: Math.round(p * 10000) / 10000,
+    significant: p < alpha, alpha, smallSample: false,
+    direction: z > 0 ? 'up' : z < 0 ? 'down' : 'flat', se: Math.round(se * 10000) / 10000,
+  };
+}
+
+/**
+ * 对两条基线做显著性检验：成功率（主指标）+ 干预率。
+ * verdict ∈ improved（显著提升）/ regressed（显著回退）/ no_change（变化不显著）/ insufficient（样本不足）
+ */
+function significance(cur, prev, alpha = ALPHA) {
+  const c = cur || {}, p = prev || {};
+  if (!prev || p.total == null) return { first: true, alpha, verdict: 'first', successRate: null, interventionRate: null };
+  const sr = proportionZTest(c.passed, c.total, p.passed, p.total, alpha);
+  const ir = proportionZTest(c.intervened, c.total, p.intervened, p.total, alpha);
+  let verdict;
+  if (sr.smallSample) verdict = 'insufficient';
+  else if (!sr.significant) verdict = 'no_change';
+  else verdict = sr.direction === 'up' ? 'improved' : 'regressed';
+  return { first: false, alpha, successRate: sr, interventionRate: ir, verdict };
+}
+
 /** SWE-bench-lite instance → 内部用例（成功判据：补丁通过 FAIL_TO_PASS 测试） */
 function sweBenchLiteToCases(rows) {
   const list = Array.isArray(rows) ? rows : [];
@@ -169,6 +229,14 @@ function metricDefinitions() {
       { key: 'avgSteps', label: '平均步数', unit: '步', target: '参考', lowerBetter: true, desc: '一轮任务消耗的工具调用次数均值（chat_traces.tool_calls 长度）' },
       { key: 'interventionRate', label: '人工干预率', unit: '%', target: `≤ ${INTERVENTION_MAX}`, lowerBetter: true, desc: '需人工介入的用例占比（安全阻断 / 被判低质 / 人工接管）' },
     ],
+    significance: {
+      alpha: ALPHA, minSample: MIN_SAMPLE, method: '两比例 z 检验（pooled，双尾）',
+      desc: `同一套件相邻两条基线对比：p < ${ALPHA} 视为差异显著；每组样本量 < ${MIN_SAMPLE} 时标记「样本不足」，只报差值不判显著。`,
+      verdicts: [
+        { key: 'improved', label: '显著提升' }, { key: 'regressed', label: '显著回退' },
+        { key: 'no_change', label: '变化不显著' }, { key: 'insufficient', label: '样本不足' },
+      ],
+    },
   };
 }
 
@@ -214,6 +282,7 @@ function normalizeBaseline(row, withDiff = true) {
   if (!r) return null;
   const metrics = {
     total: Number(r.total) || 0, passed: Number(r.passed) || 0,
+    intervened: r.intervened != null ? (Number(r.intervened) || 0) : Math.round((Number(r.intervention_rate) || 0) / 100 * (Number(r.total) || 0)),
     successRate: Number(r.success_rate) || 0, avgSteps: Number(r.avg_steps) || 0,
     interventionRate: Number(r.intervention_rate) || 0,
     meetsSuccess: !!r.meets_success, meetsIntervention: !!r.meets_intervention,
@@ -232,11 +301,13 @@ function normalizeBaseline(row, withDiff = true) {
     const prev = prevBaseline(out.suite, out.suite_type, r.id);
     const prevMetrics = prev ? {
       total: Number(prev.total) || 0, passed: Number(prev.passed) || 0,
+      intervened: prev.intervened != null ? (Number(prev.intervened) || 0) : Math.round((Number(prev.intervention_rate) || 0) / 100 * (Number(prev.total) || 0)),
       successRate: Number(prev.success_rate) || 0, avgSteps: Number(prev.avg_steps) || 0,
       interventionRate: Number(prev.intervention_rate) || 0,
     } : null;
     out.diff = diffBaseline(metrics, prevMetrics);
     out.verdict = compareVerdict(out.diff);
+    out.significance = prevMetrics ? significance(metrics, prevMetrics) : significance(metrics, null);
     out.prev_id = prev ? Number(prev.id) : null;
   }
   return out;
@@ -257,12 +328,12 @@ function createBaseline(opts) {
   const metrics = computeMetrics(cases);
   const trimmed = cases.slice(0, MAX_CASES);
   const info = db.prepare(`INSERT INTO eval_baselines
-    (suite,suite_type,ref_id,label,agent_version,total,passed,success_rate,avg_steps,intervention_rate,meets_success,meets_intervention,cases,created_by,created_at)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+    (suite,suite_type,ref_id,label,agent_version,total,passed,intervened,success_rate,avg_steps,intervention_rate,meets_success,meets_intervention,cases,created_by,created_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
     String(o.suite || 'unnamed').slice(0, 120), o.suite_type || 'agent',
     o.ref_id != null ? Number(o.ref_id) : null, String(o.label || '').slice(0, 120),
     o.agent_version != null ? Number(o.agent_version) : null,
-    metrics.total, metrics.passed, metrics.successRate, metrics.avgSteps, metrics.interventionRate,
+    metrics.total, metrics.passed, metrics.intervened, metrics.successRate, metrics.avgSteps, metrics.interventionRate,
     metrics.meetsSuccess ? 1 : 0, metrics.meetsIntervention ? 1 : 0,
     JSON.stringify(trimmed), String(o.created_by || ''), o.created_at || now());
   const row = db.prepare('SELECT * FROM eval_baselines WHERE id=?').get(info.lastInsertRowid);
@@ -352,10 +423,51 @@ function releaseBaselines(agentId) {
   });
 }
 
+/**
+ * 多版本趋势：某套件按时间正序的基线序列 + 逐点对比/显著性 + 整体趋势摘要（V2 增强）。
+ * 每点含 metrics/diff/verdict/significance；summary 给出首末净变化、回退/显著回退/显著提升计数与方向。
+ */
+function suiteTrend({ suite, suite_type, limit = 30 } = {}) {
+  const name = String(suite || '').trim();
+  if (!name) return { suite: '', suite_type: suite_type || null, count: 0, points: [], summary: null };
+  const st = suite_type || null;
+  const rows = db.prepare(`SELECT * FROM eval_baselines WHERE suite=? AND (? IS NULL OR suite_type=?) ORDER BY id ASC LIMIT ?`)
+    .all(name, st, st, Math.min(Math.max(Number(limit) || 30, 1), 200));
+  const points = [];
+  let prevMetrics = null;
+  for (const r of rows) {
+    const b = normalizeBaseline(r, false);   // 不额外查 prev，由循环维护
+    const diff = diffBaseline(b.metrics, prevMetrics);
+    const verdict = compareVerdict(diff);
+    const sig = significance(b.metrics, prevMetrics);
+    points.push({
+      id: b.id, label: b.label || '', agent_version: b.agent_version, created_at: b.created_at,
+      metrics: b.metrics, diff, verdict, significance: sig,
+    });
+    prevMetrics = b.metrics;
+  }
+  const first = points[0] || null, last = points[points.length - 1] || null;
+  const net = (key) => (first && last) ? Math.round((last.metrics[key] - first.metrics[key]) * 10) / 10 : 0;
+  const netSuccess = net('successRate'), netSteps = net('avgSteps'), netIntervention = net('interventionRate');
+  const regressions = points.filter(p => p.verdict && !p.verdict.first && !p.verdict.ok).length;
+  const significantRegressions = points.filter(p => p.significance && p.significance.verdict === 'regressed').length;
+  const significantImprovements = points.filter(p => p.significance && p.significance.verdict === 'improved').length;
+  return {
+    suite: name, suite_type: st, count: points.length, points,
+    summary: {
+      first: first ? { id: first.id, label: first.label, successRate: first.metrics.successRate, avgSteps: first.metrics.avgSteps, interventionRate: first.metrics.interventionRate } : null,
+      last: last ? { id: last.id, label: last.label, successRate: last.metrics.successRate, avgSteps: last.metrics.avgSteps, interventionRate: last.metrics.interventionRate } : null,
+      netSuccess, netSteps, netIntervention, regressions, significantRegressions, significantImprovements,
+      direction: netSuccess > 0 ? 'up' : netSuccess < 0 ? 'down' : 'flat',
+    },
+  };
+}
+
 module.exports = {
-  PASS_THRESHOLD, SUCCESS_TARGET, INTERVENTION_MAX, SUITE_TEMPLATES,
+  PASS_THRESHOLD, SUCCESS_TARGET, INTERVENTION_MAX, SUITE_TEMPLATES, ALPHA, MIN_SAMPLE,
   stepsFromTools, normalizeCase, casePassed, computeMetrics, diffBaseline, compareVerdict,
+  erf, normalTwoTailP, proportionZTest, significance,
   sweBenchLiteToCases, sweBenchLiteTemplate, metricDefinitions,
   captureFromTelemetry, createBaseline, autoCaptureOnPublish, listBaselines, baselineDetail,
-  overview, deleteBaseline, releaseBaselines, normalizeBaseline,
+  overview, deleteBaseline, releaseBaselines, suiteTrend, normalizeBaseline,
 };

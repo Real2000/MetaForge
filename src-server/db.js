@@ -2177,6 +2177,7 @@ db.exec(`CREATE TABLE IF NOT EXISTS eval_baselines (
   agent_version INTEGER DEFAULT NULL,     -- 关联 agent_publish_history.version
   total INTEGER DEFAULT 0,
   passed INTEGER DEFAULT 0,
+  intervened INTEGER DEFAULT 0,          -- 需人工介入的用例数（显著性检验用原始计数）
   success_rate REAL DEFAULT 0,            -- 任务成功率 %
   avg_steps REAL DEFAULT 0,               -- 平均步数
   intervention_rate REAL DEFAULT 0,       -- 人工干预率 %
