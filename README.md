@@ -2699,4 +2699,39 @@ agent-platform/
 - 浏览器端到端实测：后台「桌面端升级」页登记发布 → 指标与清单渲染 → 设备页版本卡显示最新版本；控制台 0 错误。
 - 已知边界（V1）：发布包为「同构单文件」（当前客户端为 Node 守护脚本，直接替换 `bridge.js`），完整 DMG/zip 包与差分更新留后续；「托盘常驻/多窗口」非本客户端形态（launchd 后台守护 + 菜单栏型 `.app` 已满足常驻）；更新在客户端**已配对**时启用（未配对不打扰）；指标分母为「更新涉及设备数」，无数据时为 `null`（不参与达标判定）。
 
+### D3-1 3D 与数字人 V1（2026-11-21）
+
+R5 远期生态首项。**先做 3D 资产生成与导出（新增资产类型 + 第三方 3D 服务），数字人只做「评估先行」的合规闸门**（生成能力待评估通过后单独排期），验收 **3D 任务成功率 ≥ 70%**。
+
+**① 3D 生成内核（`src-server/lib/model3d.js`，纯逻辑零依赖）**
+- 格式：`FORMATS`（glb/gltf/obj/fbx/stl/usdz/ply）、`detectFormat`/`is3DFormat`/`mimeOf`/`normFormat`（非法回落 glb）。
+- 请求：`buildGenRequest(prompt,{format,quality})` → 第三方 3D 服务的 OpenAI 风格请求体（`model=text-to-3d`）。
+- 导出：`exportPlan(source,target)` → 可转换性（`CONVERTIBLE` 表）+ 是否需转换 + MIME；同格式直出、不支持组合拒绝。
+- 指标：`taskStats(tasks)` → 成功率 = success/(success+failed)（进行中不计分母），附 `meetsTarget`（≥70）；无已完成任务时为 `null`。
+- 离线降级：`placeholderGltf` 生成最小合法 glTF 2.0 占位模型（单三角面，明确标注 stub），未配置第三方 3D 服务时保证链路可跑通。
+
+**② 数字人合规内核（`src-server/lib/digital-human.js`，纯逻辑零依赖）**
+- 问卷 `ASSESS_ITEMS`（本人授权 / 真人形象 / 公众人物·未成年人 / 误导性风险 / 合成标识 / 声音克隆 / 商业投放）。
+- `assess(answers)` → 合规评分（0–100）+ 风险级别 + **结论闸门** `decision`：存在高风险项（未授权 / 公众人物 / 误导性）→ `reject`；仅中风险 → `review`；齐备 → `approve`；并给出「必要动作」清单。
+- 依据《生成式人工智能服务管理暂行办法》合成标识要求与肖像权/声音权授权要求。
+
+**③ 接口（`src-server/routes/model3d.js`，JWT + owner 隔离）**
+- `POST /api/model3d/generate`：提交 3D 生成任务——逐供应商调用 `/3d/generations`（复用 providers 多供应商路由），成功产物落 `public/uploads/models3d/` 并登记为 `assets(kind='3d')`；**无可用供应商时降级 `provider=local-stub`** 产出占位模型。
+- `GET /api/model3d/tasks`（列表 + 指标）/`GET /tasks/:id`/`POST /tasks/:id/retry`（失败重跑，保留原记录用于成功率追溯）。
+- `POST /api/model3d/assets/:id/export`（导出计划 + 记录，同格式 done / 需转换 pending）；`GET /exports`。
+- `GET /api/model3d/dh/items`（问卷定义）、`POST /dh/assess`（评估 + 关联素材时回写 `digital_human` 待复核标记）、`GET /dh/assessments`。
+- `GET /api/model3d/stats`：3D 成功率 + 最近任务 + 导出/合规概览。
+
+**④ 数据（`src-server/db.js` 内联建表 + 迁移 id 98–100）**
+- `model3d_tasks`（3D 生成任务台账）、`asset_exports`（导出记录）、`dh_assessments`（合规评估记录），含必要索引；`assets.kind` 新增 `3d`（`routes/creation.js` KINDS）。
+
+**⑤ 前端**
+- `public/js/front/creation.js`：「生成 3D 资产」入口（提示词 + 目标格式）与 3D 素材「导出」按钮；素材类型下拉新增「3D 模型」。
+- 新页 `public/js/admin/model3d.js`「🧊 3D 与数字人」（路由 `#/admin/model3d` + 后台导航）：3D 任务成功率指标卡（含达标标记）+ 最近任务（失败可重跑）+ 数字人合规评估（问卷发起，弹窗给出结论/得分/必要动作）+ 导出记录。
+- `public/sw.js` bump `SW_VERSION` → `d3.1-v1`。
+
+**验证（D3-1）**
+- `npm test` 冒烟 **564/0 全绿**（559 基线 + 5 条新增 D3-1 用例：3D 内核格式/导出计划/占位模型、任务成功率指标（含达标线）、数字人合规评分与结论闸门、HTTP 3D 生成（无供应商→local-stub 降级并登记 assets 3d）/列表/指标/权限、HTTP 导出（可转换性/记录）+ 合规评估（落库 + 回写素材标记））。
+- 已知边界（V1）：3D 生成依赖**第三方 3D 服务**（配置 `/3d/generations` 兼容端点即接入），未配置时以 `provider=local-stub` 占位模型保证链路可用（成功率含占位任务，接入真实服务后为真实成功率）；导出仅做「可转换性判定 + 记录」，真实几何格式转换由下游服务完成（同格式直接指向源文件下载）；数字人**只做合规评估闸门**，生成/克隆能力待专项评估后单独排期。
+
 > AI生成

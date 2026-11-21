@@ -16,7 +16,7 @@ const creation = require('../lib/creation');
 const router = express.Router();
 router.use(auth);
 
-const KINDS = ['image', 'video', 'audio', 'text', 'other'];
+const KINDS = ['image', 'video', 'audio', 'text', '3d', 'other'];
 const PROJECT_KINDS = ['video', 'image', 'mixed'];
 const PROJECT_STATUS = ['draft', 'active', 'archived'];
 const SHOT_STATUS = ['draft', 'ready', 'generated'];

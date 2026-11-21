@@ -389,6 +389,25 @@ const ALL_MIGRATIONS = [
     device_id INTEGER, username TEXT DEFAULT '', version TEXT DEFAULT '', kind TEXT DEFAULT 'runtime',
     message TEXT DEFAULT '', stack TEXT DEFAULT '', created_at TEXT
   );` },
+  // === D3-1 3D 与数字人 V1（2026-11-21）===
+  { id: 98, name: 'model3d_tasks - 3D 资产生成任务台账', table: 'model3d_tasks', createSql: `CREATE TABLE IF NOT EXISTS model3d_tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT DEFAULT '', project_id INTEGER DEFAULT NULL, prompt TEXT DEFAULT '', format TEXT DEFAULT '',
+    status TEXT DEFAULT 'queued', model TEXT DEFAULT '', provider TEXT DEFAULT '', url TEXT DEFAULT '',
+    thumb TEXT DEFAULT '', asset_id INTEGER DEFAULT NULL, error TEXT DEFAULT '', duration_ms INTEGER DEFAULT 0,
+    meta TEXT DEFAULT '{}', created_at TEXT, finished_at TEXT
+  );` },
+  { id: 99, name: 'asset_exports - 3D 资产导出记录', table: 'asset_exports', createSql: `CREATE TABLE IF NOT EXISTS asset_exports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    asset_id INTEGER, username TEXT DEFAULT '', source_format TEXT DEFAULT '', target_format TEXT DEFAULT '',
+    need_convert INTEGER DEFAULT 0, status TEXT DEFAULT 'done', url TEXT DEFAULT '', note TEXT DEFAULT '', created_at TEXT
+  );` },
+  { id: 100, name: 'dh_assessments - 数字人合规评估记录', table: 'dh_assessments', createSql: `CREATE TABLE IF NOT EXISTS dh_assessments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    asset_id INTEGER DEFAULT NULL, project_id INTEGER DEFAULT NULL, username TEXT DEFAULT '',
+    answers TEXT DEFAULT '{}', score INTEGER DEFAULT 0, level TEXT DEFAULT 'low', decision TEXT DEFAULT 'approve',
+    reasons TEXT DEFAULT '[]', note TEXT DEFAULT '', created_at TEXT
+  );` },
 ];
 
 module.exports = {

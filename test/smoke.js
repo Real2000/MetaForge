@@ -9044,6 +9044,128 @@ print('PY_OK')
     });
   }
 
+  console.log('【D3-1】3D 与数字人（格式/任务成功率/导出计划/数字人合规评估）');
+  {
+    const m3 = require('../src-server/lib/model3d');
+    const dh = require('../src-server/lib/digital-human');
+
+    await t('D3-1: 3D 内核——格式识别/MIME/生成请求/导出计划/占位模型', async () => {
+      assert.ok(m3.FORMATS.includes('glb') && m3.FORMATS.includes('obj') && m3.FORMATS.includes('usdz'));
+      assert.strictEqual(m3.detectFormat('a.glb'), 'glb');
+      assert.strictEqual(m3.detectFormat('b.OBJ'), 'obj', '大小写不敏感');
+      assert.strictEqual(m3.detectFormat('c.png'), '');
+      assert.strictEqual(m3.is3DFormat('x.stl'), true);
+      assert.strictEqual(m3.mimeOf('glb'), 'model/gltf-binary');
+      assert.strictEqual(m3.normFormat('weird'), 'glb', '非法格式回落 glb');
+      const req = m3.buildGenRequest('cat', { format: 'obj', quality: 'x' });
+      assert.strictEqual(req.format, 'obj');
+      assert.strictEqual(req.quality, 'standard', '非法 quality 回落 standard');
+      const p1 = m3.exportPlan('glb', 'glb');
+      assert.strictEqual(p1.ok, true); assert.strictEqual(p1.needConvert, false);
+      const p2 = m3.exportPlan('obj', 'stl');
+      assert.strictEqual(p2.ok, true); assert.strictEqual(p2.needConvert, true);
+      const p3 = m3.exportPlan('glb', 'png');
+      assert.strictEqual(p3.ok, false, '不支持的目标格式');
+      const ph = m3.placeholderGltf('t');
+      assert.ok(ph.length > 100 && JSON.parse(ph).asset.version === '2.0', '占位 glTF 合法');
+    });
+
+    await t('D3-1: 3D 任务成功率指标（验收 ≥ 70%）', async () => {
+      assert.strictEqual(m3.TARGET_RATE, 70);
+      const s = m3.taskStats([{ status: 'success' }, { status: 'success' }, { status: 'success' }, { status: 'failed' }, { status: 'running' }]);
+      assert.strictEqual(s.total, 5); assert.strictEqual(s.success, 3); assert.strictEqual(s.failed, 1); assert.strictEqual(s.running, 1);
+      assert.strictEqual(s.successRate, 75); assert.strictEqual(s.meetsTarget, true);
+      const s2 = m3.taskStats([{ status: 'success' }, { status: 'failed' }, { status: 'failed' }]);
+      assert.strictEqual(s2.successRate, 33.33); assert.strictEqual(s2.meetsTarget, false);
+      const empty = m3.taskStats([]);
+      assert.strictEqual(empty.successRate, null); assert.strictEqual(empty.meetsTarget, null);
+      assert.strictEqual(m3.normalizeTask(null), null);
+    });
+
+    await t('D3-1: 数字人合规评估——评分与结论闸门（reject/review/approve）', async () => {
+      const r1 = dh.assess({ authorized: false });
+      assert.strictEqual(r1.decision, 'reject'); assert.strictEqual(r1.level, 'high');
+      assert.ok(r1.requiredActions.some(x => /授权/.test(x)));
+      const r2 = dh.assess({ authorized: true, real_person: true, disclosed: true });
+      assert.strictEqual(r2.decision, 'review', '真人+已授权+已标注 → 需人工复核');
+      const r3 = dh.assess({ authorized: true, real_person: true });
+      assert.strictEqual(r3.decision, 'review', '真人未标注 → 复核');
+      assert.ok(r3.requiredActions.some(x => /合成标识/.test(x)));
+      const r4 = dh.assess({ authorized: true, disclosed: true });
+      assert.strictEqual(r4.decision, 'approve'); assert.strictEqual(r4.score, 100);
+      assert.strictEqual(dh.requiresManualReview(r2), true);
+      assert.strictEqual(dh.requiresManualReview(r4), false);
+      assert.ok(Array.isArray(dh.ASSESS_ITEMS) && dh.ASSESS_ITEMS.length >= 5);
+    });
+
+    await t('D3-1: HTTP —— 3D 生成（无供应商→local-stub 降级，登记 assets 3d）/任务列表/指标/权限', async () => {
+      const express = require('express');
+      const m3Router = require('../src-server/routes/model3d');
+      const { sign } = require('../src-server/lib/auth');
+      db.prepare("INSERT INTO users (username,password,nickname,role,status,must_change_pwd,created_at) VALUES ('d31u1','x','U','user',1,0,datetime('now','localtime'))").run();
+      db.prepare("INSERT INTO users (username,password,nickname,role,status,must_change_pwd,created_at) VALUES ('d31adm','x','A','admin',1,0,datetime('now','localtime'))").run();
+      const tok = sign({ uid: db.prepare("SELECT id FROM users WHERE username='d31u1'").get().id, exp: Date.now() + 3600000 });
+      const tAdmin = sign({ uid: db.prepare("SELECT id FROM users WHERE username='d31adm'").get().id, exp: Date.now() + 3600000 });
+      db.prepare('UPDATE providers SET configured=0').run(); // 避免误连真实网关：置无可用供应商 → 走本地占位降级
+      db.prepare("INSERT INTO projects (name,kind,owner,status,created_at,updated_at) VALUES ('D31项目','mixed','d31u1','active',datetime('now','localtime'),datetime('now','localtime'))").run();
+      const pid = db.prepare("SELECT id FROM projects WHERE name='D31项目'").get().id;
+      const app = express(); app.use(express.json()); app.use('/api/model3d', m3Router);
+      let server; await new Promise(r => { server = app.listen(0, '127.0.0.1', r); });
+      const base = `http://127.0.0.1:${server.address().port}`;
+      const J = async (p, opts, tk) => (await fetch(base + p, { ...(opts || {}), headers: { 'Content-Type': 'application/json', ...(tk ? { authorization: 'Bearer ' + tk } : {}) } })).json();
+      const created = []; // 占位模型会写入真实 public/uploads/models3d/（gitignore），测试后清理
+      try {
+        assert.strictEqual((await fetch(base + '/api/model3d/tasks')).status, 401, '未认证 401');
+        assert.strictEqual((await J('/api/model3d/generate', { method: 'POST', body: JSON.stringify({}) }, tok)).code, 400, '缺提示词');
+        const g = await J('/api/model3d/generate', { method: 'POST', body: JSON.stringify({ project_id: pid, prompt: '一把木椅', format: 'glb' }) }, tok);
+        assert.strictEqual(g.code, 0);
+        assert.strictEqual(g.data.status, 'success');
+        assert.strictEqual(g.data.provider, 'local-stub', '无供应商时降级本地占位');
+        assert.ok(g.data.asset_id, '成功登记为素材');
+        assert.ok(/\/uploads\/models3d\//.test(g.data.url), '产物落 media 存储');
+        created.push(g.data.url);
+        const asset = db.prepare('SELECT * FROM assets WHERE id=?').get(g.data.asset_id);
+        assert.strictEqual(asset.kind, '3d'); assert.strictEqual(asset.owner, 'd31u1');
+        const list = await J('/api/model3d/tasks', {}, tok);
+        assert.ok(list.data.length >= 1 && list.stats.total >= 1);
+        const st = await J('/api/model3d/stats', {}, tok);
+        assert.strictEqual(st.data.stats.successRate, 100);
+        assert.strictEqual(st.data.stats.meetsTarget, true);
+        assert.strictEqual((await J('/api/model3d/tasks/' + g.data.id, {}, tAdmin)).code, 0, '管理员可访问');
+      } finally { server.close(); for (const u of created) try { fs.rmSync(path.join(__dirname, '..', 'public', u), { force: true }); } catch { } }
+    });
+
+    await t('D3-1: HTTP —— 3D 导出（可转换性/记录）+ 合规评估（落库 + 回写素材标记）', async () => {
+      const express = require('express');
+      const m3Router = require('../src-server/routes/model3d');
+      const { sign } = require('../src-server/lib/auth');
+      const tok = sign({ uid: db.prepare("SELECT id FROM users WHERE username='d31u1'").get().id, exp: Date.now() + 3600000 });
+      const app = express(); app.use(express.json()); app.use('/api/model3d', m3Router);
+      let server; await new Promise(r => { server = app.listen(0, '127.0.0.1', r); });
+      const base = `http://127.0.0.1:${server.address().port}`;
+      const J = async (p, opts, tk) => (await fetch(base + p, { ...(opts || {}), headers: { 'Content-Type': 'application/json', ...(tk ? { authorization: 'Bearer ' + tk } : {}) } })).json();
+      try {
+        const aid = db.prepare(`INSERT INTO assets (kind,name,url,source,meta,owner,created_at) VALUES ('3d','模型A','/uploads/models3d/x.gltf','generated','{"format":"gltf"}','d31u1',datetime('now','localtime'))`).run().lastInsertRowid;
+        const e1 = await J(`/api/model3d/assets/${aid}/export`, { method: 'POST', body: JSON.stringify({ target_format: 'gltf' }) }, tok);
+        assert.strictEqual(e1.code, 0); assert.strictEqual(e1.data.need_convert, false); assert.strictEqual(e1.data.status, 'done');
+        const e2 = await J(`/api/model3d/assets/${aid}/export`, { method: 'POST', body: JSON.stringify({ target_format: 'glb' }) }, tok);
+        assert.strictEqual(e2.data.need_convert, true); assert.strictEqual(e2.data.status, 'pending');
+        assert.strictEqual((await J(`/api/model3d/assets/${aid}/export`, { method: 'POST', body: JSON.stringify({ target_format: 'png' }) }, tok)).code, 400, '不支持格式 400');
+        assert.ok((await J('/api/model3d/exports', {}, tok)).data.length >= 2, '导出记录落库');
+        const a = await J('/api/model3d/dh/assess', { method: 'POST', body: JSON.stringify({ asset_id: aid, answers: { authorized: false, real_person: true } }) }, tok);
+        assert.strictEqual(a.code, 0); assert.strictEqual(a.data.decision, 'reject');
+        const row = db.prepare('SELECT digital_human, meta FROM assets WHERE id=?').get(aid);
+        assert.strictEqual(row.digital_human, 1, '非通过结论回写待复核标记');
+        assert.strictEqual(JSON.parse(row.meta).dh_assessment.decision, 'reject');
+        const a2 = await J('/api/model3d/dh/assess', { method: 'POST', body: JSON.stringify({ asset_id: aid, answers: { authorized: true, disclosed: true } }) }, tok);
+        assert.strictEqual(a2.data.decision, 'approve');
+        assert.strictEqual(db.prepare('SELECT digital_human FROM assets WHERE id=?').get(aid).digital_human, 0, '通过结论清除标记');
+        const dl = await J('/api/model3d/dh/assessments', {}, tok);
+        assert.ok(dl.data.length >= 2 && Array.isArray(dl.data[0].reasons));
+      } finally { server.close(); }
+    });
+  }
+
   try { db.close(); } catch { }
   fs.rmSync(process.env.AGENT_DATA_DIR, { recursive: true, force: true });
   console.log('\n———————————————');

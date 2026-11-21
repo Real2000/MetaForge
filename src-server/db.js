@@ -2712,6 +2712,59 @@ db.exec(`CREATE TABLE IF NOT EXISTS task_queue (
 db.exec('CREATE INDEX IF NOT EXISTS idx_tq_status ON task_queue(status, priority);');
 db.exec('CREATE INDEX IF NOT EXISTS idx_tq_job_id ON task_queue(job_id);');
 
+// ================== D3-1 3D 与数字人 V1（2026-11-21）==================
+//  - model3d_tasks ：3D 资产生成任务台账（成功率验收口径 ≥ 70%）
+//  - asset_exports ：3D 资产导出记录（源格式 → 目标格式 + 是否需要转换）
+//  - dh_assessments：数字人/真人合成素材合规评估记录（评估先行闸门）
+db.exec(`CREATE TABLE IF NOT EXISTS model3d_tasks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  username TEXT DEFAULT '',
+  project_id INTEGER DEFAULT NULL,
+  prompt TEXT DEFAULT '',
+  format TEXT DEFAULT '',
+  status TEXT DEFAULT 'queued',
+  model TEXT DEFAULT '',
+  provider TEXT DEFAULT '',
+  url TEXT DEFAULT '',
+  thumb TEXT DEFAULT '',
+  asset_id INTEGER DEFAULT NULL,
+  error TEXT DEFAULT '',
+  duration_ms INTEGER DEFAULT 0,
+  meta TEXT DEFAULT '{}',
+  created_at TEXT,
+  finished_at TEXT
+);`);
+db.exec('CREATE INDEX IF NOT EXISTS idx_m3d_tasks_user ON model3d_tasks(username, id DESC);');
+db.exec('CREATE INDEX IF NOT EXISTS idx_m3d_tasks_status ON model3d_tasks(status);');
+db.exec(`CREATE TABLE IF NOT EXISTS asset_exports (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  asset_id INTEGER,
+  username TEXT DEFAULT '',
+  source_format TEXT DEFAULT '',
+  target_format TEXT DEFAULT '',
+  need_convert INTEGER DEFAULT 0,
+  status TEXT DEFAULT 'done',
+  url TEXT DEFAULT '',
+  note TEXT DEFAULT '',
+  created_at TEXT
+);`);
+db.exec('CREATE INDEX IF NOT EXISTS idx_asset_exports_asset ON asset_exports(asset_id, id DESC);');
+db.exec(`CREATE TABLE IF NOT EXISTS dh_assessments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  asset_id INTEGER DEFAULT NULL,
+  project_id INTEGER DEFAULT NULL,
+  username TEXT DEFAULT '',
+  answers TEXT DEFAULT '{}',
+  score INTEGER DEFAULT 0,
+  level TEXT DEFAULT 'low',
+  decision TEXT DEFAULT 'approve',
+  reasons TEXT DEFAULT '[]',
+  note TEXT DEFAULT '',
+  created_at TEXT
+);`);
+db.exec('CREATE INDEX IF NOT EXISTS idx_dh_assess_project ON dh_assessments(project_id, id DESC);');
+db.exec('CREATE INDEX IF NOT EXISTS idx_dh_assess_asset ON dh_assessments(asset_id, id DESC);');
+
 // P1-17 版本化迁移框架（2026-11-13）：执行 _migrations 注册表中尚未登记的列迁移
 // 新迁移直接在该框架中追加，逐步替代 db.js 内联 ALTER TABLE 块
 try {

@@ -6,7 +6,7 @@ import { api } from '../api.js';
 import { esc, toast, modal, confirmBox } from '../ui.js';
 import { t } from '../i18n.js';
 
-const KIND_ICON = { image: '🖼️', video: '🎬', audio: '🎵', text: '📄', other: '📦' };
+const KIND_ICON = { image: '🖼️', video: '🎬', audio: '🎵', text: '📄', '3d': '🧊', other: '📦' };
 let S = { projects: [], current: null };
 
 export async function render(box) {
@@ -63,6 +63,7 @@ async function openProject(id) {
       </div>
       <div style="display:flex;gap:8px">
         <button class="btn" data-addasset="${d.id}">＋ ${t('登记素材')}</button>
+        <button class="btn" data-gen3d="${d.id}">🧊 ${t('生成 3D 资产')}</button>
         <button class="btn" data-addshot="${d.id}">＋ ${t('新增分镜')}</button>
       </div>
     </div>
@@ -82,6 +83,7 @@ async function openProject(id) {
         </div>
         <div style="margin-top:8px;font-size:13px"><b>${esc(a.name || '#' + a.id)}</b></div>
         <div style="font-size:11px;color:var(--text-3);margin-top:2px">${esc(a.kind)} · ${esc(a.source)}${a.compliance && a.compliance.level !== 'OK' ? ' · <span style="color:#dc2626">' + esc(a.compliance.level) + '</span>' : ''}</div>
+        ${a.kind === '3d' ? `<button class="btn" style="margin-top:6px;padding:2px 8px;font-size:12px" data-export="${a.id}">⬇ ${t('导出')}</button>` : ''}
         <button class="btn" style="position:absolute;top:8px;right:8px;padding:2px 8px" data-delasset="${a.id}" title="${t('删除')}">✕</button>
       </div>`).join('')}</div>` : `<div class="hint" style="color:var(--text-3)">${t('暂无素材')}</div>`}
   </div>
@@ -133,7 +135,7 @@ function assetForm(projectId) {
     title: t('登记素材'),
     body: `<div class="st-field"><label>${t('素材 URL')}（/uploads/... 生成物路径或 http(s) 链接）</label><input id="asUrl" class="input" style="width:100%" placeholder="/uploads/gen-images/xxx.png"></div>
       <div class="st-field" style="margin-top:10px"><label>${t('类型')}</label>
-        <select id="asKind" class="input"><option value="image">${t('图片')}</option><option value="video">${t('视频')}</option><option value="audio">${t('音频')}</option><option value="text">${t('文本')}</option></select></div>
+        <select id="asKind" class="input"><option value="image">${t('图片')}</option><option value="video">${t('视频')}</option><option value="audio">${t('音频')}</option><option value="text">${t('文本')}</option><option value="3d">${t('3D 模型')}</option></select></div>
       <div class="st-field" style="margin-top:10px"><label>${t('名称')}</label><input id="asName" class="input" style="width:100%"></div>
       <div class="st-field" style="margin-top:10px"><label>${t('标签')}（逗号分隔，用于复用匹配）</label><input id="asTags" class="input" style="width:100%"></div>
       <label style="display:flex;gap:6px;margin-top:10px;font-size:13px"><input type="checkbox" id="asReal"> ${t('含真人素材（需合规评估）')}</label>
@@ -150,6 +152,55 @@ function assetForm(projectId) {
             tags: mask.querySelector('#asTags').value, real_person: mask.querySelector('#asReal').checked ? 1 : 0, digital_human: mask.querySelector('#asDH').checked ? 1 : 0,
           } });
           close(); toast(t('素材已登记')); await openProject(projectId);
+        } catch (e) { toast(e.message, 'err'); }
+      };
+    },
+  });
+}
+
+function gen3DForm(projectId) {
+  modal({
+    title: `🧊 ${t('生成 3D 资产')}`,
+    body: `<div class="st-field"><label>${t('3D 提示词')}</label><textarea id="g3Prompt" class="input" style="width:100%;height:80px" placeholder="${t('例如：一把低多边形风格的中世纪木椅')}"></textarea></div>
+      <div class="st-field" style="margin-top:10px"><label>${t('目标格式')}</label>
+        <select id="g3Fmt" class="input"><option value="glb">glb（二进制 glTF）</option><option value="gltf">gltf（文本 glTF）</option><option value="obj">obj</option><option value="stl">stl</option><option value="fbx">fbx</option><option value="usdz">usdz</option></select></div>
+      <div class="hint" style="margin-top:8px;color:var(--text-3);font-size:12px">${t('提交后由平台 3D 生成通道产出；未配置第三方 3D 服务时降级为本地占位模型（provider=local-stub）。')}</div>`,
+    foot: `<button class="btn" data-cancel>${t('取消')}</button><button class="btn primary" data-ok>${t('生成')}</button>`,
+    onMount(mask, close) {
+      mask.querySelector('[data-cancel]').onclick = close;
+      mask.querySelector('[data-ok]').onclick = async () => {
+        const prompt = mask.querySelector('#g3Prompt').value.trim();
+        if (!prompt) return toast(t('请填写 3D 提示词'), 'err');
+        const btn = mask.querySelector('[data-ok]'); btn.disabled = true; btn.textContent = t('生成中…');
+        try {
+          const r = await api('/model3d/generate', { method: 'POST', body: { project_id: projectId, prompt, format: mask.querySelector('#g3Fmt').value } });
+          if (r.data?.status === 'success') toast(t('3D 资产已生成并登记'), 'ok');
+          else toast(t('生成失败：') + (r.raw?.error || r.data?.error || ''), 'err');
+          close(); await openProject(projectId);
+        } catch (e) { toast(e.message, 'err'); btn.disabled = false; btn.textContent = t('生成'); }
+      };
+    },
+  });
+}
+
+function exportDialog(assetId, projectId) {
+  const a = (S.current?.assets || []).find(x => x.id === assetId) || {};
+  const src = (a.meta && a.meta.format) || 'glb';
+  modal({
+    title: `⬇ ${t('导出 3D 资产')}`,
+    body: `<div style="font-size:13px;color:var(--text-2)">${t('源格式')}：<b>${esc(src)}</b></div>
+      <div class="st-field" style="margin-top:10px"><label>${t('目标格式')}</label>
+        <select id="exFmt" class="input"><option value="glb">glb</option><option value="gltf">gltf</option><option value="obj">obj</option><option value="stl">stl</option><option value="fbx">fbx</option><option value="usdz">usdz</option><option value="ply">ply</option></select></div>`,
+    foot: `<button class="btn" data-cancel>${t('取消')}</button><button class="btn primary" data-ok>${t('导出')}</button>`,
+    onMount(mask, close) {
+      mask.querySelector('#exFmt').value = src;
+      mask.querySelector('[data-cancel]').onclick = close;
+      mask.querySelector('[data-ok]').onclick = async () => {
+        try {
+          const r = await api(`/model3d/assets/${assetId}/export`, { method: 'POST', body: { target_format: mask.querySelector('#exFmt').value } });
+          toast(r.data?.message || t('已导出'), 'ok');
+          if (r.data?.url) window.open(r.data.url, '_blank');
+          close();
         } catch (e) { toast(e.message, 'err'); }
       };
     },
@@ -190,7 +241,7 @@ function attachDialog(shotId, projectId) {
 }
 
 async function onDelegatedClick(e) {
-  const t2 = e.target.closest('[data-open],[data-back],[data-addasset],[data-addshot],[data-delasset],[data-resolve],[data-attach],[data-delshot]');
+  const t2 = e.target.closest('[data-open],[data-back],[data-addasset],[data-addshot],[data-delasset],[data-resolve],[data-attach],[data-delshot],[data-gen3d],[data-export]');
   if (!t2) return;
   const d = t2.dataset;
   try {
@@ -198,6 +249,8 @@ async function onDelegatedClick(e) {
     if (d.back !== undefined) return loadProjects();
     if (d.addasset) return assetForm(+d.addasset);
     if (d.addshot) return shotForm(+d.addshot);
+    if (d.gen3d) return gen3DForm(+d.gen3d);
+    if (d.export) return exportDialog(+d.export, S.current?.id);
     if (d.delasset) {
       if (!await confirmBox(t('删除该素材？引用它的分镜将解除引用。'))) return;
       await api('/creation/assets/' + d.delasset, { method: 'DELETE' }); toast(t('已删除素材')); return openProject(S.current.id);
