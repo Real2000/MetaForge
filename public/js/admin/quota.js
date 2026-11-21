@@ -22,8 +22,20 @@ export async function render(el) {
       <div class="card" style="margin-bottom:14px"><h3 style="margin:0 0 10px">🤖 ${t('智能体用量 TOP（近 30 天）')}</h3><div class="table-wrap"><table class="tbl"><thead><tr><th>${t('智能体')}</th><th>Tokens</th><th>${t('调用次数')}</th></tr></thead><tbody id="agentTb"></tbody></table></div></div>
       <div class="card"><h3 style="margin:0 0 10px">🧠 ${t('模型用量 TOP（近 30 天）')}</h3><div class="table-wrap"><table class="tbl"><thead><tr><th>${t('模型')}</th><th>Tokens</th><th>${t('调用次数')}</th></tr></thead><tbody id="modelTb"></tbody></table></div></div>
     </div>
+  </div>
+  <div class="card" style="margin-top:14px;padding:14px 18px">
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+      <h3 style="margin:0">🧮 ${t('计费对账（单价 × 用量 = 应收）')}</h3>
+      <input class="input" id="recMonth" type="month" style="width:150px;margin-left:auto">
+      <button class="btn" id="recBtn">${t('刷新')}</button>
+    </div>
+    <div id="recGate" class="grid-4" style="margin:12px 0"></div>
+    <div class="table-wrap"><table class="tbl"><thead><tr>
+      <th>${t('模型')}</th><th>${t('调用')}</th><th>${t('输入/输出 tokens')}</th><th>${t('单价（元/千Token）')}</th><th>${t('应收')}</th><th>${t('账面')}</th><th>${t('误差')}</th>
+    </tr></thead><tbody id="recTb"></tbody></table></div>
   </div>`;
 
+  function fmtMoney(n) { return '¥' + (Number(n) || 0).toFixed(4); }
   function fmt(n) { return (n || 0).toLocaleString('zh-CN'); }
 
   function renderAll() {
@@ -57,6 +69,33 @@ export async function render(el) {
     if (c) lineChart(c, report.trend.map(td => td.day.slice(5)), report.trend.map(td => td.tokens));
   }
 
+  function renderReconcile(rec) {
+    const g = rec.gate || {};
+    el.querySelector('#recGate').innerHTML = `
+      <div class="stat"><div class="s-label">${t('应收合计')}</div><div class="s-num">${fmtMoney(rec.total.expect_cost)}</div></div>
+      <div class="stat"><div class="s-label">${t('账面合计')}</div><div class="s-num" style="color:${rec.total.balanced ? '#059669' : '#ef4444'}">${fmtMoney(rec.total.actual_cost)}</div></div>
+      <div class="stat"><div class="s-label">${t('对账结果')}</div><div class="s-num" style="font-size:18px;color:${rec.total.balanced ? '#059669' : '#ef4444'}">${rec.total.balanced ? t('账实一致 ✓') : t('存在误差 ✗')}</div></div>
+      <div class="stat"><div class="s-label">${t('闸门（拦截/活跃/结算）')}</div><div class="s-num" style="font-size:16px">${g.blocked || 0} / ${g.active || 0} / ${g.settled || 0}</div></div>`;
+    el.querySelector('#recTb').innerHTML = (rec.items || []).map(it => `
+      <tr>
+        <td class="mono">${esc(it.model)}</td>
+        <td>${fmt(it.calls)}</td>
+        <td>${fmt(it.prompt_tokens)} / ${fmt(it.completion_tokens)}</td>
+        <td>${it.priced ? `${it.price_input} / ${it.price_output}` : `<span class="tag gray">${t('未定价')}</span>`}</td>
+        <td><b>${fmtMoney(it.expect_cost)}</b></td>
+        <td>${fmtMoney(it.actual_cost)}</td>
+        <td>${it.priced ? (it.balanced ? `<span class="tag green">0</span>` : `<span class="tag red">${it.diff}</span>`) : '<span style="color:var(--text-3)">-</span>'}</td>
+      </tr>`).join('') || `<tr><td colspan="7" class="empty">${t('该月暂无计费记录')}</td></tr>`;
+  }
+
+  async function loadReconcile() {
+    const month = el.querySelector('#recMonth').value || undefined;
+    try {
+      const rec = (await api('/billing/reconcile' + (month ? `?month=${month}` : ''))).data;
+      renderReconcile(rec);
+    } catch (e) { toast(e.message, 'err'); }
+  }
+
   function openSet(username) {
     const r = report.rows.find(x => x.username === username);
     modal({
@@ -70,6 +109,13 @@ export async function render(el) {
             <a href="javascript:;" data-q="1000000">${t('100 万')}</a> ·
             <a href="javascript:;" data-q="5000000">${t('500 万')}</a>
           </div>
+        </div>
+        <div class="form-item"><label>${t('成本配额（元/月，0 = 不限）')}</label>
+          <input class="input" id="q_cost" type="number" min="0" step="1" value="${r.cost_quota || 0}" placeholder="${t('0 = 不限制')}">
+        </div>
+        <div class="form-item"><label>${t('并发上限（0 = 不限）')}</label>
+          <input class="input" id="q_conc" type="number" min="0" step="1" value="${r.max_concurrency || 0}" placeholder="${t('0 = 不限制')}">
+          <div class="hint">${t('同一用户同时进行的对话请求数上限；超出即拦截（100% 拦截）。')}</div>
         </div>`,
       foot: `<button class="btn" data-cancel>${t('取消')}</button><button class="btn primary" data-save>${t('保存')}</button>`,
       onMount(mask, close) {
@@ -77,8 +123,11 @@ export async function render(el) {
         mask.querySelector('[data-cancel]').onclick = close;
         mask.querySelector('[data-save]').onclick = async () => {
           const total = Math.max(0, Math.floor(+mask.querySelector('#q_total').value || 0));
+          const cost_quota = Math.max(0, +mask.querySelector('#q_cost').value || 0);
+          const max_concurrency = Math.max(0, Math.floor(+mask.querySelector('#q_conc').value || 0));
           try {
             const j = await api(`/quota/users/${username}`, { method: 'PUT', body: { total } });
+            await api(`/billing/users/${username}`, { method: 'PUT', body: { cost_quota, max_concurrency } });
             toast(j.msg);
             close();
             load();
@@ -93,4 +142,10 @@ export async function render(el) {
     renderAll();
   }
   await load();
+  // D2-2 计费对账（默认当月）
+  const now2 = new Date();
+  el.querySelector('#recMonth').value = `${now2.getFullYear()}-${String(now2.getMonth() + 1).padStart(2, '0')}`;
+  el.querySelector('#recBtn').onclick = loadReconcile;
+  el.querySelector('#recMonth').onchange = loadReconcile;
+  await loadReconcile();
 }

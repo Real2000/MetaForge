@@ -8656,6 +8656,130 @@ print('PY_OK')
     });
   }
 
+  console.log('【D2-2】计费用量感知闭环（预检-预留-结算三段式 / 并发上限 / 单价×用量对账）');
+  {
+    const gate = require('../src-server/lib/billing-gate');
+    const { computeCost } = require('../src-server/lib/billing');
+    const { sign } = require('../src-server/lib/auth');
+    // 造价目：供应商含模型 m1（输入 1 / 输出 2 元/千 Token）
+    db.prepare("INSERT INTO providers (name,base_url,api_key,models,configured,is_default,remark,model_price,created_at) VALUES ('p_d22','','','[\"m1\"]',1,0,'',?,datetime('now','localtime'))")
+      .run(JSON.stringify({ m1: { input: 1, output: 2 } }));
+
+    await t('D2-2: db 迁移 —— billing_holds 表 + users.cost_quota/max_concurrency 列就位', () => {
+      const cols = db.prepare('PRAGMA table_info(users)').all().map(c => c.name);
+      assert.ok(cols.includes('cost_quota'), 'users.cost_quota 应存在');
+      assert.ok(cols.includes('max_concurrency'), 'users.max_concurrency 应存在');
+      assert.ok(db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='billing_holds'").get(), 'billing_holds 表应存在');
+    });
+
+    await t('D2-2: 三段式 —— 预检 held → 结算金额=单价×用量（精确）→ 幂等重复结算不重复计', () => {
+      db.prepare("INSERT INTO users (username,password,nickname,role,status,must_change_pwd,created_at) VALUES ('d22a','x','A','user',1,0,datetime('now','localtime'))").run();
+      const pre = gate.precheck({ username: 'd22a', model: 'm1', promptText: 'hello world 你好' });
+      assert.strictEqual(pre.ok, true, '预检应放行');
+      assert.strictEqual(gate.activeConcurrency('d22a'), 1, '预留后活跃并发应为 1');
+      const s1 = gate.settle({ request_id: pre.request_id, promptTokens: 100, completionTokens: 100, model: 'm1' });
+      assert.strictEqual(s1.actual_cost, computeCost(100, 100, { input: 1, output: 2 }), '结算金额应=单价×用量');
+      assert.strictEqual(s1.actual_cost, 0.3, '100/1000×1 + 100/1000×2 = 0.3');
+      assert.strictEqual(gate.activeConcurrency('d22a'), 0, '结算后活跃并发归零');
+      const s2 = gate.settle({ request_id: pre.request_id, promptTokens: 999, completionTokens: 999, model: 'm1' });
+      assert.strictEqual(s2.idempotent, true, '重复结算应幂等');
+      assert.strictEqual(s2.actual_cost, 0.3, '幂等不改变金额');
+      const row = db.prepare("SELECT actual_cost, actual_tokens, status FROM billing_holds WHERE request_id=?").get(pre.request_id);
+      assert.strictEqual(row.actual_cost, 0.3);
+      assert.strictEqual(row.actual_tokens, 200);
+      assert.strictEqual(row.status, 'settled');
+    });
+
+    await t('D2-2: 并发上限 —— 达上限 100% 拦截，释放后放行', () => {
+      db.prepare("INSERT INTO users (username,password,nickname,role,status,must_change_pwd,max_concurrency,created_at) VALUES ('d22b','x','B','user',1,0,1,datetime('now','localtime'))").run();
+      const p1 = gate.precheck({ username: 'd22b', model: 'm1', promptText: 'a' });
+      assert.strictEqual(p1.ok, true, '首个请求应放行');
+      const p2 = gate.precheck({ username: 'd22b', model: 'm1', promptText: 'b' });
+      assert.strictEqual(p2.ok, false, '超并发应拦截');
+      assert.strictEqual(p2.code, 'concurrency');
+      gate.release(p1.request_id, 'done');
+      const p3 = gate.precheck({ username: 'd22b', model: 'm1', promptText: 'c' });
+      assert.strictEqual(p3.ok, true, '释放后应放行');
+      gate.release(p3.request_id);
+    });
+
+    await t('D2-2: release 幂等 —— 重复释放无副作用，已释放的预留不可结算', () => {
+      db.prepare("INSERT INTO users (username,password,nickname,role,status,must_change_pwd,created_at) VALUES ('d22c','x','C','user',1,0,datetime('now','localtime'))").run();
+      const p = gate.precheck({ username: 'd22c', model: 'm1', promptText: 'z' });
+      assert.strictEqual(gate.release(p.request_id).changed, 1, '首次释放生效');
+      assert.strictEqual(gate.release(p.request_id).changed, 0, '重复释放 changed=0');
+      assert.strictEqual(gate.settle({ request_id: p.request_id, promptTokens: 10, completionTokens: 10, model: 'm1' }).ok, false, '已释放不可结算');
+    });
+
+    await t('D2-2: 成本配额 —— 当月已用成本达上限则 100% 拦截', () => {
+      db.prepare("INSERT INTO users (username,password,nickname,role,status,must_change_pwd,cost_quota,created_at) VALUES ('d22d','x','D','user',1,0,0.5,datetime('now','localtime'))").run();
+      db.prepare("INSERT INTO usage_records (username,dimension,dimension_key,tokens,count,cost,meta,prompt_tokens,completion_tokens,created_at) VALUES ('d22d','model','m1',400,1,0.6,?,200,200,datetime('now','localtime'))")
+        .run(JSON.stringify({ price_input: 1, price_output: 2, priced: true }));
+      const p = gate.precheck({ username: 'd22d', model: 'm1', promptText: 'q' });
+      assert.strictEqual(p.ok, false);
+      assert.strictEqual(p.code, 'cost_quota');
+    });
+
+    await t('D2-2: Token 配额 —— 与既有 quota 口径一致，超限拦截', () => {
+      db.prepare("INSERT INTO users (username,password,nickname,role,status,must_change_pwd,quota_total,quota_used,created_at) VALUES ('d22e','x','E','user',1,0,100,100,datetime('now','localtime'))").run();
+      const p = gate.precheck({ username: 'd22e', model: 'm1', promptText: 'q' });
+      assert.strictEqual(p.ok, false);
+      assert.strictEqual(p.code, 'quota');
+    });
+
+    await t('D2-2: 对账 —— 单价×用量=应收，逐模型账实一致（误差 0）', () => {
+      // 独立月份（2099-01）隔离，避免受其它用例数据影响
+      db.prepare("INSERT INTO usage_records (username,dimension,dimension_key,tokens,count,cost,meta,prompt_tokens,completion_tokens,created_at) VALUES ('d22a','model','m9',400,1,0.6,?,200,200,'2099-01-15 10:00:00')").run(JSON.stringify({ price_input: 1, price_output: 2, priced: true }));
+      db.prepare("INSERT INTO usage_records (username,dimension,dimension_key,tokens,count,cost,meta,prompt_tokens,completion_tokens,created_at) VALUES ('d22a','model','m8',100,1,0.15,?,50,50,'2099-01-16 10:00:00')").run(JSON.stringify({ price_input: 1, price_output: 2, priced: true }));
+      const rec = gate.reconcile({ month: '2099-01' });
+      assert.strictEqual(rec.items.length, 2, '应含两个模型');
+      for (const it of rec.items) {
+        const r6 = (n) => Math.round(n * 1e6) / 1e6;
+        assert.strictEqual(it.expect_cost, r6((it.prompt_tokens / 1000) * 1 + (it.completion_tokens / 1000) * 2), `${it.model} 应收应为单价×用量`);
+        assert.strictEqual(it.diff, 0, `${it.model} 误差应为 0`);
+        assert.strictEqual(it.balanced, true);
+      }
+      assert.strictEqual(rec.total.expect_cost, 0.75, '合计应收 0.6+0.15');
+      assert.strictEqual(rec.total.diff, 0);
+      assert.strictEqual(rec.total.balanced, true, '合计账实一致');
+    });
+
+    await t('D2-2: 闸门统计 —— 拦截/结算/活跃计数可见', () => {
+      const st = gate.stats();
+      assert.ok(st.blocked >= 2, '应记录 ≥2 次拦截（并发+成本配额）');
+      assert.ok(st.settled >= 1, '应有结算记录');
+      assert.ok(Array.isArray(st.blocked_by_reason));
+    });
+
+    await t('D2-2: HTTP —— admin 对账/统计接口 + 非管理员拒绝 + 设置成本配额与并发上限', async () => {
+      const express = require('express');
+      const billingRouter = require('../src-server/routes/billing');
+      db.prepare("INSERT INTO users (username,password,nickname,role,status,must_change_pwd,created_at) VALUES ('d22admin','x','Ad','admin',1,0,datetime('now','localtime'))").run();
+      const ua = db.prepare("SELECT id FROM users WHERE username='d22admin'").get();
+      const tAdmin = sign({ uid: ua.id, exp: Date.now() + 3600000 });
+      const ub = db.prepare("SELECT id FROM users WHERE username='d22a'").get();
+      const tUser = sign({ uid: ub.id, exp: Date.now() + 3600000 });
+      const app = express(); app.use(express.json()); app.use('/api/billing', billingRouter);
+      let server; await new Promise(r => { server = app.listen(0, '127.0.0.1', r); });
+      const base = `http://127.0.0.1:${server.address().port}`;
+      try {
+        const ok = await (await fetch(base + '/api/billing/reconcile?month=2099-01', { headers: { authorization: 'Bearer ' + tAdmin } })).json();
+        assert.strictEqual(ok.code, 0);
+        assert.strictEqual(ok.data.items.length, 2);
+        assert.strictEqual(ok.data.total.balanced, true);
+        const denied = await (await fetch(base + '/api/billing/reconcile', { headers: { authorization: 'Bearer ' + tUser } })).json();
+        assert.notStrictEqual(denied.code, 0, '非管理员应被拒');
+        const st = await (await fetch(base + '/api/billing/stats', { headers: { authorization: 'Bearer ' + tAdmin } })).json();
+        assert.strictEqual(st.code, 0);
+        const put = await (await fetch(base + '/api/billing/users/d22a', { method: 'PUT', headers: { 'Content-Type': 'application/json', authorization: 'Bearer ' + tAdmin }, body: JSON.stringify({ cost_quota: 12.5, max_concurrency: 3 }) })).json();
+        assert.strictEqual(put.code, 0);
+        const u = db.prepare("SELECT cost_quota, max_concurrency FROM users WHERE username='d22a'").get();
+        assert.strictEqual(u.cost_quota, 12.5);
+        assert.strictEqual(u.max_concurrency, 3);
+      } finally { server.close(); }
+    });
+  }
+
   try { db.close(); } catch { }
   fs.rmSync(process.env.AGENT_DATA_DIR, { recursive: true, force: true });
 

@@ -2590,4 +2590,39 @@ agent-platform/
 - 浏览器端到端实测（临时 3971 端口 + 隔离库）：登记仓库 → 建索引（3 文件/4 符号/5 块/ready）→ 检索 `greetUser`/`addNumbers` 符号排第一（多通道徽章 + 命中词高亮）→ 查看文件弹窗 → 提议补丁（diff 预览 +1 -1）→ 确认应用（磁盘文件确实改写、补丁 `applied`、生成备份）→ 一键回滚（磁盘文件还原、补丁 `rolled_back`）；控制台 0 错误，排版正常。
 - 已知边界（V1）：索引与检索在单个仓库内存范围内（超大仓候选上限 5 万块）；语义通道为本地哈希向量（未接外部 embedding 模型）；补丁为「查找替换」式而非通用 unified-diff 应用；`deps`/多文件批量补丁留待后续迭代。
 
+### D2-2 计费用量感知闭环 V1（2026-11-21）
+
+在既有「单价表 `providers.model_price` + `billing.js` 成本归因 + `quota.js` 配额」之上，补上**预检—预留—结算三段式闸门 + 用户级并发上限 + 单价×用量对账页**。**支付可晚接，账先算准。**
+
+**① 闸门内核（`src-server/lib/billing-gate.js`，纯逻辑零依赖）**
+- `precheck`：模型调用前依次查 **Token 配额 → 成本配额（`users.cost_quota` 元/月）→ 并发上限（`users.max_concurrency`）**，任一命中即拒绝并落 `blocked` 台账（不放行）；放行则写 `held` 预留（`billing_holds`）。
+- `settle`：记账点按**真实 prompt/completion tokens × 真实单价**精确结算，`金额 = computeCost(...)`，无任何估算性加减 → **扣费误差为 0**；结算幂等（重复调用返回首次结果，不重复计数）。
+- `release`：异常/中断时幂等回滚预留（仅对 `held` 生效）。
+- **用户级并发上限**：以 `billing_holds` 中 `status='held'` 的行数计活跃并发；`held` 超 10 分钟 TTL 视为僵尸自动回收（`reapStale`），避免进程崩溃泄漏并发名额。
+- `reconcile`：按「单价 × 用量 = 应收」逐模型核验——对 `usage_records` 每行用 `meta` 里的**单价快照**重算应收，`diff = 账面 − 应收`（应为 0，`balanced` 标记）。
+- `stats`：闸门统计（拦截/活跃/结算计数 + 拦截原因分布 + 按用户活跃并发）。
+
+**② 接口（`src-server/routes/billing.js`，JWT）**
+- `GET /api/billing/reconcile?month=YYYY-MM`（adminOnly）：对账报表（items/total/gate）。
+- `GET /api/billing/holds?limit=`（adminOnly）：预留台账明细；`GET /api/billing/stats?month=`（adminOnly）：闸门统计。
+- `GET /api/billing/my`（auth）：本人成本配额/并发上限/活跃并发/本月成本。
+- `PUT /api/billing/users/:username`（adminOnly）：设置 `cost_quota` / `max_concurrency`（0=不限，写 `op_logs` 审计）。
+
+**③ 主链路接入（`src-server/routes/chat.js` 的 `POST /chat/stream`）**
+- 入口（Token 配额检查之后）`precheck` → 命中即 `blocked` SSE + `计费拦截` 审计；成功持有预留句柄。
+- 记账点 `settle`（与成本归因同基数）；`res.on('close')`（客户端中止）与 `try/finally`（异常收尾）均 `release` 未结算预留——**结算后置空句柄，回滚无副作用**。
+
+**④ 数据（`src-server/db.js` 内联建表 + `src-server/lib/migrate.js` 迁移 id 86–88）**
+- `billing_holds`（预留/结算/回滚/拦截台账，`request_id` 唯一）+ 索引；`users.cost_quota`（元/月）、`users.max_concurrency`（0=不限）。
+
+**⑤ 前端（`public/js/admin/quota.js`）**
+- 「用量与配额」页新增 **🧮 计费对账（单价 × 用量 = 应收）** 卡片：月份选择 + 应收/账面/对账结果（账实一致 ✓）/闸门四统计 + 逐模型表（调用、输入/输出 tokens、单价、应收、账面、**误差**）。
+- 「设置配额」弹窗新增 **成本配额（元/月）** 与 **并发上限** 两个字段；`GET /quota/report` 回传两列。`public/sw.js` bump `SW_VERSION` → `d2.2-v1`。
+
+### 验证
+- `npm test` 冒烟 **549/0 全绿**（540 基线 + 9 条新增 D2-2 用例：库迁移就位、三段式 held→精确结算→幂等、并发上限拦截与释放放行、release 幂等、成本配额拦截、Token 配额拦截、对账逐模型账实一致、闸门统计、HTTP 对账/统计/非管理员拒绝/设置参数）。
+- 浏览器端到端实测（临时 3975 端口 + 隔离库）：登录（首登强制改密）→ 打开「用量与配额」→ 对账卡片渲染「应收合计 ¥1220 / 账面合计 ¥1220 / 账实一致 ✓」，逐模型表 deepseek-chat（2 次，150k/75k，单价 2/8，应收 ¥900，误差 0）与 glm-4（应收 ¥320，误差 0）；「设置配额」弹窗保存成本配额/并发上限后落库核对一致；实机验证 **成本配额拦截**（¥1220/¥500 → 100% 拦截）与 **并发上限拦截**（上限 2，第 3 个请求拦截 `concurrency`）；控制台 0 错误，排版正常。
+- 已知边界（V1）：闸门接入点为 `/chat/stream` 主链路（断点续跑 `resume`、分享页、开放 API、调度等走既有记账，后续可平移到闸门）；单价缺失（未配置 `model_price`）时成本记 0 并标 `priced:false`，对账列「未定价」；并发计数为进程内单库口径（多副本部署时每副本各自计）。
+- 支付渠道/账单结算留待后续迭代（D 系列口径：账先算准）。
+
 > AI生成

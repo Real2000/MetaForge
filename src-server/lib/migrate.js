@@ -338,6 +338,24 @@ const ALL_MIGRATIONS = [
     status TEXT DEFAULT 'active',
     created_at TEXT
   );` },
+  // === D2-2 计费用量感知闭环（2026-11-21）===
+  { id: 86, name: 'billing_holds - 计费预检预留台账', createSql: `CREATE TABLE IF NOT EXISTS billing_holds (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id TEXT NOT NULL UNIQUE,
+    username TEXT NOT NULL,
+    model TEXT DEFAULT '',
+    provider TEXT DEFAULT '',
+    est_tokens INTEGER DEFAULT 0,
+    actual_tokens INTEGER DEFAULT 0,
+    est_cost REAL DEFAULT 0,
+    actual_cost REAL DEFAULT 0,
+    status TEXT DEFAULT 'held',
+    reason TEXT DEFAULT '',
+    created_at TEXT,
+    settled_at TEXT
+  );` },
+  { id: 87, name: 'users.cost_quota - 成本配额（元/月，0=不限）', table: 'users', column: 'cost_quota', def: 'REAL DEFAULT 0' },
+  { id: 88, name: 'users.max_concurrency - 用户级并发上限（0=不限）', table: 'users', column: 'max_concurrency', def: 'INTEGER DEFAULT 0' },
 ];
 
 module.exports = {

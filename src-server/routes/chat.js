@@ -13,6 +13,7 @@ const { buildTools, runTool, loadMcpTools, toolRiskOf, AGENT_TOOL_DENY } = requi
 const skills = require('../lib/skills');
 const { checkQuota, addUsage } = require('../lib/quota');
 const { recordModelUsage } = require('../lib/billing'); // U1-6：主链路成本归因记账
+const billingGate = require('../lib/billing-gate'); // D2-2：计费预检—预留—结算闸门
 const { parseSkillMentions, parseAgentMentions } = require('../lib/skill-mention');
 const { canView } = require('../lib/agent-access');
 const { finishExternalTurn } = require('../lib/chat-sink'); // P5.33：外部/技能链路统一收尾（唯一记账/落库/审计点）
@@ -632,9 +633,21 @@ router.post('/stream', async (req, res) => {
   let clientClosed = false;
   const abortCleanups = [];
   const ac = new AbortController();
+  // D2-2：本请求的计费预留句柄——结算置 gateSettled；异常/中断由 releaseGate 幂等回滚
+  let gateId = null, gateSettled = false;
+  const releaseGate = (reason) => {
+    if (gateId && !gateSettled) { try { billingGate.release(gateId, reason); } catch { /* 回滚失败不阻断 */ } }
+    gateId = null;
+  };
+  const settleGate = ({ promptTokens, completionTokens, model, provider }) => {
+    if (!gateId) return;
+    try { billingGate.settle({ request_id: gateId, promptTokens, completionTokens, model, provider }); } catch { /* 结算失败不阻断 */ }
+    gateSettled = true; gateId = null;
+  };
   res.on('close', () => {
     if (res.writableEnded) return; // 正常结束（已 res.end）后的连接关闭不算中断
     clientClosed = true;
+    releaseGate('client_aborted'); // D2-2：客户端中止——未结算的预留即刻回滚（释放并发名额）
     try { ac.abort(); } catch { }
     while (abortCleanups.length) { try { abortCleanups.shift()(); } catch { } }
   });
@@ -649,6 +662,16 @@ router.post('/stream', async (req, res) => {
         .run(req.user.username, '配额拦截', 'Token 配额已耗尽', req.ip, now());
       return res.end();
     }
+
+    // 0b. D2-2 计费预检：并发上限 + 成本配额（在 Token 配额之上再兜一层），命中即拦截并落 blocked 台账
+    const gate = billingGate.precheck({ username: req.user.username, model: model || '', provider: '', promptText: input });
+    if (!gate.ok) {
+      send('blocked', { msg: gate.reason });
+      db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
+        .run(req.user.username, '计费拦截', `${gate.code}：${gate.reason}`, req.ip, now());
+      return res.end();
+    }
+    gateId = gate.request_id; // 预留成功——后续 settle 结算 / release 回滚
 
     // 1. 输入敏感词
     const inCheck = check(input, 'input');
@@ -1407,6 +1430,8 @@ router.post('/stream', async (req, res) => {
     const msgInfo = db.prepare('INSERT INTO messages (session_id,role,content,tokens,created_at) VALUES (?,?,?,?,?)')
       .run(session_id, 'assistant', outMasked, tokens, now());
     addUsage(req.user.username, tokens); // P2 配额记账（本地模型链路）
+    // D2-2 计费结算：按真实用量与单价精确结算预留（幂等；与成本归因同基数）
+    settleGate({ promptTokens: Math.ceil(promptChars * 0.6), completionTokens: tokens, model: genMeta?.model || model || agent?.model || 'default', provider: genMeta?.provider });
     // U1-6 成本归因（主链路）：按真实单价计成本；拆分基数与既有口径一致（输入按 promptChars 估算、输出按 tokens）
     try {
       recordModelUsage({
@@ -1473,6 +1498,8 @@ router.post('/stream', async (req, res) => {
       }
     } catch { /* 检查点维护失败不影响错误上报 */ }
     send('error', { msg: '对话服务异常：' + e.message });
+  } finally {
+    releaseGate('unsettled'); // D2-2：未走到结算点即回滚预留（结算后 gateId 已置空，此处无副作用）
   }
   res.end();
 });

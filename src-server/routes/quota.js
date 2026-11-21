@@ -18,13 +18,14 @@ router.get('/my', (req, res) => {
 });
 
 router.get('/report', adminOnly, (req, res) => {
-  const users = db.prepare(`SELECT u.id, u.username, u.nickname, u.dept, u.quota_total, u.quota_used, u.status FROM users u ORDER BY u.quota_used DESC`).all();
+  const users = db.prepare(`SELECT u.id, u.username, u.nickname, u.dept, u.quota_total, u.quota_used, u.cost_quota, u.max_concurrency, u.status FROM users u ORDER BY u.quota_used DESC`).all();
   const rows = users.map(u => {
     const q = quotaOf(u.username);
     return {
       username: u.username, nickname: u.nickname, dept: u.dept, status: u.status,
       quota_total: q.total, quota_used: q.used, remaining: q.remaining === Infinity ? -1 : q.remaining,
       percent: q.percent, unlimited: q.unlimited,
+      cost_quota: u.cost_quota || 0, max_concurrency: u.max_concurrency || 0,
     };
   });
   // 全平台汇总

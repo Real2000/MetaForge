@@ -121,6 +121,7 @@ app.use('/api/wf-templates', require('./src-server/routes/wf-templates')); // P5
 app.use('/api/notify', require('./src-server/routes/notify'));
 // 用量报表与配额管理（P2）
 app.use('/api/quota', require('./src-server/routes/quota'));
+app.use('/api/billing', require('./src-server/routes/billing')); // D2-2 计费用量感知闭环（预检/预留/结算/对账）
 // 用户自有模型源（P3）：自带 Key 接入个人 OpenAI 兼容服务，仅本人可见可用
 app.use('/api/usermodels', require('./src-server/routes/usermodels'));
 app.use('/api/tool-keys', require('./src-server/routes/tool-keys')); // P3-2：用户级工具 API Key（weather/translate 等，加密落盘掩码回显）

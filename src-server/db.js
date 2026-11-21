@@ -1349,6 +1349,26 @@ db.exec(`CREATE TABLE IF NOT EXISTS code_patch_backups (
   status TEXT DEFAULT 'active',
   created_at TEXT
 );`);
+// D2-2 计费用量感知闭环：billing_holds 预留/结算台账（预检 held → 结算 settled / 回滚 released / 拦截 blocked）
+db.exec(`CREATE TABLE IF NOT EXISTS billing_holds (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  request_id TEXT NOT NULL UNIQUE,
+  username TEXT NOT NULL,
+  model TEXT DEFAULT '',
+  provider TEXT DEFAULT '',
+  est_tokens INTEGER DEFAULT 0,
+  actual_tokens INTEGER DEFAULT 0,
+  est_cost REAL DEFAULT 0,
+  actual_cost REAL DEFAULT 0,
+  status TEXT DEFAULT 'held',
+  reason TEXT DEFAULT '',
+  created_at TEXT,
+  settled_at TEXT
+);`);
+db.exec('CREATE INDEX IF NOT EXISTS idx_bh_user_status ON billing_holds(username, status);');
+db.exec('CREATE INDEX IF NOT EXISTS idx_bh_created ON billing_holds(created_at);');
+db.exec('CREATE INDEX IF NOT EXISTS idx_bh_status ON billing_holds(status);');
+
 // 意见反馈表（2026-10-20 帮助体系）：用户提交 → 管理员处理（回复）→ 站内信闭环通知
 // type: bug/suggest/consult；status: pending 待处理 / processed 已处理
 db.exec(`CREATE TABLE IF NOT EXISTS feedbacks (
