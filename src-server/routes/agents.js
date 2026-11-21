@@ -607,6 +607,9 @@ router.post('/:id/publish', (req, res) => {
           .run(`新智能体上架：${old.name}`, `「${old.name}」已发布到广场${record ? '——' + record : ''}，点击前往使用。`, 'agent_publish', `#/square`, now());
       }
     }
+    // D3-4 评测体系：发布时自动采集一条可对比基线（复用该智能体最近评测集结果，无则回退真实遥测；
+    // 同步 DB 聚合、零额外模型调用，fire-and-forget 不阻塞发布响应）。canvas 模式对齐发布历史版本号。
+    try { require('../lib/eval-suite').autoCaptureOnPublish(old, snapSql ? version : null, req.user); } catch { /* 基线采集失败不影响发布 */ }
   } else {
     db.prepare(`UPDATE agents SET status='draft', updated_at=datetime('now','localtime') WHERE id=?`).run(old.id);
   }

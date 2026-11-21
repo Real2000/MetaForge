@@ -2167,6 +2167,27 @@ db.exec(`CREATE TABLE IF NOT EXISTS sandbox_snapshots (
   created_by TEXT DEFAULT '',
   created_at TEXT
 );`);
+// === D3-4 评测体系 V1（2026-11-21）：发布基线（任务成功率/步数/人工干预率，同套件可对比）===
+db.exec(`CREATE TABLE IF NOT EXISTS eval_baselines (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  suite TEXT NOT NULL,                    -- 套件名（智能体名 / kb 名 / 'swe-bench-lite'）
+  suite_type TEXT DEFAULT 'agent',        -- agent | kb | builtin
+  ref_id INTEGER DEFAULT NULL,            -- agent_id / kb_id / evaluation_id
+  label TEXT DEFAULT '',                  -- 发布标签（如 'XX v3 发布'）
+  agent_version INTEGER DEFAULT NULL,     -- 关联 agent_publish_history.version
+  total INTEGER DEFAULT 0,
+  passed INTEGER DEFAULT 0,
+  success_rate REAL DEFAULT 0,            -- 任务成功率 %
+  avg_steps REAL DEFAULT 0,               -- 平均步数
+  intervention_rate REAL DEFAULT 0,       -- 人工干预率 %
+  meets_success INTEGER DEFAULT 0,        -- 是否达成功率验收线
+  meets_intervention INTEGER DEFAULT 0,   -- 是否达干预率验收线
+  cases TEXT DEFAULT '[]',                -- 用例明细 JSON [{id,passed,score,steps,intervened,note}]
+  created_by TEXT DEFAULT '',
+  created_at TEXT
+);`);
+db.exec('CREATE INDEX IF NOT EXISTS idx_eval_baselines_suite ON eval_baselines(suite, suite_type, id DESC);');
+db.exec('CREATE INDEX IF NOT EXISTS idx_eval_baselines_ref ON eval_baselines(ref_id, agent_version);');
 // P1-14 HITL 五态审批：pending → approved | rejected | expired；批准且执行完 → executed
 db.exec(`CREATE TABLE IF NOT EXISTS tool_approvals (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

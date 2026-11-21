@@ -2770,4 +2770,21 @@ R5 远期生态首项。**先做 3D 资产生成与导出（新增资产类型 +
 - 实测：冷启动 ~70ms（远低于 3s 验收线）；隔离自检三项全过、越权 0 例；快照激活后新工作进程目录含快照文件。
 - 已知边界（V1）：池管理为**单进程内**（未做跨实例共享池/分布式调度）；快照为**整目录复制**（未做增量/写时复制，源目录 ≤ 50MB）；配额粒度按**租户=用户名**（未接空间/部门维度）；预热进程为空闲 TTL 60s 回收、全局空闲上限 8；执行仍为 node 单运行时（未扩多语言/容器运行时）。
 
+## D3-4 评测体系 V1（2026-11-21）
+
+**目标**：把「智能体测评 + 知识库评测回归」升级为**可对比的发布基线**体系——补**任务成功率、步数、人工干预率**三项核心指标，提供 SWE-bench-lite 接入，验收「每次发布有可对比基线」。
+
+**实现（零新依赖）**
+- 评测内核 `src-server/lib/eval-suite.js`：纯逻辑（`normalizeCase` 用例归一、`stepsFromTools` 从 `tool_calls` 推导步数、`computeMetrics` 三项指标 + 达标判定、`diffBaseline`/`compareVerdict` 与上一条基线对比「成功率不降且干预率不升=无回退」、`sweBenchLiteToCases` 把 SWE-bench-lite instance 按「通过测试数/FAIL_TO_PASS 总数」判分）与有状态基线管理（`captureFromTelemetry` 真实遥测聚合、`createBaseline`/`listBaselines`/`baselineDetail`/`overview`/`deleteBaseline`/`releaseBaselines`）分离。
+- **指标口径**：任务成功率 = 通过用例数/总数（单用例得分 ≥ 0.6 视为通过，验收 ≥ 70%）；平均步数 = 每轮工具调用次数均值；人工干预率 = 需人工介入用例占比（安全阻断/低质/人工接管，验收 ≤ 20%）。
+- **发布即基线**：`autoCaptureOnPublish` 在智能体发布分支 fire-and-forget 调用——优先复用该智能体最近一次评测集结果，无则回退真实遥测（`messages.solved` 判成败 + `chat_traces.tool_calls/blocked` 提步数与干预），零额外模型调用，canvas 模式对齐发布历史版本号 → 每次发布都有一条可对比基线。
+- 数据层：新增 `eval_baselines` 表（db.js 内联建表 + 迁移 107，含成功率/步数/干预率/达标位/用例明细 + 按 suite、按 ref_id+version 双索引）。
+- 路由 `src-server/routes/eval.js`：`GET /config`（口径 + 模板）、`GET /suites`（内置基准 + 既有评测集）、`GET /template/swe-bench-lite`、`POST /import/swe-bench-lite`（实例→内部用例）、`POST /baselines`（管理员采集）、`GET /baselines`、`GET /baselines/:id`、`DELETE /baselines/:id`（管理员）、`GET /metrics`（各套件最新基线达标总览）、`GET /releases/:agentId`（发布历史关联基线）。
+- 新页 `public/js/admin/eval.js`「🧪 评测体系」（路由 `#/admin/eval` + 后台导航）：指标总览（成功率/步数/干预率达标卡 + 回退数）+ 采集发布基线（套件/标签/遥测或实测用例数据源）+ SWE-bench-lite 导入预览 + 发布历史关联基线 + 基线记录表（含对比与「无回退/回退」标）。
+- `public/sw.js` bump `SW_VERSION` → `d3.4-v1`。
+
+**验证（D3-4）**
+- `npm test` 冒烟 **578/0 全绿**（573 基线 + 5 条新增 D3-4 用例：评测内核（用例归一/步数推导/指标计算/SWE-bench-lite 适配）、基线对比（diff/无回退判定）、基线管理（采集/列表对比/详情/总览/删除）、发布基线（遥测聚合 + autoCaptureOnPublish）、HTTP（口径/套件/模板/导入/基线 CRUD/指标/发布关联 + 权限））。
+- 已知边界（V1）：遥测聚合为**近似口径**（trace 以「未被安全阻断≈完成」判通过，与 `messages.solved` 反馈合并；无评测集时的兜底）；任务归类/成功判据为规则与关键词，未接真实 SWE-bench-lite runner（仅提供导入适配）；基线为线性对比（未做多版本趋势图/显著性检验）；基线随发布自动采集，粒度按智能体，未按租户隔离。
+
 > AI生成

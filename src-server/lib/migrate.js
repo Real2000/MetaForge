@@ -433,6 +433,16 @@ const ALL_MIGRATIONS = [
     node_version TEXT DEFAULT '', prelude_hash TEXT DEFAULT '', size_bytes INTEGER DEFAULT 0,
     active INTEGER DEFAULT 0, created_by TEXT DEFAULT '', created_at TEXT
   );` },
+  // === D3-4 评测体系 V1（2026-11-21）===
+  { id: 107, name: 'eval_baselines - 发布基线（成功率/步数/干预率可对比）', table: 'eval_baselines', createSql: `CREATE TABLE IF NOT EXISTS eval_baselines (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    suite TEXT NOT NULL, suite_type TEXT DEFAULT 'agent', ref_id INTEGER DEFAULT NULL,
+    label TEXT DEFAULT '', agent_version INTEGER DEFAULT NULL,
+    total INTEGER DEFAULT 0, passed INTEGER DEFAULT 0,
+    success_rate REAL DEFAULT 0, avg_steps REAL DEFAULT 0, intervention_rate REAL DEFAULT 0,
+    meets_success INTEGER DEFAULT 0, meets_intervention INTEGER DEFAULT 0,
+    cases TEXT DEFAULT '[]', created_by TEXT DEFAULT '', created_at TEXT
+  );` },
 ];
 
 module.exports = {

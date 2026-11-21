@@ -9420,6 +9420,152 @@ print('PY_OK')
     pool.resetPool(); // 收尾：销毁全部空闲预热进程与临时目录
   }
 
+  console.log('【D3-4】评测体系（任务成功率/步数/人工干预率发布基线；SWE-bench-lite 接入）');
+  {
+    const es = require('../src-server/lib/eval-suite');
+
+    await t('D3-4: 评测内核——用例归一/步数推导/指标计算/SWE-bench-lite 适配', async () => {
+      // 步数：tool_calls JSON 数组长度
+      assert.strictEqual(es.stepsFromTools('[{"a":1},{"b":2}]'), 2);
+      assert.strictEqual(es.stepsFromTools('[]'), 0);
+      assert.strictEqual(es.stepsFromTools('bad'), 0);
+      // 用例归一：0~100 分值换算、只给 passed 时补 score
+      assert.deepStrictEqual(es.normalizeCase({ id: 'q', score: 80, steps: 3.6 }).score, 0.8);
+      assert.deepStrictEqual({ p: es.normalizeCase({ passed: true }).score, s: es.normalizeCase({ passed: true }).steps }, { p: 1, s: 0 });
+      assert.strictEqual(es.normalizeCase({ score: 0.3 }).passed, false, '低于阈值不通过');
+      assert.strictEqual(es.normalizeCase({ score: 0.7 }).passed, true);
+      assert.strictEqual(es.casePassed({ score: 0.2 }), false);
+      // 指标：成功率/平均步数/干预率 + 达标判定
+      const m = es.computeMetrics([
+        { score: 1, steps: 2 }, { score: 1, steps: 4 }, { score: 0, steps: 6, intervened: true }, { score: 0.8, steps: 0 },
+      ]);
+      assert.strictEqual(m.total, 4); assert.strictEqual(m.passed, 3);
+      assert.strictEqual(m.successRate, 75); assert.strictEqual(m.avgSteps, 3); assert.strictEqual(m.interventionRate, 25);
+      assert.strictEqual(m.meetsSuccess, true, '75% ≥ 70%'); assert.strictEqual(m.meetsIntervention, false, '25% > 20%');
+      assert.strictEqual(es.computeMetrics([]).successRate, 0);
+      // SWE-bench-lite：通过测试数 / FAIL_TO_PASS 总数 = 得分
+      const cases = es.sweBenchLiteToCases([
+        { instance_id: 'a-1', FAIL_TO_PASS: ['t1', 't2'], passed_tests: 2, steps: 5 },
+        { instance_id: 'a-2', FAIL_TO_PASS: ['t1'], passed_tests: 0 },
+        { instance_id: 'a-3', resolved: true },
+      ]);
+      assert.strictEqual(cases[0].score, 1); assert.strictEqual(cases[0].passed, true); assert.strictEqual(cases[0].steps, 5);
+      assert.strictEqual(cases[1].passed, false);
+      assert.strictEqual(cases[2].passed, true, 'resolved=true 视为通过');
+      assert.ok(es.sweBenchLiteTemplate().sample.length === 1 && es.SUITE_TEMPLATES.some(s => s.name === 'swe-bench-lite'));
+    });
+
+    await t('D3-4: 基线对比——diff/无回退判定（成功率降或干预率升 = 回退）', async () => {
+      const prev = { successRate: 80, avgSteps: 4, interventionRate: 10 };
+      const cur = { successRate: 75, avgSteps: 3, interventionRate: 5 };
+      const d = es.diffBaseline(cur, prev);
+      assert.strictEqual(d.successRate.delta, -5); assert.strictEqual(d.successRate.trend, 'down');
+      assert.strictEqual(d.interventionRate.delta, -5); assert.strictEqual(d.interventionRate.trend, 'down');
+      assert.strictEqual(es.compareVerdict(d).ok, false, '成功率下降 → 回退');
+      assert.ok(es.compareVerdict(d).reasons.some(r => /成功率下降/.test(r)));
+      // 持平：±0.1 内不算变化
+      assert.strictEqual(es.compareVerdict(es.diffBaseline({ successRate: 80, avgSteps: 4, interventionRate: 10 }, prev)).ok, true);
+      // 首次无基准
+      assert.strictEqual(es.compareVerdict(es.diffBaseline(cur, null)).first, true);
+      // 干预率上升 → 回退
+      assert.strictEqual(es.compareVerdict(es.diffBaseline({ successRate: 90, avgSteps: 4, interventionRate: 30 }, prev)).ok, false);
+    });
+
+    await t('D3-4: 基线管理——采集/列表对比/详情/总览/删除', async () => {
+      db.prepare('DELETE FROM eval_baselines').run();
+      const b1 = es.createBaseline({ suite: 'd34-suite', suite_type: 'builtin', label: 'v1', cases: [{ score: 1 }, { score: 0 }, { score: 1 }, { score: 1 }], created_by: 'd34adm' });
+      assert.strictEqual(b1.metrics.successRate, 75); assert.strictEqual(b1.verdict.first, true);
+      const b2 = es.createBaseline({ suite: 'd34-suite', suite_type: 'builtin', label: 'v2', cases: [{ score: 1 }, { score: 1 }, { score: 1 }, { score: 1 }], created_by: 'd34adm' });
+      assert.strictEqual(b2.metrics.successRate, 100);
+      assert.strictEqual(b2.diff.successRate.delta, 25); assert.strictEqual(b2.verdict.ok, true, '成功率上升=无回退');
+      assert.strictEqual(b2.prev_id, b1.id);
+      const list = es.listBaselines({ suite: 'd34-suite' });
+      assert.strictEqual(list.length, 2); assert.strictEqual(list[0].id, b2.id, '最新在前');
+      const det = es.baselineDetail(b2.id);
+      assert.strictEqual(det.cases.length, 4);
+      const ov = es.overview();
+      assert.ok(ov.suiteCount >= 1 && ov.total >= 2 && ov.regressions === 0);
+      assert.strictEqual(es.deleteBaseline(b2.id), true);
+      assert.strictEqual(es.baselineDetail(b2.id), null);
+      assert.strictEqual(es.deleteBaseline(999999), false);
+    });
+
+    await t('D3-4: 发布基线——遥测聚合 + autoCaptureOnPublish', async () => {
+      db.prepare('DELETE FROM eval_baselines').run();
+      db.prepare("DELETE FROM chat_traces WHERE agent_id=9991").run();
+      db.prepare("INSERT INTO agents (id,name,description,prompt,status,owner,edit_mode,created_at,updated_at) VALUES (9991,'D34专家','d','p','published','d34adm','canvas',datetime('now','localtime'),datetime('now','localtime'))").run();
+      // 造遥测：3 条已反馈消息（2 解决 1 未解决） + 2 条 trace（一条带 2 步、一条 1 步且被阻断）
+      db.prepare("INSERT INTO sessions (id,username,agent_id,title,created_at) VALUES (99910,'d34adm',9991,'s',datetime('now','localtime'))").run();
+      for (const [mid, solved] of [[1, 1], [2, 1], [3, 2]]) {
+        db.prepare("INSERT INTO messages (id,session_id,role,content,rating,solved,created_at) VALUES (?,99910,'assistant','a',0,?,datetime('now','localtime'))").run(99900 + mid, solved);
+      }
+      db.prepare("INSERT INTO chat_traces (agent_id,tool_calls,blocked,created_at) VALUES (9991,'[{\"t\":1},{\"t\":2}]','',datetime('now','localtime'))").run();
+      db.prepare("INSERT INTO chat_traces (agent_id,tool_calls,blocked,created_at) VALUES (9991,'[{\"t\":1}]','危险命令已阻断',datetime('now','localtime'))").run();
+      const cap = es.captureFromTelemetry(9991);
+      assert.strictEqual(cap.cases.length, 5, '3 条反馈 + 2 条 trace');
+      assert.strictEqual(cap.metrics.successRate, 60, '通过 3/5（反馈 2 解决 + 1 条未阻断 trace）');
+      assert.strictEqual(cap.metrics.interventionRate, 20, '1/5 干预（1 条被阻断）');
+      assert.strictEqual(cap.metrics.avgSteps, 0.6, '(2+1)/5');
+      const row = es.autoCaptureOnPublish({ id: 9991, name: 'D34专家' }, 3, { username: 'd34adm' });
+      assert.strictEqual(row.suite_type, 'agent'); assert.strictEqual(row.ref_id, 9991); assert.strictEqual(row.agent_version, 3);
+      assert.strictEqual(row.metrics.successRate, 60);
+      // 发布历史关联基线
+      db.prepare("INSERT INTO agent_publish_history (agent_id,version,workflow,note,nodes,published_by,created_at) VALUES (9991,3,'{}','发布说明',0,'d34adm',datetime('now','localtime'))").run();
+      const rel = es.releaseBaselines(9991);
+      assert.strictEqual(rel[0].version, 3); assert.ok(rel[0].baseline && rel[0].baseline.metrics.successRate === 60);
+    });
+
+    await t('D3-4: HTTP —— 口径/套件/模板/导入/基线 CRUD/指标/发布关联 + 权限', async () => {
+      const express = require('express');
+      const evRouter = require('../src-server/routes/eval');
+      const { sign } = require('../src-server/lib/auth');
+      db.prepare("INSERT INTO users (username,password,nickname,role,status,must_change_pwd,created_at) VALUES ('d34u1','x','U','user',1,0,datetime('now','localtime'))").run();
+      db.prepare("INSERT INTO users (username,password,nickname,role,status,must_change_pwd,created_at) VALUES ('d34adm','x','A','admin',1,0,datetime('now','localtime'))").run();
+      const tok = sign({ uid: db.prepare("SELECT id FROM users WHERE username='d34u1'").get().id, exp: Date.now() + 3600000 });
+      const tAdmin = sign({ uid: db.prepare("SELECT id FROM users WHERE username='d34adm'").get().id, exp: Date.now() + 3600000 });
+      const app = express(); app.use(express.json()); app.use('/api/eval', evRouter);
+      let server; await new Promise(r => { server = app.listen(0, '127.0.0.1', r); });
+      const base = `http://127.0.0.1:${server.address().port}`;
+      const J = async (p, opts, tk) => (await fetch(base + p, { ...(opts || {}), headers: { 'Content-Type': 'application/json', ...(tk ? { authorization: 'Bearer ' + tk } : {}) } })).json();
+      try {
+        assert.strictEqual((await fetch(base + '/api/eval/config')).status, 401, '未认证 401');
+        const cfg = await J('/api/eval/config', {}, tok);
+        assert.strictEqual(cfg.code, 0); assert.strictEqual(cfg.data.successTarget, 70);
+        assert.ok(cfg.data.metrics.some(x => x.key === 'successRate') && cfg.data.templates.some(x => x.name === 'swe-bench-lite'));
+        const suites = await J('/api/eval/suites', {}, tok);
+        assert.ok(suites.data.suites.some(s => s.name === 'swe-bench-lite' && s.builtin));
+        const tpl = await J('/api/eval/template/swe-bench-lite', {}, tok);
+        assert.ok(tpl.data.schema && tpl.data.sample.length === 1);
+        // 导入
+        const imp = await J('/api/eval/import/swe-bench-lite', { method: 'POST', body: JSON.stringify({ instances: [{ instance_id: 'x-1', FAIL_TO_PASS: ['a', 'b'], passed_tests: 1 }] }) }, tok);
+        assert.strictEqual(imp.code, 0); assert.strictEqual(imp.data.cases.length, 1); assert.strictEqual(imp.data.metrics.successRate, 0);
+        assert.strictEqual((await J('/api/eval/import/swe-bench-lite', { method: 'POST', body: JSON.stringify({ instances: [] }) }, tok)).code, 400);
+        // 采集基线（管理员），用例直给
+        const b1 = await J('/api/eval/baselines', { method: 'POST', body: JSON.stringify({ suite: 'd34-http', suite_type: 'builtin', label: 'v1', cases: [{ score: 1 }, { score: 0 }, { score: 1 }] }) }, tAdmin);
+        assert.strictEqual(b1.code, 0); assert.strictEqual(b1.data.metrics.successRate, 66.7);
+        assert.strictEqual((await J('/api/eval/baselines', { method: 'POST', body: JSON.stringify({ suite: 'x', cases: [{ score: 1 }] }) }, tok)).code, 403, '非管理员采集 403');
+        assert.strictEqual((await J('/api/eval/baselines', { method: 'POST', body: JSON.stringify({ suite: '' }) }, tAdmin)).code, 400);
+        // 第二条 → 对比
+        const b2 = await J('/api/eval/baselines', { method: 'POST', body: JSON.stringify({ suite: 'd34-http', suite_type: 'builtin', label: 'v2', cases: [{ score: 1 }, { score: 1 }, { score: 1 }] }) }, tAdmin);
+        assert.strictEqual(b2.data.metrics.successRate, 100); assert.strictEqual(b2.data.diff.successRate.delta, 33.3);
+        // 列表 / 详情 / 指标
+        const list = await J('/api/eval/baselines?suite=d34-http', {}, tok);
+        assert.strictEqual(list.data.length, 2);
+        const det = await J('/api/eval/baselines/' + b2.data.id, {}, tok);
+        assert.strictEqual(det.data.cases.length, 3);
+        const mtx = await J('/api/eval/metrics', {}, tok);
+        assert.ok(mtx.data.suiteCount >= 1 && mtx.data.total >= 2);
+        // 删除：非管理员 403，管理员 0
+        assert.strictEqual((await J('/api/eval/baselines/' + b2.data.id, { method: 'DELETE' }, tok)).code, 403);
+        assert.strictEqual((await J('/api/eval/baselines/' + b2.data.id, { method: 'DELETE' }, tAdmin)).code, 0);
+        assert.strictEqual((await J('/api/eval/baselines/999999', {}, tok)).code, 404);
+        // 发布关联
+        const rel = await J('/api/eval/releases/9991', {}, tok);
+        assert.ok(Array.isArray(rel.data));
+      } finally { server.close(); }
+    });
+  }
+
   try { db.close(); } catch { }
   fs.rmSync(process.env.AGENT_DATA_DIR, { recursive: true, force: true });
   console.log('\n———————————————');
