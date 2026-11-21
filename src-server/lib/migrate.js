@@ -284,6 +284,60 @@ const ALL_MIGRATIONS = [
     stderr_excerpt TEXT DEFAULT '',
     created_at TEXT
   );` },
+  // === D2-1 代码索引与仓库语义检索（2026-11-21）===
+  { id: 82, name: 'code_repos - 可检索代码仓库', createSql: `CREATE TABLE IF NOT EXISTS code_repos (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner TEXT NOT NULL,
+    name TEXT NOT NULL,
+    root_path TEXT NOT NULL,
+    description TEXT DEFAULT '',
+    status TEXT DEFAULT 'new',
+    file_count INTEGER DEFAULT 0,
+    symbol_count INTEGER DEFAULT 0,
+    chunk_count INTEGER DEFAULT 0,
+    error TEXT DEFAULT '',
+    indexed_at TEXT,
+    created_at TEXT
+  );` },
+  { id: 83, name: 'code_index - 函数/类切片索引', createSql: `CREATE TABLE IF NOT EXISTS code_index (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo_id INTEGER NOT NULL,
+    owner TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    lang TEXT DEFAULT 'text',
+    chunk_kind TEXT DEFAULT 'block',
+    symbol_name TEXT DEFAULT '',
+    symbol_parent TEXT DEFAULT '',
+    start_line INTEGER DEFAULT 0,
+    end_line INTEGER DEFAULT 0,
+    content TEXT DEFAULT '',
+    embedding TEXT DEFAULT '',
+    created_at TEXT
+  );` },
+  { id: 84, name: 'code_patches - 补丁提议/应用台账', createSql: `CREATE TABLE IF NOT EXISTS code_patches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo_id INTEGER NOT NULL,
+    owner TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    old_content TEXT DEFAULT '',
+    new_content TEXT DEFAULT '',
+    diff TEXT DEFAULT '',
+    additions INTEGER DEFAULT 0,
+    deletions INTEGER DEFAULT 0,
+    status TEXT DEFAULT 'proposed',
+    created_at TEXT,
+    applied_at TEXT
+  );` },
+  { id: 85, name: 'code_patch_backups - 补丁回滚备份', createSql: `CREATE TABLE IF NOT EXISTS code_patch_backups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo_id INTEGER NOT NULL,
+    owner TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    patch_id INTEGER DEFAULT NULL,
+    content TEXT DEFAULT '',
+    status TEXT DEFAULT 'active',
+    created_at TEXT
+  );` },
 ];
 
 module.exports = {

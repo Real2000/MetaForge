@@ -23,6 +23,7 @@ const routes = {
   '/chat': { page: () => import('./front/chat.js'), layout: 'chat', title: '智能体对话' },
   '/knowledge': { page: () => import('./front/knowledge.js'), layout: 'front', title: '知识库' },
   '/creation': { page: () => import('./front/creation.js'), layout: 'front', title: '创作资产' }, // D1-3 项目/素材库/分镜三件套
+  '/code': { page: () => import('./front/code.js'), layout: 'front', title: '代码检索' }, // D2-1 仓库索引与语义检索
   '/tasks': { page: () => import('./front/tasks.js'), layout: 'front', title: '任务管理' },
   '/help': { page: () => import('./front/help.js'), layout: 'front', title: '帮助中心' },
   '/pricing': { page: () => import('./front/pricing.js'), layout: 'none', title: '套餐与定价', public: true },
@@ -59,6 +60,7 @@ const frontNav = [
   { href: '#/models', ic: '🧩', label: '我的模型' },
   { href: '#/knowledge', ic: '📚', label: '知识库' },
   { href: '#/creation', ic: '🎨', label: '创作资产' }, // D1-3
+  { href: '#/code', ic: '🔎', label: '代码检索' }, // D2-1
   { href: '#/tasks', ic: '⏰', label: '任务管理' },
   { href: '#/devices', ic: '🖥️', label: '我的设备' },
   { href: '#/insights', ic: '📈', label: '使用分析' },

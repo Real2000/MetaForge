@@ -11,7 +11,7 @@
  *   （即任何会被 STATIC_CACHE 缓存的资源变更），发版前必须 bump SW_VERSION，否则用户端拿旧缓存。
  * 提交前自检：git diff --name-only HEAD~1 | grep -E '^public/(js|css|vendor|sw\.js|index\.html)' 命中则必须改本常量。
  */
-const SW_VERSION = 'u0.2-v1'; // 2026-11-19 bump：U0-2 实时语音对话（voice-realtime.js + chat-component 实时语音入口 + app.css 面板样式）
+const SW_VERSION = 'd2.1-v1'; // 2026-11-21 bump：D2-1 代码索引与仓库语义检索（front/code.js + app.js 路由/导航）
 const STATIC_CACHE = `ap-static-${SW_VERSION}`;
 const NEVER_CACHE = [/^\/api\//, /\/sse/, /\/stream/, /\/files\/download/, /\?[^\s]*download/];
 

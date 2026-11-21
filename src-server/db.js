@@ -1290,6 +1290,65 @@ db.exec(`CREATE TABLE IF NOT EXISTS skill_runs (
   stderr_excerpt TEXT DEFAULT '',
   created_at TEXT
 );`);
+// === D2-1 代码索引与仓库语义检索（2026-11-21）===
+// code_repos：登记的可检索代码仓库（服务器本地目录，root_path 为 realpath 后的绝对路径）
+db.exec(`CREATE TABLE IF NOT EXISTS code_repos (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  owner TEXT NOT NULL,
+  name TEXT NOT NULL,
+  root_path TEXT NOT NULL,
+  description TEXT DEFAULT '',
+  status TEXT DEFAULT 'new',
+  file_count INTEGER DEFAULT 0,
+  symbol_count INTEGER DEFAULT 0,
+  chunk_count INTEGER DEFAULT 0,
+  error TEXT DEFAULT '',
+  indexed_at TEXT,
+  created_at TEXT
+);`);
+// code_index：按「函数/类」切片的索引块（chunk_kind：function/class/method/header/block）
+db.exec(`CREATE TABLE IF NOT EXISTS code_index (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  repo_id INTEGER NOT NULL,
+  owner TEXT NOT NULL,
+  file_path TEXT NOT NULL,
+  lang TEXT DEFAULT 'text',
+  chunk_kind TEXT DEFAULT 'block',
+  symbol_name TEXT DEFAULT '',
+  symbol_parent TEXT DEFAULT '',
+  start_line INTEGER DEFAULT 0,
+  end_line INTEGER DEFAULT 0,
+  content TEXT DEFAULT '',
+  embedding TEXT DEFAULT '',
+  created_at TEXT
+);`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_code_index_repo ON code_index (repo_id);`);
+// code_patches：补丁提议（只读分析 → propose 生成 diff 待确认；apply 后才写盘）
+db.exec(`CREATE TABLE IF NOT EXISTS code_patches (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  repo_id INTEGER NOT NULL,
+  owner TEXT NOT NULL,
+  file_path TEXT NOT NULL,
+  old_content TEXT DEFAULT '',
+  new_content TEXT DEFAULT '',
+  diff TEXT DEFAULT '',
+  additions INTEGER DEFAULT 0,
+  deletions INTEGER DEFAULT 0,
+  status TEXT DEFAULT 'proposed',
+  created_at TEXT,
+  applied_at TEXT
+);`);
+// code_patch_backups：补丁应用前的原文备份（一键回滚用）
+db.exec(`CREATE TABLE IF NOT EXISTS code_patch_backups (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  repo_id INTEGER NOT NULL,
+  owner TEXT NOT NULL,
+  file_path TEXT NOT NULL,
+  patch_id INTEGER DEFAULT NULL,
+  content TEXT DEFAULT '',
+  status TEXT DEFAULT 'active',
+  created_at TEXT
+);`);
 // 意见反馈表（2026-10-20 帮助体系）：用户提交 → 管理员处理（回复）→ 站内信闭环通知
 // type: bug/suggest/consult；status: pending 待处理 / processed 已处理
 db.exec(`CREATE TABLE IF NOT EXISTS feedbacks (

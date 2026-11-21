@@ -8478,7 +8478,184 @@ print('PY_OK')
     });
   }
 
-  // 收尾：关闭库并清理临时目录
+  console.log('【D2-1】代码索引与仓库语义检索（函数/类切片 / 符号+语义混合检索 / 补丁 propose-apply-rollback）');
+  {
+    const { db } = require('../src-server/db');
+    const ci = require('../src-server/lib/code-index');
+    const csearch = require('../src-server/lib/code-search');
+    const { sign } = require('../src-server/lib/auth');
+    const os = require('os');
+
+    await t('D2-1: 内核 —— 语言识别/目录扫描/符号抽取/代码分词', () => {
+      assert.strictEqual(ci.detectLang('a/b.js'), 'javascript');
+      assert.strictEqual(ci.detectLang('x.py'), 'python');
+      assert.strictEqual(ci.detectLang('Dockerfile'), 'dockerfile');
+      const js = 'function fooBar(){ return 1; }\nclass Baz {\n  methodOne(){ return 2; }\n}\n';
+      const syms = ci.extractSymbols(js, 'javascript').map(s => s.kind + ':' + s.name);
+      assert.ok(syms.includes('function:fooBar'), '应抽到 fooBar');
+      assert.ok(syms.includes('class:Baz'), '应抽到类 Baz');
+      assert.ok(syms.includes('method:methodOne'), '应抽到方法 methodOne');
+      const py = ci.extractSymbols('class Foo:\n    def bar(self):\n        return 1\n', 'python').map(s => s.kind + ':' + s.name);
+      assert.ok(py.includes('method:bar') || py.includes('function:bar'), '类内方法 bar 应被抽到：' + py.join(','));
+      const terms = ci.codeTerms('getUserName_fromAPI');
+      for (const w of ['get', 'user', 'name', 'from', 'api']) assert.ok(terms.includes(w), '代码分词应含 ' + w);
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'd21scan-'));
+      fs.mkdirSync(path.join(tmp, 'node_modules'));
+      fs.writeFileSync(path.join(tmp, 'node_modules', 'x.js'), 'x');
+      fs.mkdirSync(path.join(tmp, 'src'));
+      fs.writeFileSync(path.join(tmp, 'src', 'a.js'), 'function a(){}');
+      fs.writeFileSync(path.join(tmp, 'img.png'), 'x');
+      const files = ci.scanFiles(tmp).sort();
+      assert.ok(files.includes('src/a.js'), '应扫描到源码');
+      assert.ok(!files.some(f => f.includes('node_modules')), '应忽略 node_modules');
+      assert.ok(!files.some(f => f.endsWith('.png')), '应忽略二进制');
+      fs.rmSync(tmp, { recursive: true, force: true });
+    });
+
+    await t('D2-1: 补丁工具 —— 查找替换 + 统一 diff', () => {
+      assert.strictEqual(ci.applyFindReplace('hello world', 'world', 'earth').content, 'hello earth');
+      assert.strictEqual(ci.applyFindReplace('a a', 'a', 'b', true).content, 'b b');
+      assert.strictEqual(ci.applyFindReplace('abc', 'zzz', 'x').ok, false);
+      const d = ci.unifiedDiff('a\nb\nc', 'a\nB\nc');
+      assert.strictEqual(d.additions, 1);
+      assert.strictEqual(d.deletions, 1);
+      assert.ok(d.diff.includes('---') && d.diff.includes('+++'));
+    });
+
+    await t('D2-1: db 迁移 —— code_repos/code_index/code_patches/code_patch_backups 就位', () => {
+      for (const tb of ['code_repos', 'code_index', 'code_patches', 'code_patch_backups']) {
+        assert.ok(db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?").get(tb), tb + ' 应存在');
+      }
+    });
+
+    await t('D2-1: 混合检索内核 —— 符号命中最强 + 语义通道可用 + RRF 融合', async () => {
+      const retriever = require('../src-server/lib/retriever');
+      const rows = [
+        { id: 1, repo_id: 1, file_path: 'src/auth.js', lang: 'javascript', chunk_kind: 'function', symbol_name: 'loginUser', symbol_parent: '', start_line: 1, end_line: 3, content: 'function loginUser(name){ return name; }' },
+        { id: 2, repo_id: 1, file_path: 'src/math.js', lang: 'javascript', chunk_kind: 'function', symbol_name: 'addNumbers', symbol_parent: '', start_line: 1, end_line: 3, content: 'function addNumbers(a,b){ return a+b; }' },
+      ];
+      for (const r of rows) r.embedding = 'H:' + JSON.stringify([...retriever.embed(r.content)]);
+      const res = await csearch.search(rows, 'loginUser', 5, { rerankEnabled: false });
+      assert.ok(res.length >= 1, '应有命中');
+      assert.strictEqual(res[0].symbol_name, 'loginUser', '符号精确匹配应排第一');
+      assert.ok(res[0].symbol > 0, '符号通道应命中');
+    });
+
+    await t('D2-1: HTTP 闭环 —— 登记→索引→检索→读文件→补丁 propose/apply/rollback', async () => {
+      const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'd21repo-'));
+      fs.mkdirSync(path.join(repo, 'src'));
+      fs.writeFileSync(path.join(repo, 'src', 'hello.js'), 'function greetUser(name) {\n  return "Hello " + name;\n}\n');
+      fs.writeFileSync(path.join(repo, 'src', 'calc.py'), 'def addNumbers(a, b):\n    return a + b\n');
+      fs.writeFileSync(path.join(repo, 'README.md'), '# demo repo\n');
+      db.prepare("INSERT INTO users (username,password,nickname,role,status,must_change_pwd,created_at) VALUES ('d21','x','D','user',1,0,datetime('now','localtime'))").run();
+      const u = db.prepare("SELECT id FROM users WHERE username='d21'").get();
+      const tok = sign({ uid: u.id, exp: Date.now() + 3600000 });
+      const express = require('express');
+      const codeRouter = require('../src-server/routes/code');
+      const app = express(); app.use(express.json()); app.use('/api/code', codeRouter);
+      let server; await new Promise(r => { server = app.listen(0, '127.0.0.1', r); });
+      const base = `http://127.0.0.1:${server.address().port}`;
+      const H = { 'Content-Type': 'application/json', authorization: 'Bearer ' + tok };
+      const J = async (m, p, b) => (await fetch(base + p, { method: m, headers: H, body: b ? JSON.stringify(b) : undefined })).json();
+      try {
+        const reg = await J('POST', '/api/code/repos', { name: 'demo', root_path: repo });
+        assert.strictEqual(reg.code, 0, '登记应成功：' + reg.msg);
+        const rid = reg.data.id;
+        const idx = await J('POST', `/api/code/repos/${rid}/index`, {});
+        assert.strictEqual(idx.code, 0, '索引应成功');
+        assert.ok(idx.data.symbol_count >= 2, '应至少抽到 2 个符号，实际 ' + idx.data.symbol_count);
+        assert.ok(idx.data.file_count >= 3, '应索引到 3 个文件，实际 ' + idx.data.file_count);
+        const s1 = await J('GET', `/api/code/repos/${rid}/search?q=greetUser&rerank=0`);
+        assert.strictEqual(s1.code, 0);
+        assert.ok(s1.data.results.length >= 1 && s1.data.results[0].symbol_name === 'greetUser', '应按符号命中 greetUser');
+        const rf = await J('GET', `/api/code/repos/${rid}/file?path=` + encodeURIComponent('src/hello.js'));
+        assert.strictEqual(rf.code, 0);
+        assert.ok(rf.data.content.includes('greetUser'));
+        const esc = await J('GET', `/api/code/repos/${rid}/file?path=` + encodeURIComponent('../../etc/passwd'));
+        assert.strictEqual(esc.code, 400, '逃逸路径应被拒');
+        const pr = await J('POST', `/api/code/repos/${rid}/patch/propose`, { path: 'src/hello.js', find: 'Hello ', replace: 'Hi ' });
+        assert.strictEqual(pr.code, 0, '提议应成功：' + pr.msg);
+        assert.ok(pr.data.diff.includes('+') && pr.data.diff.includes('-'), 'diff 应含增删行');
+        const pid = pr.data.patch_id;
+        const before = await J('GET', `/api/code/repos/${rid}/file?path=` + encodeURIComponent('src/hello.js'));
+        assert.ok(before.data.content.includes('Hello '), 'apply 前不应改动文件');
+        const ap = await J('POST', `/api/code/repos/${rid}/patch/${pid}/apply`, {});
+        assert.strictEqual(ap.code, 0, '应用应成功：' + ap.msg);
+        const after = await J('GET', `/api/code/repos/${rid}/file?path=` + encodeURIComponent('src/hello.js'));
+        assert.ok(after.data.content.includes('Hi ') && !after.data.content.includes('Hello '), 'apply 后应写入新内容');
+        const ap2 = await J('POST', `/api/code/repos/${rid}/patch/${pid}/apply`, {});
+        assert.strictEqual(ap2.code, 400, '重复应用应被拒');
+        const rb = await J('POST', `/api/code/repos/${rid}/patch/rollback`, { backup_id: ap.data.backup_id });
+        assert.strictEqual(rb.code, 0, '回滚应成功：' + rb.msg);
+        const restored = await J('GET', `/api/code/repos/${rid}/file?path=` + encodeURIComponent('src/hello.js'));
+        assert.ok(restored.data.content.includes('Hello '), '回滚后应恢复原文');
+        await J('DELETE', `/api/code/repos/${rid}`);
+        assert.strictEqual(db.prepare('SELECT COUNT(*) c FROM code_index WHERE repo_id=?').get(rid).c, 0, '删除应清索引');
+        assert.strictEqual(db.prepare('SELECT COUNT(*) c FROM code_patch_backups WHERE repo_id=?').get(rid).c, 0, '删除应清备份');
+      } finally { server.close(); fs.rmSync(repo, { recursive: true, force: true }); }
+    });
+
+    await t('D2-1: CODE_INDEX_ROOTS 白名单 —— 配置后拒绝白名单外目录', async () => {
+      const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'd21roots-'));
+      const saved = process.env.CODE_INDEX_ROOTS;
+      process.env.CODE_INDEX_ROOTS = '/definitely/not/this/path';
+      try {
+        const express = require('express');
+        const codeRouter = require('../src-server/routes/code');
+        const app = express(); app.use(express.json()); app.use('/api/code', codeRouter);
+        const u = db.prepare("SELECT id FROM users WHERE username='d21'").get();
+        const tok = sign({ uid: u.id, exp: Date.now() + 3600000 });
+        let server; await new Promise(r => { server = app.listen(0, '127.0.0.1', r); });
+        const base = `http://127.0.0.1:${server.address().port}`;
+        try {
+          const r = await (await fetch(base + '/api/code/repos', { method: 'POST', headers: { 'Content-Type': 'application/json', authorization: 'Bearer ' + tok }, body: JSON.stringify({ name: 'x', root_path: repo }) })).json();
+          assert.strictEqual(r.code, 400, '白名单外的目录应被拒');
+        } finally { server.close(); }
+      } finally {
+        if (saved === undefined) delete process.env.CODE_INDEX_ROOTS; else process.env.CODE_INDEX_ROOTS = saved;
+        fs.rmSync(repo, { recursive: true, force: true });
+      }
+    });
+
+    await t('D2-1: 归属隔离 —— 非 owner 不可见/读/写他人仓库（管理员可见）', async () => {
+      const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'd21iso-'));
+      fs.writeFileSync(path.join(repo, 'secret.js'), 'function secretFn(){ return 42; }\n');
+      db.prepare("INSERT INTO users (username,password,nickname,role,status,must_change_pwd,created_at) VALUES ('d21b','x','B','user',1,0,datetime('now','localtime'))").run();
+      const ub = db.prepare("SELECT id FROM users WHERE username='d21b'").get();
+      const tokB = sign({ uid: ub.id, exp: Date.now() + 3600000 });
+      const express = require('express');
+      const codeRouter = require('../src-server/routes/code');
+      const app = express(); app.use(express.json()); app.use('/api/code', codeRouter);
+      let server; await new Promise(r => { server = app.listen(0, '127.0.0.1', r); });
+      const base = `http://127.0.0.1:${server.address().port}`;
+      const HB = { 'Content-Type': 'application/json', authorization: 'Bearer ' + tokB };
+      try {
+        // 由 d21b 自己登记并索引
+        const reg = await (await fetch(base + '/api/code/repos', { method: 'POST', headers: HB, body: JSON.stringify({ name: 'iso', root_path: repo }) })).json();
+        assert.strictEqual(reg.code, 0, '登记应成功：' + reg.msg);
+        const rid = reg.data.id;
+        await (await fetch(base + `/api/code/repos/${rid}/index`, { method: 'POST', headers: HB, body: '{}' })).json();
+        // 另建 d21c 用户，不可见 d21b 的仓库
+        db.prepare("INSERT INTO users (username,password,nickname,role,status,must_change_pwd,created_at) VALUES ('d21c','x','C','user',1,0,datetime('now','localtime'))").run();
+        const uc = db.prepare("SELECT id FROM users WHERE username='d21c'").get();
+        const tokC = sign({ uid: uc.id, exp: Date.now() + 3600000 });
+        const HC = { 'Content-Type': 'application/json', authorization: 'Bearer ' + tokC };
+        const list = await (await fetch(base + '/api/code/repos', { headers: HC })).json();
+        assert.ok(!list.data.some(r => r.id === rid), '列表不应含他人仓库');
+        const get = await (await fetch(base + `/api/code/repos/${rid}`, { headers: HC })).json();
+        assert.strictEqual(get.code, 404, '按 id 读取他人仓库应 404');
+        const rf = await (await fetch(base + `/api/code/repos/${rid}/file?path=` + encodeURIComponent('secret.js'), { headers: HC })).json();
+        assert.strictEqual(rf.code, 404, '越权读文件应被拒');
+        const del = await (await fetch(base + `/api/code/repos/${rid}`, { method: 'DELETE', headers: HC })).json();
+        assert.strictEqual(del.code, 404, '越权删除应被拒');
+        // owner 自己仍可读
+        const own = await (await fetch(base + `/api/code/repos/${rid}/file?path=` + encodeURIComponent('secret.js'), { headers: HB })).json();
+        assert.strictEqual(own.code, 0, 'owner 应可读自己仓库');
+        await (await fetch(base + `/api/code/repos/${rid}`, { method: 'DELETE', headers: HB })).json();
+      } finally { server.close(); fs.rmSync(repo, { recursive: true, force: true }); }
+    });
+  }
+
   try { db.close(); } catch { }
   fs.rmSync(process.env.AGENT_DATA_DIR, { recursive: true, force: true });
 

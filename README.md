@@ -2555,4 +2555,39 @@ agent-platform/
 - 后端内核自检（隔离库）：manifest 校验、哈希/签名验证、密钥掩码回显、运行注入 `key=***` 脱敏、审计落库均通过。
 - 已知边界：安装源 V1 支持内联 manifest 与 http(s) JSON 清单（zip 解包与依赖自动安装留待后续迭代，依赖仅记录不自动装）；签名采用平台密钥（`SKILL_SIGNING_KEY`）HMAC，未签名包允许安装但标记 `verified=0`；运行时 V1 仅 `node`。
 
+---
+
+### D2-1 代码索引与仓库语义检索 V1（2026-11-21）
+
+把「检索」从文档段落级推进到「代码符号级 + 补丁闭环」：登记服务器本地代码仓库 → 按**函数/类切片**建索引 → 只读**符号+关键词+语义三通道混合检索** → 查看源码 → 补丁 propose（dry-run diff）→ 人工确认 apply（写前备份）→ 一键 rollback。
+
+**① 索引内核（`src-server/lib/code-index.js`，纯逻辑零依赖）**
+- `detectLang/scanFiles`：按扩展名+文件名识别 20+ 语言；目录扫描忽略 `.git/node_modules/dist/.venv` 等与二进制、超大（>1MB）文件。
+- `extractSymbols/chunkFile`：JS/TS/Python/Go/Java/Rust 等按「函数/类/方法」切块（括号配平 + Python 缩进定界），其余走行窗兜底；文件头另存概览块。**分片单位是符号，命中即整段可读**。
+- `codeTerms/splitIdent`：代码感知分词（camelCase/snake_case/kebab 拆分 + 中文 2-gram）。
+- `readRepoFile`：realpath 解析 + 相对路径逃逸防护 + 大小/二进制校验。
+- `applyFindReplace/unifiedDiff`：查找替换 + 行级 LCS 统一 diff（超长输入退化为有界前后缀裁剪）。
+
+**② 混合检索内核（`src-server/lib/code-search.js`）**
+- 三通道：**符号通道**（查询词 vs symbol_name 精确/前缀/包含/标识符拆分，函数名命中最强）+ **BM25-lite**（代码感知分词）+ **语义通道**（复用 retriever 本地 256 维哈希向量余弦，离线一致）。
+- **加权 RRF 融合** + 可选 cross-encoder 重排（复用 `retriever.bgeRerank`，失败自动回落 RRF 序）；返回命中通道徽章与命中词供前端高亮。
+
+**③ 接口（`src-server/routes/code.js`，JWT + owner 隔离）**
+- 仓库：`GET/POST /repos`、`GET/DELETE /repos/:id`；`POST /repos/:id/index`（重建索引，事务分批入库）。
+- 检索/读文件：`GET /repos/:id/search`（topN/lang/path 过滤）、`GET /repos/:id/file`。
+- 补丁：`POST /repos/:id/patch/propose`（只读分析生成 diff，落 `proposed`）→ `POST /repos/:id/patch/:pid/apply`（校验文件未被外部改动 → 写前备份 → 写盘 → `applied`）→ `POST /repos/:id/patch/rollback`（按备份还原）；`GET /repos/:id/patches` 回传 `backup_id` 供前端回滚。
+- 安全：**非 owner 一律不可见/读/写他人仓库**（管理员可见全部）；可选 `CODE_INDEX_ROOTS` 白名单（配置后仅允许登记其下目录）；拒绝文件系统根目录。
+
+**④ 数据（`src-server/db.js` + `src-server/lib/migrate.js` 迁移 id 82–85）**
+- `code_repos`（仓库台账）/`code_index`（符号切片 + 向量）/`code_patches`（补丁提议与应用台账）/`code_patch_backups`（写前备份，一键回滚）。
+
+**⑤ 前端（`public/js/front/code.js`）+ 导航**
+- 仓库卡列表（建索引/检索/删除）+ 登记表单；详情页：索引统计 + 语言分布 + 检索框（命中通道徽章 / 命中词高亮）+ 源码查看弹窗 + 补丁记录（proposed 可应用、applied 可回滚）。
+- `app.js` 注册路由 `#/code` 与侧栏导航「🔎 代码检索」；`public/sw.js` bump `SW_VERSION` → `d2.1-v1`。
+
+### 验证
+- `npm test` 冒烟 **540/0 全绿**（533 基线 + 7 条新增 D2-1 用例：内核语言识别/扫描/符号抽取/分词、补丁工具查找替换·diff、库迁移就位、混合检索符号优先·语义可用·RRF 融合、HTTP 闭环 登记→索引→检索→读文件→propose/apply/rollback、`CODE_INDEX_ROOTS` 白名单、归属隔离）。
+- 浏览器端到端实测（临时 3971 端口 + 隔离库）：登记仓库 → 建索引（3 文件/4 符号/5 块/ready）→ 检索 `greetUser`/`addNumbers` 符号排第一（多通道徽章 + 命中词高亮）→ 查看文件弹窗 → 提议补丁（diff 预览 +1 -1）→ 确认应用（磁盘文件确实改写、补丁 `applied`、生成备份）→ 一键回滚（磁盘文件还原、补丁 `rolled_back`）；控制台 0 错误，排版正常。
+- 已知边界（V1）：索引与检索在单个仓库内存范围内（超大仓候选上限 5 万块）；语义通道为本地哈希向量（未接外部 embedding 模型）；补丁为「查找替换」式而非通用 unified-diff 应用；`deps`/多文件批量补丁留待后续迭代。
+
 > AI生成

@@ -162,6 +162,8 @@ app.use('/api/voice-providers', require('./src-server/routes/voice-providers'));
 app.use('/api/browser', require('./src-server/routes/browser'));
 // D1-3 创作资产 V1（2026-11-20）：项目/素材库/分镜三件套
 app.use('/api/creation', require('./src-server/routes/creation'));
+// D2-1 代码索引与仓库语义检索（2026-11-21）：只读检索 + 补丁 propose/apply/rollback
+app.use('/api/code', require('./src-server/routes/code'));
 // P3 MCP Server（2026-10-22 ⑤）：已发布智能体暴露为 MCP 工具（Streamable HTTP + Bearer 令牌；管理端 /api/mcp-server）
 app.use('/mcp', require('./src-server/routes/mcp-server'));
 app.use('/api/mcp-server', require('./src-server/routes/mcp-server'));
