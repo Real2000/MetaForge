@@ -8780,6 +8780,119 @@ print('PY_OK')
     });
   }
 
+  console.log('【D2-4】MCP 与连接器广场');
+  {
+    const catalog = require('../src-server/lib/mcp-catalog');
+    const mcred = require('../src-server/lib/mcp-credentials');
+
+    await t('D2-4: 目录内核——结构/过滤/匹配/必填凭据', async () => {
+      const { items, categories } = catalog.listCatalog();
+      assert.ok(items.length >= 10, '目录应有 ≥10 条');
+      assert.ok(categories.includes('异构平台'), '分类含「异构平台」');
+      assert.ok(catalog.listCatalog({ type: 'mcp' }).items.every(e => e.type === 'mcp'), 'type 过滤生效');
+      assert.ok(catalog.listCatalog({ category: '异构平台' }).items.length >= 2, 'category 过滤生效');
+      const gh = catalog.getEntry('github');
+      assert.strictEqual(gh.type, 'mcp');
+      assert.deepStrictEqual(catalog.requiredCredentials(gh), ['api_key'], 'github 必填 api_key');
+      assert.strictEqual(catalog.getEntry('not-exist'), null);
+      assert.ok(catalog.listCatalog({ q: 'github' }).items.some(e => e.id === 'github'), '关键词过滤命中');
+      assert.ok(catalog.CATALOG.every(e => e.id && e.name && e.type), '每条字段齐备');
+    });
+
+    await t('D2-4: 健康态与风险摘要（纯函数）', async () => {
+      assert.strictEqual(catalog.healthOf(null).level, 'unknown');
+      assert.strictEqual(catalog.healthOf({ status: 0 }).level, 'down');
+      assert.strictEqual(catalog.healthOf({ status: 1, last_error: 'boom' }).level, 'down');
+      assert.strictEqual(catalog.healthOf({ status: 1, last_check_at: '2026-01-01' }).level, 'ok');
+      assert.deepStrictEqual(catalog.riskSummary([{ risk: 'low' }, { risk: 'high' }, {}]), { total: 3, low: 1, high: 2 });
+      assert.deepStrictEqual(catalog.riskSummary(null), { total: 0, low: 0, high: 0 });
+    });
+
+    await t('D2-4: 凭据托管——加密落库/掩码回显/注入取回/占位渲染/脱敏', async () => {
+      const info = db.prepare("INSERT INTO mcp_servers (name,url,api_key,transport,status,created_at) VALUES ('凭据测试','http://127.0.0.1:1/{TENANT}','','http',1,datetime('now','localtime'))").run();
+      const sid = Number(info.lastInsertRowid);
+      assert.strictEqual(mcred.setSecret(sid, '1bad', 'x').ok, false, '非法名应拒');
+      assert.strictEqual(mcred.setSecret(sid, 'api_key', '').ok, false, '空值应拒');
+      assert.strictEqual(mcred.setSecret(sid, 'api_key', 'sk-abcdef123456').ok, true);
+      const stored = db.prepare('SELECT value FROM mcp_credentials WHERE server_id=? AND name=?').get(sid, 'api_key').value;
+      assert.ok(stored && stored !== 'sk-abcdef123456' && !stored.includes('sk-abcdef'), '明文不得落库');
+      const list = mcred.listSecrets(sid);
+      assert.strictEqual(list[0].masked, 'sk-****56', '掩码头3尾2');
+      assert.ok(!list[0].masked.includes('abcdef'), '掩码不含中段');
+      const srv = db.prepare('SELECT * FROM mcp_servers WHERE id=?').get(sid);
+      assert.strictEqual(mcred.effectiveApiKey(srv), 'sk-abcdef123456', '注入取回明文');
+      assert.strictEqual(mcred.renderUrl(srv.url, mcred.getSecrets(sid)), 'http://127.0.0.1:1/{TENANT}', '未提供占位保留');
+      assert.strictEqual(mcred.renderUrl(srv.url, { TENANT: 'acme' }), 'http://127.0.0.1:1/acme', '占位替换');
+      assert.strictEqual(mcred.scrub('leak sk-abcdef123456 here', ['sk-abcdef123456']), 'leak *** here', '输出脱敏');
+      assert.strictEqual(mcred.setSecret(sid, 'api_key', 'sk-newvalue9999').action, 'updated', '覆盖为更新');
+      assert.strictEqual(mcred.deleteSecret(sid, 'api_key'), true);
+      assert.strictEqual(mcred.listSecrets(sid).length, 0);
+    });
+
+    await t('D2-4: effectiveApiKey 回落旧字段 api_key（兼容存量明文）', async () => {
+      const info = db.prepare("INSERT INTO mcp_servers (name,url,api_key,transport,status,created_at) VALUES ('旧服务','http://127.0.0.1:1/mcp','legacy-token','http',1,datetime('now','localtime'))").run();
+      const srv = db.prepare('SELECT * FROM mcp_servers WHERE id=?').get(Number(info.lastInsertRowid));
+      assert.strictEqual(mcred.effectiveApiKey(srv), 'legacy-token');
+    });
+
+    await t('D2-4: HTTP —— 目录浏览/一键安装（凭据校验+落库）/非管理员拒绝/凭据 CRUD/列表附健康', async () => {
+      const express = require('express');
+      const mcpRouter = require('../src-server/routes/mcp');
+      const { sign } = require('../src-server/lib/auth');
+      db.prepare("INSERT INTO users (username,password,nickname,role,status,must_change_pwd,created_at) VALUES ('d24admin','x','A','admin',1,0,datetime('now','localtime'))").run();
+      db.prepare("INSERT INTO users (username,password,nickname,role,status,must_change_pwd,created_at) VALUES ('d24user','x','U','user',1,0,datetime('now','localtime'))").run();
+      const tAdmin = sign({ uid: db.prepare("SELECT id FROM users WHERE username='d24admin'").get().id, exp: Date.now() + 3600000 });
+      const tUser = sign({ uid: db.prepare("SELECT id FROM users WHERE username='d24user'").get().id, exp: Date.now() + 3600000 });
+      const app = express(); app.use(express.json()); app.use('/api/mcp', mcpRouter);
+      let server; await new Promise(r => { server = app.listen(0, '127.0.0.1', r); });
+      const base = `http://127.0.0.1:${server.address().port}`;
+      const J = async (p, opts, tok) => (await fetch(base + p, { ...(opts || {}), headers: { 'Content-Type': 'application/json', authorization: 'Bearer ' + tok } })).json();
+      try {
+        const cat = await J('/api/mcp/catalog', {}, tUser);
+        assert.strictEqual(cat.code, 0, '登录用户可浏览目录');
+        assert.ok(cat.data.items.length >= 10 && Array.isArray(cat.data.categories));
+        // 非管理员安装被拒
+        const denied = await J('/api/mcp/install', { method: 'POST', body: JSON.stringify({ catalog_id: 'fetch' }) }, tUser);
+        assert.notStrictEqual(denied.code, 0, '非管理员安装应被拒');
+        // 缺必填凭据
+        const miss = await J('/api/mcp/install', { method: 'POST', body: JSON.stringify({ catalog_id: 'github', url: 'http://127.0.0.1:1/mcp' }) }, tAdmin);
+        assert.strictEqual(miss.code, 400);
+        assert.ok(/缺少必填凭据/.test(miss.msg), '缺凭据应提示');
+        // 未知条目
+        const noEnt = await J('/api/mcp/install', { method: 'POST', body: JSON.stringify({ catalog_id: 'zzz' }) }, tAdmin);
+        assert.strictEqual(noEnt.code, 400);
+        // 正常安装（fetch 无需凭据；url 指向不可达端口→首测快速失败，非致命）
+        const ins = await J('/api/mcp/install', { method: 'POST', body: JSON.stringify({ catalog_id: 'fetch', url: 'http://127.0.0.1:1/mcp' }) }, tAdmin);
+        assert.strictEqual(ins.code, 0);
+        assert.strictEqual(ins.data.catalog_id, 'fetch');
+        const row = db.prepare("SELECT * FROM mcp_servers WHERE catalog_id='fetch'").get();
+        assert.ok(row && row.source === 'catalog', '落库来源为 catalog');
+        // 重复安装 → 升级
+        const up = await J('/api/mcp/install', { method: 'POST', body: JSON.stringify({ catalog_id: 'fetch', url: 'http://127.0.0.1:1/mcp' }) }, tAdmin);
+        assert.strictEqual(up.data.upgraded, true, '重复安装应为升级');
+        // 含凭据安装 + 凭据 CRUD
+        const ins2 = await J('/api/mcp/install', { method: 'POST', body: JSON.stringify({ catalog_id: 'github', url: 'http://127.0.0.1:1/mcp', credentials: { api_key: 'ghp_secret123456' } }) }, tAdmin);
+        assert.strictEqual(ins2.code, 0);
+        const ghId = ins2.data.id;
+        assert.deepStrictEqual(ins2.data.credentials, ['api_key'], '凭据已托管');
+        const cl = await J(`/api/mcp/${ghId}/credentials`, {}, tAdmin);
+        assert.strictEqual(cl.code, 0);
+        assert.ok(cl.data.some(c => c.name === 'api_key' && /^ghp\*{4}/.test(c.masked)), '凭据掩码回显');
+        const deniedCred = await J(`/api/mcp/${ghId}/credentials`, {}, tUser);
+        assert.notStrictEqual(deniedCred.code, 0, '非管理员不可读凭据');
+        const add = await J(`/api/mcp/${ghId}/credentials`, { method: 'POST', body: JSON.stringify({ name: 'extra', value: 'v123' }) }, tAdmin);
+        assert.strictEqual(add.code, 0);
+        const del = await J(`/api/mcp/${ghId}/credentials/extra`, { method: 'DELETE' }, tAdmin);
+        assert.strictEqual(del.code, 0);
+        // 列表附带 health/risk/credentials
+        const list = await J('/api/mcp', {}, tUser);
+        const ghRow = list.data.find(s => s.id === ghId);
+        assert.ok(ghRow.health && ghRow.risk && Array.isArray(ghRow.credentials), '列表附 health/risk/credentials');
+        assert.strictEqual(ghRow.api_key_set, 1, '有凭据时 api_key_set=1');
+      } finally { server.close(); }
+    });
+  }
+
   try { db.close(); } catch { }
   fs.rmSync(process.env.AGENT_DATA_DIR, { recursive: true, force: true });
 

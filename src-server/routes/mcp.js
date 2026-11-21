@@ -1,13 +1,26 @@
-/** MCP 服务管理：注册 / 测试 / 刷新工具清单 / 智能体挂载 */
+/** MCP 服务管理：注册 / 测试 / 刷新工具清单 / 智能体挂载
+ *  D2-4 连接器广场：目录（catalog）一键安装 + 凭证托管（加密/掩码）+ 统一连通测试 + 工具级风险分级。
+ */
 const express = require('express');
 const { db, now } = require('../db');
 const { auth, adminOnly } = require('../lib/auth');
 const mcp = require('../lib/mcp');
+const catalog = require('../lib/mcp-catalog');
+const creds = require('../lib/mcp-credentials');
 
 const router = express.Router();
 router.use(auth);
 
-// 列表（普通用户也可读，用于智能体挂载选择；API Key 不回传明文）
+/** 解析服务连接参数：托管凭据解密 + URL 占位符渲染（明文仅内存态，不落日志） */
+function resolveServer(row) {
+  let secrets = {};
+  try { secrets = creds.getSecrets(row.id); } catch { secrets = {}; }
+  const apiKey = creds.API_KEY_NAMES.map(n => secrets[n]).find(Boolean) || row.api_key || '';
+  return { ...row, api_key: apiKey, url: creds.renderUrl(row.url, secrets) };
+}
+
+/** 列表（普通用户也可读，用于智能体挂载选择；API Key 不回传明文）
+ *  D2-4：附凭据名清单（不回值）、健康态与风险摘要。 */
 router.get('/', (req, res) => {
   const rows = db.prepare('SELECT * FROM mcp_servers ORDER BY id DESC').all();
   res.json({
@@ -26,6 +39,12 @@ router.get('/', (req, res) => {
         const ov = overrides[t.originalName] || null;
         return { name: t.originalName || t.name, risk: ov || (t.risk === 'low' ? 'low' : 'high'), override: ov };
       });
+      // D2-4：凭据名清单（掩码，不回值）+ 健康态 + 风险摘要
+      try { rest.credentials = creds.listSecrets(s.id).map(c => ({ name: c.name, masked: c.masked })); }
+      catch { rest.credentials = []; }
+      if (rest.credentials.length) rest.api_key_set = 1;
+      rest.health = catalog.healthOf(s);
+      rest.risk = catalog.riskSummary(tools);
       return rest;
     }),
   });
@@ -86,6 +105,7 @@ router.put('/:id/tool-risk', adminOnly, (req, res) => {
 router.delete('/:id', adminOnly, (req, res) => {
   const old = db.prepare('SELECT * FROM mcp_servers WHERE id=?').get(req.params.id);
   if (!old) return res.json({ code: 404, msg: 'MCP 服务不存在' });
+  creds.purgeServer(old.id); // D2-4：级联清理托管凭据，避免孤立密文
   db.prepare('DELETE FROM mcp_servers WHERE id=?').run(old.id);
   // 解除全部智能体挂载
   const agents = db.prepare("SELECT id, mcp_servers FROM agents WHERE mcp_servers != '[]'").all();
@@ -103,16 +123,37 @@ router.delete('/:id', adminOnly, (req, res) => {
 router.post('/:id/refresh', adminOnly, async (req, res) => {
   const server = db.prepare('SELECT * FROM mcp_servers WHERE id=?').get(req.params.id);
   if (!server) return res.json({ code: 404, msg: 'MCP 服务不存在' });
+  const t0 = Date.now();
   try {
-    const { tools, sessionId } = await mcp.listTools(server);
-    db.prepare('UPDATE mcp_servers SET tools_cache=?, last_check_at=?, last_error=? WHERE id=?')
-      .run(JSON.stringify(tools), now(), '', server.id);
+    const { tools } = await mcp.listTools(resolveServer(server));
+    const latency = Date.now() - t0;
+    db.prepare('UPDATE mcp_servers SET tools_cache=?, last_check_at=?, last_error=?, last_tool_count=?, last_latency_ms=?, last_test_at=? WHERE id=?')
+      .run(JSON.stringify(tools), now(), '', tools.length, latency, now(), server.id);
     db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-      .run(req.user.username, '刷新MCP工具', `${server.name}（${tools.length} 个工具，低风险 ${tools.filter(t => t.risk === 'low').length} 个）`, req.ip, now());
-    res.json({ code: 0, data: { count: tools.length, tools: tools.map(t => ({ name: t.originalName, desc: (t.description || '').slice(0, 100), risk: t.risk })) } });
+      .run(req.user.username, '刷新MCP工具', `${server.name}（${tools.length} 个工具，低风险 ${tools.filter(t => t.risk === 'low').length} 个，${latency}ms）`, req.ip, now());
+    res.json({ code: 0, data: { count: tools.length, latency_ms: latency, tools: tools.map(t => ({ name: t.originalName, desc: (t.description || '').slice(0, 100), risk: t.risk })) } });
   } catch (e) {
-    db.prepare('UPDATE mcp_servers SET last_check_at=?, last_error=? WHERE id=?').run(now(), e.message, server.id);
+    db.prepare('UPDATE mcp_servers SET last_check_at=?, last_error=?, last_test_at=? WHERE id=?').run(now(), e.message, now(), server.id);
     res.json({ code: 502, msg: '连接失败：' + e.message });
+  }
+});
+
+// D2-4：统一连通测试（admin）——连接 + 拉清单 + 计时 + 风险摘要 + 健康态
+router.post('/:id/test', adminOnly, async (req, res) => {
+  const server = db.prepare('SELECT * FROM mcp_servers WHERE id=?').get(req.params.id);
+  if (!server) return res.json({ code: 404, msg: 'MCP 服务不存在' });
+  const t0 = Date.now();
+  try {
+    const { tools } = await mcp.listTools(resolveServer(server));
+    const latency = Date.now() - t0;
+    db.prepare('UPDATE mcp_servers SET tools_cache=?, last_check_at=?, last_error=?, last_tool_count=?, last_latency_ms=?, last_test_at=? WHERE id=?')
+      .run(JSON.stringify(tools), now(), '', tools.length, latency, now(), server.id);
+    const fresh = db.prepare('SELECT * FROM mcp_servers WHERE id=?').get(server.id);
+    res.json({ code: 0, data: { ok: true, latency_ms: latency, tool_count: tools.length, risk: catalog.riskSummary(tools), health: catalog.healthOf(fresh) } });
+  } catch (e) {
+    db.prepare('UPDATE mcp_servers SET last_error=?, last_test_at=? WHERE id=?').run(e.message, now(), server.id);
+    const fresh = db.prepare('SELECT * FROM mcp_servers WHERE id=?').get(server.id);
+    res.json({ code: 502, msg: '连接失败：' + e.message, data: { ok: false, health: catalog.healthOf(fresh) } });
   }
 });
 
@@ -128,4 +169,119 @@ router.post('/probe', adminOnly, async (req, res) => {
   }
 });
 
+/* ---------------- D2-4 连接器广场 ---------------- */
+
+/** 广场目录（登录即可浏览；已安装项附健康态、工具数、风险摘要与凭据名） */
+router.get('/catalog', (req, res) => {
+  const { items, categories } = catalog.listCatalog({
+    type: req.query.type, category: req.query.category, q: req.query.q,
+  });
+  const servers = db.prepare('SELECT * FROM mcp_servers').all();
+  const data = items.map(e => {
+    const hit = catalog.matchInstalled(e, servers);
+    let tools = [];
+    try { tools = JSON.parse((hit && hit.tools_cache) || '[]'); } catch { }
+    return {
+      ...e,
+      installed: !!hit,
+      installed_id: hit ? hit.id : null,
+      installed_name: hit ? hit.name : '',
+      health: catalog.healthOf(hit),
+      tool_count: hit ? (hit.last_tool_count || tools.length) : 0,
+      risk: hit ? catalog.riskSummary(tools) : null,
+      credential_names: hit ? creds.listSecrets(hit.id).map(c => c.name) : e.credentials.map(c => c.name),
+    };
+  });
+  res.json({ code: 0, data: { items: data, categories } });
+});
+
+/** 一键安装（admin）：按目录条目创建 MCP 服务 + 托管凭据 + 首测连通 */
+router.post('/install', adminOnly, async (req, res) => {
+  const { catalog_id, name, url, trusted, credentials } = req.body || {};
+  const entry = catalog.getEntry(catalog_id);
+  if (!entry) return res.json({ code: 400, msg: '目录条目不存在：' + catalog_id });
+  if (entry.type !== 'mcp') return res.json({ code: 400, msg: '该条目为异构平台，请在「接入管理」内配置' });
+
+  const finalName = String(name || entry.name).trim();
+  const finalUrl = String(url || entry.url).trim();
+  if (!finalName || !finalUrl) return res.json({ code: 400, msg: '服务名称与 URL 必填' });
+
+  // 必填凭据校验
+  const provided = (credentials && typeof credentials === 'object') ? credentials : {};
+  const missing = catalog.requiredCredentials(entry).filter(n => !String(provided[n] || '').trim());
+  if (missing.length) return res.json({ code: 400, msg: '缺少必填凭据：' + missing.join('、') });
+
+  // 同目录已安装 → 覆盖升级（保留 id，更新 url/trusted）
+  const exist = db.prepare("SELECT id FROM mcp_servers WHERE catalog_id=?").get(entry.id);
+  const nextTrusted = trusted !== undefined ? (trusted ? 1 : 0) : entry.defaultTrusted;
+  let id, upgraded = false;
+  if (exist) {
+    db.prepare('UPDATE mcp_servers SET name=?,url=?,transport=?,trusted=?,status=1 WHERE id=?')
+      .run(finalName, finalUrl, entry.transport, nextTrusted, exist.id);
+    id = exist.id; upgraded = true;
+  } else {
+    const info = db.prepare("INSERT INTO mcp_servers (name,url,api_key,transport,status,trusted,catalog_id,source,created_at) VALUES (?,?,'',?,1,?,?,'catalog',datetime('now','localtime'))")
+      .run(finalName, finalUrl, entry.transport, nextTrusted, entry.id);
+    id = Number(info.lastInsertRowid);
+  }
+
+  // 托管凭据（加密落盘）
+  const savedCreds = [];
+  for (const c of entry.credentials) {
+    const v = String(provided[c.name] || '').trim();
+    if (!v) continue;
+    const r = creds.setSecret(id, c.name, v);
+    if (r.ok) savedCreds.push(c.name);
+  }
+
+  // 首测连通（非致命）
+  let tested = { ok: false, tool_count: 0, latency_ms: 0 };
+  try {
+    const server = db.prepare('SELECT * FROM mcp_servers WHERE id=?').get(id);
+    const t0 = Date.now();
+    const { tools } = await mcp.listTools(resolveServer(server));
+    const latency = Date.now() - t0;
+    db.prepare('UPDATE mcp_servers SET tools_cache=?,last_check_at=?,last_error=?,last_tool_count=?,last_latency_ms=?,last_test_at=? WHERE id=?')
+      .run(JSON.stringify(tools), now(), '', tools.length, latency, now(), id);
+    tested = { ok: true, tool_count: tools.length, latency_ms: latency };
+  } catch (e) {
+    db.prepare('UPDATE mcp_servers SET last_error=?,last_test_at=? WHERE id=?').run(e.message, now(), id);
+    tested = { ok: false, error: e.message, tool_count: 0, latency_ms: 0 };
+  }
+
+  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
+    .run(req.user.username, upgraded ? '广场升级连接器' : '广场安装连接器',
+      `${entry.name}（来源 ${entry.id}，凭据 ${savedCreds.join('/') || '无'}，${tested.ok ? '连通 ' + tested.tool_count + ' 工具' : '连通失败'}）`, req.ip, now());
+
+  res.json({ code: 0, msg: upgraded ? '连接器已更新' : '连接器已安装', data: { id, name: finalName, catalog_id: entry.id, upgraded, credentials: savedCreds, tested, health: catalog.healthOf(db.prepare('SELECT * FROM mcp_servers WHERE id=?').get(id)) } });
+});
+
+/** 凭证列表（admin，掩码回显） */
+router.get('/:id/credentials', adminOnly, (req, res) => {
+  const server = db.prepare('SELECT id FROM mcp_servers WHERE id=?').get(req.params.id);
+  if (!server) return res.json({ code: 404, msg: 'MCP 服务不存在' });
+  res.json({ code: 0, data: creds.listSecrets(server.id) });
+});
+
+/** 写入/更新凭证（admin） */
+router.post('/:id/credentials', adminOnly, (req, res) => {
+  const server = db.prepare('SELECT * FROM mcp_servers WHERE id=?').get(req.params.id);
+  if (!server) return res.json({ code: 404, msg: 'MCP 服务不存在' });
+  const { name, value } = req.body || {};
+  const r = creds.setSecret(server.id, name, value);
+  if (!r.ok) return res.json({ code: 400, msg: r.msg });
+  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
+    .run(req.user.username, '配置连接器凭据', `${server.name} / ${r.name}（${r.action}）`, req.ip, now());
+  res.json({ code: 0, msg: r.action === 'created' ? '凭据已保存' : '凭据已更新', data: { name: r.name } });
+});
+
+/** 删除凭证（admin） */
+router.delete('/:id/credentials/:name', adminOnly, (req, res) => {
+  const server = db.prepare('SELECT id FROM mcp_servers WHERE id=?').get(req.params.id);
+  if (!server) return res.json({ code: 404, msg: 'MCP 服务不存在' });
+  creds.deleteSecret(server.id, req.params.name);
+  res.json({ code: 0, msg: '已删除' });
+});
+
 module.exports = router;
+

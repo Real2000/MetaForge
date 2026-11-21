@@ -2625,4 +2625,39 @@ agent-platform/
 - 已知边界（V1）：闸门接入点为 `/chat/stream` 主链路（断点续跑 `resume`、分享页、开放 API、调度等走既有记账，后续可平移到闸门）；单价缺失（未配置 `model_price`）时成本记 0 并标 `priced:false`，对账列「未定价」；并发计数为进程内单库口径（多副本部署时每副本各自计）。
 - 支付渠道/账单结算留待后续迭代（D 系列口径：账先算准）。
 
+### D2-4 MCP 与连接器广场 V1（2026-11-21）
+
+在既有「MCP 服务注册/测试/刷新 + 工具级风险分级」与「异构平台（Coze/Dify）接入管理」之上，把连接器**广场化**：精选目录一键安装 + 凭据加密托管 + 统一连通测试 + 「受信任才免确认」的风险分级贯穿。**端点自动预填、装完即测，配置从「查文档填参数」缩到「选条目填凭据」。**
+
+**① 目录内核（`src-server/lib/mcp-catalog.js`，纯逻辑零依赖）**
+- `CATALOG`：13 条精选预设——11 个 MCP 参考服务（文件系统 / 网页抓取 / Git / SQLite / 记忆图谱 / 结构化推理 / 时间 / GitHub / PostgreSQL 只读 / Slack / 浏览器自动化）+ 2 个异构平台（扣子 Coze / Dify）。
+- 每条含：分类、图标、说明、默认端点、官方文档、标签、**所需凭据**（名/标签/是否必填/是否密文/提示）、默认信任位、风险说明。
+- 纯函数助手：`listCatalog({type,category,q})`、`getEntry`、`requiredCredentials`、`matchInstalled`（按目录 id 优先、URL 回落）、`healthOf`（由状态/错误/最近检查推导 正常/停用/异常/未测试）、`riskSummary`（工具清单 → 读/写计数）。
+
+**② 凭据托管（`src-server/lib/mcp-credentials.js`，AES-256-GCM 复用 `crypto-util`）**
+- 按「服务 id × 凭据名」隔离：值**加密落库**，任何接口只回**掩码（头3尾2）**，明文零落库、零回显。
+- `setSecret/deleteSecret/listSecrets/getSecrets/purgeServer`；`effectiveApiKey`（托管 `api_key`/`bearer_token` 优先，回落旧明文 `mcp_servers.api_key` 兼容存量）；`renderUrl`（`{NAME}` 占位符用凭据渲染）；`scrub`（输出脱敏，防凭据被工具回显）。
+
+**③ 接口（`src-server/routes/mcp.js`）**
+- `GET /api/mcp/catalog`（登录可浏览）：目录 + 已安装态（附健康、工具数、风险摘要、凭据名）。
+- `POST /api/mcp/install`（adminOnly）：按条目创建 MCP 服务（`source='catalog'`、`catalog_id`）+ 凭据加密入库 + **首测连通**（计时）；缺必填凭据即 400；同目录重复安装 = 覆盖升级。
+- `POST /api/mcp/:id/test`（adminOnly）：统一连通测试（连接 + 拉清单 + 计时 + 风险摘要 + 健康态）。
+- `GET/POST/DELETE /api/mcp/:id/credentials`（adminOnly）：凭据托管（掩码回显）。
+- `refresh`/`test` 改为经 `resolveServer` 用托管凭据连接并记录延迟/工具数/最近测试时间；列表接口附 `health`/`risk`/`credentials`；删除服务级联清理凭据。
+
+**④ 运行期注入（`src-server/lib/tools.js`）**
+- `loadMcpTools` 解析托管凭据（解密 + URL 渲染）注入 server 记录，智能体调用 MCP 工具时自动携带，明文仅内存态不落日志。
+
+**⑤ 数据（`src-server/db.js` 内联建表 + 迁移 id 89–94）**
+- `mcp_servers` 扩列：`catalog_id` / `source` / `last_latency_ms` / `last_tool_count` / `last_test_at`；新表 `mcp_credentials`（`server_id+name` 唯一索引）。
+
+**⑥ 前端**
+- 新页 `public/js/front/connectors.js`「🔌 连接器广场」（路由 `#/connectors` + 前台导航）：分类/类型/关键词/仅看已安装过滤；卡片显示凭据清单与风险；**一键安装**弹窗（端点预填 + 凭据表单 + 信任开关，装完自动首测）；已安装项 **连通测试 / 凭据管理（掩码增删）/ 重新安装**；非管理员显示「需管理员在后台安装」。
+- `public/js/admin/mcp.js`：新增「🔌 连接器广场」入口卡；服务列表加 **健康徽标 / 连通耗时 / 连通测试 / 凭据** 按钮与凭据托管弹窗。`public/sw.js` bump `SW_VERSION` → `d2.4-v1`。
+
+### 验证
+- `npm test` 冒烟 **554/0 全绿**（549 基线 + 5 条新增 D2-4 用例：目录内核结构/过滤/匹配/必填凭据、健康态与风险摘要纯函数、凭据托管加密落库·掩码回显·注入取回·占位渲染·脱敏、`effectiveApiKey` 回落旧字段、HTTP 目录浏览/一键安装（凭据校验+落库）/非管理员拒绝/凭据 CRUD/列表附健康）。
+- 浏览器端到端实测：登记目录 → 一键安装（预填端点 + 凭据）→ 首测连通结果回显 → 凭据掩码 → 列表健康态；控制台 0 错误。
+- 已知边界（V1）：目录为内置精选（远程仓库/URL 订阅留后续）；一键安装与凭据为管理员能力（MCP 服务为平台级资源）；连通测试依赖目标可达，首测失败不阻断安装（标记 `last_error` 并显示「连接异常」）；异构平台条目在本广场仅作发现，安装/同步仍在「接入管理」。`GET /api/mcp/catalog` 为登录可读、其余写操作限管理员。
+
 > AI生成

@@ -7,6 +7,7 @@
  */
 const { retrieve } = require('./retriever');
 const mcp = require('./mcp');
+const mcCreds = require('./mcp-credentials'); // D2-4：MCP 托管凭据（运行期解密注入）
 const { db } = require('../db');
 const skills = require('./skills'); // 文生图委托给 skills.genImage（多供应商路由 + 重试容错，避免绑死默认供应商）
 const { AGENT_TOOL_DENY } = require('./tool-deny'); // P5.34b：抽零依赖模块（db.js 迁移也引用，避免循环依赖）
@@ -288,11 +289,19 @@ function loadMcpTools(agentMcpIds) {
   for (const s of servers) {
     let overrides = {};
     try { overrides = JSON.parse(s.risk_overrides || '{}') || {}; } catch { overrides = {}; }
+    // D2-4：解析托管凭据（解密 + URL 占位符渲染），供运行期调用 MCP 工具
+    let secrets = {};
+    try { secrets = mcCreds.getSecrets(s.id); } catch { secrets = {}; }
+    const resolvedServer = {
+      ...s,
+      api_key: mcCreds.API_KEY_NAMES.map(n => secrets[n]).find(Boolean) || s.api_key || '',
+      url: mcCreds.renderUrl(s.url, secrets),
+    };
     try {
       const tools = JSON.parse(s.tools_cache || '[]');
       tools.forEach(t => {
         const ov = overrides[t.originalName];
-        out.push({ ...t, server: s, risk: ov || t.risk, risk_override: ov || null });
+        out.push({ ...t, server: resolvedServer, risk: ov || t.risk, risk_override: ov || null });
       });
     } catch { }
   }

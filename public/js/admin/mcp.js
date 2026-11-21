@@ -11,6 +11,14 @@ export async function render(el) {
   el.innerHTML = `
     <div class="page-head"><h2>${t('MCP 服务')}</h2><div class="desc">${t('注册 MCP（Model Context Protocol）服务器，智能体可挂载其工具能力（Streamable HTTP 传输）；支持连接测试与工具清单刷新。平台自身也可作为 MCP Server 向外提供已发布智能体（见下方服务端卡）。')}</div></div>
 
+    <div class="card" style="margin-bottom:16px;border-left:4px solid var(--brand);display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
+      <div>
+        <h3 style="margin:0 0 4px">🔌 ${t('连接器广场')}</h3>
+        <div style="font-size:13px;color:var(--text-2)">${t('从精选目录一键安装 MCP 服务：端点自动预填、凭据加密托管、装完即测连通。')}</div>
+      </div>
+      <a class="btn primary" href="#/connectors">${t('前往连接器广场')} →</a>
+    </div>
+
     <div class="card" style="margin-bottom:16px;border-left:4px solid #7c3aed">
       <div class="toolbar">
         <h3 style="margin:0">🟢 ${t('平台 MCP Server（对外提供智能体）')}</h3>
@@ -51,8 +59,8 @@ export async function render(el) {
       <tr>
         <td><b>${esc(s.name)}</b></td>
         <td class="mono" style="max-width:260px;word-break:break-all;font-size:12px">${esc(s.url)}</td>
-        <td>${s.status ? `<span class="tag green">${t('启用')}</span>` : `<span class="tag gray">${t('停用')}</span>`}${s.trusted ? ` <span class="tag purple" title="${t('只读工具免确认执行')}">🤝 ${t('已信任')}</span>` : ''}${s.last_error ? `<div style="font-size:11px;color:var(--danger);margin-top:2px">${esc(s.last_error.slice(0, 60))}</div>` : ''}</td>
-        <td><b>${s.toolNames?.length || 0}</b></td>
+        <td>${s.health ? `<span class="tag ${s.health.level === 'ok' ? 'green' : s.health.level === 'down' ? 'red' : 'gray'}" style="font-size:10px">${esc(s.health.label)}</span> ` : ''}${s.status ? `<span class="tag green">${t('启用')}</span>` : `<span class="tag gray">${t('停用')}</span>`}${s.trusted ? ` <span class="tag purple" title="${t('只读工具免确认执行')}">🤝 ${t('已信任')}</span>` : ''}${s.last_error ? `<div style="font-size:11px;color:var(--danger);margin-top:2px">${esc(s.last_error.slice(0, 60))}</div>` : ''}</td>
+        <td><b>${s.toolNames?.length || 0}</b>${s.last_latency_ms ? `<div style="font-size:10px;color:var(--text-3)">${s.last_latency_ms}ms</div>` : ''}</td>
         <td style="font-size:12px;color:var(--text-2)">${s.toolList?.length ? s.toolList.map(tl => {
           const lv = tl.override || 'auto';
           const cls = tl.risk === 'low' ? 'green' : 'orange';
@@ -65,6 +73,8 @@ export async function render(el) {
         <td style="color:var(--text-3);font-size:12px">${esc(s.last_check_at || '-')}</td>
         <td>
           <button class="btn link" data-rf="${s.id}">${t('刷新工具')}</button>
+          <button class="btn link" data-test="${s.id}">${t('连通测试')}</button>
+          <button class="btn link" data-cred="${s.id}">${t('凭据')}${(s.credentials && s.credentials.length) ? `(${s.credentials.length})` : ''}</button>
           <button class="btn link" data-tr="${s.id}">${s.trusted ? t('取消信任') : t('信任')}</button>
           <button class="btn link" data-tg="${s.id}">${s.status ? t('停用') : t('启用')}</button>
           <button class="btn link" data-ed="${s.id}">${t('编辑')}</button>
@@ -81,6 +91,16 @@ export async function render(el) {
       } catch (e) { toast(e.message, 'err'); b.textContent = t('刷新工具'); b.disabled = false; }
     });
     // P5.32 信任开关：trusted=1 时该服务的只读（低风险）工具在对话中免确认执行
+    el.querySelectorAll('[data-test]').forEach(b => b.onclick = async () => {
+      b.textContent = t('测试中…'); b.disabled = true;
+      try {
+        const j = await api(`/mcp/${b.dataset.test}/test`, { method: 'POST', body: {} });
+        toast(t('连通正常，{n} 个工具（{ms}ms，读 {low} / 写 {high}）').replace('{n}', j.data.tool_count).replace('{ms}', j.data.latency_ms).replace('{low}', j.data.risk.low).replace('{high}', j.data.risk.high), 'ok');
+      } catch (e) { toast(e.message, 'err'); }
+      load();
+    });
+    // D2-4 凭据托管：掩码列表 + 新增/删除（值加密落库，绝不回显明文）
+    el.querySelectorAll('[data-cred]').forEach(b => b.onclick = () => openCreds(+b.dataset.cred));
     el.querySelectorAll('[data-tr]').forEach(b => b.onclick = async () => {
       const s = servers.find(x => x.id === +b.dataset.tr);
       const next = s.trusted ? 0 : 1;
@@ -162,6 +182,46 @@ export async function render(el) {
   }
 
   el.querySelector('#newSrv').onclick = () => openEdit(null);
+
+  // D2-4：凭据托管弹窗（掩码回显 + 新增/删除）
+  function openCreds(id) {
+    const s = servers.find(x => x.id === id) || { name: '' };
+    const draw = async (mask) => {
+      let list = [];
+      try { list = (await api(`/mcp/${id}/credentials`)).data || []; } catch (e) { toast(e.message, 'err'); }
+      mask.querySelector('#credList').innerHTML = list.map(c => `
+        <div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px dashed var(--line)">
+          <b style="font-family:monospace">${esc(c.name)}</b>
+          <span class="mono" style="color:var(--text-3)">${esc(c.masked)}</span>
+          <span style="flex:1"></span>
+          <button class="btn link" style="color:var(--danger)" data-cdel="${esc(c.name)}">${t('删除')}</button>
+        </div>`).join('') || `<div style="font-size:13px;color:var(--text-3)">${t('暂无凭据')}</div>`;
+      mask.querySelectorAll('[data-cdel]').forEach(bb => bb.onclick = async () => {
+        if (!await confirmBox(t('删除凭据「{n}」？').replace('{n}', bb.dataset.cdel))) return;
+        try { await api(`/mcp/${id}/credentials/${encodeURIComponent(bb.dataset.cdel)}`, { method: 'DELETE' }); toast(t('已删除')); draw(mask); load(); }
+        catch (e) { toast(e.message, 'err'); }
+      });
+    };
+    modal({
+      title: t('凭据托管：{name}').replace('{name}', s.name),
+      body: `<div class="form-item"><div style="margin-bottom:10px" id="credList">${t('加载中…')}</div>
+        <label>${t('凭据名')}</label><input class="input mono" id="cdName" placeholder="api_key">
+        <label>${t('凭据值')}</label><input class="input mono" id="cdVal" type="password" placeholder="${t('仅保存，不回显明文')}">
+        <div class="hint">${t('名以字母/下划线开头；值 AES-256-GCM 加密落库，接口仅回掩码（头3尾2）。')}</div></div>`,
+      foot: `<button class="btn" data-cancel>${t('关闭')}</button><button class="btn primary" data-save>${t('保存凭据')}</button>`,
+      onMount(mask, close) {
+        mask.querySelector('[data-cancel]').onclick = close;
+        mask.querySelector('[data-save]').onclick = async () => {
+          const n = mask.querySelector('#cdName').value.trim();
+          const v = mask.querySelector('#cdVal').value;
+          if (!n || !v) return toast(t('凭据名与值均不能为空'), 'err');
+          try { await api(`/mcp/${id}/credentials`, { method: 'POST', body: { name: n, value: v } }); toast(t('已保存')); mask.querySelector('#cdVal').value = ''; draw(mask); load(); }
+          catch (e) { toast(e.message, 'err'); }
+        };
+        draw(mask);
+      },
+    });
+  }
 
   // ================= P3：平台 MCP Server 服务端（令牌管理） =================
   function renderSrvInfo() {

@@ -356,6 +356,20 @@ const ALL_MIGRATIONS = [
   );` },
   { id: 87, name: 'users.cost_quota - 成本配额（元/月，0=不限）', table: 'users', column: 'cost_quota', def: 'REAL DEFAULT 0' },
   { id: 88, name: 'users.max_concurrency - 用户级并发上限（0=不限）', table: 'users', column: 'max_concurrency', def: 'INTEGER DEFAULT 0' },
+  // === D2-4 MCP 与连接器广场（2026-11-21）===
+  { id: 89, name: 'mcp_servers.catalog_id - 广场目录来源标识', table: 'mcp_servers', column: 'catalog_id', def: "TEXT DEFAULT ''" },
+  { id: 90, name: 'mcp_servers.source - 来源（manual/catalog）', table: 'mcp_servers', column: 'source', def: "TEXT DEFAULT 'manual'" },
+  { id: 91, name: 'mcp_servers.last_latency_ms - 最近连通耗时', table: 'mcp_servers', column: 'last_latency_ms', def: 'INTEGER DEFAULT 0' },
+  { id: 92, name: 'mcp_servers.last_tool_count - 最近工具数', table: 'mcp_servers', column: 'last_tool_count', def: 'INTEGER DEFAULT 0' },
+  { id: 93, name: 'mcp_servers.last_test_at - 最近测试时间', table: 'mcp_servers', column: 'last_test_at', def: "TEXT DEFAULT ''" },
+  { id: 94, name: 'mcp_credentials - 连接器凭据托管', table: 'mcp_credentials', createSql: `CREATE TABLE IF NOT EXISTS mcp_credentials (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    server_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    value TEXT NOT NULL,
+    created_at TEXT,
+    updated_at TEXT
+  );` },
 ];
 
 module.exports = {

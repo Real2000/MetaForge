@@ -1160,6 +1160,15 @@ db.exec(`CREATE INDEX IF NOT EXISTS idx_shots_project ON shots(project_id, seq);
     db.exec("ALTER TABLE mcp_servers ADD COLUMN risk_overrides TEXT DEFAULT '{}'");
     console.log('[db] mcp_servers 表已迁移：新增 risk_overrides 字段（工具风险人工标注）');
   }
+  // D2-4 连接器广场：来源与连通健康字段
+  if (!mcpCols.includes('catalog_id')) {
+    db.exec("ALTER TABLE mcp_servers ADD COLUMN catalog_id TEXT DEFAULT ''"); // 广场目录 id（一键安装来源）
+    db.exec("ALTER TABLE mcp_servers ADD COLUMN source TEXT DEFAULT 'manual'"); // manual | catalog
+    db.exec('ALTER TABLE mcp_servers ADD COLUMN last_latency_ms INTEGER DEFAULT 0'); // 最近连通耗时
+    db.exec('ALTER TABLE mcp_servers ADD COLUMN last_tool_count INTEGER DEFAULT 0'); // 最近工具数
+    db.exec("ALTER TABLE mcp_servers ADD COLUMN last_test_at TEXT DEFAULT ''"); // 最近测试时间
+    console.log('[db] mcp_servers 表已迁移：新增 catalog_id/source/last_latency_ms/last_tool_count/last_test_at（连接器广场）');
+  }
 }
 // P5.34（审查 Y4 完整方案）：agents 稳定标识列——系统资源（内置智能体）与用户资产解耦，
 // 按 system_key 查找/种子不再受 agents.name 无唯一约束的影响（用户自建同名智能体无法劫持）
@@ -1368,6 +1377,17 @@ db.exec(`CREATE TABLE IF NOT EXISTS billing_holds (
 db.exec('CREATE INDEX IF NOT EXISTS idx_bh_user_status ON billing_holds(username, status);');
 db.exec('CREATE INDEX IF NOT EXISTS idx_bh_created ON billing_holds(created_at);');
 db.exec('CREATE INDEX IF NOT EXISTS idx_bh_status ON billing_holds(status);');
+
+// D2-4 MCP 与连接器广场：服务凭据托管（AES-256-GCM 加密落盘，掩码回显，按服务隔离）
+db.exec(`CREATE TABLE IF NOT EXISTS mcp_credentials (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  server_id INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  value TEXT NOT NULL,
+  created_at TEXT,
+  updated_at TEXT
+);`);
+db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_mc_srv_name ON mcp_credentials(server_id, name);');
 
 // 意见反馈表（2026-10-20 帮助体系）：用户提交 → 管理员处理（回复）→ 站内信闭环通知
 // type: bug/suggest/consult；status: pending 待处理 / processed 已处理
