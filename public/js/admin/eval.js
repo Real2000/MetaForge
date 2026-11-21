@@ -23,6 +23,7 @@ export async function render(box) {
       <h3>📈 ${t('多版本趋势')} <span class="sub">${t('同一套件按版本序列，标注回退点与显著性')}</span></h3>
       <div style="display:flex;gap:6px">
         <select class="input" id="evTrendSuite" style="width:230px"><option value="">${t('加载中…')}</option></select>
+        <select class="input" id="evTrendAxis" style="width:110px"><option value="version">${t('版本轴')}</option><option value="time">${t('时间轴')}</option></select>
         <button class="btn sm" id="evTrendLoad">${t('查看趋势')}</button>
       </div>
     </div>
@@ -33,6 +34,7 @@ export async function render(box) {
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
         <h3>🧷 ${t('采集发布基线')}</h3>
         <button class="btn sm" id="evImport">${t('SWE-bench-lite 导入')}</button>
+        <button class="btn sm" id="evRunner">${t('外部 runner 执行')}</button>
       </div>
       <div style="display:flex;flex-direction:column;gap:8px">
         <label style="font-size:12px;color:var(--text-3)">${t('套件（选内置模板或既有评测集）')}
@@ -102,7 +104,7 @@ export async function render(box) {
     return `<span class="tag gray">${t('持平')}</span>`;
   }
 
-  // 显著性徽标（两比例 z 检验结论）
+  // 显著性徽标（两比例 z 检验 / Fisher 精确检验结论）
   function sigBadge(sig) {
     if (!sig || sig.first) return `<span class="tag gray">${t('首次')}</span>`;
     const map = {
@@ -110,18 +112,39 @@ export async function render(box) {
       no_change: ['gray', t('变化不显著')], insufficient: ['orange', t('样本不足')],
     };
     const m = map[sig.verdict] || ['gray', sig.verdict];
-    const pv = sig.successRate && sig.successRate.p != null ? ` p=${sig.successRate.p}` : '';
-    return `<span class="tag ${m[0]}" title="${t('两比例 z 检验')}${pv}">${m[1]}</span>`;
+    const sr = sig.successRate || {};
+    const mm = sr.method === 'fisher' ? t('Fisher 精确检验') : t('两比例 z 检验');
+    const pv = sr.p != null ? ` p=${sr.p}` : '';
+    return `<span class="tag ${m[0]}" title="${mm}${pv}">${m[1]}</span>`;
   }
 
-  // 零依赖手绘 SVG 折线：成功率（绿）/ 干预率（橙）；回退点标红、显著变化点加环
-  function trendSvg(points) {
-    const W = 660, H = 210, padL = 36, padR = 16, padT = 16, padB = 30;
+  // 零依赖手绘 SVG 折线：成功率（绿）/ 干预率（橙）+ Wilson 95% 置信带；回退点标红、显著变化点加环
+  function trendSvg(points, axis) {
+    const W = 660, H = 220, padL = 36, padR = 16, padT = 16, padB = 30;
     const iw = W - padL - padR, ih = H - padT - padB, n = points.length;
-    const X = (i) => n === 1 ? padL + iw / 2 : padL + iw * i / (n - 1);
+    const X = (i) => {
+      if (n === 1) return padL + iw / 2;
+      if (axis === 'time') {
+        const ts = points.map(p => Date.parse(String(p.created_at || '').replace(' ', 'T')) || 0);
+        const tmin = Math.min(...ts), tmax = Math.max(...ts);
+        if (tmax <= tmin) return padL + iw / 2;
+        return padL + iw * (ts[i] - tmin) / (tmax - tmin);
+      }
+      return padL + iw * i / (n - 1);
+    };
     const Y = (v) => padT + ih * (1 - Math.max(0, Math.min(100, v)) / 100);
     const sr = points.map(p => p.metrics.successRate);
     const ir = points.map(p => p.metrics.interventionRate);
+    const ciBand = (lo, hi, fill) => {
+      const top = hi.map((v, i) => `${X(i).toFixed(1)},${Y(v).toFixed(1)}`).join(' ');
+      const bot = lo.map((v, i) => `${X(i).toFixed(1)},${Y(v).toFixed(1)}`).reverse().join(' ');
+      return `<polygon points="${top} ${bot}" fill="${fill}" stroke="none"/>`;
+    };
+    const srLo = points.map(p => (p.ci && p.ci.successRate ? p.ci.successRate.low : p.metrics.successRate));
+    const srHi = points.map(p => (p.ci && p.ci.successRate ? p.ci.successRate.high : p.metrics.successRate));
+    const irLo = points.map(p => (p.ci && p.ci.interventionRate ? p.ci.interventionRate.low : p.metrics.interventionRate));
+    const irHi = points.map(p => (p.ci && p.ci.interventionRate ? p.ci.interventionRate.high : p.metrics.interventionRate));
+    const bands = ciBand(irLo, irHi, 'rgba(245,158,11,0.10)') + ciBand(srLo, srHi, 'rgba(22,163,74,0.14)');
     const line = (arr, color) => `<polyline fill="none" stroke="${color}" stroke-width="2" points="${arr.map((v, i) => `${X(i).toFixed(1)},${Y(v).toFixed(1)}`).join(' ')}"/>`;
     const dots = (arr, color, isSr) => arr.map((v, i) => {
       const p = points[i];
@@ -135,8 +158,8 @@ export async function render(box) {
     }).join('');
     const grid = [0, 25, 50, 75, 100].map(g => `<line x1="${padL}" y1="${Y(g)}" x2="${W - padR}" y2="${Y(g)}" stroke="var(--line,#eee)" stroke-width="1"/><text x="${padL - 6}" y="${Y(g) + 4}" font-size="10" fill="var(--text-3)" text-anchor="end">${g}</text>`).join('');
     const xl = points.map((p, i) => `<text x="${X(i)}" y="${H - 8}" font-size="10" fill="var(--text-3)" text-anchor="middle">${esc((p.label || ('#' + p.id)).slice(0, 9))}</text>`).join('');
-    return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;max-width:${W}px" role="img">${grid}${xl}${line(sr, 'var(--ok,#16a34a)')}${line(ir, '#f59e0b')}${dots(ir, '#f59e0b', false)}${dots(sr, 'var(--ok,#16a34a)', true)}</svg>
-      <div style="font-size:12px;color:var(--text-3);margin-top:4px"><span style="color:var(--ok,#16a34a)">━</span> ${t('任务成功率')} &nbsp; <span style="color:#f59e0b">━</span> ${t('人工干预率')} &nbsp; <span style="color:var(--danger,#dc2626)">●</span> ${t('回退点')} &nbsp; ◯ ${t('显著变化点')}</div>`;
+    return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;max-width:${W}px" role="img">${grid}${bands}${xl}${line(sr, 'var(--ok,#16a34a)')}${line(ir, '#f59e0b')}${dots(ir, '#f59e0b', false)}${dots(sr, 'var(--ok,#16a34a)', true)}</svg>
+      <div style="font-size:12px;color:var(--text-3);margin-top:4px"><span style="color:var(--ok,#16a34a)">━</span> ${t('任务成功率')} &nbsp; <span style="color:#f59e0b">━</span> ${t('人工干预率')} &nbsp; <span style="display:inline-block;width:10px;height:10px;background:rgba(22,163,74,0.18);vertical-align:middle"></span> ${t('95% 置信带')} &nbsp; <span style="color:var(--danger,#dc2626)">●</span> ${t('回退点')} &nbsp; ◯ ${t('显著变化点')}${axis === 'time' ? ` &nbsp; ⏱ ${t('时间轴')}` : ''}</div>`;
   }
 
   async function loadTrendSuites() {
@@ -159,6 +182,7 @@ export async function render(box) {
       const pts = d.points || [];
       if (!pts.length) { el.innerHTML = `<div style="padding:16px;text-align:center;color:var(--text-3);font-size:13px">${t('该套件暂无基线——采集或发布后即可查看趋势')}</div>`; return; }
       const s = d.summary || {};
+      const axis = box.querySelector('#evTrendAxis').value || 'version';
       const dirTag = s.direction === 'up' ? `<span class="tag green">↑ +${s.netSuccess}pp</span>`
         : s.direction === 'down' ? `<span class="tag red">↓ ${s.netSuccess}pp</span>` : `<span class="tag gray">${t('持平')}</span>`;
       el.innerHTML = `<div style="display:flex;gap:8px;flex-wrap:wrap;font-size:12px;margin-bottom:10px">
@@ -167,11 +191,12 @@ export async function render(box) {
           <span class="tag red">${t('显著回退')} ${s.significantRegressions || 0}</span>
           <span class="tag green">${t('显著提升')} ${s.significantImprovements || 0}</span>
           <span class="tag gray">${t('干预率净变化')} ${s.netIntervention > 0 ? '+' : ''}${s.netIntervention}pp</span>
-        </div>${trendSvg(pts)}
+          <span class="tag gray">${d.ciLevel || 95}% ${t('置信带')}</span>
+        </div>${trendSvg(pts, axis)}
         <div style="margin-top:10px;display:flex;flex-direction:column;gap:5px">
           ${pts.map(p => `<div style="font-size:12px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
             <b style="min-width:90px">${esc(p.label || ('#' + p.id))}</b>
-            <span style="color:var(--text-3)">${t('成功率')} ${p.metrics.successRate}% · ${t('步数')} ${p.metrics.avgSteps} · ${t('干预率')} ${p.metrics.interventionRate}%</span>
+            <span style="color:var(--text-3)">${t('成功率')} ${p.metrics.successRate}%${p.ci && p.ci.successRate ? ` [${p.ci.successRate.low}~${p.ci.successRate.high}]` : ''} · ${t('步数')} ${p.metrics.avgSteps} · ${t('干预率')} ${p.metrics.interventionRate}%</span>
             ${sigBadge(p.significance)}
           </div>`).join('')}
         </div>`;
@@ -293,7 +318,48 @@ export async function render(box) {
     });
   };
 
-  box.querySelector('#evRelLoad').onclick = async () => {    const id = Number(box.querySelector('#evRelAgent').value);
+  async function openRunner() {
+    let probe = {};
+    try { probe = (await api('/eval/runner/probe')).data || {}; } catch { }
+    let tpl = {};
+    try { tpl = (await api('/eval/template/swe-bench-lite')).data; } catch { }
+    modal({
+      title: t('外部 runner 执行 SWE-bench-lite'),
+      wide: true,
+      body: `<div style="font-size:12px;line-height:1.8;color:var(--text-2);margin-bottom:8px">
+          ${t('平台不捆绑 SWE-bench harness；配置外部 runner 命令后即可驱动真实执行（平台把 instances 写入 stdin，读取 predictions JSON）。')}
+          <div style="margin-top:6px">${probe.configured ? `<span class="tag green">${t('已配置')}</span> <code>${esc(probe.command)}</code>` : `<span class="tag orange">${t('未配置')}</span>`}</div>
+          ${probe.note ? `<div style="color:var(--text-3);margin-top:4px">${esc(probe.note)}</div>` : ''}
+        </div>
+        <label style="font-size:12px;color:var(--text-3)">${t('runner 命令（留空则用环境变量 SWEBENCH_RUNNER_CMD）')}
+          <input class="input" id="rnCmd" placeholder="python3 run_swebench.py --dataset lite" value="${esc(probe.command || '')}"></label>
+        <label style="font-size:12px;color:var(--text-3);display:block;margin-top:8px">instances JSON
+          <textarea class="input" id="rnInst" rows="6" style="width:100%;font-family:monospace;font-size:12px">${esc(JSON.stringify(tpl.sample || [], null, 0))}</textarea></label>
+        <div id="rnOut" style="margin-top:8px;font-size:12px"></div>`,
+      foot: `<button class="btn" data-cancel>${t('取消')}</button><button class="btn primary" data-go>${t('执行')}</button>`,
+      onMount(m, close) {
+        m.querySelector('[data-cancel]').onclick = close;
+        m.querySelector('[data-go]').onclick = async () => {
+          const o = m.querySelector('#rnOut');
+          let rows; try { rows = JSON.parse(m.querySelector('#rnInst').value || '[]'); } catch { toast(t('JSON 解析失败'), 'err'); return; }
+          if (!rows.length) { toast(t('instances 为空'), 'err'); return; }
+          o.innerHTML = `<span style="color:var(--text-3)">${t('执行中…（受 runner 超时约束）')}</span>`;
+          try {
+            const d = (await api('/eval/runner/swe-bench-lite', { method: 'POST', body: { instances: rows, command: m.querySelector('#rnCmd').value.trim() || undefined } })).data;
+            o.innerHTML = `<span class="tag green">${d.metrics.total} ${t('实例')}</span>
+              <span class="tag ${d.metrics.meetsSuccess ? 'green' : 'red'}">${t('成功率')} ${d.metrics.successRate}%</span>
+              <span class="tag gray">${t('步数')} ${d.metrics.avgSteps}</span>
+              <span class="tag ${d.metrics.meetsIntervention ? 'green' : 'red'}">${t('干预率')} ${d.metrics.interventionRate}%</span>
+              ${d.baseline ? `<span class="tag blue">${t('已落基线')} #${d.baseline.id}</span>` : ''}`;
+            loadList(); loadMetrics();
+          } catch (e) { o.innerHTML = `<span style="color:var(--danger,#dc2626)">${esc(e.message)}</span>`; }
+        };
+      },
+    });
+  }
+
+  box.querySelector('#evRelLoad').onclick = async () => {
+    const id = Number(box.querySelector('#evRelAgent').value);
     const el = box.querySelector('#evReleases');
     if (!id) { toast(t('请填写智能体 ID'), 'err'); return; }
     el.innerHTML = `<span style="color:var(--text-3)">${t('加载中…')}</span>`;
@@ -308,6 +374,8 @@ export async function render(box) {
   };
 
   box.querySelector('#evTrendLoad').onclick = renderTrend;
+  box.querySelector('#evTrendAxis').onchange = () => { if (box.querySelector('#evTrend svg')) renderTrend(); };
+  box.querySelector('#evRunner').onclick = openRunner;
 
   loadMetrics();
   loadSuites();

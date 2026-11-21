@@ -11,7 +11,7 @@
  *   （即任何会被 STATIC_CACHE 缓存的资源变更），发版前必须 bump SW_VERSION，否则用户端拿旧缓存。
  * 提交前自检：git diff --name-only HEAD~1 | grep -E '^public/(js|css|vendor|sw\.js|index\.html)' 命中则必须改本常量。
  */
-const SW_VERSION = 'd3.4-v2'; // 2026-11-21 bump：D3-4 增强（多版本趋势图 + 统计显著性检验，admin/eval.js）
+const SW_VERSION = 'd3.4-v3'; // 2026-11-21 bump：D3-4 增强2（置信带/时间轴 + Fisher + runner 接入，admin/eval.js）
 const STATIC_CACHE = `ap-static-${SW_VERSION}`;
 const NEVER_CACHE = [/^\/api\//, /\/sse/, /\/stream/, /\/files\/download/, /\?[^\s]*download/];
 

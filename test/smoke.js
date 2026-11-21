@@ -9591,7 +9591,12 @@ print('PY_OK')
       assert.strictEqual(es.significance({ passed: 90, total: 100, intervened: 5 }, { passed: 60, total: 100, intervened: 5 }).verdict, 'improved');
       assert.strictEqual(es.significance({ passed: 60, total: 100, intervened: 5 }, { passed: 90, total: 100, intervened: 5 }).verdict, 'regressed');
       assert.strictEqual(es.significance({ passed: 50, total: 100, intervened: 5 }, { passed: 49, total: 100, intervened: 5 }).verdict, 'no_change');
-      assert.strictEqual(es.significance({ passed: 2, total: 3, intervened: 0 }, { passed: 1, total: 3, intervened: 0 }).verdict, 'insufficient');
+      // 小样本：改用 Fisher 精确检验给出结论（2/3 vs 1/3 差异不显著）
+      const smallSig = es.significance({ passed: 2, total: 3, intervened: 0 }, { passed: 1, total: 3, intervened: 0 });
+      assert.strictEqual(smallSig.successRate.method, 'fisher');
+      assert.strictEqual(smallSig.verdict, 'no_change');
+      // 退化（无可比样本）→ insufficient
+      assert.strictEqual(es.significance({ passed: 0, total: 0, intervened: 0 }, { passed: 0, total: 0, intervened: 0 }).verdict, 'insufficient');
       assert.strictEqual(es.significance({ passed: 1, total: 5, intervened: 0 }, null).first, true);
       // 口径说明
       assert.strictEqual(es.metricDefinitions().significance.alpha, 0.05);
@@ -9642,7 +9647,109 @@ print('PY_OK')
         assert.ok(tr.data.points[2].significance && tr.data.points[2].significance.verdict === 'improved');
         assert.strictEqual((await J('/api/eval/trend?suite=', tok)).code, 400, '缺 suite 400');
         const cfg = await J('/api/eval/config', tok);
-        assert.ok(cfg.data.significance && cfg.data.significance.alpha === 0.05 && /z/.test(cfg.data.significance.method));
+        assert.ok(cfg.data.significance && cfg.data.significance.alpha === 0.05 && Array.isArray(cfg.data.significance.methods) && cfg.data.significance.methods.includes('fisher'));
+        assert.ok(cfg.data.confidence && cfg.data.confidence.level === 95, '含 95% 置信区间口径');
+      } finally { server.close(); }
+    });
+  }
+
+  console.log('【D3-4 增强2】置信区间带/时间轴 + Fisher 精确检验 + SWE-bench-lite runner 接入');
+  {
+    const es = require('../src-server/lib/eval-suite');
+    const runner = require('../src-server/lib/swebench-runner');
+
+    await t('D3-4 增强2: Wilson 置信区间 + 正态分位数', async () => {
+      assert.ok(Math.abs(es.normInv(0.975) - 1.959964) < 1e-3, 'z_0.975 ≈ 1.96');
+      assert.ok(Math.abs(es.normInv(0.5)) < 1e-6, 'z_0.5 = 0');
+      const c = es.wilsonInterval(50, 100);
+      assert.ok(c.low < 50 && c.high > 50 && c.center >= 49 && c.center <= 51, JSON.stringify(c));
+      assert.ok(c.low > 39 && c.high < 61, '区间宽度合理');
+      assert.strictEqual(es.wilsonInterval(0, 0).width, 0);
+      // 极端比例：0/10 仍有正上界（Wilson 稳健）
+      const z0 = es.wilsonInterval(0, 10);
+      assert.strictEqual(z0.low, 0); assert.ok(z0.high > 0);
+      assert.ok(es.wilsonInterval(10, 10).low < 100);
+    });
+
+    await t('D3-4 增强2: Fisher 精确检验（两尾）+ 方法自动选择', async () => {
+      const f = es.fisherExact(3, 1, 1, 3);
+      assert.ok(Math.abs(f.p - 0.4857) < 0.01, `fisher p=${f.p}`);
+      assert.strictEqual(f.method, 'fisher');
+      const f2 = es.fisherExact(9, 1, 1, 9);
+      assert.ok(f2.p < 0.01 && f2.significant === true, JSON.stringify(f2));
+      assert.strictEqual(f2.direction, 'up');
+      // 方法选择：小样本 → fisher；大样本 → z；大样本但期望频数过低 → fisher
+      assert.strictEqual(es.proportionTest(2, 3, 1, 3).method, 'fisher');
+      assert.strictEqual(es.proportionTest(90, 100, 60, 100).method, 'z');
+      assert.strictEqual(es.proportionTest(100, 100, 99, 100).method, 'fisher');
+      // significance 用 Fisher 给结论（小样本，4/4 vs 0/4 显著提升）
+      const s = es.significance({ passed: 4, total: 4, intervened: 0 }, { passed: 0, total: 4, intervened: 0 });
+      assert.strictEqual(s.successRate.method, 'fisher');
+      assert.strictEqual(s.verdict, 'improved');
+    });
+
+    await t('D3-4 增强2: suiteTrend 置信区间字段 + 时间轴数据', async () => {
+      db.prepare('DELETE FROM eval_baselines').run();
+      const mk = (pass, total) => { const a = []; for (let i = 0; i < total; i++) a.push({ id: 'c' + i, score: i < pass ? 1 : 0 }); return a; };
+      es.createBaseline({ suite: 'd34-ci', suite_type: 'builtin', label: 'v1', cases: mk(50, 100) });
+      es.createBaseline({ suite: 'd34-ci', suite_type: 'builtin', label: 'v2', cases: mk(80, 100) });
+      const tr = es.suiteTrend({ suite: 'd34-ci' });
+      assert.strictEqual(tr.ciLevel, 95);
+      assert.ok(tr.points[0].ci && tr.points[0].ci.successRate.low < 50 && tr.points[0].ci.successRate.high > 50);
+      assert.ok(tr.points[0].created_at, '点含时间（供时间轴）');
+      assert.strictEqual(tr.points.length, 2);
+    });
+
+    await t('D3-4 增强2: SWE-bench-lite runner 适配器——解析/未配置/端到端（mock）', async () => {
+      const parsed = runner.parseRunnerOutput('log line\n[{"instance_id":"a","resolved":true}]');
+      assert.strictEqual(parsed.length, 1);
+      assert.strictEqual(runner.parseRunnerOutput('not json'), null);
+      const saved = process.env.SWEBENCH_RUNNER_CMD;
+      delete process.env.SWEBENCH_RUNNER_CMD;
+      assert.strictEqual(runner.runnerProbe().configured, false);
+      const noCmd = await runner.runSweBenchLite({ instances: [{ instance_id: 'x' }] });
+      assert.strictEqual(noCmd.ok, false); assert.strictEqual(noCmd.configured, false);
+      // 端到端：mock runner（读 stdin → 输出 predictions，容忍日志行）
+      const mockPath = path.join(process.env.AGENT_DATA_DIR, 'mock-runner.js');
+      fs.writeFileSync(mockPath, "let s='';process.stdin.on('data',d=>s+=d);process.stdin.on('end',()=>{const ins=JSON.parse(s);const out=ins.map((it,i)=>({instance_id:it.instance_id,resolved:i%2===0,passed_tests:i%2===0?2:0,steps:3}));process.stdout.write('running...\\n'+JSON.stringify(out));});");
+      const res = await runner.runSweBenchLite({ instances: [{ instance_id: 'a' }, { instance_id: 'b' }], command: `node ${mockPath}` });
+      assert.strictEqual(res.ok, true, JSON.stringify(res));
+      assert.strictEqual(res.cases.length, 2);
+      assert.strictEqual(res.metrics.successRate, 50, '1/2 通过');
+      const bad = await runner.runSweBenchLite({ instances: [{ instance_id: 'a' }], command: 'node -e "process.exit(3)"' });
+      assert.strictEqual(bad.ok, false); assert.ok(/退出码/.test(bad.error));
+      if (saved != null) process.env.SWEBENCH_RUNNER_CMD = saved;
+    });
+
+    await t('D3-4 增强2: HTTP /runner + /trend 置信字段 + 权限', async () => {
+      const express = require('express');
+      const evRouter = require('../src-server/routes/eval');
+      const { sign } = require('../src-server/lib/auth');
+      for (const [u, r] of [['d34u1', 'user'], ['d34adm', 'admin']]) {
+        if (!db.prepare('SELECT id FROM users WHERE username=?').get(u)) {
+          db.prepare("INSERT INTO users (username,password,nickname,role,status,must_change_pwd,created_at) VALUES (?,?,?,?,1,0,datetime('now','localtime'))").run(u, 'x', u, r);
+        }
+      }
+      const tok = sign({ uid: db.prepare("SELECT id FROM users WHERE username='d34u1'").get().id, exp: Date.now() + 3600000 });
+      const tAdmin = sign({ uid: db.prepare("SELECT id FROM users WHERE username='d34adm'").get().id, exp: Date.now() + 3600000 });
+      const mockPath = path.join(process.env.AGENT_DATA_DIR, 'mock-runner2.js');
+      fs.writeFileSync(mockPath, "let s='';process.stdin.on('data',d=>s+=d);process.stdin.on('end',()=>{const ins=JSON.parse(s);process.stdout.write(JSON.stringify(ins.map(it=>({instance_id:it.instance_id,resolved:true,passed_tests:1,steps:2}))));});");
+      const app = express(); app.use(express.json()); app.use('/api/eval', evRouter);
+      let server; await new Promise(r => { server = app.listen(0, '127.0.0.1', r); });
+      const base = `http://127.0.0.1:${server.address().port}`;
+      const J = async (p, opts, tk) => (await fetch(base + p, { ...(opts || {}), headers: { 'Content-Type': 'application/json', ...(tk ? { authorization: 'Bearer ' + tk } : {}) } })).json();
+      try {
+        assert.strictEqual((await fetch(base + '/api/eval/runner/probe')).status, 401, '未认证 401');
+        assert.strictEqual((await J('/api/eval/runner/probe', {}, tok)).code, 403, '非管理员 probe 403');
+        const probe = await J('/api/eval/runner/probe', {}, tAdmin);
+        assert.strictEqual(probe.code, 0); assert.strictEqual(probe.data.bundled, false);
+        const run = await J('/api/eval/runner/swe-bench-lite', { method: 'POST', body: JSON.stringify({ instances: [{ instance_id: 'a' }, { instance_id: 'b' }], command: `node ${mockPath}`, suite: 'd34-runner' }) }, tAdmin);
+        assert.strictEqual(run.code, 0, JSON.stringify(run)); assert.strictEqual(run.data.metrics.successRate, 100);
+        assert.ok(run.data.baseline && run.data.baseline.id, '落为发布基线');
+        assert.strictEqual((await J('/api/eval/runner/swe-bench-lite', { method: 'POST', body: JSON.stringify({ instances: [{ instance_id: 'a' }], command: `node ${mockPath}` }) }, tok)).code, 403, '非管理员 403');
+        assert.strictEqual((await J('/api/eval/runner/swe-bench-lite', { method: 'POST', body: JSON.stringify({ instances: [] }) }, tAdmin)).code, 400);
+        const tr = await J('/api/eval/trend?suite=d34-ci&suite_type=builtin', {}, tok);
+        assert.strictEqual(tr.data.ciLevel, 95); assert.ok(tr.data.points[0].ci.successRate);
       } finally { server.close(); }
     });
   }

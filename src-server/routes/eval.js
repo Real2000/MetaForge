@@ -9,6 +9,7 @@
  *              DELETE /baselines/:id
  *  - 指标总览：/metrics；发布历史关联基线：/releases/:agentId
  *  - 多版本趋势（V2）：/trend（套件按版本序列 + 逐点回退/显著性 + 趋势摘要）
+ *  - runner 接入（V2）：GET /runner/probe、POST /runner/swe-bench-lite（外部 harness 适配器）
  *
  * 读接口要求 JWT 认证（router.use(auth)）；写/删基线为管理员操作（adminOnly）。
  * 基线是发布治理数据（系统级可比基线），不按用户隔离。
@@ -17,6 +18,7 @@ const express = require('express');
 const { db } = require('../db');
 const { auth, adminOnly } = require('../lib/auth');
 const evalSuite = require('../lib/eval-suite');
+const swebenchRunner = require('../lib/swebench-runner');
 
 const router = express.Router();
 router.use(auth);
@@ -118,6 +120,39 @@ router.get('/trend', (req, res) => {
   const suite = String(req.query.suite || '').trim();
   if (!suite) return res.json({ code: 400, msg: '请提供 suite' });
   res.json({ code: 0, data: evalSuite.suiteTrend({ suite, suite_type: req.query.suite_type, limit: req.query.limit }) });
+});
+
+/* ==================== SWE-bench-lite 真实 runner 接入（适配器） ==================== */
+
+/** 探测是否已接入外部 runner（零依赖：平台不捆绑 harness） */
+router.get('/runner/probe', adminOnly, (req, res) => {
+  res.json({ code: 0, data: swebenchRunner.runnerProbe() });
+});
+
+/**
+ * 用外部 runner 执行 SWE-bench-lite（管理员）。
+ * body: { instances:[...], command?, timeoutMs?, suite?, suite_type?, label?, agent_version?, baseline? }
+ *   - 未提供 command 时用环境变量 SWEBENCH_RUNNER_CMD；
+ *   - baseline=true（默认）时把执行结果落为一条发布基线，便于与历史对比。
+ */
+router.post('/runner/swe-bench-lite', adminOnly, async (req, res) => {
+  const b = req.body || {};
+  const instances = Array.isArray(b.instances) ? b.instances : [];
+  if (!instances.length) return res.json({ code: 400, msg: '请提供 instances 数组（SWE-bench-lite 实例）' });
+  const out = await swebenchRunner.runSweBenchLite({ instances, command: b.command, timeoutMs: b.timeoutMs });
+  if (!out.ok) return res.json({ code: out.configured ? 500 : 400, msg: out.error, data: { configured: out.configured, command: out.command } });
+  let baseline = null;
+  if (b.baseline !== false) {
+    baseline = evalSuite.createBaseline({
+      suite: String(b.suite || 'swe-bench-lite').slice(0, 120), suite_type: b.suite_type || 'builtin',
+      ref_id: b.ref_id != null ? b.ref_id : null, label: b.label || ('runner 执行 ' + new Date().toISOString().slice(0, 16)),
+      agent_version: b.agent_version != null ? b.agent_version : null,
+      cases: out.cases, created_by: req.user.username,
+    });
+  }
+  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
+    .run(req.user.username, 'SWE-bench-lite runner 执行', `${instances.length} 实例：成功率 ${out.metrics.successRate}% / 步数 ${out.metrics.avgSteps} / 干预率 ${out.metrics.interventionRate}%`, req.ip, require('../db').now());
+  res.json({ code: 0, data: { predictions: out.predictions, cases: out.cases, metrics: out.metrics, baseline, command: out.command } });
 });
 
 /** 智能体发布历史 + 每次发布关联的基线（可对比基线视图） */

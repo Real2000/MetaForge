@@ -2842,4 +2842,23 @@ R5 远期生态首项。**先做 3D 资产生成与导出（新增资产类型 +
 - 浏览器 E2E（临时 3982 端口 + 隔离库）：4 版本序列（90%→68%→88%→89%），趋势图 2 条折线 + 数据点 + 回退点标红，摘要「↓ -1pp / 回退 1 / 显著回退 1 / 显著提升 1」，逐版本显著性徽标「首次 / 显著回退 / 显著提升 / 变化不显著」全部正确；控制台 0 错误，排版目检无重叠/溢出/截断。
 - 已知边界（增强项）：显著性用**两比例 z 检验（正态近似）**，未用 Fisher 精确检验；成功率为主指标定结论、干预率仅附报；趋势图为**线性版本序列**（未做时间轴 / 置信区间带）；`suiteTrend` 单套件上限 200 点。
 
+## D3-4 增强2：置信区间带/时间轴 + Fisher 精确检验 + SWE-bench-lite runner 接入（2026-11-21）
+
+**目标**：在「多版本趋势 + 两比例 z 检验」基础上补齐三项——(1) 给成功率/干预率加 **Wilson 95% 置信区间带**并支持**时间轴**横轴；(2) 小样本 / 低期望频数时改用 **Fisher 精确检验**（两尾），避免正态近似失真；(3) 提供 **SWE-bench-lite 真实 runner 接入适配器**（平台不捆绑 harness，通过可配置外部命令驱动真实执行）。
+
+**实现（零新依赖）**
+- 内核 `src-server/lib/eval-suite.js`：
+  - `normInv`（Acklam 标准正态分位数近似，|相对误差| < 1.15e-9）+ `wilsonInterval`（Wilson 得分区间，默认 95%，输出百分比 low/high/center/width）。
+  - `lfact`/`logChoose`（对数阶乘缓存 + 组合数对数）+ `fisherExact`（2×2 两尾 Fisher 精确检验，含 oddsRatio/direction）。
+  - `proportionTest`：按样本规模**自动选择**检验方法——每组 ≥ 5 且期望频数 ≥ 5 用两比例 z 检验，否则用 Fisher 精确检验；`significance` 改经 `proportionTest`，小样本不再直接判「样本不足」，而是给出 Fisher 结论。
+  - `suiteTrend` 每点新增 `ci`（成功率/干预率的 Wilson 区间）并返回 `ciLevel`；`metricDefinitions` 增 `confidence` 口径、`significance` 增 `methods:['z','fisher']`。
+- 内核 `src-server/lib/swebench-runner.js`（新增）：runner bridge 适配器——平台把 instances JSON 写入子进程 stdin，读取 stdout 的 predictions JSON（容忍日志行），按 `sweBenchLiteToCases` 归一为内部用例 → 指标 → 可落基线；`runnerProbe` 探测是否已配置（环境变量 `SWEBENCH_RUNNER_CMD` 或请求显式 command）；零依赖（不捆绑 harness）、超时/大小上限保护。
+- 路由 `src-server/routes/eval.js`：新增 `GET /runner/probe`、`POST /runner/swe-bench-lite`（管理员，结果默认落为发布基线 + 审计日志）；`/trend` 返回含 CI 字段与 `ciLevel`。
+- 前端 `public/js/admin/eval.js`：趋势图新增 **Wilson 95% 置信带**（两条半透明 polygon）+ **版本轴/时间轴切换**（时间轴按 `created_at` 真实时间映射横轴）+ 逐版本成功率区间标注 + 显著性徽标标注所用检验方法（z / Fisher）；新增「外部 runner 执行」入口（探测配置状态 + 命令/instances 输入 + 执行结果与落基线回显）。`public/sw.js` bump → `d3.4-v3`。
+
+**验证（D3-4 增强2）**
+- `npm test` 冒烟 **586/0 全绿**（581 基线 + 5 条新增：Wilson 置信区间 + 正态分位数、Fisher 精确检验 + 方法自动选择、suiteTrend CI 字段 + 时间轴数据、runner 适配器（解析/未配置/mock 端到端）、HTTP `/runner` + `/trend` 置信字段 + 权限）。
+- 浏览器 E2E（临时 3983 端口 + 隔离库）：趋势图 2 条置信带 polygon；逐版本 Wilson 区间（如 v1.0 90% [82.6~94.5]）与显著性徽标（首次/显著回退/显著提升/变化不显著）正确；**时间轴切换**——横轴坐标由均匀 [203,203,203] 变为按真实时间 [32,32,544]，证明按时间映射；**runner 端到端**——弹窗未配置提示正确，填入 mock 命令执行 3 实例 → 成功率 66.7% / 步数 3 / 干预率 0% / 落基线 #13；控制台 0 错误。
+- 已知边界：runner 为**可配置外部命令适配器**，平台不捆绑 harness（本机未安装 `swebench`，以 mock runner 验证协议端到端）；置信带为 Wilson 得分区间；时间轴按字符串 `created_at` 解析；Fisher 仅用于 2×2 两尾。
+
 > AI生成

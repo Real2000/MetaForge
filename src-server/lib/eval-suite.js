@@ -148,40 +148,116 @@ function normalTwoTailP(z) {
 }
 
 const ALPHA = 0.05;      // 显著性水平（双尾）
-const MIN_SAMPLE = 5;    // 每组最小样本量，低于则「样本不足」不做显著性判断
+const MIN_SAMPLE = 5;    // 每组最小样本量；低于此值改用 Fisher 精确检验（不做「样本不足」直接放行）
+const EXPECTED_MIN = 5;  // z 检验适用前提：每个期望频数 ≥ 5，否则改用 Fisher
+
+/** 标准正态分位数（Acklam 近似，双精度 |相对误差| < 1.15e-9） */
+function normInv(p) {
+  if (!(p > 0 && p < 1)) return p <= 0 ? -Infinity : Infinity;
+  const a = [-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02, 1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00];
+  const b = [-5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02, 6.680131188771972e+01, -1.328068155288572e+01];
+  const c = [-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00, -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00];
+  const d = [7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00, 3.754408661907416e+00];
+  const plow = 0.02425, phigh = 1 - plow;
+  let q, r;
+  if (p < plow) { q = Math.sqrt(-2 * Math.log(p)); return (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1); }
+  if (p > phigh) { q = Math.sqrt(-2 * Math.log(1 - p)); return -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1); }
+  q = p - 0.5; r = q * q;
+  return (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q / (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1);
+}
+
+/**
+ * Wilson 得分置信区间（比例，默认 95%）。比正态近似在小样本/极端比例下更稳健。
+ * @returns {{low:number, high:number, center:number, width:number}} 均为百分比（0~100，一位小数）
+ */
+function wilsonInterval(successes, total, alpha = ALPHA) {
+  const n = Number(total) || 0, x = Math.max(0, Math.min(Number(successes) || 0, n));
+  const r1 = (v) => Math.round(v * 1000) / 10;
+  if (n <= 0) return { low: 0, high: 0, center: 0, width: 0 };
+  const z = normInv(1 - alpha / 2);
+  const phat = x / n;
+  const denom = 1 + z * z / n;
+  const center = (phat + z * z / (2 * n)) / denom;
+  const half = (z * Math.sqrt(phat * (1 - phat) / n + z * z / (4 * n * n))) / denom;
+  const lo = Math.max(0, center - half), hi = Math.min(1, center + half);
+  return { low: r1(lo), high: r1(hi), center: r1(center), width: r1(hi - lo) };
+}
+
+/** 对数阶乘（带缓存）与组合数对数，供 Fisher 精确检验做数值稳定运算 */
+const _lfact = [0];
+function lfact(n) {
+  n = Math.floor(Number(n) || 0);
+  if (n < 0) return 0;
+  for (let i = _lfact.length; i <= n; i++) _lfact[i] = _lfact[i - 1] + Math.log(i);
+  return _lfact[n];
+}
+function logChoose(n, k) { if (k < 0 || k > n) return -Infinity; return lfact(n) - lfact(k) - lfact(n - k); }
+
+/**
+ * Fisher 精确检验（两尾，2×2 表）。表 [[a,b],[c,d]]：a=当前通过、b=当前未过、c=上一条通过、d=上一条未过。
+ * 小样本 / 期望频数过低时替代 z 检验，避免正态近似失真。
+ * @returns {{p:number|null, oddsRatio:number|null, significant:boolean, alpha:number, method:'fisher', smallSample:boolean, direction:'up'|'down'|'flat'|'unknown'}}
+ */
+function fisherExact(a, b, c, d, alpha = ALPHA) {
+  a = Math.round(Number(a) || 0); b = Math.round(Number(b) || 0); c = Math.round(Number(c) || 0); d = Math.round(Number(d) || 0);
+  const r1 = a + b, r2 = c + d, col1 = a + c, col2 = b + d, n = a + b + c + d;
+  if (n === 0 || r1 === 0 || r2 === 0 || col1 === 0 || col2 === 0) {
+    return { p: null, oddsRatio: null, significant: false, alpha, method: 'fisher', smallSample: true, direction: 'unknown' };
+  }
+  const logP = (x) => logChoose(r1, x) + logChoose(r2, col1 - x) - logChoose(n, col1);
+  const pObs = Math.exp(logP(a));
+  const lo = Math.max(0, col1 - r2), hi = Math.min(r1, col1);
+  let ptwo = 0;
+  for (let x = lo; x <= hi; x++) { const p = Math.exp(logP(x)); if (p <= pObs * (1 + 1e-7)) ptwo += p; }
+  ptwo = Math.min(1, ptwo);
+  const OR = (b * c === 0) ? ((a * d === 0) ? null : Infinity) : (a * d) / (b * c);
+  const direction = (a / r1) > (c / r2) ? 'up' : (a / r1) < (c / r2) ? 'down' : 'flat';
+  return { p: Math.round(ptwo * 10000) / 10000, oddsRatio: (OR == null || !isFinite(OR)) ? OR : Math.round(OR * 1000) / 1000, significant: ptwo < alpha, alpha, method: 'fisher', smallSample: false, direction };
+}
 
 /**
  * 两比例 z 检验（pooled，双尾）。比较两组「成功数/总数」比例差异是否统计显著。
- * @param {number} x1 组1 成功数   @param {number} n1 组1 总数（当前基线）
- * @param {number} x2 组2 成功数   @param {number} n2 组2 总数（上一基线）
- * @returns {{z:number|null, p:number|null, significant:boolean, alpha:number, smallSample:boolean, direction:'up'|'down'|'flat'|'unknown', se:number|null}}
+ * @returns {{z:number|null, p:number|null, significant:boolean, alpha:number, smallSample:boolean, direction:'up'|'down'|'flat'|'unknown', se:number|null, method:'z'}}
  */
 function proportionZTest(x1, n1, x2, n2, alpha = ALPHA) {
   const N1 = Number(n1) || 0, N2 = Number(n2) || 0, X1 = Number(x1) || 0, X2 = Number(x2) || 0;
   if (N1 < MIN_SAMPLE || N2 < MIN_SAMPLE) {
-    return { z: null, p: null, significant: false, alpha, smallSample: true, direction: 'unknown', se: null };
+    return { z: null, p: null, significant: false, alpha, smallSample: true, direction: 'unknown', se: null, method: 'z' };
   }
   const pPool = (X1 + X2) / (N1 + N2);
   const se = Math.sqrt(pPool * (1 - pPool) * (1 / N1 + 1 / N2));
-  if (se <= 0) return { z: null, p: null, significant: false, alpha, smallSample: false, direction: 'unknown', se: 0 };
+  if (se <= 0) return { z: null, p: null, significant: false, alpha, smallSample: false, direction: 'unknown', se: 0, method: 'z' };
   const z = (X1 / N1 - X2 / N2) / se;      // 正 = 当前比例更高
   const p = normalTwoTailP(z);
   return {
     z: Math.round(z * 1000) / 1000, p: Math.round(p * 10000) / 10000,
     significant: p < alpha, alpha, smallSample: false,
-    direction: z > 0 ? 'up' : z < 0 ? 'down' : 'flat', se: Math.round(se * 10000) / 10000,
+    direction: z > 0 ? 'up' : z < 0 ? 'down' : 'flat', se: Math.round(se * 10000) / 10000, method: 'z',
   };
 }
 
 /**
- * 对两条基线做显著性检验：成功率（主指标）+ 干预率。
+ * 按样本规模自动选择检验方法：任一组样本 < MIN_SAMPLE 或任一期望频数 < EXPECTED_MIN → Fisher 精确检验；否则两比例 z 检验。
+ */
+function proportionTest(x1, n1, x2, n2, alpha = ALPHA) {
+  const N1 = Number(n1) || 0, N2 = Number(n2) || 0, X1 = Number(x1) || 0, X2 = Number(x2) || 0;
+  const pPool = (X1 + X2) / ((N1 + N2) || 1);
+  const expMin = Math.min(N1 * pPool, N1 * (1 - pPool), N2 * pPool, N2 * (1 - pPool));
+  if (N1 < MIN_SAMPLE || N2 < MIN_SAMPLE || !Number.isFinite(expMin) || expMin < EXPECTED_MIN) {
+    return fisherExact(X1, N1 - X1, X2, N2 - X2, alpha);
+  }
+  return proportionZTest(X1, N1, X2, N2, alpha);
+}
+
+/**
+ * 对两条基线做显著性检验：成功率（主指标）+ 干预率；按样本规模自动选 z / Fisher。
  * verdict ∈ improved（显著提升）/ regressed（显著回退）/ no_change（变化不显著）/ insufficient（样本不足）
  */
 function significance(cur, prev, alpha = ALPHA) {
   const c = cur || {}, p = prev || {};
   if (!prev || p.total == null) return { first: true, alpha, verdict: 'first', successRate: null, interventionRate: null };
-  const sr = proportionZTest(c.passed, c.total, p.passed, p.total, alpha);
-  const ir = proportionZTest(c.intervened, c.total, p.intervened, p.total, alpha);
+  const sr = proportionTest(c.passed, c.total, p.passed, p.total, alpha);
+  const ir = proportionTest(c.intervened, c.total, p.intervened, p.total, alpha);
   let verdict;
   if (sr.smallSample) verdict = 'insufficient';
   else if (!sr.significant) verdict = 'no_change';
@@ -230,12 +306,17 @@ function metricDefinitions() {
       { key: 'interventionRate', label: '人工干预率', unit: '%', target: `≤ ${INTERVENTION_MAX}`, lowerBetter: true, desc: '需人工介入的用例占比（安全阻断 / 被判低质 / 人工接管）' },
     ],
     significance: {
-      alpha: ALPHA, minSample: MIN_SAMPLE, method: '两比例 z 检验（pooled，双尾）',
-      desc: `同一套件相邻两条基线对比：p < ${ALPHA} 视为差异显著；每组样本量 < ${MIN_SAMPLE} 时标记「样本不足」，只报差值不判显著。`,
+      alpha: ALPHA, minSample: MIN_SAMPLE, expectedMin: EXPECTED_MIN,
+      methods: ['z', 'fisher'],
+      desc: `同一套件相邻两条基线对比：按样本规模自动选择检验方法——样本充足（每组 ≥ ${MIN_SAMPLE} 且期望频数 ≥ ${EXPECTED_MIN}）用两比例 z 检验，小样本/低期望频数用 Fisher 精确检验（两尾）；p < ${ALPHA} 视为差异显著。`,
       verdicts: [
         { key: 'improved', label: '显著提升' }, { key: 'regressed', label: '显著回退' },
-        { key: 'no_change', label: '变化不显著' }, { key: 'insufficient', label: '样本不足' },
+        { key: 'no_change', label: '变化不显著' }, { key: 'insufficient', label: '样本不足/退化' },
       ],
+    },
+    confidence: {
+      level: Math.round((1 - ALPHA) * 100), method: 'Wilson 得分区间',
+      desc: `${Math.round((1 - ALPHA) * 100)}% Wilson 得分置信区间：对成功率/干预率给出区间估计，小样本与极端比例下比正态近似更稳健（趋势图置信带即由此绘制）。`,
     },
   };
 }
@@ -443,6 +524,10 @@ function suiteTrend({ suite, suite_type, limit = 30 } = {}) {
     points.push({
       id: b.id, label: b.label || '', agent_version: b.agent_version, created_at: b.created_at,
       metrics: b.metrics, diff, verdict, significance: sig,
+      ci: {
+        successRate: wilsonInterval(b.metrics.passed, b.metrics.total),
+        interventionRate: wilsonInterval(b.metrics.intervened, b.metrics.total),
+      },
     });
     prevMetrics = b.metrics;
   }
@@ -454,6 +539,7 @@ function suiteTrend({ suite, suite_type, limit = 30 } = {}) {
   const significantImprovements = points.filter(p => p.significance && p.significance.verdict === 'improved').length;
   return {
     suite: name, suite_type: st, count: points.length, points,
+    ciLevel: Math.round((1 - ALPHA) * 100),
     summary: {
       first: first ? { id: first.id, label: first.label, successRate: first.metrics.successRate, avgSteps: first.metrics.avgSteps, interventionRate: first.metrics.interventionRate } : null,
       last: last ? { id: last.id, label: last.label, successRate: last.metrics.successRate, avgSteps: last.metrics.avgSteps, interventionRate: last.metrics.interventionRate } : null,
@@ -464,9 +550,10 @@ function suiteTrend({ suite, suite_type, limit = 30 } = {}) {
 }
 
 module.exports = {
-  PASS_THRESHOLD, SUCCESS_TARGET, INTERVENTION_MAX, SUITE_TEMPLATES, ALPHA, MIN_SAMPLE,
+  PASS_THRESHOLD, SUCCESS_TARGET, INTERVENTION_MAX, SUITE_TEMPLATES, ALPHA, MIN_SAMPLE, EXPECTED_MIN,
   stepsFromTools, normalizeCase, casePassed, computeMetrics, diffBaseline, compareVerdict,
-  erf, normalTwoTailP, proportionZTest, significance,
+  erf, normalTwoTailP, normInv, wilsonInterval, lfact, logChoose,
+  proportionZTest, proportionTest, fisherExact, significance,
   sweBenchLiteToCases, sweBenchLiteTemplate, metricDefinitions,
   captureFromTelemetry, createBaseline, autoCaptureOnPublish, listBaselines, baselineDetail,
   overview, deleteBaseline, releaseBaselines, suiteTrend, normalizeBaseline,
