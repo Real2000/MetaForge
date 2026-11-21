@@ -2660,4 +2660,43 @@ agent-platform/
 - 浏览器端到端实测：登记目录 → 一键安装（预填端点 + 凭据）→ 首测连通结果回显 → 凭据掩码 → 列表健康态；控制台 0 错误。
 - 已知边界（V1）：目录为内置精选（远程仓库/URL 订阅留后续）；一键安装与凭据为管理员能力（MCP 服务为平台级资源）；连通测试依赖目标可达，首测失败不阻断安装（标记 `last_error` 并显示「连接异常」）；异构平台条目在本广场仅作发现，安装/同步仍在「接入管理」。`GET /api/mcp/catalog` 为登录可读、其余写操作限管理员。
 
+### D2-3 桌面端升级通道 V1（2026-11-21）
+
+在既有「本地桥设备配对（D1-1 端侧执行底座）」之上，补齐客户端**自动更新闭环**：平台维护发布清单 → 客户端启动/定时比对版本 → 下载发布包并做 sha256 完整性校验 → **原子替换自身脚本** → 上报结果（成功/失败/回滚）并交由 launchd 拉起新版本；同时采集**崩溃上报**。核心是从「手动重装客户端」变为「自动保持最新」，并以两个指标守住质量线：**更新成功率 ≥ 95%、崩溃率 < 0.5%**。
+
+**① 决策内核（`src-server/lib/bridge-update.js`，纯逻辑零依赖）**
+- 版本：`parseVersion`/`cmpVersion`/`normalizeVersion`（semver-lite，兼容 `v` 前缀与 `-beta.1` 预发布，预发布 < 同号正式）。
+- 发布选择：`pickRelease(releases,{platform,arch,channel,current})`——过滤 `active` + 平台/架构匹配（`any` 通配）+ 通道一致（发布 `channel=any` 通配），取版本最高者，与当前版本比较得 `update_available`/`mandatory`（发布标强制，或 `current < min_version`）。
+- 完整性：`sha256`/`verifySha256`（未提供校验值视为不校验，兼容历史流程）。
+- 指标：`updateStats(updates,crashes)` → 更新成功率（success / 全部尝试）与崩溃率（崩溃设备 / 更新涉及设备），附 `meetsSuccessTarget`（≥95）/`meetsCrashTarget`（<0.5）。
+- `releaseView`：行 → 前端安全展示对象。
+
+**② 接口（`src-server/routes/localbridge.js`）**
+- `GET /api/localbridge/version?current&platform&arch&channel`（公开）：给出 `latest`/`update_available`/`mandatory` + 发布详情与下载地址；带设备令牌则顺带刷新 `last_seen`。
+- `GET /api/localbridge/release/download?version&...`（公开）：命中版本优先，否则按平台/架构/通道取最新；响应附 `X-Bridge-Version`/`X-Sha256` 头；文件缺失返回 404 提示（管理员需先放入 `public/downloads/`）。
+- `POST /api/localbridge/update-report`（软设备鉴权，未配对也可上报）：记录 `success`/`failed`/`rollback`。
+- `POST /api/localbridge/crash-report`（软设备鉴权）：记录 `startup`/`runtime`/`unhandled` 崩溃。
+- `GET/POST /api/localbridge/releases`、`DELETE /api/localbridge/releases/:id`（admin）：发布清单增改（同版本×平台×架构×通道幂等覆盖，文件在库自动补 sha256/size）、软下线（`archived`）/硬删（`?hard=1`）。
+- `GET /api/localbridge/update-stats`（admin）：更新成功率/崩溃率 + 发布清单 + 最近更新/崩溃记录。
+
+**③ 客户端自动更新（`local-bridge/bridge.js`）**
+- 版本常量 `BRIDGE_VERSION`；启动即查一次、之后每 6 小时检查（`--update` 可手动触发，`--version` 查看）。
+- 流程：`checkForUpdate` → `downloadRelease`（原始字节）→ sha256 校验 → `applySelfUpdate`（先写临时文件 → 备份 `.bak` → 同目录 `rename` 原子覆盖，运行中进程持旧 inode 安全）→ 上报 `success` → 退出交由 launchd KeepAlive 拉起新版本；任一步失败上报 `failed`（已替换则 `rollback` 并恢复 `.bak`）。
+- 崩溃上报：`uncaughtException`/`unhandledRejection`/启动失败 → `/crash-report`（fire-and-forget）。
+- 可禁用：配置 `auto_update:false` 或环境变量 `AP_NO_AUTOUPDATE=1`。
+
+**④ 数据（`src-server/db.js` 内联建表 + 迁移 id 95–97）**
+- `bridge_releases`（发布清单）、`bridge_updates`（更新台账）、`bridge_crashes`（崩溃上报），含必要索引。
+
+**⑤ 前端**
+- 新页 `public/js/admin/bridge.js`「🛰️ 桌面端升级」（路由 `#/admin/bridge` + 后台导航）：指标卡（更新成功率/崩溃率/尝试/崩溃设备，含达标标记）+ 发布清单（登记/下线/删除，显示文件是否就位与实际 sha256）+ 最近更新/崩溃记录。
+- `public/js/front/devices.js`：新增「🛰️ 客户端版本与更新」卡（展示最新版本/通道/说明与下载，登录可读）。
+- `public/sw.js` bump `SW_VERSION` → `d2.3-v1`。
+
+### 验证
+- `npm test` 冒烟 **559/0 全绿**（554 基线 + 5 条新增 D2-3 用例：版本内核解析/比较/规范化、sha256 计算与校验、发布选择（平台/架构/通道匹配 + 强制升级）、指标（成功率/崩溃率含达标线）、HTTP 闭环（发布登记+文件在库自动补哈希/公开版本检查/下载字节与哈希一致/缺文件 404/更新与崩溃上报/指标与权限/软删硬删））。
+- 客户端自动更新实测（临时副本 + 临时服务，不改仓库文件）：`--update` 命中新版本 → 校验 → 原子替换本地副本 → 上报 `success`；损坏包触发 sha256 校验失败 → 上报 `failed` 且原文件不变。
+- 浏览器端到端实测：后台「桌面端升级」页登记发布 → 指标与清单渲染 → 设备页版本卡显示最新版本；控制台 0 错误。
+- 已知边界（V1）：发布包为「同构单文件」（当前客户端为 Node 守护脚本，直接替换 `bridge.js`），完整 DMG/zip 包与差分更新留后续；「托盘常驻/多窗口」非本客户端形态（launchd 后台守护 + 菜单栏型 `.app` 已满足常驻）；更新在客户端**已配对**时启用（未配对不打扰）；指标分母为「更新涉及设备数」，无数据时为 `null`（不参与达标判定）。
+
 > AI生成

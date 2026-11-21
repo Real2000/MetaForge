@@ -11,7 +11,7 @@
  *   （即任何会被 STATIC_CACHE 缓存的资源变更），发版前必须 bump SW_VERSION，否则用户端拿旧缓存。
  * 提交前自检：git diff --name-only HEAD~1 | grep -E '^public/(js|css|vendor|sw\.js|index\.html)' 命中则必须改本常量。
  */
-const SW_VERSION = 'd2.4-v1'; // 2026-11-21 bump：D2-4 MCP 与连接器广场（front/connectors.js 新页 + admin/mcp.js 广场/凭据/测试）
+const SW_VERSION = 'd2.3-v1'; // 2026-11-21 bump：D2-3 桌面端升级通道（admin/bridge.js 新页 + front/devices.js 版本卡 + app.js 路由）
 const STATIC_CACHE = `ap-static-${SW_VERSION}`;
 const NEVER_CACHE = [/^\/api\//, /\/sse/, /\/stream/, /\/files\/download/, /\?[^\s]*download/];
 

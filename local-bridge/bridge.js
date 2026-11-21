@@ -48,6 +48,9 @@ function loadConfig() {
 }
 const CFG = loadConfig();
 
+// D2-3 桌面端升级通道：客户端版本号（随发布包递增；自动更新据此与平台发布清单比对）
+const BRIDGE_VERSION = '1.0.0';
+
 // ---------- 日志（追加写，轮转保护：>5MB 截断） ----------
 function log(...a) {
   const line = `[${new Date().toLocaleString('sv-SE')}] ${a.join(' ')}\n`;
@@ -309,6 +312,101 @@ async function api(method, p, body) {
   return { status: res.status, ...j };
 }
 
+// ================== D2-3 桌面端升级通道（自动更新 + 崩溃上报）==================
+// 客户端自检新版本 → 下载发布包 → sha256 校验 → 原子替换自身脚本 → 上报结果 → 交由 launchd 拉起新版本。
+// 全流程失败可回滚（替换前保留 .bak），并如实上报 success / failed / rollback 供平台统计更新成功率。
+function bridgePlatform() { return process.platform === 'darwin' ? 'darwin' : (process.platform === 'win32' ? 'win32' : process.platform); }
+
+/** 下载发布包原始字节（非 JSON）；返回 { buf, sha256 } */
+async function downloadRelease(url) {
+  const res = await fetch(CFG.platform_url + url, { headers: { 'X-Device-Token': CFG.device_token } });
+  if (!res.ok) throw new Error(`下载失败 HTTP ${res.status}`);
+  const buf = Buffer.from(await res.arrayBuffer());
+  return { buf, sha256: String(res.headers.get('x-sha256') || '').trim().toLowerCase() };
+}
+
+/** 原子替换自身脚本：先写临时文件 → 备份现状 → rename 覆盖（运行中的进程仍持旧 inode，安全） */
+function applySelfUpdate(buf) {
+  const target = __filename;                 // 当前运行的 bridge.js（.app/Contents/MacOS/bridge.js）
+  const dir = path.dirname(target);
+  const tmp = path.join(dir, `.bridge.new-${Date.now()}`);
+  const bak = target + '.bak';
+  fs.writeFileSync(tmp, buf);
+  try { fs.copyFileSync(target, bak); } catch { }
+  fs.renameSync(tmp, target);                // 同目录 rename：POSIX 原子
+  return { target, bak };
+}
+
+/** 回滚：恢复 .bak 到 target */
+function restoreSelf(bak) { try { if (bak && fs.existsSync(bak)) fs.copyFileSync(bak, __filename); } catch { } }
+
+async function reportUpdate(status, { from, to, channel, error, duration_ms }) {
+  try {
+    await api('POST', '/api/localbridge/update-report', {
+      status, from_version: from || BRIDGE_VERSION, to_version: to || '',
+      channel: channel || CFG.channel || 'stable', error: String(error || '').slice(0, 500), duration_ms: Number(duration_ms) || 0,
+    });
+  } catch { }
+}
+
+/** 崩溃上报（含启动失败）；未配对也可上报（服务端软鉴权） */
+function reportCrash(kind, err) {
+  try {
+    const body = JSON.stringify({
+      kind: kind || 'runtime', version: BRIDGE_VERSION,
+      message: String((err && err.message) || err || '').slice(0, 500),
+      stack: String((err && err.stack) || '').slice(0, 4000),
+    });
+    // fire-and-forget（进程可能随即退出，不 await）
+    fetch(CFG.platform_url + '/api/localbridge/crash-report', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Device-Token': CFG.device_token }, body,
+    }).catch(() => { });
+  } catch { }
+}
+
+/** 查询是否有新版本 */
+async function checkForUpdate() {
+  const q = `current=${encodeURIComponent(BRIDGE_VERSION)}&platform=${encodeURIComponent(bridgePlatform())}&arch=${encodeURIComponent(process.arch)}&channel=${encodeURIComponent(CFG.channel || 'stable')}`;
+  const r = await api('GET', `/api/localbridge/version?${q}`);
+  return (r && r.code === 0) ? r.data : null;
+}
+
+let _updating = false;
+/** 执行一次自动更新（若可用）。成功 → 退出进程交由 launchd 拉起新版本。 */
+async function autoUpdate() {
+  if (_updating) return { ok: false, reason: 'busy' };
+  if (CFG.auto_update === false || process.env.AP_NO_AUTOUPDATE === '1') return { ok: false, reason: 'disabled' };
+  _updating = true;
+  const t0 = Date.now();
+  let replaced = false;
+  try {
+    const info = await checkForUpdate();
+    if (!info || !info.update_available || !info.release) { log(`⏫ 已是最新版本（${BRIDGE_VERSION}）`); return { ok: true, updated: false }; }
+    log(`⬆ 发现新版本 ${info.latest}（当前 ${BRIDGE_VERSION}${info.mandatory ? '，强制' : ''}）`);
+    const { buf, sha256 } = await downloadRelease(info.release.url);
+    const expect = String(info.release.sha256 || sha256 || '').toLowerCase();
+    if (expect) {
+      const got = crypto.createHash('sha256').update(buf).digest('hex');
+      if (got !== expect) throw new Error(`包完整性校验失败（期望 ${expect.slice(0, 12)}…，实际 ${got.slice(0, 12)}…）`);
+    }
+    applySelfUpdate(buf);
+    replaced = true;
+    await reportUpdate('success', { from: BRIDGE_VERSION, to: info.latest, duration_ms: Date.now() - t0 });
+    log(`✅ 更新完成 → ${info.latest}，即将重启生效`);
+    setTimeout(() => process.exit(0), 400); // launchd KeepAlive 拉起新版本
+    return { ok: true, updated: true };
+  } catch (e) {
+    await reportUpdate(replaced ? 'rollback' : 'failed', { error: e.message, duration_ms: Date.now() - t0 });
+    if (replaced) restoreSelf(__filename + '.bak');
+    log(`⚠ 自动更新失败：${e.message}（已保留原版本）`);
+    return { ok: false, error: e.message };
+  } finally { _updating = false; }
+}
+
+// 崩溃/未捕获异常上报（含启动期），便于平台统计崩溃率（验收 < 0.5%）
+process.on('uncaughtException', (e) => { log(`💥 未捕获异常：${e && e.message}`); reportCrash('unhandled', e); setTimeout(() => process.exit(1), 200); });
+process.on('unhandledRejection', (e) => { log(`💥 未处理的 Promise 拒绝：${(e && e.message) || e}`); reportCrash('unhandled', e); });
+
 // ---------- 配对（安装脚本收集配对码后调用） ----------
 async function pairWithCode(code) {
   const r = await api('POST', '/api/localbridge/claim', {
@@ -355,7 +453,7 @@ async function loop() {
 }
 
 function start() {
-  log(`TeleAgent 本地桥启动：device=${CFG.device_name} platform=${CFG.platform_url} paired=${!!CFG.paired}`);
+  log(`TeleAgent 本地桥启动：device=${CFG.device_name} platform=${CFG.platform_url} paired=${!!CFG.paired} version=${BRIDGE_VERSION}`);
   if (CFG.paired) {
     setInterval(loop, CFG.poll_interval);
     loop();
@@ -363,6 +461,9 @@ function start() {
     setInterval(async () => {
       try { await api('POST', '/api/localbridge/heartbeat', {}); } catch { }
     }, 30000);
+    // D2-3 自动更新：启动即查一次，之后每 6 小时检查（有新版则替换并重启生效）
+    autoUpdate();
+    setInterval(autoUpdate, 6 * 3600 * 1000);
   } else {
     log('⏳ 未配对——等待配对（安装程序引导 / 手动: node bridge.js --pair <配对码>）');
     // 未配对时低频探测（用户可能在网页侧用 token 直接激活）
@@ -392,7 +493,11 @@ if (arg === '--pair') {
     process.exit(r.ok ? 0 : 1);
   }).catch(e => { console.error('配对异常：', e.message); process.exit(1); });
 } else if (arg === '--status') {
-  console.log(JSON.stringify({ paired: !!CFG.paired, user: CFG.paired_user || null, platform_url: CFG.platform_url, device_name: CFG.device_name, token: CFG.device_token.slice(0, 8) + '…' }, null, 2));
+  console.log(JSON.stringify({ paired: !!CFG.paired, user: CFG.paired_user || null, platform_url: CFG.platform_url, device_name: CFG.device_name, version: BRIDGE_VERSION, channel: CFG.channel || 'stable', token: CFG.device_token.slice(0, 8) + '…' }, null, 2));
+} else if (arg === '--version') {
+  console.log(BRIDGE_VERSION);
+} else if (arg === '--update') { // D2-3：手动触发一次自动更新检查
+  autoUpdate().then(r => { console.log(JSON.stringify(r, null, 2)); if (!r.ok && r.updated === undefined) process.exit(1); }).catch(e => { console.error('更新异常：' + e.message); process.exit(1); });
 } else if (arg === '--test') { // 自检：白名单操作连通性
   (async () => {
     const tmp = `Desktop/teleagent-自检-${Date.now()}`;
@@ -403,5 +508,5 @@ if (arg === '--pair') {
     process.exit(0);
   })();
 } else {
-  start();
+  try { start(); } catch (e) { reportCrash('startup', e); log(`💥 启动失败：${e.message}`); process.exit(1); }
 }

@@ -8893,9 +8893,159 @@ print('PY_OK')
     });
   }
 
+  console.log('【D2-3】桌面端升级通道（自动更新 / 发布清单 / 更新成功率·崩溃率）');
+  {
+    const bu = require('../src-server/lib/bridge-update');
+
+    await t('D2-3: 版本内核——解析/比较/规范化', async () => {
+      assert.deepStrictEqual(bu.parseVersion('v1.2.3-beta.1'), { major: 1, minor: 2, patch: 3, pre: 'beta.1' });
+      assert.strictEqual(bu.parseVersion('abc'), null);
+      assert.strictEqual(bu.cmpVersion('1.2.0', '1.10.0'), -1, '按数值比较而非字典序');
+      assert.strictEqual(bu.cmpVersion('1.2.3', '1.2.3'), 0);
+      assert.strictEqual(bu.cmpVersion('1.2.3-beta', '1.2.3'), -1, '预发布 < 正式');
+      assert.strictEqual(bu.cmpVersion('2.0.0', '1.9.9'), 1);
+      assert.strictEqual(bu.normalizeVersion('v1.2.3-beta.1'), '1.2.3-beta.1');
+      assert.strictEqual(bu.normalizeVersion(''), '');
+    });
+
+    await t('D2-3: 包完整性——sha256 计算与校验', async () => {
+      const buf = Buffer.from('hello');
+      const h = bu.sha256(buf);
+      assert.strictEqual(h, '2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824');
+      assert.strictEqual(bu.verifySha256(buf, h), true);
+      assert.strictEqual(bu.verifySha256(buf, h.toUpperCase()), true, '大小写不敏感');
+      assert.strictEqual(bu.verifySha256(buf, 'deadbeef'), false);
+      assert.strictEqual(bu.verifySha256(buf, ''), true, '未提供校验值视为不校验');
+    });
+
+    await t('D2-3: 发布选择——平台/架构/通道匹配 + 强制升级', async () => {
+      const rows = [
+        { version: '1.1.0', platform: 'any', arch: 'any', channel: 'stable', status: 'active' },
+        { version: '1.2.0', platform: 'darwin', arch: 'arm64', channel: 'stable', status: 'active' },
+        { version: '2.0.0', platform: 'darwin', arch: 'arm64', channel: 'beta', status: 'active' },
+        { version: '9.9.9', platform: 'win32', arch: 'x64', channel: 'stable', status: 'active' },
+        { version: '3.0.0', platform: 'any', arch: 'any', channel: 'stable', status: 'archived' },
+      ];
+      const r1 = bu.pickRelease(rows, { platform: 'darwin', arch: 'arm64', channel: 'stable', current: '1.0.0' });
+      assert.strictEqual(r1.latest, '1.2.0', 'stable 通道取最高稳定版，不含 beta/归档');
+      assert.strictEqual(r1.update_available, true);
+      const r2 = bu.pickRelease(rows, { platform: 'darwin', arch: 'arm64', channel: 'beta', current: '1.0.0' });
+      assert.strictEqual(r2.latest, '2.0.0', 'beta 通道可取 beta 版');
+      const r3 = bu.pickRelease(rows, { platform: 'darwin', arch: 'arm64', channel: 'stable', current: '1.2.0' });
+      assert.strictEqual(r3.update_available, false, '已是最高版则无更新');
+      const r4 = bu.pickRelease(rows, { platform: 'win32', arch: 'x64', channel: 'stable', current: '1.0.0' });
+      assert.strictEqual(r4.latest, '9.9.9');
+      const rows2 = [{ version: '1.5.0', platform: 'any', arch: 'any', channel: 'stable', status: 'active', min_version: '1.4.0' }];
+      assert.strictEqual(bu.pickRelease(rows2, { platform: 'darwin', arch: 'arm64', channel: 'stable', current: '1.3.0' }).mandatory, true, '低于 min_version 强制升级');
+      assert.strictEqual(bu.pickRelease(rows2, { platform: 'darwin', arch: 'arm64', channel: 'stable', current: '1.4.0' }).mandatory, false);
+      const rows3 = [{ version: '1.5.0', platform: 'any', arch: 'any', channel: 'stable', status: 'active', mandatory: 1 }];
+      assert.strictEqual(bu.pickRelease(rows3, { platform: 'darwin', arch: 'arm64', channel: 'stable', current: '1.0.0' }).mandatory, true, '标记强制');
+      assert.strictEqual(bu.pickRelease([], { current: '1.0.0' }).latest, null, '无发布返回 null');
+    });
+
+    await t('D2-3: 指标——更新成功率与崩溃率（含达标线）', async () => {
+      const updates = [
+        { status: 'success', device_id: 1 }, { status: 'success', device_id: 1 },
+        { status: 'success', device_id: 2 }, { status: 'failed', device_id: 2 },
+        { status: 'rollback', device_id: 3 },
+      ];
+      const s = bu.updateStats(updates, [{ device_id: 2 }]);
+      assert.strictEqual(s.total, 5);
+      assert.strictEqual(s.success, 3);
+      assert.strictEqual(s.successRate, 60);
+      assert.strictEqual(s.meetsSuccessTarget, false);
+      assert.strictEqual(s.crashRate, 33.33, '1/3 设备崩溃率');
+      assert.strictEqual(s.meetsCrashTarget, false);
+      const good = bu.updateStats([...Array(20).keys()].map(i => ({ status: i < 19 ? 'success' : 'failed', device_id: i })), []);
+      assert.strictEqual(good.successRate, 95);
+      assert.strictEqual(good.meetsSuccessTarget, true, '95% 视为达标');
+      assert.strictEqual(good.crashRate, 0);
+      assert.strictEqual(good.meetsCrashTarget, true);
+      const empty = bu.updateStats([], []);
+      assert.strictEqual(empty.successRate, null);
+      assert.strictEqual(empty.crashRate, null);
+      assert.strictEqual(empty.meetsSuccessTarget, null);
+      assert.deepStrictEqual(bu.releaseView(null), null);
+    });
+
+    await t('D2-3: HTTP —— 发布登记/版本检查/下载校验/上报/指标/权限', async () => {
+      const express = require('express');
+      const lb = require('../src-server/routes/localbridge');
+      const { sign } = require('../src-server/lib/auth');
+      db.prepare("INSERT INTO users (username,password,nickname,role,status,must_change_pwd,created_at) VALUES ('d23admin','x','A','admin',1,0,datetime('now','localtime'))").run();
+      db.prepare("INSERT INTO users (username,password,nickname,role,status,must_change_pwd,created_at) VALUES ('d23user','x','U','user',1,0,datetime('now','localtime'))").run();
+      const tAdmin = sign({ uid: db.prepare("SELECT id FROM users WHERE username='d23admin'").get().id, exp: Date.now() + 3600000 });
+      const tUser = sign({ uid: db.prepare("SELECT id FROM users WHERE username='d23user'").get().id, exp: Date.now() + 3600000 });
+      const app = express(); app.use(express.json()); app.use('/api/localbridge', lb.router);
+      let server; await new Promise(r => { server = app.listen(0, '127.0.0.1', r); });
+      const base = `http://127.0.0.1:${server.address().port}`;
+      const J = async (p, opts, tok) => (await fetch(base + p, { ...(opts || {}), headers: { 'Content-Type': 'application/json', ...(tok ? { authorization: 'Bearer ' + tok } : {}) } })).json();
+      const testFile = '__d23_test_bridge.js';
+      const testPath = path.join(__dirname, '..', 'public', 'downloads', testFile);
+      try {
+        // 权限：非管理员登记被拒
+        const denied = await J('/api/localbridge/releases', { method: 'POST', body: JSON.stringify({ version: '1.0.1' }) }, tUser);
+        assert.notStrictEqual(denied.code, 0, '非管理员登记应被拒');
+        // 版本号格式校验
+        const bad = await J('/api/localbridge/releases', { method: 'POST', body: JSON.stringify({ version: 'abc' }) }, tAdmin);
+        assert.strictEqual(bad.code, 400);
+        // 准备发布包文件在库 → 自动补 sha256/size
+        fs.writeFileSync(testPath, 'console.log("bridge v1.2.0");\n');
+        const realSha = bu.sha256(fs.readFileSync(testPath));
+        const reg = await J('/api/localbridge/releases', { method: 'POST', body: JSON.stringify({ version: '1.2.0', platform: 'darwin', arch: 'arm64', channel: 'stable', file_name: testFile, notes: '测试版本' }) }, tAdmin);
+        assert.strictEqual(reg.code, 0);
+        assert.strictEqual(reg.data.file_exists, true);
+        assert.strictEqual(reg.data.sha256, realSha, '文件在库自动补 sha256');
+        // 公开版本检查：旧版客户端应收到更新
+        const ver = await J('/api/localbridge/version?current=1.0.0&platform=darwin&arch=arm64&channel=stable');
+        assert.strictEqual(ver.code, 0);
+        assert.strictEqual(ver.data.latest, '1.2.0');
+        assert.strictEqual(ver.data.update_available, true);
+        assert.strictEqual(ver.data.release.sha256, realSha);
+        assert.ok(ver.data.release.url.includes('/release/download'), '附下载地址');
+        const ver2 = await J('/api/localbridge/version?current=1.2.0&platform=darwin&arch=arm64&channel=stable');
+        assert.strictEqual(ver2.data.update_available, false);
+        const ver3 = await J('/api/localbridge/version?current=1.0.0&platform=win32&arch=x64&channel=stable');
+        assert.strictEqual(ver3.data.latest, null, '平台不匹配无可用发布');
+        // 下载（原始字节 + X-Sha256 头）
+        const dres = await fetch(base + ver.data.release.url);
+        assert.strictEqual(dres.status, 200);
+        assert.strictEqual(String(dres.headers.get('x-sha256')).toLowerCase(), realSha);
+        assert.strictEqual(bu.sha256(Buffer.from(await dres.arrayBuffer())), realSha, '下载字节与原文件一致');
+        // 缺文件下载 → 404
+        const reg2 = await J('/api/localbridge/releases', { method: 'POST', body: JSON.stringify({ version: '1.3.0', platform: 'linux', arch: 'x64', channel: 'stable', file_name: '__not_exist__.js' }) }, tAdmin);
+        assert.strictEqual(reg2.code, 0);
+        const d404 = await fetch(base + '/api/localbridge/release/download?version=1.3.0&platform=linux&arch=x64&channel=stable');
+        assert.strictEqual(d404.status, 404);
+        // 更新上报（无需鉴权，非法状态回落 failed 不报错）
+        assert.strictEqual((await J('/api/localbridge/update-report', { method: 'POST', body: JSON.stringify({ status: 'success', from_version: '1.0.0', to_version: '1.2.0', channel: 'stable', duration_ms: 120 }) })).code, 0);
+        assert.strictEqual((await J('/api/localbridge/update-report', { method: 'POST', body: JSON.stringify({ status: 'weird' }) })).code, 0);
+        // 崩溃上报
+        assert.strictEqual((await J('/api/localbridge/crash-report', { method: 'POST', body: JSON.stringify({ kind: 'startup', version: '1.2.0', message: 'boom', stack: 'at x' }) })).code, 0);
+        assert.ok(db.prepare('SELECT COUNT(*) c FROM bridge_updates').get().c >= 2, '更新台账落库');
+        assert.ok(db.prepare('SELECT COUNT(*) c FROM bridge_crashes').get().c >= 1, '崩溃台账落库');
+        // 指标（admin）
+        const st = await J('/api/localbridge/update-stats', {}, tAdmin);
+        assert.strictEqual(st.code, 0);
+        assert.ok(st.data.stats.total >= 2 && st.data.stats.successRate != null, '指标可算');
+        assert.ok(Array.isArray(st.data.releases) && Array.isArray(st.data.updates) && Array.isArray(st.data.crashes));
+        assert.notStrictEqual((await J('/api/localbridge/update-stats', {}, tUser)).code, 0, '非管理员看指标被拒');
+        // 发布列表（admin）附文件就位与实际哈希
+        const list = await J('/api/localbridge/releases', {}, tAdmin);
+        const rel = list.data.find(r => r.version === '1.2.0');
+        assert.strictEqual(rel.file_exists, true);
+        assert.strictEqual(rel.actual_sha256, realSha);
+        // 下线（软删）与删除（硬删）
+        assert.strictEqual((await J(`/api/localbridge/releases/${reg2.data.id}`, { method: 'DELETE' }, tAdmin)).code, 0);
+        assert.strictEqual(db.prepare('SELECT status FROM bridge_releases WHERE id=?').get(reg2.data.id).status, 'archived');
+        assert.strictEqual((await J(`/api/localbridge/releases/${reg2.data.id}?hard=1`, { method: 'DELETE' }, tAdmin)).code, 0);
+        assert.strictEqual(db.prepare('SELECT 1 FROM bridge_releases WHERE id=?').get(reg2.data.id), undefined);
+      } finally { server.close(); try { fs.rmSync(testPath, { force: true }); } catch { } }
+    });
+  }
+
   try { db.close(); } catch { }
   fs.rmSync(process.env.AGENT_DATA_DIR, { recursive: true, force: true });
-
   console.log('\n———————————————');
   console.log(`结果：${passed} 通过 / ${failed} 失败`);
   process.exit(failed ? 1 : 0);

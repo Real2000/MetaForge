@@ -370,6 +370,25 @@ const ALL_MIGRATIONS = [
     created_at TEXT,
     updated_at TEXT
   );` },
+  // === D2-3 桌面端升级通道（2026-11-21）===
+  { id: 95, name: 'bridge_releases - 客户端发布清单', table: 'bridge_releases', createSql: `CREATE TABLE IF NOT EXISTS bridge_releases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    version TEXT NOT NULL, platform TEXT DEFAULT 'any', arch TEXT DEFAULT 'any',
+    channel TEXT DEFAULT 'stable', file_name TEXT DEFAULT '', sha256 TEXT DEFAULT '',
+    size INTEGER DEFAULT 0, notes TEXT DEFAULT '', mandatory INTEGER DEFAULT 0,
+    min_version TEXT DEFAULT '', status TEXT DEFAULT 'active', created_at TEXT
+  );` },
+  { id: 96, name: 'bridge_updates - 客户端更新尝试台账', table: 'bridge_updates', createSql: `CREATE TABLE IF NOT EXISTS bridge_updates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id INTEGER, username TEXT DEFAULT '', from_version TEXT DEFAULT '', to_version TEXT DEFAULT '',
+    channel TEXT DEFAULT 'stable', status TEXT DEFAULT 'success', error TEXT DEFAULT '',
+    duration_ms INTEGER DEFAULT 0, created_at TEXT
+  );` },
+  { id: 97, name: 'bridge_crashes - 客户端崩溃上报', table: 'bridge_crashes', createSql: `CREATE TABLE IF NOT EXISTS bridge_crashes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id INTEGER, username TEXT DEFAULT '', version TEXT DEFAULT '', kind TEXT DEFAULT 'runtime',
+    message TEXT DEFAULT '', stack TEXT DEFAULT '', created_at TEXT
+  );` },
 ];
 
 module.exports = {

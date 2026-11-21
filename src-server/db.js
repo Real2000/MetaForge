@@ -1908,6 +1908,53 @@ db.exec(`CREATE TABLE IF NOT EXISTS localbridge_backups (
 );`);
 db.exec('CREATE INDEX IF NOT EXISTS idx_lb_backups_dev ON localbridge_backups(device_id, created_at);');
 
+// ================== D2-3 桌面端升级通道 V1（2026-11-21）==================
+// bridge_releases：客户端发布清单（同一版本可多平台/架构/通道），服务端据此给出「是否有新版」。
+// bridge_updates ：每次更新尝试的台账（成功/失败/回滚），用于更新成功率（验收 ≥ 95%）。
+// bridge_crashes ：客户端崩溃上报（含启动失败），用于崩溃率（验收 < 0.5%）。
+db.exec(`CREATE TABLE IF NOT EXISTS bridge_releases (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  version TEXT NOT NULL,            -- 规范化版本号（1.2.3）
+  platform TEXT DEFAULT 'any',      -- darwin / win32 / any
+  arch TEXT DEFAULT 'any',          -- x64 / arm64 / any
+  channel TEXT DEFAULT 'stable',    -- stable / beta
+  file_name TEXT DEFAULT '',        -- 平台端文件名（public/downloads 下或 release 目录）
+  sha256 TEXT DEFAULT '',           -- 包完整性校验值（下载后客户端校验）
+  size INTEGER DEFAULT 0,           -- 字节数
+  notes TEXT DEFAULT '',            -- 更新说明（Markdown 纯文本）
+  mandatory INTEGER DEFAULT 0,      -- 是否强制升级
+  min_version TEXT DEFAULT '',      -- 低于此版本的客户端强制升级
+  status TEXT DEFAULT 'active',     -- active / archived
+  created_at TEXT
+);`);
+db.exec('CREATE INDEX IF NOT EXISTS idx_br_rel_pick ON bridge_releases(platform, arch, channel, status);');
+db.exec(`CREATE TABLE IF NOT EXISTS bridge_updates (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  device_id INTEGER,                -- localbridge_devices.id（可为空：未配对设备也上报）
+  username TEXT DEFAULT '',
+  from_version TEXT DEFAULT '',
+  to_version TEXT DEFAULT '',
+  channel TEXT DEFAULT 'stable',
+  status TEXT DEFAULT 'success',    -- success / failed / rollback
+  error TEXT DEFAULT '',            -- 失败/回滚原因摘要
+  duration_ms INTEGER DEFAULT 0,
+  created_at TEXT
+);`);
+db.exec('CREATE INDEX IF NOT EXISTS idx_bu_created ON bridge_updates(created_at);');
+db.exec('CREATE INDEX IF NOT EXISTS idx_bu_device ON bridge_updates(device_id);');
+db.exec(`CREATE TABLE IF NOT EXISTS bridge_crashes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  device_id INTEGER,
+  username TEXT DEFAULT '',
+  version TEXT DEFAULT '',          -- 崩溃时客户端版本
+  kind TEXT DEFAULT 'runtime',      -- startup / runtime / unhandled
+  message TEXT DEFAULT '',
+  stack TEXT DEFAULT '',
+  created_at TEXT
+);`);
+db.exec('CREATE INDEX IF NOT EXISTS idx_bc_created ON bridge_crashes(created_at);');
+db.exec('CREATE INDEX IF NOT EXISTS idx_bc_device ON bridge_crashes(device_id);');
+
 // ---------------- P1-4 分层记忆v1：agent_memories 增加 type/confidence/source/summary 字段（2026-11-11）----------------
 {
   const cols = db.prepare('PRAGMA table_info(agent_memories)').all().map(r => r.name);

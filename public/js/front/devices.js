@@ -31,6 +31,11 @@ export async function render(box) {
     <h3 style="margin-bottom:10px">📱 ${t('已配对设备')}</h3>
     <div id="devList">${t('加载中…')}</div>
   </div>
+  <!-- D2-3 桌面端升级通道（客户端自动更新） -->
+  <div class="card" style="margin-top:18px;padding:22px">
+    <h3 style="margin-bottom:10px">🛰️ ${t('客户端版本与更新')} <span class="sub">${t('助手将自动检查并安装新版本')}</span></h3>
+    <div id="updateInfo">${t('加载中…')}</div>
+  </div>
   <!-- D1-1 备份与回滚（端侧执行 V1） -->
   <div class="card" style="margin-top:18px;padding:22px">
     <h3 style="margin-bottom:10px">🛟 ${t('端侧改动与回滚')} <span class="sub">${t('本地写操作（file_write/file_patch）自动备份，可一键回滚')}</span></h3>
@@ -210,7 +215,32 @@ export async function render(box) {
   }
   loadDevs();
   loadBackups();
+  loadUpdateInfo();
   const refresh = setInterval(() => { if (!box.isConnected) return clearInterval(refresh); loadDevs(); loadBackups(); }, 15000);
+
+  async function loadUpdateInfo() {
+    const el = box.querySelector('#updateInfo');
+    if (!el) return;
+    try {
+      const j = await api('/localbridge/version?current=0.0.0&channel=stable');
+      const d = j.data || {};
+      if (!d.latest) {
+        el.innerHTML = `<div style="padding:12px;color:var(--text-3);font-size:13px">${t('平台暂未发布客户端版本。安装并配对后，助手会自动保持最新。')}</div>`;
+        return;
+      }
+      const latest = d.release || {};
+      el.innerHTML = `<div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap">
+        <span class="tag blue" style="font-size:13px">${t('最新版本')} ${esc(d.latest)}</span>
+        ${latest.mandatory ? `<span class="tag red">${t('强制更新')}</span>` : ''}
+        <span style="font-size:12px;color:var(--text-3)">${esc(latest.platform || 'any')}/${esc(latest.arch || 'any')} · ${esc(latest.channel || 'stable')}</span>
+        <span style="font-size:12px;color:var(--text-3)">${esc((latest.notes || '').slice(0, 80))}</span>
+        <a class="btn sm" href="${esc(latest.url || '/api/localbridge/installer')}">⬇️ ${t('下载')}</a>
+      </div>
+      <p style="font-size:12px;color:var(--text-3);margin-top:10px;line-height:1.7">${t('助手（本地桥）启动后会自动比对版本、校验包完整性并原子替换，成功后自动重启生效；更新结果可在后台「桌面端升级」页查看。')}</p>`;
+    } catch (e) {
+      el.innerHTML = `<div style="padding:12px;color:var(--danger,#dc2626);font-size:13px">${esc(e.message)}</div>`;
+    }
+  }
 
   async function loadBackups() {
     const el = box.querySelector('#backupList');

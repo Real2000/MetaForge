@@ -16,7 +16,7 @@
 const express = require('express');
 const crypto = require('crypto');
 const { db, now } = require('../db');
-const { auth } = require('../lib/auth');
+const { auth, adminOnly } = require('../lib/auth');
 const { clientIp } = require('../lib/rate-limit');
 
 const router = express.Router();
@@ -283,6 +283,162 @@ router.get('/installer', (req, res) => {
   const f = path.join(base, file);
   if (!fs.existsSync(f)) return res.status(404).json({ code: 404, msg: '安装包未构建（管理员执行 local-bridge/build-installer.sh）' });
   res.download(f, file);
+});
+
+/* ================== D2-3 桌面端升级通道 V1（2026-11-21）================== */
+const bridgeUpdate = require('../lib/bridge-update');
+
+/** 读取发布包文件信息（存在则实时算 sha256/size）；public/downloads 下按文件名定位 */
+function resolveReleaseFile(fileName) {
+  const fs = require('fs');
+  const f = path.join(__dirname, '..', '..', 'public', 'downloads', String(fileName || ''));
+  try {
+    const st = fs.statSync(f);
+    return { path: f, exists: true, size: st.size, sha256: bridgeUpdate.sha256(fs.readFileSync(f)) };
+  } catch { return { path: f, exists: false, size: 0, sha256: '' }; }
+}
+
+/** 软设备鉴权：令牌有效则返回设备行，否则 null（不阻断——供未配对/启动失败场景上报） */
+function softDevice(req) {
+  const token = String(req.headers['x-device-token'] || '');
+  if (!token) return null;
+  try { return db.prepare('SELECT * FROM localbridge_devices WHERE device_token=?').get(token) || null; }
+  catch { return null; }
+}
+
+// 检查更新（客户端启动 + 定时调用）：公开可查（与安装包下载同域，不含敏感信息）
+router.get('/version', (req, res) => {
+  const { current = '0.0.0', platform = '', arch = '', channel = 'stable' } = req.query;
+  const rows = db.prepare("SELECT * FROM bridge_releases WHERE status='active'").all();
+  const picked = bridgeUpdate.pickRelease(rows, { platform, arch, channel, current });
+  const device = softDevice(req);
+  if (device) db.prepare('UPDATE localbridge_devices SET last_seen=? WHERE id=?').run(now(), device.id);
+  const r = picked.release;
+  res.json({
+    code: 0, data: {
+      current: bridgeUpdate.normalizeVersion(current),
+      latest: picked.latest, update_available: picked.update_available, mandatory: picked.mandatory,
+      release: r ? {
+        ...bridgeUpdate.releaseView(r),
+        url: `/api/localbridge/release/download?version=${encodeURIComponent(r.version)}&platform=${encodeURIComponent(r.platform || 'any')}&arch=${encodeURIComponent(r.arch || 'any')}&channel=${encodeURIComponent(r.channel || 'stable')}`,
+      } : null,
+    },
+  });
+});
+
+// 下载发布包（公开，与 /installer 同口径）：命中版本优先，否则按平台/架构/通道取最新
+router.get('/release/download', (req, res) => {
+  const { version, platform = '', arch = '', channel = 'stable' } = req.query;
+  let row = null;
+  if (version) {
+    row = db.prepare("SELECT * FROM bridge_releases WHERE version=? AND status='active' AND (platform=? OR platform='any' OR platform='') AND (arch=? OR arch='any' OR arch='') ORDER BY id DESC LIMIT 1")
+      .get(bridgeUpdate.normalizeVersion(version), platform, arch);
+  }
+  if (!row) {
+    const rows = db.prepare("SELECT * FROM bridge_releases WHERE status='active'").all();
+    row = bridgeUpdate.pickRelease(rows, { platform, arch, channel, current: '0.0.0' }).release;
+  }
+  if (!row) return res.status(404).json({ code: 404, msg: '未找到匹配的发布包' });
+  const f = resolveReleaseFile(row.file_name);
+  if (!f.exists) return res.status(404).json({ code: 404, msg: `发布包文件不存在：${row.file_name}（管理员需先放入 public/downloads/）` });
+  res.setHeader('X-Bridge-Version', row.version);
+  res.setHeader('X-Sha256', row.sha256 || f.sha256);
+  res.download(f.path, row.file_name);
+});
+
+// 更新结果上报（桥端自动更新完成后回推）：success / failed / rollback
+router.post('/update-report', (req, res) => {
+  const device = softDevice(req);
+  const b = req.body || {};
+  const st = ['success', 'failed', 'rollback'].includes(b.status) ? b.status : 'failed';
+  db.prepare('INSERT INTO bridge_updates (device_id,username,from_version,to_version,channel,status,error,duration_ms,created_at) VALUES (?,?,?,?,?,?,?,?,?)')
+    .run(device ? device.id : null, device ? device.username : '',
+      bridgeUpdate.normalizeVersion(b.from_version), bridgeUpdate.normalizeVersion(b.to_version),
+      bridgeUpdate.CHANNELS.includes(b.channel) ? b.channel : 'stable', st,
+      String(b.error || '').slice(0, 500), Number(b.duration_ms) || 0, now());
+  if (device) db.prepare('UPDATE localbridge_devices SET last_seen=? WHERE id=?').run(now(), device.id);
+  res.json({ code: 0 });
+});
+
+// 崩溃上报（含启动失败，uncaughtException/unhandledRejection）：未配对也可上报
+router.post('/crash-report', (req, res) => {
+  const device = softDevice(req);
+  const b = req.body || {};
+  const kind = ['startup', 'runtime', 'unhandled'].includes(b.kind) ? b.kind : 'runtime';
+  db.prepare('INSERT INTO bridge_crashes (device_id,username,version,kind,message,stack,created_at) VALUES (?,?,?,?,?,?,?)')
+    .run(device ? device.id : null, device ? device.username : '',
+      bridgeUpdate.normalizeVersion(b.version) || String(b.version || '').slice(0, 40),
+      kind, String(b.message || '').slice(0, 500), String(b.stack || '').slice(0, 4000), now());
+  res.json({ code: 0 });
+});
+
+// 发布清单（admin）：附文件是否就位 + 实际哈希
+router.get('/releases', auth, adminOnly, (req, res) => {
+  const rows = db.prepare('SELECT * FROM bridge_releases ORDER BY id DESC').all();
+  res.json({
+    code: 0, data: rows.map(r => {
+      const f = r.file_name ? resolveReleaseFile(r.file_name) : { exists: false, size: 0, sha256: '' };
+      return { ...bridgeUpdate.releaseView(r), file_exists: !!r.file_name && f.exists, actual_sha256: f.sha256, actual_size: f.size };
+    }),
+  });
+});
+
+// 登记发布（admin）：同版本×平台×架构×通道幂等更新；文件在库时自动补 sha256/size
+router.post('/releases', auth, adminOnly, (req, res) => {
+  const b = req.body || {};
+  const version = bridgeUpdate.normalizeVersion(b.version);
+  if (!/^\d+\.\d+\.\d+/.test(version)) return res.json({ code: 400, msg: '版本号格式应为 1.2.3（可带 -beta.1）' });
+  const platform = String(b.platform || 'any').trim() || 'any';
+  const arch = String(b.arch || 'any').trim() || 'any';
+  const channel = bridgeUpdate.CHANNELS.includes(b.channel) ? b.channel : 'stable';
+  const file_name = String(b.file_name || '').trim();
+  const finfo = file_name ? resolveReleaseFile(file_name) : { exists: false, size: 0, sha256: '' };
+  const sha256 = String(b.sha256 || finfo.sha256 || '').toLowerCase();
+  const size = Number(b.size) || finfo.size || 0;
+  const notes = String(b.notes || '').slice(0, 2000);
+  const mandatory = b.mandatory ? 1 : 0;
+  const min_version = bridgeUpdate.normalizeVersion(b.min_version || '');
+  const dup = db.prepare('SELECT id FROM bridge_releases WHERE version=? AND platform=? AND arch=? AND channel=?').get(version, platform, arch, channel);
+  let id;
+  if (dup) {
+    db.prepare('UPDATE bridge_releases SET file_name=?,sha256=?,size=?,notes=?,mandatory=?,min_version=?,status=? WHERE id=?')
+      .run(file_name, sha256, size, notes, mandatory, min_version, 'active', dup.id);
+    id = dup.id;
+  } else {
+    const info = db.prepare('INSERT INTO bridge_releases (version,platform,arch,channel,file_name,sha256,size,notes,mandatory,min_version,status,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
+      .run(version, platform, arch, channel, file_name, sha256, size, notes, mandatory, min_version, 'active', now());
+    id = Number(info.lastInsertRowid);
+  }
+  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
+    .run(req.user.username, dup ? '更新发布' : '登记发布', `桥端 ${version} ${platform}/${arch} ${channel}${finfo.exists ? '' : '（文件缺失）'}`, req.ip, now());
+  res.json({ code: 0, msg: dup ? '发布已更新' : '发布已登记', data: { id, version, file_exists: finfo.exists, sha256 } });
+});
+
+// 下线发布（admin）：默认软下线（status=archived），?hard=1 真删
+router.delete('/releases/:id', auth, adminOnly, (req, res) => {
+  const row = db.prepare('SELECT * FROM bridge_releases WHERE id=?').get(Number(req.params.id));
+  if (!row) return res.status(404).json({ code: 404, msg: '发布不存在' });
+  if (String(req.query.hard) === '1') db.prepare('DELETE FROM bridge_releases WHERE id=?').run(row.id);
+  else db.prepare("UPDATE bridge_releases SET status='archived' WHERE id=?").run(row.id);
+  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
+    .run(req.user.username, '下线发布', `桥端 ${row.version} ${row.platform}/${row.arch}`, req.ip, now());
+  res.json({ code: 0 });
+});
+
+// 更新与崩溃指标（admin）：更新成功率 / 崩溃率 + 最近记录（验收：成功率 ≥ 95%、崩溃率 < 0.5%）
+router.get('/update-stats', auth, adminOnly, (req, res) => {
+  const updates = db.prepare('SELECT * FROM bridge_updates ORDER BY id DESC LIMIT 1000').all();
+  const crashes = db.prepare('SELECT * FROM bridge_crashes ORDER BY id DESC LIMIT 1000').all();
+  const stats = bridgeUpdate.updateStats(updates, crashes);
+  const releases = db.prepare("SELECT * FROM bridge_releases WHERE status='active' ORDER BY id DESC").all().map(bridgeUpdate.releaseView);
+  res.json({
+    code: 0, data: {
+      stats,
+      releases,
+      updates: updates.slice(0, 50),
+      crashes: crashes.slice(0, 50),
+    },
+  });
 });
 
 module.exports = { router, OPS_WHITELIST, TIER_OPS, TIER_ORDER, TIERS, normalizeTier, allowedOpsForTier, opAllowedForTier, opMinTier };
