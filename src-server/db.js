@@ -2137,6 +2137,36 @@ db.exec(`CREATE TABLE IF NOT EXISTS sandbox_runs (
   created_at TEXT
 );`);
 db.exec('CREATE INDEX IF NOT EXISTS idx_sandbox_runs_owner ON sandbox_runs(owner, id);');
+// === D3-3 沙箱池 V1（2026-11-21）：pool 运行扩展列（租户/是否命中预热/冷启动耗时）===
+try { db.exec("ALTER TABLE sandbox_runs ADD COLUMN tenant TEXT DEFAULT ''"); } catch { }
+try { db.exec('ALTER TABLE sandbox_runs ADD COLUMN pool_hit INTEGER DEFAULT 0'); } catch { }
+try { db.exec('ALTER TABLE sandbox_runs ADD COLUMN cold_start_ms INTEGER DEFAULT NULL'); } catch { }
+// 沙箱池租户配额（tenant → 并发上限 / 预热进程数 / 启停）
+db.exec(`CREATE TABLE IF NOT EXISTS sandbox_pools (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant TEXT NOT NULL,
+  max_concurrent INTEGER DEFAULT 2,     -- 租户并发上限（0=不限）
+  max_idle INTEGER DEFAULT 1,           -- 空闲预热进程上限
+  warm_size INTEGER DEFAULT 1,          -- 保持预热的进程数
+  enabled INTEGER DEFAULT 1,
+  created_by TEXT DEFAULT '',
+  created_at TEXT,
+  updated_at TEXT
+);`);
+db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_sandbox_pools_tenant ON sandbox_pools(tenant);');
+// 沙箱池快照（预置环境目录镜像；新工作进程目录由激活快照播种）
+db.exec(`CREATE TABLE IF NOT EXISTS sandbox_snapshots (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  source_dir TEXT DEFAULT '',
+  snapshot_path TEXT DEFAULT '',        -- 相对项目根的快照目录
+  node_version TEXT DEFAULT '',
+  prelude_hash TEXT DEFAULT '',         -- 生成快照时的沙箱基座指纹
+  size_bytes INTEGER DEFAULT 0,
+  active INTEGER DEFAULT 0,             -- 同一时刻仅一个激活
+  created_by TEXT DEFAULT '',
+  created_at TEXT
+);`);
 // P1-14 HITL 五态审批：pending → approved | rejected | expired；批准且执行完 → executed
 db.exec(`CREATE TABLE IF NOT EXISTS tool_approvals (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

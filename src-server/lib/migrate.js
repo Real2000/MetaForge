@@ -417,6 +417,22 @@ const ALL_MIGRATIONS = [
     repeat_runs INTEGER DEFAULT 0, repeat_success INTEGER DEFAULT 0,
     total_duration_ms INTEGER DEFAULT 0, last_status TEXT DEFAULT '', last_at TEXT, updated_at TEXT
   );` },
+  // === D3-3 沙箱池 V1（2026-11-21）===
+  { id: 102, name: 'sandbox_runs.tenant - 沙箱池租户', table: 'sandbox_runs', column: 'tenant', def: "TEXT DEFAULT ''" },
+  { id: 103, name: 'sandbox_runs.pool_hit - 是否命中预热进程', table: 'sandbox_runs', column: 'pool_hit', def: 'INTEGER DEFAULT 0' },
+  { id: 104, name: 'sandbox_runs.cold_start_ms - 冷启动耗时', table: 'sandbox_runs', column: 'cold_start_ms', def: 'INTEGER DEFAULT NULL' },
+  { id: 105, name: 'sandbox_pools - 沙箱池租户配额', table: 'sandbox_pools', createSql: `CREATE TABLE IF NOT EXISTS sandbox_pools (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant TEXT NOT NULL, max_concurrent INTEGER DEFAULT 2, max_idle INTEGER DEFAULT 1,
+    warm_size INTEGER DEFAULT 1, enabled INTEGER DEFAULT 1,
+    created_by TEXT DEFAULT '', created_at TEXT, updated_at TEXT
+  );` },
+  { id: 106, name: 'sandbox_snapshots - 沙箱池快照', table: 'sandbox_snapshots', createSql: `CREATE TABLE IF NOT EXISTS sandbox_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL, source_dir TEXT DEFAULT '', snapshot_path TEXT DEFAULT '',
+    node_version TEXT DEFAULT '', prelude_hash TEXT DEFAULT '', size_bytes INTEGER DEFAULT 0,
+    active INTEGER DEFAULT 0, created_by TEXT DEFAULT '', created_at TEXT
+  );` },
 ];
 
 module.exports = {

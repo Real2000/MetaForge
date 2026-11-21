@@ -107,4 +107,97 @@ router.post('/test-cmd', adminOnly, async (req, res) => {
   res.json({ code: 0, data: r, msg: r.status === 'denied' ? '命令被白名单拒绝' : `执行完成（${r.status}）` });
 });
 
+// ---------------- D3-3 沙箱池（预热/快照/并发隔离/租户配额） ----------------
+const pool = require('../lib/sandbox-pool');
+
+/** 租户归属：管理员可指定 tenant，普通用户强制为自身用户名（防越权配额/快照操作） */
+function tenantOf(req) {
+  const u = req.user || {};
+  if (u.role === 'admin' && req.body && req.body.tenant) return String(req.body.tenant);
+  if (u.role === 'admin' && req.query && req.query.tenant) return String(req.query.tenant);
+  return String(u.username || 'default');
+}
+
+/** 池指标：冷启动（< 3s 达标）/预热命中率/池内空闲忙碌 */
+router.get('/pool/stats', (req, res) => {
+  res.json({ code: 0, data: pool.poolStats() });
+});
+
+/** 租户配额列表 + 当前租户配额 */
+router.get('/pool/quotas', (req, res) => {
+  res.json({ code: 0, data: { mine: pool.quotaOf(tenantOf(req)), list: listPoolQuotas() } });
+});
+
+/** 登记/更新租户配额（管理员） */
+router.post('/pool/quota/upsert', adminOnly, (req, res) => {
+  const b = req.body || {};
+  try {
+    const q = pool.upsertPool({
+      tenant: b.tenant, max_concurrent: b.max_concurrent, max_idle: b.max_idle,
+      warm_size: b.warm_size, enabled: b.enabled, createdBy: req.user.username,
+    });
+    res.json({ code: 0, data: q, msg: '配额已保存' });
+  } catch (e) { res.json({ code: 400, msg: e.message }); }
+});
+
+/** 预热：为该租户保持 n 个待命进程 */
+router.post('/pool/warm', (req, res) => {
+  const n = req.body?.n != null ? Number(req.body.n) : undefined;
+  res.json({ code: 0, data: pool.warmUp(tenantOf(req), n), msg: '已预热' });
+});
+
+/** 池化执行：POST /api/sandbox/pool/run { code, netAllow?, globals?, timeoutMs? } */
+router.post('/pool/run', async (req, res) => {
+  const b = req.body || {};
+  if (!b.code) return res.json({ code: 400, msg: 'code 必填' });
+  const r = await pool.runPooled({
+    code: String(b.code),
+    tenant: tenantOf(req),
+    owner: req.user.username,
+    netAllow: Array.isArray(b.netAllow) ? b.netAllow : [],
+    globals: b.globals && typeof b.globals === 'object' ? b.globals : undefined,
+    timeoutMs: Number(b.timeoutMs) || 15000,
+  });
+  res.json({ code: r.status === 'denied' ? 403 : 0, data: r, msg: `执行完成（${r.status}）` });
+});
+
+/** 隔离自检：返回跨进程/跨租户越权计数（验收 0 例） */
+router.get('/pool/isolation', async (req, res) => {
+  res.json({ code: 0, data: await pool.isolationSelfCheck() });
+});
+
+/** 快照列表 */
+router.get('/snapshots', (req, res) => {
+  res.json({ code: 0, data: pool.listSnapshots() });
+});
+
+/** 创建快照（管理员）：把预置环境目录登记为快照 */
+router.post('/snapshots', adminOnly, (req, res) => {
+  const b = req.body || {};
+  try {
+    const s = pool.createSnapshot({ name: b.name, source: b.source, createdBy: req.user.username });
+    res.json({ code: 0, data: s, msg: '快照已创建' });
+  } catch (e) { res.json({ code: 400, msg: e.message }); }
+});
+
+/** 激活快照（管理员）：新工作进程目录从该快照播种 */
+router.post('/snapshots/:id/activate', adminOnly, (req, res) => {
+  try { res.json({ code: 0, data: pool.activateSnapshot(Number(req.params.id)), msg: '快照已激活' }); }
+  catch (e) { res.json({ code: 404, msg: e.message }); }
+});
+
+/** 删除快照（管理员） */
+router.delete('/snapshots/:id', adminOnly, (req, res) => {
+  try { res.json({ code: 0, data: pool.deleteSnapshot(Number(req.params.id)), msg: '快照已删除' }); }
+  catch (e) { res.json({ code: 404, msg: e.message }); }
+});
+
+/** 租户配额列表（含实时忙碌数） */
+function listPoolQuotas() {
+  return pool.listPools().map(r => ({
+    tenant: r.tenant, max_concurrent: r.max_concurrent, max_idle: r.max_idle,
+    warm_size: r.warm_size, enabled: !!r.enabled, busy: r.busy,
+  }));
+}
+
 module.exports = router;

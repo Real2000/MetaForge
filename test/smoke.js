@@ -9281,6 +9281,145 @@ print('PY_OK')
     });
   }
 
+  console.log('【D3-3】沙箱池（预热/快照/并发隔离/租户配额；冷启动 < 3 秒、越权 0 例）');
+  {
+    const pool = require('../src-server/lib/sandbox-pool');
+    const os = require('os');
+
+    await t('D3-3: 池内核——配额判定/冷启动达标/池汇总/快照元数据/隔离结论', async () => {
+      // 并发配额：忙碌数 ≥ 上限即超限；上限 ≤0 视为不限
+      assert.strictEqual(pool.quotaExceeded(1, 2), false);
+      assert.strictEqual(pool.quotaExceeded(2, 2), true);
+      assert.strictEqual(pool.quotaExceeded(99, 0), false, '上限 0 = 不限');
+      // 冷启动达标（严格 < 3 秒）
+      assert.strictEqual(pool.TARGET_COLD_MS, 3000);
+      assert.strictEqual(pool.meetsColdStart(1200), true);
+      assert.strictEqual(pool.meetsColdStart(3000), false, '等于 3000 不算达标');
+      assert.strictEqual(pool.meetsColdStart(null), null);
+      // 池汇总
+      const s = pool.poolSummary([{ tenant: 'a', state: 'idle' }, { tenant: 'a', state: 'busy' }, { tenant: 'b', state: 'idle' }]);
+      assert.deepStrictEqual({ total: s.total, idle: s.idle, busy: s.busy }, { total: 3, idle: 2, busy: 1 });
+      assert.strictEqual(s.byTenant.a.idle, 1); assert.strictEqual(s.byTenant.b.idle, 1);
+      // 快照元数据（体积人性化 + 派生字段）
+      const sm = pool.snapshotMeta({ id: 1, name: 'base', size_bytes: 2048, active: 1, node_version: 'v20' });
+      assert.strictEqual(sm.size_human, '2.0KB'); assert.strictEqual(sm.active, true);
+      assert.strictEqual(pool.snapshotMeta({ size_bytes: 500 }).size_human, '500B');
+      // 隔离结论：有任一检查失败即存在越权
+      assert.deepStrictEqual(pool.isolationVerdict([{ ok: true }, { ok: true }]).passed, true);
+      assert.deepStrictEqual(pool.isolationVerdict([{ ok: true }, { ok: false }]).violations, 1);
+      assert.ok(pool.preludeHash().length === 16, 'prelude 指纹 16 位');
+    });
+
+    await t('D3-3: 池化执行——一次性预热进程 + sandbox_runs 审计 + 预热命中/冷启动', async () => {
+      const tenant = 'd33u1';
+      db.prepare('DELETE FROM sandbox_runs').run();
+      pool.resetPool();
+      const r1 = await pool.runPooled({ code: "console.log('hello pool', 1+1)", tenant, owner: tenant, timeoutMs: 8000 });
+      assert.strictEqual(r1.status, 'success');
+      assert.ok(/hello pool 2/.test(r1.stdout), 'stdout 捕获');
+      assert.ok(r1.runId, '审计 runId');
+      const row = db.prepare('SELECT * FROM sandbox_runs WHERE id=?').get(r1.runId);
+      assert.strictEqual(row.run_env, 'pool'); assert.strictEqual(row.tenant, tenant); assert.strictEqual(row.status, 'success');
+      // 首次无预热 → 冷启动样本（< 3 秒）
+      assert.strictEqual(r1.poolHit, false, '首次应为冷启动');
+      assert.ok(r1.coldStartMs != null && r1.coldStartMs < pool.TARGET_COLD_MS, `冷启动 ${r1.coldStartMs}ms < 3000ms`);
+      // 第二次：runPooled 已后台补足预热 → 命中
+      const r2 = await pool.runPooled({ code: 'console.log("warm")', tenant, owner: tenant, timeoutMs: 8000 });
+      assert.strictEqual(r2.status, 'success'); assert.strictEqual(r2.poolHit, true, '第二次应命中预热进程');
+      assert.strictEqual(r2.coldStartMs, null, '命中预热无冷启动样本');
+      const st = pool.poolStats();
+      assert.ok(st.runs.total >= 2 && st.runs.coldStarts >= 1 && st.runs.poolHits >= 1);
+      assert.strictEqual(st.runs.coldStartMet, true);
+      // 空代码 → denied
+      assert.strictEqual((await pool.runPooled({ code: '  ', tenant })).status, 'denied');
+    });
+
+    await t('D3-3: 隔离自检——进程边界隔离，越权 0 例', async () => {
+      const v = await pool.isolationSelfCheck();
+      assert.strictEqual(v.violations, 0, '不应存在越权');
+      assert.strictEqual(v.passed, true);
+      assert.ok(v.checks.length >= 3);
+      assert.ok(v.checks.every(c => c.ok), '全部检查通过');
+      assert.ok(v.checks.some(c => /模块边界/.test(c.name)) && v.checks.some(c => /环境变量掩蔽/.test(c.name)) && v.checks.some(c => /跨进程状态隔离/.test(c.name)));
+    });
+
+    await t('D3-3: 快照——创建/激活/播种到工作进程 + 删除', async () => {
+      const src = fs.mkdtempSync(path.join(os.tmpdir(), 'd33snap-'));
+      fs.writeFileSync(path.join(src, 'helper.txt'), 'hello-from-snapshot');
+      let snap;
+      try {
+        assert.throws(() => pool.createSnapshot({ name: 'x', source: path.join(src, '__nope__') }), /不存在/);
+        snap = pool.createSnapshot({ name: 'd33-base', source: src, createdBy: 'd33adm' });
+        assert.ok(snap.id && snap.size_bytes >= 18 && /KB$|B$/.test(snap.size_human));
+        assert.strictEqual(snap.active, false);
+        const act = pool.activateSnapshot(snap.id);
+        assert.strictEqual(act.active, true);
+        assert.ok(pool.listSnapshots().some(s => s.id === snap.id && s.active));
+        // 新工作进程目录由激活快照播种 → files 里应含 helper.txt
+        const r = await pool.runPooled({ code: 'console.log("ok")', tenant: 'd33u2' });
+        assert.ok(r.files.includes('helper.txt'), '工作目录由快照播种（含 helper.txt）');
+      } finally {
+        if (snap) try { pool.deleteSnapshot(snap.id); } catch { }
+        try { fs.rmSync(src, { recursive: true, force: true }); } catch { }
+      }
+      assert.ok(!pool.listSnapshots().some(s => s.name === 'd33-base'), '删除后不在列表');
+    });
+
+    await t('D3-3: HTTP —— 配额/预热/池化执行/快照/隔离自检 + 权限', async () => {
+      const express = require('express');
+      const sbRouter = require('../src-server/routes/sandbox');
+      const { sign } = require('../src-server/lib/auth');
+      db.prepare("INSERT INTO users (username,password,nickname,role,status,must_change_pwd,created_at) VALUES ('d33u1','x','U','user',1,0,datetime('now','localtime'))").run();
+      db.prepare("INSERT INTO users (username,password,nickname,role,status,must_change_pwd,created_at) VALUES ('d33adm','x','A','admin',1,0,datetime('now','localtime'))").run();
+      const tok = sign({ uid: db.prepare("SELECT id FROM users WHERE username='d33u1'").get().id, exp: Date.now() + 3600000 });
+      const tAdmin = sign({ uid: db.prepare("SELECT id FROM users WHERE username='d33adm'").get().id, exp: Date.now() + 3600000 });
+      const app = express(); app.use(express.json()); app.use('/api/sandbox', sbRouter);
+      let server; await new Promise(r => { server = app.listen(0, '127.0.0.1', r); });
+      const base = `http://127.0.0.1:${server.address().port}`;
+      const J = async (p, opts, tk) => (await fetch(base + p, { ...(opts || {}), headers: { 'Content-Type': 'application/json', ...(tk ? { authorization: 'Bearer ' + tk } : {}) } })).json();
+      const src = fs.mkdtempSync(path.join(os.tmpdir(), 'd33http-'));
+      fs.writeFileSync(path.join(src, 'seed.txt'), 'seed');
+      let snapId;
+      try {
+        assert.strictEqual((await fetch(base + '/api/sandbox/pool/stats')).status, 401, '未认证 401');
+        assert.strictEqual((await J('/api/sandbox/pool/run', { method: 'POST', body: JSON.stringify({}) }, tok)).code, 400, '缺 code 400');
+        // 管理员登记配额
+        const q = await J('/api/sandbox/pool/quota/upsert', { method: 'POST', body: JSON.stringify({ tenant: 'd33u1', max_concurrent: 3, warm_size: 1 }) }, tAdmin);
+        assert.strictEqual(q.code, 0); assert.strictEqual(q.data.max_concurrent, 3);
+        assert.strictEqual((await J('/api/sandbox/pool/quota/upsert', { method: 'POST', body: JSON.stringify({ tenant: 'd33u1' }) }, tok)).code, 403, '非管理员 403');
+        // 预热 + 池化执行（普通用户）
+        const w = await J('/api/sandbox/pool/warm', { method: 'POST', body: JSON.stringify({ n: 1 }) }, tok);
+        assert.strictEqual(w.code, 0);
+        const run = await J('/api/sandbox/pool/run', { method: 'POST', body: JSON.stringify({ code: "console.log('http pool')" }) }, tok);
+        assert.strictEqual(run.code, 0); assert.strictEqual(run.data.status, 'success');
+        assert.ok(/http pool/.test(run.data.stdout));
+        // 隔离自检
+        const iso = await J('/api/sandbox/pool/isolation', {}, tok);
+        assert.strictEqual(iso.code, 0); assert.strictEqual(iso.data.passed, true);
+        // 快照：管理员创建/激活，普通用户可见列表，删除
+        assert.strictEqual((await J('/api/sandbox/snapshots', { method: 'POST', body: JSON.stringify({ name: 'h', source: src }) }, tok)).code, 403, '非管理员创建 403');
+        const sc = await J('/api/sandbox/snapshots', { method: 'POST', body: JSON.stringify({ name: 'd33-http', source: src }) }, tAdmin);
+        assert.strictEqual(sc.code, 0); snapId = sc.data.id;
+        assert.strictEqual((await J(`/api/sandbox/snapshots/${snapId}/activate`, { method: 'POST' }, tAdmin)).code, 0);
+        const list = await J('/api/sandbox/snapshots', {}, tok);
+        assert.ok(list.data.some(s => s.id === snapId && s.active));
+        assert.strictEqual((await J(`/api/sandbox/snapshots/${snapId}`, { method: 'DELETE' }, tAdmin)).code, 0);
+        // 配额列表
+        const qs = await J('/api/sandbox/pool/quotas', {}, tok);
+        assert.ok(qs.data.mine.tenant === 'd33u1' && Array.isArray(qs.data.list));
+        // 指标
+        const st = await J('/api/sandbox/pool/stats', {}, tok);
+        assert.ok(st.data.pool && st.data.runs.total >= 1);
+      } finally {
+        if (snapId) try { pool.deleteSnapshot(snapId); } catch { }
+        try { fs.rmSync(src, { recursive: true, force: true }); } catch { }
+        server.close();
+      }
+    });
+
+    pool.resetPool(); // 收尾：销毁全部空闲预热进程与临时目录
+  }
+
   try { db.close(); } catch { }
   fs.rmSync(process.env.AGENT_DATA_DIR, { recursive: true, force: true });
   console.log('\n———————————————');

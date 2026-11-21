@@ -2750,4 +2750,24 @@ R5 远期生态首项。**先做 3D 资产生成与导出（新增资产类型 +
 - `npm test` 冒烟 **568/0 全绿**（564 基线 + 4 条新增 D3-2 用例：经验内核（归类/贝叶斯可靠度/首跑复跑分桶）、专家优选排序 + 经验提示（样本不足不误伤）、自进化验收指标（含无复跑不臆造/负提升不达标）、HTTP 经验记录（首跑/复跑/失败）/查询/排行/指标/清空/权限）。
 - 已知边界（V1）：任务类型归类为**关键词匹配**（未接向量/模型分类，优先离线可用）；可靠度评分为贝叶斯平滑成功率（未含成本/耗时加权，且不区分"失败重试后成功"的中间态）；经验为**全局共享**（同一 agent 跨用户累计，未按租户隔离）；`rankAgents` 仅在编排提示词层面引导（不强制替换用户图，尊重编排器判断）。
 
+## D3-3 沙箱池 V1（2026-11-21）
+
+**目标**：在 sandbox.js「一次性子进程隔离执行」之上增加**预热池 + 快照 + 按租户并发配额**，验收「冷启动 < 3 秒、隔离越权 0 例」。
+
+**实现（零新依赖）**
+- 预热工作进程 `src-server/lib/sandbox-worker.js`：常驻待命，收到 stdin 一行 JSON 作业即执行（复用 runIsolated 的 prelude 语义——受控 fetch 网络白名单 + `process.env`/`process.exit` 掩蔽；vm 执行使 `require`/`module` 不可见），回写一行结果 JSON 后自毁（**一次性进程 = 进程边界即隔离边界**）。
+- 池内核 `src-server/lib/sandbox-pool.js`：纯逻辑（`quotaExceeded` 并发配额判定、`meetsColdStart` 冷启动达标 < 3s、`poolSummary` 池汇总、`snapshotMeta`/`preludeHash` 快照元数据、`isolationVerdict` 越权结论）与有状态池管理（`warmUp` 预热、`acquire` 取空闲进程或现场 spawn、`replenish` 后台补足、`runPooled` 池化执行 + 审计、`poolStats` 指标、`isolationSelfCheck` 自检、`resetPool` 收尾）。
+- **快照**：`createSnapshot`/`activateSnapshot`——把预置环境目录复制登记为快照，新工作进程工作目录由**激活快照播种**（预热即带环境）；`deleteSnapshot` 清理。
+- **并发隔离**：每作业独占一次性进程 + 一次性工作目录；`runPooled` 用租户匹配空闲进程（不跨租户复用），作业结束销毁进程并回收目录；`isolationSelfCheck` 三项探测（模块边界/环境掩蔽/跨进程状态不泄漏）返回越权计数。
+- **按租户配额**：`sandbox_pools` 表（tenant → max_concurrent / max_idle / warm_size / enabled）；超并发配额直接 denied（计入审计）。
+- 数据层：`sandbox_pools`、`sandbox_snapshots` 两表（db.js 内联建表 + 迁移 105/106）；`sandbox_runs` 扩展列 `tenant`/`pool_hit`/`cold_start_ms`（迁移 102–104），池化运行统一落 `run_env='pool'` 审计（复用 sandbox_runs）。
+- 路由扩展 `src-server/routes/sandbox.js`：`GET /pool/stats`、`GET /pool/quotas`、`POST /pool/quota/upsert`（管理员）、`POST /pool/warm`、`POST /pool/run`（普通用户走自身租户、受配额约束）、`GET /pool/isolation`、`GET /snapshots`、`POST /snapshots`（管理员）、`POST /snapshots/:id/activate`、`DELETE /snapshots/:id`。
+- 新页 `public/js/admin/sandbox-pool.js`「🧊 沙箱池」（路由 `#/admin/sandbox-pool` + 后台导航）：池指标卡（冷启动均值/预热命中率/空闲忙碌/运行总数）+ 执行与自检（池化执行/预热/隔离自检）+ 租户并发配额（增改）+ 环境快照（创建/激活/删除）。
+- `public/sw.js` bump `SW_VERSION` → `d3.3-v1`。
+
+**验证（D3-3）**
+- `npm test` 冒烟 **573/0 全绿**（568 基线 + 5 条新增 D3-3 用例：池内核（配额/冷启动达标/池汇总/快照元数据/隔离结论）、池化执行（一次性预热进程 + sandbox_runs 审计 + 冷启动 < 3s + 预热命中）、隔离自检（模块边界/环境掩蔽/跨进程状态，越权 0 例）、快照（创建/激活/播种到工作进程/删除）、HTTP（配额/预热/池化执行/快照/隔离自检 + 权限））。
+- 实测：冷启动 ~70ms（远低于 3s 验收线）；隔离自检三项全过、越权 0 例；快照激活后新工作进程目录含快照文件。
+- 已知边界（V1）：池管理为**单进程内**（未做跨实例共享池/分布式调度）；快照为**整目录复制**（未做增量/写时复制，源目录 ≤ 50MB）；配额粒度按**租户=用户名**（未接空间/部门维度）；预热进程为空闲 TTL 60s 回收、全局空闲上限 8；执行仍为 node 单运行时（未扩多语言/容器运行时）。
+
 > AI生成
