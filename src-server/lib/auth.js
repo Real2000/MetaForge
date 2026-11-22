@@ -223,7 +223,7 @@ function auditTenantBypass(req, user, tenantId) {
 }
 
 /** 租户上下文中间件：必须置于全部业务路由之前 */
-const TENANT_PUBLIC_PREFIXES = ['/api/auth', '/api/health', '/api/edition', '/api/a2a', '/.well-known', '/api/config/public'];
+const TENANT_PUBLIC_PREFIXES = ['/api/auth', '/api/health', '/api/edition', '/api/a2a', '/.well-known', '/api/config/public', '/api/payment/callback'];
 function isTenantPublicPath(reqPath) {
   const p = String(reqPath || '');
   return TENANT_PUBLIC_PREFIXES.some(pre => p === pre || p.startsWith(pre + '/'));

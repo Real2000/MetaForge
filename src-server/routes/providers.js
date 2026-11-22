@@ -6,6 +6,7 @@ const circuit = require('../lib/circuit');
 const { classifyModel } = require('../lib/model-types');
 const { encrypt, decrypt } = require('../lib/crypto-util');
 const { assertPublicHttpUrl } = require('../lib/ssrf-guard'); // SEC-05：供应商 URL 的 SSRF 校验
+const { scopeTenant, mgmtScope, canManageRow } = require('../lib/tenant'); // MT-12：租户覆盖层
 
 const router = express.Router();
 router.use(auth, adminOnly);
@@ -45,7 +46,12 @@ function maskKey(key) {
 }
 
 router.get('/', (req, res) => {
-  const rows = db.prepare('SELECT * FROM providers ORDER BY id').all().map(p => {
+  // MT-12：可见性——单租户/平台超管未指定 → 全部；否则「平台全局基线(0) ∪ 当前租户层」
+  const visTid = (req.tenant && req.tenant.single) ? null : scopeTenant(req);
+  const raw = visTid == null
+    ? db.prepare('SELECT * FROM providers ORDER BY tenant_id, id').all()
+    : db.prepare('SELECT * FROM providers WHERE tenant_id=0 OR tenant_id=? ORDER BY is_default DESC, id').all(visTid);
+  const rows = raw.map(p => {
     const plain = decrypt(p.api_key);
     return { ...p, api_key: maskKey(plain), model_types: parseTypes(p.model_types) };
   });
@@ -57,28 +63,30 @@ router.get('/health', (req, res) => {
   res.json({ code: 0, data: circuit.healthReport() });
 });
 
-router.post('/', (req, res) => {
+router.post('/', async (req, res) => {
   const { name, base_url, api_key, models, remark, model_price } = req.body || {};
   if (!name?.trim()) return res.json({ code: 400, msg: '供应商名称不能为空' });
   // SEC-05：SSRF 校验（拒绝私网/环回/云元数据地址，除非管理员 AGENT_FETCH_ALLOW_PRIVATE=1）
-  if (base_url && String(base_url).trim()) { try { assertPublicHttpUrl(String(base_url).trim()); } catch (e) { return res.json({ code: 400, msg: e.message }); } }
+  if (base_url && String(base_url).trim()) { try { await assertPublicHttpUrl(String(base_url).trim()); } catch (e) { return res.json({ code: 400, msg: e.message }); } }
   const ms = typeof models === 'string' ? models.split(/[,，\s]+/).filter(Boolean) : (models || []);
   const configured = 1;
   const priceJson = parsePriceBody(model_price);
   if (model_price !== undefined && priceJson === null) return res.json({ code: 400, msg: '模型单价格式不正确（应为 {"模型名":{"input":x,"output":y}}，元/千Token，非负）' });
   const encryptedKey = api_key ? encrypt(api_key) : '';
-  const info = db.prepare(`INSERT INTO providers (name,base_url,api_key,models,configured,is_default,remark,model_price,created_at) VALUES (?,?,?,?,?,0,?,?,datetime('now','localtime'))`)
-    .run(name.trim(), base_url || '', encryptedKey, JSON.stringify(ms), configured, remark || '', priceJson || '{}');
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)').run(req.user.username, '新增模型供应商', name.trim(), req.ip, now());
+  const tenantScope = mgmtScope(req); // MT-12：租户管理员写入本租户层；平台超管/单租户→平台全局(0)
+  const info = db.prepare(`INSERT INTO providers (name,base_url,api_key,models,configured,is_default,remark,model_price,tenant_id,created_at) VALUES (?,?,?,?,?,0,?,?,?,datetime('now','localtime'))`)
+    .run(name.trim(), base_url || '', encryptedKey, JSON.stringify(ms), configured, remark || '', priceJson || '{}', tenantScope);
+  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)').run(req.user.username, '新增模型供应商', `${name.trim()}（租户层 ${tenantScope}）`, req.ip, now());
   res.json({ code: 0, data: { id: info.lastInsertRowid } });
 });
 
-router.put('/:id', (req, res) => {
+router.put('/:id', async (req, res) => {
   const old = db.prepare('SELECT * FROM providers WHERE id=?').get(req.params.id);
   if (!old) return res.json({ code: 404, msg: '供应商不存在' });
+  if (!canManageRow(req, old.tenant_id)) return res.status(403).json({ code: 403, msg: '无权修改其他租户的供应商' }); // MT-12
   const { name, base_url, api_key, models, remark, auth_type, auth_config, status, status_msg, model_price } = req.body || {};
   // SEC-05：SSRF 校验（改地址同样拦截）
-  if (base_url && String(base_url).trim()) { try { assertPublicHttpUrl(String(base_url).trim()); } catch (e) { return res.json({ code: 400, msg: e.message }); } }
+  if (base_url && String(base_url).trim()) { try { await assertPublicHttpUrl(String(base_url).trim()); } catch (e) { return res.json({ code: 400, msg: e.message }); } }
   let ms;
   if (Array.isArray(models)) ms = models;
   else if (typeof models === 'string' && models) ms = models.split(/[,，\s]+/).filter(Boolean);
@@ -102,6 +110,8 @@ router.put('/:id', (req, res) => {
 
 router.delete('/:id', (req, res) => {
   const old = db.prepare('SELECT * FROM providers WHERE id=?').get(req.params.id);
+  if (!old) return res.json({ code: 404, msg: '供应商不存在' });
+  if (!canManageRow(req, old.tenant_id)) return res.status(403).json({ code: 403, msg: '无权删除其他租户的供应商' }); // MT-12
   if (old?.is_default) return res.json({ code: 400, msg: '默认供应商不可删除，请先切换默认' });
   db.prepare('DELETE FROM providers WHERE id=?').run(req.params.id);
   res.json({ code: 0, msg: '已删除' });
@@ -110,8 +120,9 @@ router.delete('/:id', (req, res) => {
 router.post('/:id/default', (req, res) => {
   const old = db.prepare('SELECT * FROM providers WHERE id=?').get(req.params.id);
   if (!old) return res.json({ code: 404, msg: '供应商不存在' });
-  // 修复：原代码漏了 .run()，导致「清空其他默认」从未执行 → 出现多个默认供应商并存
-  db.prepare('UPDATE providers SET is_default=0').run();
+  if (!canManageRow(req, old.tenant_id)) return res.status(403).json({ code: 403, msg: '无权设置其他租户的供应商' }); // MT-12
+  // 仅清空同租户层的默认（MT-12：各租户可有各自默认，互不干扰）
+  db.prepare('UPDATE providers SET is_default=0 WHERE tenant_id=?').run(Number(old.tenant_id) || 0);
   db.prepare('UPDATE providers SET is_default=1 WHERE id=?').run(old.id);
   db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)').run(req.user.username, '设置默认供应商', old.name, req.ip, now());
   res.json({ code: 0, msg: `已将「${old.name}」设为默认` });
@@ -152,6 +163,7 @@ async function verifyModelByType(base_url, api_key, model, type = 'chat') {
 router.post('/:id/models', async (req, res) => {
   const old = db.prepare('SELECT * FROM providers WHERE id=?').get(req.params.id);
   if (!old) return res.json({ code: 404, msg: '供应商不存在' });
+  if (!canManageRow(req, old.tenant_id)) return res.status(403).json({ code: 403, msg: '无权修改其他租户的供应商' }); // MT-12
   const m = ((req.body || {}).model || '').trim();
   if (!m) return res.json({ code: 400, msg: '模型名不能为空' });
   if (!old.base_url) return res.json({ code: 400, msg: '供应商未配置服务地址，请先在「配置」中填写' });
@@ -175,6 +187,7 @@ router.post('/:id/models', async (req, res) => {
 router.delete('/:id/models/:model', (req, res) => {
   const old = db.prepare('SELECT * FROM providers WHERE id=?').get(req.params.id);
   if (!old) return res.json({ code: 404, msg: '供应商不存在' });
+  if (!canManageRow(req, old.tenant_id)) return res.status(403).json({ code: 403, msg: '无权修改其他租户的供应商' }); // MT-12
   const ms = JSON.parse(old.models || '[]').filter(m => m !== req.params.model);
   db.prepare('UPDATE providers SET models=? WHERE id=?').run(JSON.stringify(ms), old.id);
   res.json({ code: 0, msg: '已移除模型' });
@@ -185,6 +198,7 @@ router.delete('/:id/models/:model', (req, res) => {
 router.post('/:id/sync', async (req, res) => {
   const old = db.prepare('SELECT * FROM providers WHERE id=?').get(req.params.id);
   if (!old) return res.json({ code: 404, msg: '供应商不存在' });
+  if (!canManageRow(req, old.tenant_id)) return res.status(403).json({ code: 403, msg: '无权修改其他租户的供应商' }); // MT-12
   const plainKey = decrypt(old.api_key);
   if (!old.base_url || !plainKey) return res.json({ code: 400, msg: '请先填写服务地址与 API Key' });
   try {
@@ -210,6 +224,7 @@ router.post('/:id/sync', async (req, res) => {
 router.post('/:id/test', async (req, res) => {
   const old = db.prepare('SELECT * FROM providers WHERE id=?').get(req.params.id);
   if (!old) return res.json({ code: 404, msg: '供应商不存在' });
+  if (!canManageRow(req, old.tenant_id)) return res.status(403).json({ code: 403, msg: '无权访问其他租户的供应商' }); // MT-12
   if (!old.base_url) return res.json({ code: 400, msg: '未配置服务地址' });
   const plainKey = decrypt(old.api_key);
   try {
@@ -268,8 +283,11 @@ router.get('/capabilities', (req, res) => {
 router.get('/capabilities/filter', (req, res) => {
   const { capability } = req.query;
   if (!capability) return res.json({ code: 400, msg: '请指定 capability' });
-  // 1. 从已配置供应商的 model_types 中提取
-  const ps = db.prepare("SELECT name, models FROM providers WHERE configured=1").all();
+  // 1. 从已配置供应商的 model_types 中提取（MT-12：仅平台基线 + 本租户可见层）
+  const visTid = (req.tenant && req.tenant.single) ? null : scopeTenant(req);
+  const ps = visTid == null
+    ? db.prepare("SELECT name, models FROM providers WHERE configured=1").all()
+    : db.prepare("SELECT name, models FROM providers WHERE configured=1 AND (tenant_id=0 OR tenant_id=?)").all(visTid);
   const fromType = [];
   for (const p of ps) {
     let mt = {};

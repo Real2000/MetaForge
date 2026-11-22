@@ -510,6 +510,90 @@ const ALL_MIGRATIONS = [
     ctx.addColumn('tenants', 'admin_username', "TEXT DEFAULT ''");
     ctx.addColumn('tenants', 'note', "TEXT DEFAULT ''");
   } },
+  // === M2 / MT-12 租户级模型·密钥·配置隔离（2026-11-22）===
+  // providers 由 SHARED 升级为「平台全局基线 + 租户覆盖层」：tenant_id=0 平台全局（全租户可见），>0 租户专有。
+  { id: 115, name: 'providers.tenant_id - 供应商租户覆盖层（MT-12）', up: (ctx) => {
+    ctx.addColumn('providers', 'tenant_id', 'INTEGER DEFAULT 0');
+    // 存量供应商视为平台全局基线（0）
+    try { ctx.db.prepare('UPDATE providers SET tenant_id=0 WHERE tenant_id IS NULL').run(); } catch { }
+    // 默认唯一索引改为「按租户唯一」：每个租户可有各自默认供应商（全局与各租户互不干扰）
+    try { ctx.db.exec('DROP INDEX IF EXISTS idx_providers_single_default'); } catch { }
+    try { ctx.db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_providers_tenant_default ON providers(tenant_id, is_default) WHERE is_default=1'); } catch { }
+  } },
+  // secrets 唯一键由全局 name 改为 (name, tenant_id)：同一密钥名可在不同租户各自定义；存量键归平台全局（0）。
+  { id: 116, name: 'secrets 租户隔离：唯一键改 (name,tenant_id)（MT-12）', up: (ctx) => {
+    if (!ctx.tableExists('secrets')) return;
+    const ddl = ctx.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='secrets'").pluck().get() || '';
+    if (/UNIQUE\s*\(\s*name\s*,\s*tenant_id\s*\)/i.test(ddl)) return; // 已重建，幂等跳过
+    const cols = ctx.db.prepare('PRAGMA table_info(secrets)').all().map(c => c.name);
+    const hasTenant = cols.includes('tenant_id');
+    ctx.db.exec(`CREATE TABLE secrets__mt12 (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      value TEXT NOT NULL,
+      remark TEXT DEFAULT '',
+      created_at TEXT,
+      updated_at TEXT,
+      tenant_id INTEGER DEFAULT 0,
+      UNIQUE(name, tenant_id)
+    );`);
+    // 存量密钥一律归平台全局基线（0）——它们此前均为平台级基础设施密钥（ENCRYPTION_KEY 等）
+    const tenantExpr = hasTenant ? '0' : '0';
+    ctx.db.exec(`INSERT INTO secrets__mt12 (id,name,value,remark,created_at,updated_at,tenant_id)
+      SELECT id,name,value,remark,created_at,updated_at, ${tenantExpr} FROM secrets;`);
+    ctx.db.exec('DROP TABLE secrets;');
+    ctx.db.exec('ALTER TABLE secrets__mt12 RENAME TO secrets;');
+    console.log('[migrate] secrets 表已重建：(name,tenant_id) 复合唯一，存量归平台全局（tenant_id=0）');
+  } },
+  // === M2 / MT-13 支付/订阅闭环（2026-11-22）===
+  { id: 117, name: 'tenant_wallets - 租户钱包（MT-13）', table: 'tenant_wallets', createSql: `CREATE TABLE IF NOT EXISTS tenant_wallets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id INTEGER UNIQUE,
+    balance REAL DEFAULT 0,
+    currency TEXT DEFAULT 'CNY',
+    updated_at TEXT,
+    created_at TEXT
+  );` },
+  { id: 118, name: 'tenant_subscriptions - 租户订阅（MT-13）', table: 'tenant_subscriptions', createSql: `CREATE TABLE IF NOT EXISTS tenant_subscriptions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id INTEGER,
+    plan_key TEXT DEFAULT 'free',
+    status TEXT DEFAULT 'active',
+    period_start TEXT,
+    period_end TEXT,
+    quota_grant INTEGER DEFAULT 0,
+    price REAL DEFAULT 0,
+    auto_renew INTEGER DEFAULT 0,
+    order_no TEXT DEFAULT '',
+    created_at TEXT,
+    updated_at TEXT
+  );` },
+  { id: 119, name: 'payment_orders - 支付订单（MT-13）', table: 'payment_orders', createSql: `CREATE TABLE IF NOT EXISTS payment_orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_no TEXT UNIQUE,
+    tenant_id INTEGER,
+    type TEXT DEFAULT 'subscribe',
+    plan_key TEXT DEFAULT '',
+    amount REAL DEFAULT 0,
+    channel TEXT DEFAULT '',
+    subject TEXT DEFAULT '',
+    status TEXT DEFAULT 'pending',
+    operator TEXT DEFAULT '',
+    paid_at TEXT,
+    refunded_at TEXT,
+    meta TEXT DEFAULT '{}',
+    created_at TEXT
+  );` },
+  { id: 120, name: 'payment_events - 支付回调事件台账（MT-13 幂等）', table: 'payment_events', createSql: `CREATE TABLE IF NOT EXISTS payment_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT UNIQUE,
+    order_no TEXT,
+    channel TEXT DEFAULT '',
+    type TEXT DEFAULT 'paid',
+    amount REAL DEFAULT 0,
+    raw TEXT DEFAULT '',
+    created_at TEXT
+  );` },
 ];
 
 module.exports = {

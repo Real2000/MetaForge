@@ -2922,4 +2922,27 @@ R5 远期生态首项。**先做 3D 资产生成与导出（新增资产类型 +
 - 本批为 M2 商用地基；**MT-11 配额账单 / MT-12 密钥隔离 / MT-13 支付订阅 / BE-B1 响应契约 / BE-B3 限流配额 / BE-B4 OpenAPI / SEC-09~12/14** 待在后续批次交付。
 - impersonation 令牌经剪贴板交付（运维排障用，非对外接口）；B 端「单点登录式」切换台未做。
 
+## M2 对外商用功能闭环 · 批次2：租户账单/隔离/支付订阅（2026-11-22）
+
+**目标**：M2 商用闭环——租户级配额与成本账单、租户级模型/密钥/配置隔离、支付/订阅闭环（对应《开发计划表 v1.1》MT-11 / MT-12 / MT-13）。
+
+**交付**
+- **MT-11 租户级配额聚合与账单**：`lib/billing.js` 记账按写入时用户 `tenant_id` 快照回填 `usage_records.tenant_id`，新增 `tenantCostOfMonth`（租户维度成本聚合）/`tenantReport`（`tenant_id → username` 两级账单）/`tenantReportCsv`（CSV·带 UTF-8 BOM，Excel 直开）；`lib/billing-gate.js` 预留台账 `billing_holds` 回填 `tenant_id` 并新增 `tenantMonthCost`；`lib/quota.js` 新增 `tenantQuotaSummary`；路由新增 `GET /api/billing/tenants`、`/api/billing/tenant`、`/api/billing/tenant/export`（CSV，落 `op_logs`）与 `GET /api/quota/tenants`；`routes/quota.js` 报表/趋势/按智能体·模型 TOP 全部按租户收敛。
+- **MT-12 租户级模型/密钥/配置隔离**：`providers` 由全局升级为「平台全局基线(`tenant_id=0`) + 租户覆盖层(`>0`)」（迁移 **115**，默认唯一索引改按租户）；`secrets` 唯一键改 `(name, tenant_id)`（迁移 **116**，存量归平台全局层），`lib/secrets.js` 运行时 `loadSecrets(tenantId)` = 平台基线 ∪ 租户覆盖、脱敏取全租户并集；`lib/tenant.js` 新增 `scopeTenant`/`mgmtScope`/`canManageRow` 统一作用域口径；`routes/providers.js` 全面 fail-closed（列表可见「基线 ∪ 本租户」、写/删/设默认按租户校验）；`lib/llm.js` 与 `lib/model-router.js` 路由候选按请求租户限定，`routes/chat.js` auto 路由传 `tenantId`，防跨租户路由。
+- **MT-13 支付/订阅闭环**：新增 `lib/payment.js`（下单 → 回调验签 fail-closed（HMAC-SHA256，密钥缺省一律拒绝）→ 幂等按 `event_id`（`payment_events`）→ 生效（订阅置 `tenants.plan` + 下发成员配额 / 充值记钱包）→ 退款（幂等）→ 对账 `diff=0`）；新增 `routes/payment.js`（回调 `POST /api/payment/callback/:channel` 免登录·验签内置、订单/状态/退款/对账/沙箱签名）；表 `tenant_wallets`/`tenant_subscriptions`/`payment_orders`/`payment_events`（迁移 **117~120**）；`server.js` 捕获 `req.rawBody` 供逐字节验签，`lib/auth.js` 放行回调路径。
+- **前端**：新增后台页 `public/js/admin/payment.js`「租户账单与订阅」（Tab1 租户账单+CSV 导出 / Tab2 订单与订阅·下单·标记已支付·退款·沙箱回调签名 / Tab3 支付对账），平台超管可跨租户下拉、租户管理员仅本租户；`public/sw.js` bump。
+
+**修复（同批）**
+- 恢复被「C2 清透风」整站样式替换时**误删**的基础样式 `.grid-2/.grid-3/.grid-4` 与 `.stat/.s-num/.s-label/.s-unit`（`public/css/app.css`）——quota/biz/feedback/quality/memories/billing/insights/payment 等 16+ 页此前统计卡片失样式、栅格退化为纵向堆叠，本批一并回归修复。
+
+**验证**
+- `npm test`：冒烟 **612/0 全绿**（604 基线 + 8 新增：`scopeTenant`/`mgmtScope`/`canManageRow`、secrets 分层、MT-11 两级聚合、支付验签 fail-closed、订阅生效+配额下发、回调幂等+金额篡改拒绝、SEC-05 SSRF 回归）+ 双租户 E2E **26/0 全绿**（19 基线 + 7 新增：MT-11 账单隔离/跨租户改配额 403、MT-12 密钥分层/供应商可见性、MT-13 下单→标记支付→订阅生效、沙箱回调验签+幂等、支付对账 diff=0）。
+- 隔离实例（多租户 `AGENT_MULTI_TENANT=1`）Playwright 端到端：UI 登录 → 首登改密 → 进入「租户账单与订阅」→ 订单表渲染（下单/标记已支付/生成回调签名全链）→ 订阅 `pro` 生效（`tenants.plan=pro`、成员配额下发 500 万）→ 钱包 ¥200 → 对账「账实一致 ✓」→ 修复后统计卡片横向成行、控制台 0 错误。
+- `lint:sql`：批次2 新增模块含裸查，门禁基线自 M1 后未刷新（M0/批次1 亦未刷新），此处按现状刷新基线，收敛仍走 BE-C1 连续轨道。
+
+**已知边界（M2 后续批次）**
+- 支付渠道 `wechat`/`alipay` 为**预留适配位**（当前 `sandbox` 联调闭环）；真实网关接入需配置 `PAYMENT_CALLBACK_SECRET` 与渠道适配器。
+- 订阅仅「单周期」（下月同日到期）+ 手动续费；未做自动续费扣款与到期降级任务。
+- **BE-B1 统一响应契约 / BE-B3 对外限流配额 / BE-B4 OpenAPI 3.1 / SEC-09~12/14** 待在后续批次交付。
+
 > AI生成

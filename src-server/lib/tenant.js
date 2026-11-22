@@ -77,4 +77,61 @@ function setTenantStatus(id, status) {
   return { ok: true, status: st };
 }
 
-module.exports = { listTenants, getTenant, createTenant, setTenantStatus, validPwd };
+/** 是否平台超管（复用 auth 的判定：platform_admin=1 或 admin+清单） */
+function isPlatformSuper(user) {
+  try { return require('./auth').isPlatformSuperadmin(user || {}); } catch { return false; }
+}
+
+/**
+ * MT-11/12：解析「本次请求的租户作用域」（列表/报表/管理的统一口径）。
+ * @param {object} req Express 请求（须过 tenantContext）
+ * @param {object} [opts] { param='tenant_id', superDefault=null }
+ * @returns {number|null} number = 限定该租户；null = 不限定（单租户全量 / 平台超管未指定）
+ *   - 单租户模式：null（不做租户过滤，零回归）
+ *   - 平台超管：req.query[param] 显式指定则用之，否则 superDefault
+ *   - 租户内用户：强制本人 req.tenant.id（fail-closed，防头伪造跨租户）
+ */
+function scopeTenant(req, { param = 'tenant_id', superDefault = null } = {}) {
+  const t = req && req.tenant;
+  if (!t || t.single) return null;
+  if (isPlatformSuper(req.user)) {
+    const raw = req.query ? req.query[param] : undefined;
+    if (raw !== undefined && raw !== '' && raw !== null && Number.isFinite(Number(raw))) return Number(raw);
+    return superDefault;
+  }
+  return t.id != null ? Number(t.id) : null;
+}
+
+/**
+ * MT-12：管理视角的租户作用域（providers / secrets 的「平台全局基线 + 租户覆盖层」口径）。
+ * @param {object} req
+ * @param {object} [opts] { param='tenant_id' }
+ * @returns {number} 目标层级：0=平台全局基线；>0=某租户覆盖层
+ *   - 单租户模式：0（平台全局层，零回归）
+ *   - 平台超管：req.query[param] 指定则用之，否则 0（管理平台基线）
+ *   - 租户内用户：强制本人 req.tenant.id（fail-closed，不得操作平台基线或他租户）
+ */
+function mgmtScope(req, { param = 'tenant_id' } = {}) {
+  const t = req && req.tenant;
+  if (!t || t.single) return 0;
+  if (isPlatformSuper(req.user)) {
+    const raw = req.query ? req.query[param] : undefined;
+    if (raw !== undefined && raw !== '' && raw !== null && Number.isFinite(Number(raw))) return Number(raw);
+    return 0;
+  }
+  return t.id != null && Number(t.id) > 0 ? Number(t.id) : 0;
+}
+
+/**
+ * MT-12：某资源行是否可被当前管理作用域操作（写权限校验，fail-closed）。
+ * 平台超管可操作全局层(0)与任意租户层；租户用户仅可操作本租户层。
+ */
+function canManageRow(req, rowTenantId) {
+  const rt = Number(rowTenantId) || 0;
+  const t = req && req.tenant;
+  if (!t || t.single) return true; // 单租户：全部可管理
+  if (isPlatformSuper(req.user)) return true;
+  return rt === Number(t.id);
+}
+
+module.exports = { listTenants, getTenant, createTenant, setTenantStatus, validPwd, isPlatformSuper, scopeTenant, mgmtScope, canManageRow };

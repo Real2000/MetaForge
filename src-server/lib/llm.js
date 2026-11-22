@@ -16,8 +16,14 @@ const { db } = require('../db');
 const circuit = require('./circuit');
 
 function getDefaultProvider() {
-  const p = db.prepare('SELECT * FROM providers WHERE is_default=1').get();
-  return p || null;
+  const p = db.prepare('SELECT * FROM providers WHERE is_default=1 AND tenant_id=0').get();
+  return p || db.prepare('SELECT * FROM providers WHERE is_default=1 ORDER BY tenant_id LIMIT 1').get() || null;
+}
+
+/** MT-12：由 username 反查租户（容错 null）——用于构建租户可见的供应商候选。*/
+function tenantOfUser(username) {
+  if (!username) return null;
+  try { const r = db.prepare('SELECT tenant_id FROM users WHERE username=?').get(username); return r && r.tenant_id != null ? Number(r.tenant_id) : null; } catch { return null; }
 }
 
 /* ---------------- 网络容错层（2026-10-14）：瞬时故障自动重试 ----------------
@@ -309,9 +315,13 @@ async function* callMock(messages, opts = {}) {
 // 注意：VL 系列是多模态对话模型（Qwen-VL 纯文本对话可用），不在黑名单内
 const NON_TEXT_MODEL_RE = /tts|asr|speech|whisper|embedding|rerank|image|video|audio|voice|ocr|t2v|a2v|realtime|sensevoice|minimax[\s-]?h\d|ref2va/i;
 
-/** 已配置供应商清单（默认优先，跨供应商路由用） */
-function getConfiguredProviders() {
-  return db.prepare("SELECT * FROM providers WHERE configured=1 AND api_key != '' AND base_url != '' ORDER BY is_default DESC, id").all();
+/** 已配置供应商清单（默认优先，跨供应商路由用）。MT-12：传入 tenantId 时仅返回「平台基线(0) ∪ 本租户」*/
+function getConfiguredProviders(tenantId) {
+  const base = "SELECT * FROM providers WHERE configured=1 AND api_key != '' AND base_url != ''";
+  if (Number.isFinite(Number(tenantId))) {
+    return db.prepare(`${base} AND (tenant_id=0 OR tenant_id=?) ORDER BY is_default DESC, id`).all(Number(tenantId));
+  }
+  return db.prepare(`${base} ORDER BY is_default DESC, id`).all();
 }
 
 function safeModels(p) {
@@ -324,7 +334,9 @@ function safeModels(p) {
  *  过滤：非文本模型（TTS/图片/视频/向量）排除；熔断中的模型跳过——
  *  若过滤后为空（平台供应商全部熔断）则忽略熔断状态保底放行（宁可再试也不直接拒绝服务）。 */
 function buildCandidates(model, opts = {}) {
-  const providers = getConfiguredProviders();
+  // MT-12：以请求租户（opts.tenantId 或由 opts.username 反查）限定可见供应商，防跨租户路由
+  const _tid = opts.tenantId != null ? Number(opts.tenantId) : tenantOfUser(opts.username);
+  const providers = getConfiguredProviders(_tid);
   const seen = new Set();
   const out = [];
   const push = (p, m) => {
@@ -378,7 +390,7 @@ function chat(messages, opts = {}) {
     const fbList = (Array.isArray(opts.fallbackModels) ? opts.fallbackModels : [])
       .map(x => String(x || '').trim()).filter(x => x && !NON_TEXT_MODEL_RE.test(x) && x !== model);
     if (fbList.length && candidates.length) {
-      const providers = getConfiguredProviders();
+      const providers = getConfiguredProviders(opts.tenantId != null ? Number(opts.tenantId) : tenantOfUser(opts.username));
       // 先移除候选链中已存在的同名模型（全网关兜底段自然存在的），再按序插到主模型候选之后
       for (const fm of fbList) {
         const idx = candidates.findIndex(c => c.model === fm);
@@ -483,4 +495,4 @@ async function visionDescribe(imageBuf, modelName, prompt) {
   }
 }
 
-module.exports = { chat, chatOnce, visionDescribe, getDefaultProvider, getConfiguredProviders, buildCandidates, postModel, friendlyNetError, isFailoverWorthy, accumulateUsage };
+module.exports = { chat, chatOnce, visionDescribe, getDefaultProvider, getConfiguredProviders, buildCandidates, postModel, friendlyNetError, isFailoverWorthy, accumulateUsage, tenantOfUser };

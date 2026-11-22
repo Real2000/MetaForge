@@ -114,7 +114,7 @@ function t(name, fn) {
   const origin = `http://127.0.0.1:${port}`;
   const child = spawn(process.execPath, ['server.js'], {
     cwd: path.join(__dirname, '..'),
-    env: { ...process.env, PORT: String(port), AGENT_DATA_DIR: process.env.AGENT_DATA_DIR, AGENT_MULTI_TENANT: '1' },
+    env: { ...process.env, PORT: String(port), AGENT_DATA_DIR: process.env.AGENT_DATA_DIR, AGENT_MULTI_TENANT: '1', PAYMENT_CALLBACK_SECRET: 'e2e-pay-secret', AGENT_FETCH_ALLOW_PRIVATE: '1' },
     stdio: 'ignore',
   });
   try {
@@ -185,6 +185,90 @@ function t(name, fn) {
       assert.strictEqual(j.code, 0, JSON.stringify(j));
       const mj = await (await fetch(origin + '/api/auth/me', { headers: { Authorization: 'Bearer ' + j.data.token } })).json();
       assert.strictEqual(mj.data.username, 'e2eadm', '借用令牌应以目标用户身份生效');
+    });
+
+    // ---------- 8. MT-11/12/13 商用闭环（账单 / 隔离 / 支付） ----------
+    await t('MT-11：租户账单隔离——平台超管跨租户、租户管理员仅本租户（伪造 tenant_id 被强制）', async () => {
+      const ins = "INSERT INTO usage_records (username,dimension,dimension_key,tokens,count,cost,prompt_tokens,completion_tokens,tenant_id,created_at) VALUES (?,?,?,?,1,?,?,?,?,datetime('now','localtime'))";
+      db.prepare(ins).run('admin', 'model', 'm1', 100, 1.5, 60, 40, 1);
+      db.prepare(ins).run('e2eadm', 'model', 'm1', 200, 2.5, 120, 80, 2);
+      const superAll = await (await fetch(origin + '/api/billing/tenants', { headers: { Authorization: 'Bearer ' + adminTok } })).json();
+      assert.strictEqual(superAll.code, 0, JSON.stringify(superAll));
+      const tids = superAll.data.tenants.map(x => x.tenant_id);
+      assert.ok(tids.includes(2), '平台超管应见新租户成本：' + JSON.stringify(tids));
+      const btok = (await login('e2eadm', 'E2e@2026')).data.token;
+      const mine = await (await fetch(origin + '/api/billing/tenants', { headers: { Authorization: 'Bearer ' + btok } })).json();
+      assert.ok(mine.data.tenants.length > 0 && mine.data.tenants.every(x => x.tenant_id === 2), '租户管理员仅见本租户：' + JSON.stringify(mine.data.tenants));
+      const force = await (await fetch(origin + '/api/billing/tenants?tenant_id=1', { headers: { Authorization: 'Bearer ' + btok } })).json();
+      assert.ok(force.data.tenants.every(x => x.tenant_id === 2), '伪造 tenant_id 应被强制本租户：' + JSON.stringify(force.data.tenants));
+    });
+
+    await t('MT-11：跨租户调整用户配额被拒（403）', async () => {
+      const btok = (await login('e2eadm', 'E2e@2026')).data.token;
+      const r = await fetch(origin + '/api/quota/users/admin', { method: 'PUT', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + btok }, body: JSON.stringify({ total: 123 }) });
+      assert.strictEqual(r.status, 403, '跨租户改配额应 403，实际 ' + r.status);
+    });
+
+    await t('MT-12：密钥分层——租户层列表仅见本层；平台全局层不含租户密钥', async () => {
+      await jpost('/api/secrets', adminTok, { name: 'E2E_GLOBAL', value: 'gvalue-12345' });
+      const btok = (await login('e2eadm', 'E2e@2026')).data.token;
+      await jpost('/api/secrets', btok, { name: 'E2E_T2', value: 't2val-123456' });
+      const tj = await (await fetch(origin + '/api/secrets', { headers: { Authorization: 'Bearer ' + btok } })).json();
+      assert.ok(tj.data.some(x => x.name === 'E2E_T2'), '租户层应见本租户密钥');
+      assert.ok(!tj.data.some(x => x.name === 'E2E_GLOBAL'), '租户层列表不应含平台全局密钥');
+      const gj = await (await fetch(origin + '/api/secrets', { headers: { Authorization: 'Bearer ' + adminTok } })).json();
+      assert.ok(gj.data.some(x => x.name === 'E2E_GLOBAL'), '全局层应见全局密钥');
+      assert.ok(!gj.data.some(x => x.name === 'E2E_T2'), '全局层不应含租户密钥');
+    });
+
+    await t('MT-12：供应商可见性——租户层可见「全局基线 ∪ 本租户」，不可见他租户层', async () => {
+      await jpost('/api/providers', adminTok, { name: 'E2E_全局供应商', base_url: 'https://api.example.com/v1', models: ['m-e2e'] });
+      await jpost('/api/providers?tenant_id=1', adminTok, { name: 'E2E_T1供应商', base_url: 'https://api.t1.com/v1', models: ['m-t1'] });
+      const btok = (await login('e2eadm', 'E2e@2026')).data.token;
+      await jpost('/api/providers', btok, { name: 'E2E_T2供应商', base_url: 'https://api.t2.com/v1', models: ['m-t2'] });
+      const list = await (await fetch(origin + '/api/providers', { headers: { Authorization: 'Bearer ' + btok } })).json();
+      const names = (list.data || []).map(p => p.name);
+      assert.ok(names.includes('E2E_全局供应商'), '应见全局基线：' + JSON.stringify(names));
+      assert.ok(names.includes('E2E_T2供应商'), '应见本租户供应商');
+      assert.ok(!names.includes('E2E_T1供应商'), '不应见他租户供应商：' + JSON.stringify(names));
+    });
+
+    await t('MT-13：租户下单 → 平台超管标记已支付 → 订阅生效 + 成员配额下发', async () => {
+      const btok = (await login('e2eadm', 'E2e@2026')).data.token;
+      const c = await jpost('/api/payment/orders', btok, { type: 'subscribe', plan_key: 'pro', channel: 'sandbox' });
+      assert.strictEqual(c.code, 0, JSON.stringify(c));
+      const no = c.data.order_no;
+      const ol = await (await fetch(origin + '/api/payment/orders', { headers: { Authorization: 'Bearer ' + btok } })).json();
+      assert.ok(ol.data.length > 0 && ol.data.every(o => o.tenant_id === 2), '租户订单列表仅本租户：' + JSON.stringify(ol.data.map(o => o.tenant_id)));
+      const mp = await jpost(`/api/payment/orders/${no}/mark-paid`, adminTok, {});
+      assert.strictEqual(mp.code, 0, JSON.stringify(mp));
+      const st = await (await fetch(origin + '/api/payment/status', { headers: { Authorization: 'Bearer ' + btok } })).json();
+      assert.strictEqual(st.data.subscription.status, 'active');
+      assert.strictEqual(st.data.subscription.plan_key, 'pro');
+      const uj = await (await fetch(origin + '/api/users', { headers: { Authorization: 'Bearer ' + btok } })).json();
+      assert.ok(uj.data.every(u => u.quota_total === 5000000), '成员配额应下发套餐额度：' + JSON.stringify(uj.data.map(u => u.quota_total)));
+    });
+
+    await t('MT-13：沙箱回调验签 + 幂等（同 event_id 只生效一次）；未签名被拒', async () => {
+      const btok = (await login('e2eadm', 'E2e@2026')).data.token;
+      const c = await jpost('/api/payment/orders', btok, { type: 'recharge', amount: 66, channel: 'sandbox' });
+      const no = c.data.order_no;
+      const r0 = await fetch(origin + '/api/payment/callback/sandbox', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ order_no: no, event_id: 'e2e-evt-x', status: 'paid', amount: 66 }) });
+      assert.strictEqual(r0.status, 401, '无签名回调应 401，实际 ' + r0.status);
+      const s = (await jpost(`/api/payment/orders/${no}/sign`, adminTok, { event_id: 'e2e-evt-1' })).data;
+      const post = () => fetch(origin + '/api/payment/callback/sandbox', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Pay-Sign': s.sign }, body: s.raw });
+      const r1 = await (await post()).json();
+      assert.strictEqual(r1.code, 0, JSON.stringify(r1));
+      const r2 = await (await post()).json();
+      assert.strictEqual(r2.data.idempotent, true, '重复回调应幂等');
+      const st = await (await fetch(origin + '/api/payment/status', { headers: { Authorization: 'Bearer ' + btok } })).json();
+      assert.strictEqual(st.data.wallet.balance, 66, '充值应入钱包且不重复：' + JSON.stringify(st.data.wallet));
+    });
+
+    await t('MT-13：支付对账账实一致（平台超管）', async () => {
+      const rec = await (await fetch(origin + '/api/payment/reconcile', { headers: { Authorization: 'Bearer ' + adminTok } })).json();
+      assert.strictEqual(rec.code, 0, JSON.stringify(rec));
+      assert.strictEqual(rec.data.balanced, true, '对账应账实一致：' + JSON.stringify(rec.data));
     });
 
     await t('MT-10：停用租户后其账号登录被拒、旧令牌失效', async () => {

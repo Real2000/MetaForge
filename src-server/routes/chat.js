@@ -1363,7 +1363,7 @@ router.post('/stream', async (req, res) => {
     if (!model && agent?.model === 'auto') {
       try {
         const { autoRoute } = require('../lib/model-router');
-        const routeResult = await autoRoute({ input, attachments: req.body?.attachments, agentName: agent?.name });
+        const routeResult = await autoRoute({ input, attachments: req.body?.attachments, agentName: agent?.name, tenantId: req.user.tenant_id });
         if (routeResult.ok) {
           model = routeResult.model;
           console.log(`[route] ${agent?.name} auto → ${routeResult.model}@${routeResult.provider}`);

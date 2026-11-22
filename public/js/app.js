@@ -48,6 +48,7 @@ const routes = {
   '/admin/operation': { page: () => import('./admin/operation.js'), layout: 'admin', title: '运营监控', admin: true },
   '/admin/mcp': { page: () => import('./admin/mcp.js'), layout: 'admin', title: 'MCP 服务', admin: true },
   '/admin/quota': { page: () => import('./admin/quota.js'), layout: 'admin', title: '用量与配额', admin: true },
+  '/admin/payment': { page: () => import('./admin/payment.js'), layout: 'admin', title: '租户账单与订阅', admin: true }, // MT-11/13
   '/admin/bridge': { page: () => import('./admin/bridge.js'), layout: 'admin', title: '桌面端升级', admin: true }, // D2-3 桌面端升级通道
   '/admin/model3d': { page: () => import('./admin/model3d.js'), layout: 'admin', title: '3D 与数字人', admin: true }, // D3-1 3D 资产与数字人合规
   '/admin/experience': { page: () => import('./admin/experience.js'), layout: 'admin', title: '经验自进化', admin: true }, // D3-2 专家×任务类型可靠度
@@ -90,6 +91,7 @@ const adminNav = [
   { href: '#/admin/secrets', ic: '🔐', label: '密钥管理' },
   { href: '#/admin/security', ic: '🛡️', label: '安全合规' },
   { href: '#/admin/quota', ic: '💳', label: '用量与配额' },
+  { href: '#/admin/payment', ic: '🧾', label: '租户账单与订阅' }, // MT-11/13 租户账单 + 支付订阅闭环
   { href: '#/admin/bridge', ic: '🛰️', label: '桌面端升级' }, // D2-3
   { href: '#/admin/model3d', ic: '🧊', label: '3D 与数字人' }, // D3-1
   { href: '#/admin/experience', ic: '🧠', label: '经验自进化' }, // D3-2

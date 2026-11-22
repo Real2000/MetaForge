@@ -68,4 +68,32 @@ function resetQuotaAlert(username) {
   } catch { }
 }
 
-module.exports = { quotaOf, checkQuota, addUsage, resetQuotaAlert };
+/**
+ * MT-11：租户维度配额聚合（tenant_id → username 两级）。
+ * @param {number|null} tenantId 指定租户；null/非数值 = 全部租户
+ * @returns {{ tenant_id, user_count, quota_total, quota_used, users:[...] }}
+ */
+function tenantQuotaSummary(tenantId = null) {
+  const scoped = tenantId != null && tenantId !== '' && Number.isFinite(Number(tenantId));
+  const where = scoped ? 'WHERE tenant_id=?' : '';
+  const args = scoped ? [Number(tenantId)] : [];
+  const rows = db.prepare(`SELECT username, nickname, quota_total, quota_used, cost_quota FROM users ${where} ORDER BY quota_used DESC`).all(...args);
+  const users = rows.map(u => {
+    const q = quotaOf(u.username);
+    return {
+      username: u.username, nickname: u.nickname,
+      unlimited: q.unlimited, total: q.total, used: q.used,
+      remaining: q.remaining === Infinity ? -1 : q.remaining, percent: q.percent,
+      cost_quota: u.cost_quota || 0,
+    };
+  });
+  return {
+    tenant_id: scoped ? Number(tenantId) : null,
+    user_count: users.length,
+    quota_total: users.reduce((s, r) => s + r.total, 0),
+    quota_used: users.reduce((s, r) => s + r.used, 0),
+    users,
+  };
+}
+
+module.exports = { quotaOf, checkQuota, addUsage, resetQuotaAlert, tenantQuotaSummary };

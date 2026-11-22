@@ -1232,13 +1232,17 @@ db.exec(`CREATE TABLE IF NOT EXISTS wf_files (
   created_at TEXT
 );`);
 // P5.5 通用密钥表（画布 {{env.XXX}} 占位符运行时注入；值仅管理员可写，任何接口不回读明文）
+// MT-12（2026-11-22）租户隔离：tenant_id=0 为平台全局基线，>0 为租户专有覆盖层；
+//   唯一键改为 (name, tenant_id)——同一密钥名可在不同租户各自定义（迁移 116 对旧库重建）。
 db.exec(`CREATE TABLE IF NOT EXISTS secrets (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  name TEXT NOT NULL UNIQUE,
+  name TEXT NOT NULL,
   value TEXT NOT NULL,
   remark TEXT DEFAULT '',
   created_at TEXT,
-  updated_at TEXT
+  updated_at TEXT,
+  tenant_id INTEGER DEFAULT 0,
+  UNIQUE(name, tenant_id)
 );`);
 // 安全事件表（PII 命中 / 提示词注入检测）
 db.exec(`CREATE TABLE IF NOT EXISTS security_events (
@@ -1401,6 +1405,61 @@ db.exec(`CREATE TABLE IF NOT EXISTS billing_holds (
 db.exec('CREATE INDEX IF NOT EXISTS idx_bh_user_status ON billing_holds(username, status);');
 db.exec('CREATE INDEX IF NOT EXISTS idx_bh_created ON billing_holds(created_at);');
 db.exec('CREATE INDEX IF NOT EXISTS idx_bh_status ON billing_holds(status);');
+
+// === M2 / MT-13 支付/订阅闭环（2026-11-22）===
+// 租户钱包（充值余额）、订阅（套餐周期）、支付订单、回调事件台账（幂等去重）。
+// 迁移 117~120 对存量库同样创建；此处内联保证全新建库即具备（与项目「表集中定义」约定对齐）。
+db.exec(`CREATE TABLE IF NOT EXISTS tenant_wallets (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id INTEGER UNIQUE,
+  balance REAL DEFAULT 0,
+  currency TEXT DEFAULT 'CNY',
+  updated_at TEXT,
+  created_at TEXT
+);`);
+db.exec(`CREATE TABLE IF NOT EXISTS tenant_subscriptions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id INTEGER,
+  plan_key TEXT DEFAULT 'free',
+  status TEXT DEFAULT 'active',
+  period_start TEXT,
+  period_end TEXT,
+  quota_grant INTEGER DEFAULT 0,
+  price REAL DEFAULT 0,
+  auto_renew INTEGER DEFAULT 0,
+  order_no TEXT DEFAULT '',
+  created_at TEXT,
+  updated_at TEXT
+);`);
+db.exec(`CREATE TABLE IF NOT EXISTS payment_orders (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  order_no TEXT UNIQUE,
+  tenant_id INTEGER,
+  type TEXT DEFAULT 'subscribe',
+  plan_key TEXT DEFAULT '',
+  amount REAL DEFAULT 0,
+  channel TEXT DEFAULT '',
+  subject TEXT DEFAULT '',
+  status TEXT DEFAULT 'pending',
+  operator TEXT DEFAULT '',
+  paid_at TEXT,
+  refunded_at TEXT,
+  meta TEXT DEFAULT '{}',
+  created_at TEXT
+);`);
+db.exec(`CREATE TABLE IF NOT EXISTS payment_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id TEXT UNIQUE,
+  order_no TEXT,
+  channel TEXT DEFAULT '',
+  type TEXT DEFAULT 'paid',
+  amount REAL DEFAULT 0,
+  raw TEXT DEFAULT '',
+  created_at TEXT
+);`);
+db.exec('CREATE INDEX IF NOT EXISTS idx_po_tenant ON payment_orders(tenant_id, status);');
+db.exec('CREATE INDEX IF NOT EXISTS idx_po_created ON payment_orders(created_at);');
+db.exec('CREATE INDEX IF NOT EXISTS idx_ts_tenant ON tenant_subscriptions(tenant_id);');
 
 // D2-4 MCP 与连接器广场：服务凭据托管（AES-256-GCM 加密落盘，掩码回显，按服务隔离）
 db.exec(`CREATE TABLE IF NOT EXISTS mcp_credentials (

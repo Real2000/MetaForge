@@ -123,6 +123,16 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
 
 /* 统计卡片栅格 */
 .grid-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
+/* 基础栅格与统计卡类（C2 清透风整站替换时误删，2026-11-22 回归修复：
+   quota/biz/feedback/quality/memories/billing/insights/payment 等页均依赖 .grid-2/3/4 与 .stat/.s-num/.s-label） */
+.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+.grid-4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 14px; }
+.stat { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); padding: 16px 18px; min-width: 0; }
+.stat .s-label { color: var(--text-2); font-size: 12px; }
+.stat .s-num { font-size: 26px; font-weight: 700; margin-top: 4px; font-variant-numeric: tabular-nums; }
+.stat .s-unit { font-size: 12px; color: var(--text-3); margin-left: 4px; font-weight: 400; }
+@media (max-width: 1000px) { .grid-2, .grid-3 { grid-template-columns: 1fr; } }
 .stat-card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); padding: 20px; transition: all .15s; }
 .stat-card:hover { box-shadow: var(--shadow-hover); }
 .stat-card .num { font-size: 28px; font-weight: 700; color: var(--text); margin-top: 2px; font-variant-numeric: tabular-nums; letter-spacing: -.5px; }

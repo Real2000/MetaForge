@@ -41,10 +41,13 @@ function guessCapabilities(input, attachments) {
   return caps;
 }
 
-/** 从已配置供应商的能力注册表中筛选符合条件的候选模型 */
-function getCandidates(caps) {
+/** 从已配置供应商的能力注册表中筛选符合条件的候选模型（MT-12：传入 tenantId 时仅「平台基线(0) ∪ 本租户」） */
+function getCandidates(caps, tenantId) {
   // 从已配置供应商中提取
-  const ps = db.prepare("SELECT id, name, models, configured, is_default, status AS conn_status FROM providers WHERE configured=1 AND api_key != '' AND base_url != '' ORDER BY is_default DESC, id").all();
+  const base = "SELECT id, name, models, configured, is_default, status AS conn_status FROM providers WHERE configured=1 AND api_key != '' AND base_url != ''";
+  const ps = Number.isFinite(Number(tenantId))
+    ? db.prepare(`${base} AND (tenant_id=0 OR tenant_id=?) ORDER BY is_default DESC, id`).all(Number(tenantId))
+    : db.prepare(`${base} ORDER BY is_default DESC, id`).all();
   const candidates = [];
 
   for (const provider of ps) {
@@ -113,7 +116,7 @@ function scoreCandidate(provider, model, modelCaps, neededCaps) {
  */
 async function autoRoute(opts = {}) {
   const caps = guessCapabilities(opts.input, opts.attachments);
-  const candidates = getCandidates(caps);
+  const candidates = getCandidates(caps, opts.tenantId);
   if (!candidates.length) {
     return { ok: false, error: '没有符合条件的可用模型（所有候选模型熔断或供应商异常）', candidatesCount: 0 };
   }

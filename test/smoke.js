@@ -6151,6 +6151,41 @@ function t(name, fn) {
       }
     });
 
+    // SEC-05 回归：providers/sso/usermodels 的 SSRF 校验是 async，若漏 await 会造成
+    // 「promise rejection 逃逸 → 进程崩溃」。此处以不可解析域名验证「返回 400 且服务存活」。
+    await t('SEC-05 回归：POST /api/providers 不可解析域名 → 400 而非进程崩溃', async () => {
+      const { spawn } = require('child_process');
+      const adminId = db.prepare("SELECT id FROM users WHERE username='admin'").get().id;
+      const adminTok = sign({ uid: adminId, exp: Date.now() + 3600000 });
+      const port = 38200 + Math.floor(Math.random() * 300);
+      const base = `http://127.0.0.1:${port}`;
+      const env = { ...process.env, PORT: String(port), AGENT_DATA_DIR: process.env.AGENT_DATA_DIR };
+      delete env.AGENT_FETCH_ALLOW_PRIVATE; // 确保走公网校验路径
+      const child = spawn(process.execPath, ['server.js'], { cwd: path.join(__dirname, '..'), env, stdio: 'ignore' });
+      const jfetch = async (p, opts = {}, tok) => {
+        const r = await fetch(base + p, { ...opts, headers: { 'Content-Type': 'application/json', ...(tok ? { Authorization: 'Bearer ' + tok } : {}) } });
+        let j = null; try { j = await r.json(); } catch { }
+        return { status: r.status, j };
+      };
+      try {
+        let up = false;
+        for (let i = 0; i < 50 && !up; i++) {
+          await new Promise(r2 => setTimeout(r2, 200));
+          try { up = (await fetch(base + '/api/health')).ok; } catch { }
+        }
+        assert.ok(up, 'SEC-05 子进程应在 10s 内就绪');
+        const bad = await jfetch('/api/providers', { method: 'POST', body: JSON.stringify({ name: 'SSRF回归', base_url: 'https://ssrf-regress-nonexistent.invalid/v1', models: ['m'] }) }, adminTok);
+        assert.strictEqual(bad.j && bad.j.code, 400, '不可解析域名应 400：' + JSON.stringify(bad.j));
+        // 关键：进程仍存活（修复前此处会因未捕获的 rejection 崩溃）
+        const h = await fetch(base + '/api/health');
+        assert.ok(h.ok, '服务应存活（未因 SSRF 校验 rejection 崩溃）');
+      } finally {
+        try { child.kill('SIGTERM'); } catch { }
+        try { child.kill('SIGKILL'); } catch { }
+      }
+    });
+
+
     // 清理 U1-6 造数（不影响其他用例）
     db.prepare('DELETE FROM usage_records WHERE username IN (?,?,?)').run('u16a', 'u16b', 'u16c');
     db.prepare('DELETE FROM users WHERE username IN (?,?,?)').run('u16a', 'u16b', 'u16c');
@@ -9984,6 +10019,128 @@ print('PY_OK')
     assert.ok(after > before, '停用应 bump token_version');
     assert.strictEqual(tenantLib.getTenant(r.tenantId).status, 'disabled');
     assert.strictEqual(tenantLib.setTenantStatus(1, 'disabled').ok, false, '默认租户不可停用');
+  });
+
+  // ================== M2 批次2：租户账单 / 隔离 / 支付订阅（MT-11/12/13，2026-11-22） ==================
+  console.log('【MT-11/12/13】租户账单聚合 · 租户级隔离 · 支付订阅闭环');
+  const billingLib = require('../src-server/lib/billing');
+  const quotaLib = require('../src-server/lib/quota');
+  const secretsLib = require('../src-server/lib/secrets');
+  const payLib = require('../src-server/lib/payment');
+
+  // MT-12：scopeTenant / mgmtScope / canManageRow 语义
+  await t('MT-12：scopeTenant 单租户→null；平台超管取 query；租户用户强制本租户（fail-closed）', () => {
+    assert.strictEqual(tenantLib.scopeTenant({ tenant: { id: 1, single: true } }), null);
+    assert.strictEqual(tenantLib.scopeTenant({ tenant: { id: 5 }, user: { role: 'admin', username: 'x', platform_admin: 0 }, query: { tenant_id: '9' } }), 5, '租户用户伪造 tenant_id 应被忽略');
+    assert.strictEqual(tenantLib.scopeTenant({ tenant: { id: 5 }, user: { role: 'admin', username: 'admin', platform_admin: 1 }, query: { tenant_id: '9' } }), 9, '平台超管可用 query 指定');
+  });
+  await t('MT-12：mgmtScope 默认平台全局层(0)；canManageRow fail-closed', () => {
+    assert.strictEqual(tenantLib.mgmtScope({ tenant: { id: 1, single: true } }), 0);
+    assert.strictEqual(tenantLib.mgmtScope({ tenant: { id: 5 }, user: { platform_admin: 0, role: 'admin', username: 'x' }, query: {} }), 5);
+    assert.strictEqual(tenantLib.canManageRow({ tenant: { id: 5 }, user: { platform_admin: 0, role: 'admin', username: 'x' } }, 7), false, '租户用户不可管理他租户行');
+    assert.strictEqual(tenantLib.canManageRow({ tenant: { id: 5 }, user: { platform_admin: 0, role: 'admin', username: 'x' } }, 5), true);
+    assert.strictEqual(tenantLib.canManageRow({ tenant: { id: 5 }, user: { platform_admin: 1, role: 'admin', username: 'admin' } }, 7), true, '平台超管可跨租户');
+  });
+
+  // MT-12：密钥租户隔离（平台全局基线 ∪ 租户覆盖，且列表按层隔离）
+  await t('MT-12：secrets 分层——listNames 仅本层；loadSecrets = 全局基线 ∪ 租户覆盖', () => {
+    secretsLib.upsert('MT12_BASE', 'base-value-1234', '', 0);
+    secretsLib.upsert('MT12_BASE', 'tenant-value-99', '', 777); // 租户覆盖同名
+    secretsLib.upsert('MT12_ONLY_T', 'only-tenant-abc', '', 777);
+    const names0 = secretsLib.listNames(0).map(r => r.name);
+    const namesT = secretsLib.listNames(777).map(r => r.name);
+    assert.ok(names0.includes('MT12_BASE') && !names0.includes('MT12_ONLY_T'), '全局层不应含租户专有密钥');
+    assert.ok(namesT.includes('MT12_BASE') && namesT.includes('MT12_ONLY_T'), '租户层应含自身密钥');
+    const vis = secretsLib.loadSecrets(777);
+    assert.strictEqual(vis.MT12_BASE, 'tenant-value-99', '租户覆盖应优先生效');
+    const base = secretsLib.loadSecrets(0);
+    assert.strictEqual(base.MT12_BASE, 'base-value-1234', '全局层不应被租户覆盖');
+  });
+
+  // MT-11：租户账单聚合（tenant_id → username 两级）
+  await t('MT-11：tenantQuotaSummary / tenantReport / tenantReportCsv 两级聚合正确', () => {
+    const pa = tenantLib.createTenant({ name: '账单客户A', adminUsername: 'billA', adminPassword: 'Bill@2026' });
+    const pb = tenantLib.createTenant({ name: '账单客户B', adminUsername: 'billB', adminPassword: 'Bill@2026' });
+    const A = pa.tenantId, B = pb.tenantId;
+    const ins = "INSERT INTO usage_records (username,dimension,dimension_key,tokens,count,cost,prompt_tokens,completion_tokens,tenant_id,created_at) VALUES (?,?,?,?,1,?,?,?,?,datetime('now','localtime'))";
+    db.prepare(ins).run('billA', 'model', 'm1', 100, 1.5, 60, 40, A);
+    db.prepare(ins).run('billB', 'model', 'm1', 200, 2.5, 120, 80, B);
+    const repA = billingLib.tenantReport({ tenantId: A });
+    assert.strictEqual(repA.users.length, 1);
+    assert.strictEqual(repA.users[0].username, 'billA');
+    assert.ok(Math.abs(repA.monthlyTotal - 1.5) < 1e-9, 'A 租户成本应仅含自身：' + repA.monthlyTotal);
+    const aggAll = billingLib.tenantCostOfMonth(undefined, null);
+    const ids = aggAll.tenants.map(x => x.tenant_id);
+    assert.ok(ids.includes(A) && ids.includes(B), '跨租户聚合应含 A/B');
+    assert.ok(aggAll.tenants.find(x => x.tenant_id === A).cost === 1.5, 'A 成本不串账');
+    assert.ok(aggAll.tenants.find(x => x.tenant_id === B).cost === 2.5, 'B 成本不串账');
+    const csv = billingLib.tenantReportCsv({ tenantId: A }).csv;
+    assert.ok(csv.startsWith('\ufeff'), 'CSV 应带 BOM');
+    assert.ok(csv.includes('billA') && !csv.includes('billB'), 'A 导出不应含 B 用户');
+    const qs = quotaLib.tenantQuotaSummary(A);
+    assert.strictEqual(qs.tenant_id, A);
+    assert.ok(qs.users.every(u => ['billA'].includes(u.username)), '租户配额聚合仅本租户成员');
+  });
+
+  // MT-13：支付/订阅闭环（下单 → 回调验签 → 生效 → 退款 → 对账）
+  await t('MT-13：验签 fail-closed（未配密钥一律拒绝）', () => {
+    const old = process.env.PAYMENT_CALLBACK_SECRET;
+    delete process.env.PAYMENT_CALLBACK_SECRET;
+    const r = payLib.verifySignature('raw', 'fakesign');
+    assert.strictEqual(r.ok, false);
+    assert.strictEqual(r.code, 401);
+    if (old != null) process.env.PAYMENT_CALLBACK_SECRET = old;
+  });
+  await t('MT-13：订阅下单 → 标记已支付 → 订阅生效 + 成员配额下发', () => {
+    const pc = tenantLib.createTenant({ name: '支付客户C', adminUsername: 'payC', adminPassword: 'Pay@2026' });
+    const C = pc.tenantId;
+    const c = payLib.createOrder({ tenantId: C, type: 'subscribe', planKey: 'pro', channel: 'sandbox', operator: 'admin' });
+    assert.strictEqual(c.ok, true, JSON.stringify(c));
+    assert.strictEqual(c.order.status, 'pending');
+    assert.strictEqual(c.order.amount, 199);
+    const mp = payLib.markPaid(c.order.order_no, { amount: 199, channel: 'sandbox', operator: 'admin' });
+    assert.strictEqual(mp.ok, true, JSON.stringify(mp));
+    const sub = db.prepare('SELECT * FROM tenant_subscriptions WHERE tenant_id=?').get(C);
+    assert.strictEqual(sub.status, 'active');
+    assert.strictEqual(sub.plan_key, 'pro');
+    const u = db.prepare('SELECT quota_total FROM users WHERE username=?').get('payC');
+    assert.strictEqual(u.quota_total, 5000000, '成员配额应下发为套餐额度');
+    // 幂等：重复 markPaid 不再改变
+    const mp2 = payLib.markPaid(c.order.order_no, { amount: 199 });
+    assert.strictEqual(mp2.idempotent, true, '重复标记应幂等');
+    // 对账 balanced
+    const rec = payLib.reconcile({});
+    assert.ok(rec.items.some(it => it.order_no === c.order.order_no && it.balanced), '订阅订单应核验为已生效');
+  });
+  await t('MT-13：回调幂等（同 event_id 只生效一次）+ 金额篡改拒绝', () => {
+    process.env.PAYMENT_CALLBACK_SECRET = 'smoke-secret';
+    try {
+      const pc = tenantLib.createTenant({ name: '支付客户D', adminUsername: 'payD', adminPassword: 'Pay@2026' });
+      const D = pc.tenantId;
+      const o = payLib.createOrder({ tenantId: D, type: 'recharge', amount: 50, channel: 'sandbox' });
+      const no = o.order.order_no;
+      const raw = JSON.stringify({ order_no: no, event_id: 'evt-smoke-1', status: 'paid', amount: 50 });
+      const sign = payLib.signPayload(raw, 'smoke-secret');
+      const r1 = payLib.handleCallback({ channel: 'sandbox', rawBody: raw, sign, payload: JSON.parse(raw) });
+      assert.strictEqual(r1.ok, true, JSON.stringify(r1));
+      assert.strictEqual(r1.status, 'paid');
+      assert.strictEqual(payLib.getWallet(D).balance, 50, '充值应入钱包');
+      const r2 = payLib.handleCallback({ channel: 'sandbox', rawBody: raw, sign, payload: JSON.parse(raw) });
+      assert.strictEqual(r2.idempotent, true, '重复回调应幂等');
+      assert.strictEqual(payLib.getWallet(D).balance, 50, '幂等不应重复入账');
+      // 金额篡改：少于应付 → 拒绝
+      const o2 = payLib.createOrder({ tenantId: D, type: 'recharge', amount: 100, channel: 'sandbox' });
+      const raw2 = JSON.stringify({ order_no: o2.order.order_no, event_id: 'evt-smoke-2', status: 'paid', amount: 1 });
+      const sign2 = payLib.signPayload(raw2, 'smoke-secret');
+      const bad = payLib.handleCallback({ channel: 'sandbox', rawBody: raw2, sign: sign2, payload: JSON.parse(raw2) });
+      assert.strictEqual(bad.ok, false, '少付应被拒');
+      // 退款幂等
+      const rf1 = payLib.refund({ orderNo: no, operator: 'admin' });
+      assert.strictEqual(rf1.ok, true);
+      assert.strictEqual(payLib.getWallet(D).balance, 0, '退款应扣回钱包');
+      const rf2 = payLib.refund({ orderNo: no, operator: 'admin' });
+      assert.strictEqual(rf2.idempotent, true, '重复退款应幂等');
+    } finally { delete process.env.PAYMENT_CALLBACK_SECRET; }
   });
 
   try { db.close(); } catch { }

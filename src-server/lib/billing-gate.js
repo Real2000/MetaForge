@@ -15,7 +15,7 @@
  *  - 本模块只做「实测与预检」，支付闭环可后续接入，账先算准。
  */
 const { db } = require('../db');
-const { computeCost, priceOf } = require('./billing');
+const { computeCost, priceOf, userTenantId } = require('./billing');
 
 const HOLD_TTL_MS = 10 * 60 * 1000; // 预留超时：10 分钟未结算视为僵尸（如进程崩溃遗留）
 
@@ -34,9 +34,9 @@ function estimateTokens(text) {
   return Math.max(1, Math.ceil(String(text || '').length * 0.6));
 }
 
-/** 读取用户计费元数据（配额 + 并发上限） */
+/** 读取用户计费元数据（配额 + 并发上限 + 租户） */
 function userMeta(username) {
-  return db.prepare('SELECT quota_total, quota_used, cost_quota, max_concurrency FROM users WHERE username=?').get(username) || null;
+  return db.prepare('SELECT quota_total, quota_used, cost_quota, max_concurrency, tenant_id FROM users WHERE username=?').get(username) || null;
 }
 
 /** 回收超时的 held 预留（僵尸占用并发名额 / 台账悬挂） */
@@ -62,6 +62,17 @@ function monthCostOfUser(username, month) {
 }
 
 /**
+ * MT-11：某租户某月成本口径已用（元）——usage_records 快照 tenant_id 聚合。
+ * @param {number} tenantId 租户 ID
+ * @param {string} [month] YYYY-MM（缺省当月）
+ */
+function tenantMonthCost(tenantId, month) {
+  const m = /^\d{4}-\d{2}$/.test(month || '') ? month : currentMonth();
+  const r = db.prepare("SELECT COALESCE(SUM(cost),0) c FROM usage_records WHERE tenant_id=? AND dimension='model' AND created_at LIKE ? || '%'").get(Number(tenantId), m);
+  return r ? Number(r.c) : 0;
+}
+
+/**
  * 预检（模型调用之前调用）。
  * 检查顺序：Token 配额 → 成本配额 → 并发上限；任一命中即拒绝（落 blocked 台账）。
  * @param {object} p { username, model, provider, promptText, promptTokens }
@@ -71,10 +82,11 @@ function precheck({ username, model, provider, promptText, promptTokens } = {}) 
   if (!username) return { ok: false, code: 'no_user', reason: '缺少用户信息' };
   const u = userMeta(username);
   if (!u) return { ok: false, code: 'no_user', reason: '用户不存在' };
+  const tid = u.tenant_id != null ? Number(u.tenant_id) : null; // MT-11：预留台账回填租户
 
   const est_tokens = (Number.isFinite(+promptTokens) && +promptTokens > 0)
     ? Math.ceil(+promptTokens) : estimateTokens(promptText);
-  const price = priceOf(model, provider);
+  const price = priceOf(model, provider, tid);
   // 预留成本：输入按 est_tokens、输出按同量保守估计（结算时以真实用量为准重算）
   const est_cost = price ? computeCost(est_tokens, est_tokens, price) : 0;
 
@@ -90,15 +102,15 @@ function precheck({ username, model, provider, promptText, promptTokens } = {}) 
 
   const request_id = newRequestId();
   if (block) {
-    db.prepare(`INSERT INTO billing_holds (request_id,username,model,provider,est_tokens,est_cost,status,reason,created_at)
-      VALUES (?,?,?,?,?,?, 'blocked', ?, datetime('now','localtime'))`)
-      .run(request_id, username, model || '', provider || '', est_tokens, est_cost, block.reason);
+    db.prepare(`INSERT INTO billing_holds (request_id,username,model,provider,est_tokens,est_cost,status,reason,tenant_id,created_at)
+      VALUES (?,?,?,?,?,?, 'blocked', ?, ?, datetime('now','localtime'))`)
+      .run(request_id, username, model || '', provider || '', est_tokens, est_cost, block.reason, tid);
     return { ok: false, code: block.code, reason: block.reason, request_id };
   }
 
-  db.prepare(`INSERT INTO billing_holds (request_id,username,model,provider,est_tokens,est_cost,status,reason,created_at)
-    VALUES (?,?,?,?,?,?, 'held', '', datetime('now','localtime'))`)
-    .run(request_id, username, model || '', provider || '', est_tokens, est_cost);
+  db.prepare(`INSERT INTO billing_holds (request_id,username,model,provider,est_tokens,est_cost,status,reason,tenant_id,created_at)
+    VALUES (?,?,?,?,?,?, 'held', '', ?, datetime('now','localtime'))`)
+    .run(request_id, username, model || '', provider || '', est_tokens, est_cost, tid);
   return { ok: true, request_id, est_tokens, est_cost, priced: !!price };
 }
 
@@ -118,7 +130,8 @@ function settle({ request_id, promptTokens = 0, completionTokens = 0, model, pro
 
   const useModel = model || h.model || '';
   const useProvider = provider || h.provider || '';
-  const price = priceOf(useModel, useProvider);
+  const tid = h.tenant_id != null ? Number(h.tenant_id) : userTenantId(h.username); // MT-11：优先台账快照，回兑用户
+  const price = priceOf(useModel, useProvider, tid);
   const pt = Math.max(0, Math.ceil(+promptTokens || 0));
   const ct = Math.max(0, Math.ceil(+completionTokens || 0));
   const actual_tokens = pt + ct;
@@ -237,6 +250,7 @@ module.exports = {
   estimateTokens,
   currentMonth,
   monthCostOfUser,
+  tenantMonthCost,
   activeConcurrency,
   reapStale,
   precheck,

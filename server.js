@@ -96,7 +96,8 @@ app.use('/api/a2a/admin', adminRouter); // U2-7 Phase 3：密钥管理（平台�
 app.use('/api/a2a', authRouter); // /api/a2a/* 需认证
 const PORT = process.env.PORT || 3210;
 
-app.use(express.json({ limit: '20mb' })); // 知识库支持 PDF/DOCX base64 上传
+// MT-13：捕获原始报文（req.rawBody）供支付回调 HMAC 验签逐字节比对（防重排/篡改）
+app.use(express.json({ limit: '20mb', verify: (req, _res, buf) => { req.rawBody = buf; } })); // 知识库支持 PDF/DOCX base64 上传
 
 // 静态文件服务（必须在 API 路由之前，且沙箱产物中间件在最后）
 const staticOptions = { maxAge: 0, etag: false, lastModified: false };
@@ -175,6 +176,8 @@ app.use('/api/users', require('./src-server/routes/users'));
 app.use('/api/tenants', require('./src-server/routes/tenants'));
 // MT-09 平台超管跨租户运维台（2026-11-22）：跨租户只读统计 / 带审计 impersonation / 审计查询
 app.use('/api/platform-admin', require('./src-server/routes/platform-admin'));
+// MT-13 支付/订阅闭环（2026-11-22）：下单/回调验签(免登录)/订单/钱包/退款/对账
+app.use('/api/payment', require('./src-server/routes/payment'));
 // 意见反馈（帮助体系）：全站反馈通道 + 管理员闭环处理（站内信回告提交者）
 app.use('/api/feedback', require('./src-server/routes/feedback'));
 // P5.27 本地桥（桌面操控客户端服务）：设备配对 + 任务队列（轮询模式，桥端 device_token 鉴权）

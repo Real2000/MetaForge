@@ -31,12 +31,12 @@ router.get('/', (req, res) => {
   });
 });
 
-router.post('/', (req, res) => {
+router.post('/', async (req, res) => {
   const { name, base_url, api_key, models } = req.body || {};
   if (!name?.trim()) return res.json({ code: 400, msg: '名称不能为空' });
   if (!base_url?.trim()) return res.json({ code: 400, msg: '服务地址不能为空（OpenAI 兼容，如 https://api.xxx.com/v1）' });
   // SEC-05：SSRF 校验（拒绝私网/环回/云元数据地址，除非管理员 AGENT_FETCH_ALLOW_PRIVATE=1）
-  try { assertPublicHttpUrl(base_url.trim()); } catch (e) { return res.json({ code: 400, msg: e.message }); }
+  try { await assertPublicHttpUrl(base_url.trim()); } catch (e) { return res.json({ code: 400, msg: e.message }); }
   const cnt = db.prepare('SELECT COUNT(*) c FROM user_providers WHERE username=?').get(req.user.username).c;
   if (cnt >= 10) return res.json({ code: 400, msg: '每人最多接入 10 个模型源' });
   const ms = parseModels(models, '[]');
@@ -48,12 +48,12 @@ router.post('/', (req, res) => {
   res.json({ code: 0, data: { id: info.lastInsertRowid } });
 });
 
-router.put('/:id', (req, res) => {
+router.put('/:id', async (req, res) => {
   const old = db.prepare('SELECT * FROM user_providers WHERE id=? AND username=?').get(req.params.id, req.user.username);
   if (!old) return res.json({ code: 404, msg: '模型源不存在' });
   const { name, base_url, api_key, models, status } = req.body || {};
   // SEC-05：改地址同样过 SSRF 校验
-  if (base_url && base_url.trim()) { try { assertPublicHttpUrl(base_url.trim()); } catch (e) { return res.json({ code: 400, msg: e.message }); } }
+  if (base_url && base_url.trim()) { try { await assertPublicHttpUrl(base_url.trim()); } catch (e) { return res.json({ code: 400, msg: e.message }); } }
   const ms = parseModels(models, old.models);
   // Key 编辑保护：未传/传空/传掩码（****）都保留旧值；只有传新明文才覆盖
   const keepKey = (api_key == null || api_key === '' || String(api_key).includes('****')) ? old.api_key : encrypt(api_key);

@@ -10,8 +10,25 @@
  *
  * 记账口径与 quota.js 的关系：quota（users.quota_used）仍按 messages.tokens 输出估算口径；
  * 本模块是「成本」口径：tokens = prompt + completion，二者用途不同互不干扰。
+ *
+ * MT-11（2026-11-22）租户级账单：记账时按写入时用户 tenant_id 快照回填 usage_records.tenant_id，
+ * 新增 tenantCostOfMonth / tenantReport 聚合，实现「tenant_id → username」两级账单口径（两租户互不串账）。
  */
 const { db, now } = require('../db');
+
+/** 有效租户号判定：null/undefined/'' → false（"全部租户"语义，零过滤）。
+ *  注意：Number.isFinite(Number(null)) 为 true，故必须先排除空值，否则会把"全部"误当 tenant_id=0。 */
+function hasTenant(tenantId) {
+  return tenantId != null && tenantId !== '' && Number.isFinite(Number(tenantId));
+}
+
+/** 用户所属租户（写入时快照；容错返回 null）。*/ 
+function userTenantId(username) {
+  try {
+    const r = db.prepare('SELECT tenant_id FROM users WHERE username=?').get(username);
+    return r && r.tenant_id != null ? Number(r.tenant_id) : null;
+  } catch { return null; }
+}
 
 /** 解析单价 JSON（容错：坏数据按无单价处理）。返回 Map<模型名, {input, output}> */
 function parsePriceTable(raw) {
@@ -29,12 +46,22 @@ function parsePriceTable(raw) {
 
 /** 查某模型单价。providerName 可空（按模型名在已配置供应商中找第一个含该模型且配了单价的）。
  *  返回 { input, output } | null（无单价） */
-function priceOf(modelName, providerName) {
+function priceOf(modelName, providerName, tenantId) {
   if (!modelName) return null;
-  const rows = providerName
-    ? db.prepare('SELECT model_price, models FROM providers WHERE name=?').all(providerName)
-    : db.prepare("SELECT model_price, models FROM providers WHERE configured=1").all();
-  // 指定供应商：其单价表里有该模型 → 命中
+  // MT-12 起 providers 带 tenant_id（0=平台全局基线，>0=租户覆盖层）。
+  // 传入 tenantId 时按「全局基线 ∪ 本租户」过滤，并让租户专有单价优先命中（覆盖层语义）。
+  const useTenant = hasTenant(tenantId);
+  let rows;
+  if (providerName) {
+    rows = useTenant
+      ? db.prepare('SELECT model_price, models, tenant_id FROM providers WHERE name=? AND (tenant_id=0 OR tenant_id=?) ORDER BY tenant_id DESC').all(providerName, Number(tenantId))
+      : db.prepare('SELECT model_price, models, tenant_id FROM providers WHERE name=?').all(providerName);
+  } else if (useTenant) {
+    rows = db.prepare('SELECT model_price, models, tenant_id FROM providers WHERE configured=1 AND (tenant_id=0 OR tenant_id=?) ORDER BY tenant_id DESC').all(Number(tenantId));
+  } else {
+    rows = db.prepare('SELECT model_price, models, tenant_id FROM providers WHERE configured=1').all();
+  }
+  // 指定供应商：其单价表里有该模型 → 命中（按 tenant_id 降序，租户专有覆盖全局）
   for (const r of rows) {
     const table = parsePriceTable(r.model_price);
     const hit = table.get(modelName);
@@ -59,16 +86,17 @@ function computeCost(promptTokens, completionTokens, price) {
 function recordModelUsage({ username, model, provider, promptTokens = 0, completionTokens = 0, meta } = {}) {
   if (!username || !model) return null;
   try {
-    const price = priceOf(model, provider);
+    const u = db.prepare('SELECT dept_id, tenant_id FROM users WHERE username=?').get(username);
+    const tid = u && u.tenant_id != null ? Number(u.tenant_id) : null;
+    const price = priceOf(model, provider, tid);
     const cost = computeCost(promptTokens, completionTokens, price);
-    const dept = db.prepare('SELECT dept_id FROM users WHERE username=?').get(username);
     const tokens = Math.max(0, Math.ceil(+promptTokens || 0)) + Math.max(0, Math.ceil(+completionTokens || 0));
     const metaObj = Object.assign({ provider: provider || '', priced: !!price }, meta || {});
     if (price) { metaObj.price_input = price.input; metaObj.price_output = price.output; } // 单价快照（后续调价不影响历史成本可审计性）
-    db.prepare(`INSERT INTO usage_records (username, dimension, dimension_key, tokens, count, cost, meta, prompt_tokens, completion_tokens, dept_id, created_at)
-      VALUES (?, 'model', ?, ?, 1, ?, ?, ?, ?, ?, datetime('now','localtime'))`)
+    db.prepare(`INSERT INTO usage_records (username, dimension, dimension_key, tokens, count, cost, meta, prompt_tokens, completion_tokens, dept_id, tenant_id, created_at)
+      VALUES (?, 'model', ?, ?, 1, ?, ?, ?, ?, ?, ?, datetime('now','localtime'))`)
       .run(username, String(model), tokens, cost, JSON.stringify(metaObj),
-        Math.max(0, Math.ceil(+promptTokens || 0)), Math.max(0, Math.ceil(+completionTokens || 0)), dept ? dept.dept_id : null);
+        Math.max(0, Math.ceil(+promptTokens || 0)), Math.max(0, Math.ceil(+completionTokens || 0)), u ? u.dept_id : null, tid);
     return { priced: !!price, cost };
   } catch (e) {
     console.error('[billing] 用量记账失败（不阻断对话）：', e.message);
@@ -107,8 +135,8 @@ function recordKbFederatedUsage({ username, query, tokens = 1, sourceOrg = '', k
   try {
     const dimKey = `kb_federated:${(sourceOrg || '').slice(0, 30)}:${(kbName || '').slice(0, 30)}`;
     const finalCost = cost != null ? cost : Number((tokens * 0.001).toFixed(6));
-    db.prepare("INSERT INTO usage_records (username, dimension, dimension_key, tokens, count, cost, meta, created_at) VALUES (?, 'kb', ?, ?, 1, ?, ?, datetime('now','localtime'))")
-      .run(username, dimKey, tokens, finalCost, JSON.stringify({ sourceOrg, kbName, query, type: 'kb_federated' }));
+    db.prepare("INSERT INTO usage_records (username, dimension, dimension_key, tokens, count, cost, meta, tenant_id, created_at) VALUES (?, 'kb', ?, ?, 1, ?, ?, ?, datetime('now','localtime'))")
+      .run(username, dimKey, tokens, finalCost, JSON.stringify({ sourceOrg, kbName, query, type: 'kb_federated' }), userTenantId(username));
     return { ok: true, cost: finalCost };
   } catch (e) {
     console.error('[billing] kb_federated 计费失败（不阻断）：', e.message);
@@ -116,4 +144,93 @@ function recordKbFederatedUsage({ username, query, tokens = 1, sourceOrg = '', k
   }
 }
 
-module.exports = { parsePriceTable, priceOf, computeCost, recordModelUsage, deptCostOfMonth, recordKbFederatedUsage };
+/**
+ * MT-11：某月租户维度成本聚合（按 usage_records 快照 tenant_id 归组）。
+ * @param {string} month YYYY-MM（缺省当月）
+ * @param {number|null} tenantId 指定租户；null = 全部租户
+ * @returns {{ month, tenants:[{tenant_id,tenant_name,members,tokens,cost}], totalCost }}
+ */
+function tenantCostOfMonth(month, tenantId = null) {
+  const m = /^\d{4}-\d{2}$/.test(month || '')
+    ? month
+    : new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Shanghai' }).slice(0, 7);
+  const limit = hasTenant(tenantId) ? ' AND ur.tenant_id = ?' : '';
+  const args = limit ? [m, Number(tenantId)] : [m];
+  const rows = db.prepare(`SELECT ur.tenant_id, t.name AS tenant_name,
+      COUNT(DISTINCT ur.username) AS members, SUM(ur.tokens) AS tokens, SUM(ur.cost) AS cost
+    FROM usage_records ur
+    LEFT JOIN tenants t ON t.id = ur.tenant_id
+    WHERE ur.dimension='model' AND ur.created_at LIKE ? || '%'${limit}
+    GROUP BY ur.tenant_id`).all(...args);
+  const tenants = rows.map(r => ({
+    tenant_id: r.tenant_id,
+    tenant_name: r.tenant_name || (r.tenant_id == null ? '未归属' : `租户#${r.tenant_id}`),
+    members: r.members || 0,
+    tokens: r.tokens || 0,
+    cost: Number((r.cost || 0).toFixed(6)),
+  })).sort((a, b) => b.cost - a.cost);
+  return { month: m, tenants, totalCost: Number(tenants.reduce((s, r) => s + r.cost, 0).toFixed(6)) };
+}
+
+/**
+ * MT-11：租户账单报表（tenant_id → username 两级）。
+ * @param {object} p { month, tenantId|null }
+ * @returns {{ month, tenantId, users:[...], monthlyTotal, lifetimeTotal }}
+ */
+function tenantReport({ month, tenantId = null } = {}) {
+  const m = /^\d{4}-\d{2}$/.test(month || '')
+    ? month
+    : new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Shanghai' }).slice(0, 7);
+  const limit = hasTenant(tenantId) ? ' AND ur.tenant_id = ?' : '';
+  const mArgs = limit ? [m, Number(tenantId)] : [m];
+  const users = db.prepare(`SELECT ur.username, SUM(ur.tokens) AS tokens, SUM(ur.cost) AS cost,
+      SUM(ur.prompt_tokens) AS prompt_tokens, SUM(ur.completion_tokens) AS completion_tokens, COUNT(*) AS calls
+    FROM usage_records ur
+    WHERE ur.dimension='model' AND ur.created_at LIKE ? || '%'${limit}
+    GROUP BY ur.username ORDER BY cost DESC`).all(...mArgs)
+    .map(r => ({
+      username: r.username,
+      calls: r.calls || 0,
+      tokens: r.tokens || 0,
+      prompt_tokens: r.prompt_tokens || 0,
+      completion_tokens: r.completion_tokens || 0,
+      cost: Number((r.cost || 0).toFixed(6)),
+    }));
+  const monthlyTotal = Number(users.reduce((s, r) => s + r.cost, 0).toFixed(6));
+  const lArgs = limit ? [Number(tenantId)] : [];
+  const life = db.prepare(`SELECT SUM(cost) AS cost FROM usage_records ur WHERE ur.dimension='model'${limit}`).get(...lArgs);
+  return {
+    month: m,
+    tenantId: hasTenant(tenantId) ? Number(tenantId) : null,
+    users,
+    monthlyTotal,
+    lifetimeTotal: Number(((life && life.cost) || 0).toFixed(6)),
+  };
+}
+
+/**
+ * MT-11：租户账单导出（CSV 文本；UTF-8 BOM 便于 Excel 打开不乱码）。
+ * 字段：租户ID,租户名,用户名,调用次数,输入tokens,输出tokens,tokens合计,成本(元)
+ */
+function tenantReportCsv({ month, tenantId = null } = {}) {
+  const rep = tenantReport({ month, tenantId });
+  const rows = db.prepare(`SELECT ur.tenant_id, t.name AS tenant_name, ur.username,
+      SUM(ur.tokens) AS tokens, SUM(ur.prompt_tokens) AS pt, SUM(ur.completion_tokens) AS ct, SUM(ur.cost) AS cost, COUNT(*) AS calls
+    FROM usage_records ur LEFT JOIN tenants t ON t.id = ur.tenant_id
+    WHERE ur.dimension='model' AND ur.created_at LIKE ? || '%'${hasTenant(tenantId) ? ' AND ur.tenant_id = ?' : ''}
+    GROUP BY ur.tenant_id, ur.username ORDER BY ur.tenant_id, cost DESC`)
+    .all(...(hasTenant(tenantId) ? [rep.month, Number(tenantId)] : [rep.month]));
+  const esc = (v) => {
+    const s = String(v ?? '');
+    return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  };
+  const head = ['租户ID', '租户名', '用户名', '调用次数', '输入tokens', '输出tokens', 'tokens合计', '成本(元)'];
+  const lines = [head.join(',')];
+  for (const r of rows) {
+    lines.push([r.tenant_id, esc(r.tenant_name || ''), esc(r.username || ''), r.calls || 0, r.pt || 0, r.ct || 0, r.tokens || 0, Number((r.cost || 0).toFixed(6))].join(','));
+  }
+  lines.push(['合计', '', '', '', '', '', '', rep.monthlyTotal].join(','));
+  return { month: rep.month, csv: '\ufeff' + lines.join('\n'), total: rep.monthlyTotal, rowCount: rows.length };
+}
+
+module.exports = { parsePriceTable, priceOf, computeCost, recordModelUsage, deptCostOfMonth, recordKbFederatedUsage, tenantCostOfMonth, tenantReport, tenantReportCsv, userTenantId };

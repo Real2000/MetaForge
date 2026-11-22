@@ -59,14 +59,14 @@ router.get('/', (req, res) => {
 });
 
 // 创建 SSO 提供方
-router.post('/', (req, res) => {
+router.post('/', async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ code: 403, msg: '需要管理员权限' });
   const b = req.body || {};
   const name = String(b.name || '').trim();
   if (!name) return res.json({ code: 400, msg: '提供方名称不能为空' });
   // SEC-05：SSO 端点 URL 出站前需为公网地址（issuer/authorization_url/token_url/userinfo_url）
   for (const k of ['issuer', 'authorization_url', 'token_url', 'userinfo_url']) {
-    if (b[k] && String(b[k]).trim()) { try { assertPublicHttpUrl(String(b[k]).trim()); } catch (e) { return res.json({ code: 400, msg: `字段 ${k} 非法：${e.message}` }); } }
+    if (b[k] && String(b[k]).trim()) { try { await assertPublicHttpUrl(String(b[k]).trim()); } catch (e) { return res.json({ code: 400, msg: `字段 ${k} 非法：${e.message}` }); } }
   }
   const secret = String(b.client_secret || '');
   const encrypted = secret ? encrypt(secret) : '';
@@ -80,14 +80,14 @@ router.post('/', (req, res) => {
 });
 
 // 更新 SSO 提供方
-router.put('/:id', (req, res) => {
+router.put('/:id', async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ code: 403, msg: '需要管理员权限' });
   const old = db.prepare('SELECT * FROM sso_providers WHERE id=?').get(req.params.id);
   if (!old) return res.json({ code: 404, msg: 'SSO 提供方不存在' });
   const b = req.body || {};
   // SEC-05：SSO 端点 URL 出站前需为公网地址
   for (const k of ['issuer', 'authorization_url', 'token_url', 'userinfo_url']) {
-    if (b[k] && String(b[k]).trim()) { try { assertPublicHttpUrl(String(b[k]).trim()); } catch (e) { return res.json({ code: 400, msg: `字段 ${k} 非法：${e.message}` }); } }
+    if (b[k] && String(b[k]).trim()) { try { await assertPublicHttpUrl(String(b[k]).trim()); } catch (e) { return res.json({ code: 400, msg: `字段 ${k} 非法：${e.message}` }); } }
   }
   const secret = String(b.client_secret || '');
   // 仅当提供了新密钥且与掩码不同时才更新
