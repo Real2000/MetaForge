@@ -166,6 +166,12 @@ function runMigrations(steps, opts = {}) {
  *
  * 添加新迁移：在数组末尾追加新项，id 为上一个 id + 1
  */
+/**
+ * M1 / MT-02 租户域表清单（权威来源：docs/tenant-scope.md §3.1）。
+ * 单一数据源见 lib/tenant-tables.js（不依赖 db，供探针脚本安全共用，避免误触生产库）。
+ */
+const { TENANT_TABLES } = require('./tenant-tables');
+
 const ALL_MIGRATIONS = [
   // === 2026-10-20 体验优化 ===
   { id: 1,  name: 'messages.rating - 对话质量反馈', table: 'messages', column: 'rating', def: 'INTEGER DEFAULT 0' },
@@ -445,6 +451,49 @@ const ALL_MIGRATIONS = [
   );` },
 
   { id: 108, name: 'eval_baselines.intervened - 需人工介入用例数（显著性检验原始计数）', table: 'eval_baselines', column: 'intervened', def: 'INTEGER DEFAULT 0' },
+
+  // === M1 / MT-02 多租户隔离底座（2026-11-22）===
+  // 权威范围：docs/tenant-scope.md §3.1 TENANT 清单。SHARED / INFRA 表不加 tenant_id。
+  { id: 109, name: 'tenants - 租户一等实体 + 默认租户 id=1', up: (ctx) => {
+    ctx.ensureTable('tenants', `CREATE TABLE IF NOT EXISTS tenants (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      status TEXT DEFAULT 'active',
+      plan TEXT DEFAULT 'free',
+      parent_tenant_id INTEGER DEFAULT NULL,
+      created_at TEXT
+    );`);
+    const c = ctx.db.prepare('SELECT COUNT(*) AS c FROM tenants').get().c;
+    if (!c) {
+      ctx.db.prepare("INSERT INTO tenants (id,name,status,plan,created_at) VALUES (1,'默认租户','active','enterprise',datetime('now','localtime'))").run();
+    }
+  } },
+  { id: 110, name: '租户域表新增 tenant_id（INTEGER DEFAULT 1）', up: (ctx) => {
+    let n = 0;
+    for (const tbl of TENANT_TABLES) {
+      if (!ctx.tableExists(tbl)) continue;
+      if (ctx.addColumn(tbl, 'tenant_id', 'INTEGER DEFAULT 1')) n++;
+    }
+    if (n) console.log(`[migrate] 租户域表 tenant_id 已补齐 ${n} 张`);
+  } },
+  { id: 111, name: '租户域表存量回填 tenant_id=1', up: (ctx) => {
+    for (const tbl of TENANT_TABLES) {
+      if (!ctx.tableExists(tbl)) continue;
+      try { ctx.db.prepare(`UPDATE ${tbl} SET tenant_id=1 WHERE tenant_id IS NULL`).run(); } catch (e) { /* 忽略无 tenant_id 的表 */ }
+    }
+  } },
+  { id: 112, name: 'spaces.owner 昵称归一化为 username', up: (ctx) => {
+    // 依据 users 的 nickname→username 映射，将 spaces.owner 中的昵称改写为用户名。
+    // 若某昵称与任何用户名冲突，跳过以避免误改；已是用户名的值不变。
+    const users = ctx.db.prepare('SELECT username, nickname FROM users').all();
+    const usernames = new Set(users.map(u => u.username));
+    let n = 0;
+    for (const u of users) {
+      if (!u.nickname || usernames.has(u.nickname)) continue;
+      n += ctx.db.prepare('UPDATE spaces SET owner=? WHERE owner=?').run(u.username, u.nickname).changes;
+    }
+    if (n) console.log(`[migrate] spaces.owner 昵称归一化 ${n} 行`);
+  } },
 ];
 
 module.exports = {
@@ -456,4 +505,5 @@ module.exports = {
   runMigrations,
   getAppliedIds,
   ALL_MIGRATIONS,
+  TENANT_TABLES,
 };

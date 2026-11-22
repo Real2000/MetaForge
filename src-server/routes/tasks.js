@@ -68,8 +68,12 @@ router.use(auth);
 
 router.get('/', (req, res) => {
   // P5.31：非管理员仅见自己创建的任务（此前全部任务对所有用户可见可删——越权面）；管理员全局可见
-  const where = req.user.role === 'admin' ? '' : ' WHERE t.username=?';
-  const args = req.user.role === 'admin' ? [] : [req.user.username];
+  // MT-05（2026-11-22）：多租户下所有查询强制注入 tenant_id（单租户 scope=null，零回归）。
+  const scope = require('../lib/dal').tenantScope(req);
+  const conds = [], args = [];
+  if (req.user.role !== 'admin') { conds.push('t.username=?'); args.push(req.user.username); }
+  if (scope != null) { conds.push('t.tenant_id=?'); args.push(scope); }
+  const where = conds.length ? ' WHERE ' + conds.join(' AND ') : '';
   const rows = db.prepare(`
     SELECT t.*, a.name AS agent_name FROM tasks t LEFT JOIN agents a ON a.id=t.target_id${where}
     ORDER BY t.id DESC`).all(...args);

@@ -28,7 +28,7 @@ const {
   VALID_STEP,           // 步骤名白名单校验（PUT pipeline 字段用）
   parsePipelineConfig,  // kbs.pipeline 读取侧归一（NULL/空/损坏 → null=默认管道）
 } = require('../lib/ingestion-pipeline'); // V2.3 #5 2026-10-31：摄取管道（上传链路自此管道化）
-const { spaceVisibleTo } = require('../lib/space-utils'); // V2.4 #9 收尾 2026-11-02：列表空间过滤统一语义
+const { filterBySpace, reqTenantOpt } = require('../lib/space-utils'); // V2.4 #9 收尾 2026-11-02；MT-05 2026-11-22：接租户边界
 const { parsePagination } = require('../lib/pagination'); // P1-3 2026-11-04：分页参数容错统一解析
 
 const router = express.Router();
@@ -64,12 +64,9 @@ router.get('/', (req, res) => {
   // 注意：sql 的第 51-53 行已做了 owner 过滤，此处仅做空间的追加过滤。
   // ============================================================
   let filtered = rows;
-  if (req.user.role !== 'admin') {
-    // V2.4 #9 收尾（2026-11-02）：改用 space-utils 统一语义（与 agents 列表的 spaceFilterSql 严格一致）——
-    // 无归属(0/NULL)→全员可见；企业空间→全员可见；个人/部门空间→空间/资源 owner 可见。
-    // 消除此前与 agents 路由各自手写导致的空间语义分叉（企业空间资源曾被双方判为仅 owner 可见）。
-    filtered = rows.filter(k => !k.space_id || k.owner === req.user.username || spaceVisibleTo(db, k.space_id, req.user.username));
-  }
+  // MT-05（2026-11-22）：统一走 filterBySpace——内含「租户边界 + 空间 + owner」判定；
+  // 单租户模式下 admin 零条件放行、普通用户空间语义与改造前一致（零回归）。
+  filtered = filterBySpace(rows, req.user, db, 'space_id', 'owner', reqTenantOpt(req));
   const data = filtered.map(r => ({ ...r, pipeline: parsePipelineConfig(r.pipeline) }));
   res.json({ code: 0, data });
 });

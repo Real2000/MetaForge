@@ -2880,4 +2880,28 @@ R5 远期生态首项。**先做 3D 资产生成与导出（新增资产类型 +
 - 浏览器 E2E（隔离实例，端口 3901 + 独立 `AGENT_DATA_DIR`）：登录→强制改密→首页全量渲染（CSP Report-Only 未破坏 SPA，0 控制台错误）；安全头齐备；**SEC-02a 端到端**——创建密钥一次性回显 `sk-ap-…`、列表掩码 `sk-ap-90****f44c`、库内 `agent_api_keys.key` 存 64 位哈希、明文密钥调 `/openapi/v1/models` 返回 200 且仅列出绑定智能体；MCP 令牌弹窗强制「绑定智能体（必选）、全域令牌已停用」。**修复既有前端 bug**：`admin/agents.js` 的 `loadKeys` 误置于 `.then()` 回调作用域、却在回调外调用，导致 API 弹窗一直 ReferenceError 打不开——已将声明上提至 `openApiKeys` 作用域。`public/sw.js` bump → `m0-v2`。
 - 注意事项：本地嵌入/重排网关（如本机 bge 服务）在默认安全策略下会被视为私网拒绝，需设 `AGENT_FETCH_ALLOW_PRIVATE=1`；生产部署务必设 `NODE_ENV=production`（或 `AGENT_ENABLE_HSTS=1`）以启用 Cookie `Secure` 与 HSTS。
 
+## M1 多租户隔离底座 + 数据出口收敛（进行中，2026-11-22）
+
+**目标**：落实《开发计划表 v1.1》M1（P0，9 项）——建立 `tenant` 硬边界与 fail-closed 隔离，并统一查询出口（DAL/方言）。
+
+**已完成**
+- **MT-01 表级分类清单（前置）**：新增 `docs/tenant-scope.md`——按「同一份数据是否可能同时属于两个客户」口径，将 113 张业务表分为 **TENANT / SHARED / INFRA** 三类，作为 MT-02 回填的唯一权威范围。
+- **MT-02 租户模型落地（扩围）**：`tenants` 一等实体（id/name/status/plan/parent_tenant_id）+ 默认租户 `id=1`；`lib/migrate.js` 迁移 **109~112**：89 张租户域表加 `tenant_id INTEGER DEFAULT 1`、存量回填 `1`、`spaces.owner` 昵称→username 归一化。单租户私有化部署下全部数据恒为 `tenant_id=1`，业务行为与现状一致。租户域清单抽为 `lib/tenant-tables.js` 单一数据源（不依赖 db，供探针脚本安全共用，避免误触生产库）。
+- **MT-03 租户上下文中间件（fail-closed）**：`lib/auth.js` 新增 `tenantContext`，置于 `server.js` 全部业务路由之前。单租户默认注入 `req.tenant={id:1,single:true}`（零行为变更）；多租户（`AGENT_MULTI_TENANT=1`）解析优先级「已认证用户 `users.tenant_id`（服务端权威）> JWT claim > `X-Tenant-Id` 头/子域 > **拒绝 403**」；平台超管（`AGENT_PLATFORM_ADMINS`）跨租户强制写 `security_events` 审计。
+- **MT-04 空间过滤重写（删 fail-open）**：`lib/space-utils.js` 改为「租户匹配 + 空间过滤」两段判定，任一缺失即拒绝；多租户下 admin 亦受租户边界约束；不传 opts 时行为与改造前完全一致。
+- **MT-05 租户过滤出口化（首批）**：`lib/dal.js` 新增统一出口 `tenantScope(req)` / `tenantWhere(alias,scope)`；`space-utils.js` 新增 `reqTenantOpt(req)`。已接线核心列表端点：`agents`（列表空间过滤）、`knowledge`（`filterBySpace`）、`tasks`、`chat/sessions`——多租户下强制注入 `tenant_id`，单租户零回归。
+- **MT-06 租户隔离越权探针**：`scripts/tenant-audit.js` 静态扫描 SQL，量化「命中租户域表但未含 `tenant_id`」的风险项（当前基线 **1273 处**，作为 MT-05/BE-C1 收敛进度度量）。
+- **BE-C1 查询适配器收敛（DAL 强制入口，首批）**：`lib/dal.js` 新增 `q/getq/runq`（经方言层翻译）+ `translateSql`；新增 `scripts/lint-bare-prepare.js` **棘轮门禁**（基线 `scripts/dal-baseline.json`：107 文件 / 1591 处裸查，禁止新增，存量逐步下调）+ `npm run lint:sql`。
+- **BE-C2 SQL 方言闭环（首批）**：`lib/sql-dialect.js` 新增 `strftime(fmt,arg)` 改写（`%s`→ epoch：金仓 `EXTRACT(EPOCH FROM …)`、达梦 `DATEDIFF(SECOND,…)`；日期格式→ `to_char`），移除 strftime 未映射告警；新增 `scripts/dialect-audit.js`（构造分布 + dm/kingbase translate 冒烟，`--strict` 可作门禁）。
+- **MT-07 双租户 E2E 验收**：新增 `test/tenant-e2e.js`——13 项用例覆盖「单租户零回归 / 多租户跨租户不可见（agents·kbs）/ `reqTenantOpt` / DAL 出口 / HTTP fail-closed（缺租户 403、带租户头未认证 401）」；已接入 `npm test`（`test = smoke + tenant-e2e`）。
+
+**验证**
+- `npm test`：冒烟 **600/0 全绿**（597 基线 + 3 新增：MT-05 `reqTenantOpt`、BE-C1 DAL 出口、BE-C2 方言 translate）+ 双租户 E2E **13/0 全绿**。同步更新 1 条既有断言（原「strftime 未映射告警」→ 改测仍属未映射的 `julianday`）。
+- 生产库迁移已落地并核对：迁移至 **112**、`tenants` 默认租户就绪、89 表 `tenant_id` 存量全部回填 `1`、`spaces.owner` 归一化 2 行。
+
+**已知边界（待续）**
+- MT-05/BE-C1 为**增量收敛**：全站约 1500+ 处裸查，本次交付「出口机制 + 棘轮门禁 + 首批核心资源接线 + 探针量化」，其余逐步迁移（`scripts/tenant-audit.js` 给出精确清单）。
+- BE-C2 的 `PRAGMA`/`AUTOINCREMENT`/`lastInsertRowid` 多在框架与 DDL 层，属「收敛抽象」而非清零；`INSERT OR REPLACE` 因缺冲突目标仍显式告警。
+- BE-C1 的 `q/getq/runq` 已具备方言能力，但尚未替换全部路由裸查。
+
 > AI生成

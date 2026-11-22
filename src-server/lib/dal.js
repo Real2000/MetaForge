@@ -20,6 +20,7 @@
  * 方言差异当前由内部 SQLite 函数实现；达梦方言落地时继承同一接口。
  */
 const { db: sqlite3, now: sqliteNow } = require('../db');
+const sqlDialect = require('./sql-dialect');
 
 const DIALECT = process.env.DB_DIALECT || 'sqlite';
 
@@ -160,7 +161,7 @@ function transaction(fn) {
   sqlite3.prepare('BEGIN').run();
   try {
     const result = fn({
-      query, get, insert, update, remove, exec, pragma, now, pluck, upsert,
+      query, get, insert, update, remove, exec, pragma, now, pluck, upsert, q, getq, runq,
     });
     sqlite3.prepare('COMMIT').run();
     return result;
@@ -170,4 +171,58 @@ function transaction(fn) {
   }
 }
 
-module.exports = { insert, upsert, update, remove, query, get, pluck, exec, pragma, now, transaction, DIALECT };
+/* ==================== BE-C1 / MT-05：统一查询出口 ==================== */
+
+/**
+ * SQL 出口翻译：所有经 dal 出口的 SQL 先过方言层（sqlite 恒等，零回归）。
+ * 供「方言层可拦截全部 SQL」目标使用。
+ * @param {string} sql
+ * @returns {string}
+ */
+function translateSql(sql) {
+  return sqlDialect.translate(sql, DIALECT).sql;
+}
+
+/** 经方言出口查询多行 */
+function q(sql, params) {
+  return sqlite3.prepare(translateSql(sql)).all(...(Array.isArray(params) ? params : []));
+}
+/** 经方言出口查询单行 */
+function getq(sql, params) {
+  return sqlite3.prepare(translateSql(sql)).get(...(Array.isArray(params) ? params : []));
+}
+/** 经方言出口执行写入（INSERT/UPDATE/DELETE），返回 { changes, lastInsertRowid } */
+function runq(sql, params) {
+  return sqlite3.prepare(translateSql(sql)).run(...(Array.isArray(params) ? params : []));
+}
+
+/* ---------- MT-05 租户过滤出口（统一注入） ---------- */
+
+/**
+ * 从请求解析租户范围：单租户模式返回 null（不启用边界）；多租户返回整数 tenant_id。
+ * @param {object} req Express 请求（须已过 tenantContext 中间件，挂 req.tenant）
+ * @returns {number|null}
+ */
+function tenantScope(req) {
+  if (!req || !req.tenant || req.tenant.single) return null;
+  const id = req.tenant.id;
+  return (id != null && Number.isFinite(Number(id))) ? Number(id) : null;
+}
+
+/**
+ * 生成租户过滤 SQL 片段（供各资源查询统一拼接，禁止路由自拼 tenant 条件）。
+ * 单租户（scope=null）→ 空片段（零回归）；多租户 → ` AND <alias>.tenant_id=?`。
+ * @param {string} [alias] 表别名（如 'a'）；缺省为无别名
+ * @param {number|null} scope tenantScope(req) 的返回值
+ * @returns {{sqlStr:string, args:Array}}
+ */
+function tenantWhere(alias, scope) {
+  if (scope == null) return { sqlStr: '', args: [] };
+  const a = alias ? `${alias}.` : '';
+  return { sqlStr: ` AND ${a}tenant_id=?`, args: [scope] };
+}
+
+module.exports = {
+  insert, upsert, update, remove, query, get, pluck, exec, pragma, now, transaction,
+  q, getq, runq, translateSql, tenantScope, tenantWhere, DIALECT,
+};

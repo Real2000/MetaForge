@@ -24,6 +24,45 @@ const COMMON_RULES = [
   { re: /`([^`]+)`/g, to: '"$1"' },
 ];
 
+/* ---------------- strftime() 处理（BE-C2 2026-11-22） ---------------- */
+
+/** strftime 格式符 → Oracle/PG 通用 to_char 格式符 */
+const STRFTIME_FMT_MAP = {
+  '%Y': 'YYYY', '%m': 'MM', '%d': 'DD', '%H': 'HH24', '%M': 'MI', '%S': 'SS',
+  '%j': 'DDD', '%W': 'IW', '%w': 'D',
+};
+/** 把 strftime 格式串转成 to_char 格式串（未识别项原样保留） */
+function convertStrftimeFormat(fmt) {
+  return String(fmt).replace(/%[YmdHMSjWw]/g, m => STRFTIME_FMT_MAP[m] || m);
+}
+
+/**
+ * 将 strftime(fmt, arg...) 改写为方言等价表达式。
+ *   - '%s' 秒级时间戳：kingbase → EXTRACT(EPOCH FROM <arg>)::bigint；dm → DATEDIFF(SECOND, 1970-01-01, <arg>)
+ *     特例 arg 为 'now'/'now','localtime' 时取当前时间。
+ *   - 其余格式：to_char(<arg>, '<转换后格式>')（PG/dm 均支持 to_char）。
+ * 仅处理「单引号格式串 + 无嵌套括号的参数」，命中即改写；否则保留并留给 unsupported 告警。
+ */
+function replaceStrftime(sql, dialectName) {
+  const isDm = dialectName === 'dm';
+  return String(sql).replace(/strftime\(\s*'([^']*)'\s*(?:,\s*([^)]*))?\)/gi, (whole, fmt, argRaw) => {
+    const arg0 = String(argRaw || '').trim();
+    const isNow = /^'now'(\s*,\s*'localtime')?$/.test(arg0) || arg0 === '';
+    if (fmt === '%s') {
+      if (isDm) {
+        return isNow
+          ? `DATEDIFF(SECOND, TIMESTAMP '1970-01-01 00:00:00', SYSDATE)`
+          : `DATEDIFF(SECOND, TIMESTAMP '1970-01-01 00:00:00', ${arg0})`;
+      }
+      return isNow
+        ? `EXTRACT(EPOCH FROM now())::bigint`
+        : `EXTRACT(EPOCH FROM ${arg0})::bigint`;
+    }
+    if (!arg0) return whole; // 无参数（无目标列）不臆造
+    return `to_char(${arg0}, '${convertStrftimeFormat(fmt)}')`;
+  });
+}
+
 /* ---------------- 方言定义 ---------------- */
 
 const DIALECTS = {
@@ -41,7 +80,6 @@ const DIALECTS = {
       ...COMMON_RULES,
     ],
     unsupported: [
-      { name: 'strftime()', re: /\bstrftime\s*\(/i },
       { name: 'julianday()', re: /\bjulianday\s*\(/i },
       { name: 'printf()', re: /\bprintf\s*\(/i },
       { name: 'randomblob()', re: /\brandomblob\s*\(/i },
@@ -62,7 +100,6 @@ const DIALECTS = {
       ...COMMON_RULES,
     ],
     unsupported: [
-      { name: 'strftime()', re: /\bstrftime\s*\(/i },
       { name: 'julianday()', re: /\bjulianday\s*\(/i },
       { name: 'printf()', re: /\bprintf\s*\(/i },
       { name: 'randomblob()', re: /\brandomblob\s*\(/i },
@@ -115,6 +152,9 @@ function translate(sql, dialectName = 'sqlite') {
     }
   }
 
+  // --- strftime(…) → to_char/epoch 等价改写（BE-C2） ---
+  out = replaceStrftime(out, d.name);
+
   // --- 正则规则逐条应用 ---
   for (const r of d.rules) out = out.replace(r.re, r.to);
 
@@ -133,4 +173,4 @@ function appendClause(sql, clause) {
   return `${trimmed} ${clause}${semi}`;
 }
 
-module.exports = { dialects, isKnown, getDialect, translate, DIALECTS };
+module.exports = { dialects, isKnown, getDialect, translate, DIALECTS, convertStrftimeFormat, replaceStrftime };

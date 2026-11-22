@@ -165,4 +165,96 @@ function cleanBlacklist() {
 cleanBlacklist();
 setInterval(cleanBlacklist, 60 * 60 * 1000).unref();
 
-module.exports = { sign, verify, auth, adminOnly, revokeToken, bumpTokenVersion, cleanBlacklist, TOKEN_TTL_MS, readToken, setAuthCookie, clearAuthCookie };
+// ==================== MT-03 租户上下文中间件（2026-11-22） ====================
+// 设计（对应 docs/tenant-scope.md §4.2）：
+//   - 单租户模式（默认）：不启用租户硬边界，全部请求挂 req.tenant={id:1}，业务行为与现状一致（零回归）。
+//   - 多租户模式（AGENT_MULTI_TENANT=1）：解析优先级 —— 已认证用户的 users.tenant_id（服务端权威）
+//     > JWT claim tenant_id > X-Tenant-Id 头 / 子域 > 拒绝（fail-closed 403）。
+//   - 平台超管（AGENT_PLATFORM_ADMINS，默认 admin）：可旁路跨租户，但每次旁路强制写审计。
+const MULTI_TENANT = ['1', 'true', 'yes', 'on'].includes(String(process.env.AGENT_MULTI_TENANT || '').toLowerCase());
+const PLATFORM_ADMINS = String(process.env.AGENT_PLATFORM_ADMINS || 'admin').split(',').map(s => s.trim()).filter(Boolean);
+const DEFAULT_TENANT_ID = 1;
+
+/** 是否平台超管（role=admin 且在平台超管清单内） */
+function isPlatformSuperadmin(user) {
+  return !!(user && user.role === 'admin' && PLATFORM_ADMINS.includes(user.username));
+}
+
+/** 从请求解析租户 ID（不读 DB 用户，仅取 JWT/头/子域） */
+function resolveTenantId(req) {
+  // 1) JWT claim tenant_id（服务端签发，可信）
+  const payload = verify(readToken(req));
+  if (payload && payload.tenant_id != null && Number.isFinite(Number(payload.tenant_id))) {
+    return { id: Number(payload.tenant_id), source: 'jwt' };
+  }
+  // 2) X-Tenant-Id 头
+  const h = String(req.headers['x-tenant-id'] || '').trim();
+  if (h) {
+    const n = Number(h);
+    return { id: Number.isFinite(n) ? n : NaN, source: 'header' };
+  }
+  // 3) 子域（Host 首段，按 tenants.name 反查）
+  const host = String(req.headers.host || '').split(':')[0];
+  const seg = host.split('.')[0];
+  if (seg && !/^\d+$/.test(seg) && seg !== 'localhost' && seg !== '127') {
+    try {
+      const t = db.prepare('SELECT id FROM tenants WHERE name=? AND status=\'active\' LIMIT 1').get(seg);
+      if (t) return { id: t.id, source: 'subdomain' };
+    } catch { /* ignore */ }
+  }
+  return null;
+}
+
+/** 平台超管旁路强制审计 */
+function auditTenantBypass(req, user, tenantId) {
+  try {
+    db.prepare('INSERT INTO security_events (type, detail, action, source, created_at) VALUES (?,?,?,?,datetime(\'now\',\'localtime\'))')
+      .run('tenant_bypass', `平台超管 ${user.username} 跨租户访问 tenant_id=${tenantId}`, String(req.method) + ' ' + String(req.originalUrl || req.url), 'tenant-context');
+  } catch { /* 审计失败不阻断 */ }
+}
+
+/** 租户上下文中间件：必须置于全部业务路由之前 */
+const TENANT_PUBLIC_PREFIXES = ['/api/auth', '/api/health', '/api/edition', '/api/a2a', '/.well-known', '/api/config/public'];
+function isTenantPublicPath(reqPath) {
+  const p = String(reqPath || '');
+  return TENANT_PUBLIC_PREFIXES.some(pre => p === pre || p.startsWith(pre + '/'));
+}
+function tenantContext(req, res, next) {
+  if (!MULTI_TENANT) {
+    req.tenant = { id: DEFAULT_TENANT_ID, name: '默认租户', single: true };
+    return next();
+  }
+  // 公开端点（登录/健康/发现/版本）无需租户上下文
+  if (isTenantPublicPath(req.path)) {
+    req.tenant = { id: DEFAULT_TENANT_ID, source: 'public' };
+    return next();
+  }
+  // 多租户：先尝试认证，用于平台超管旁路与用户权威租户
+  const payload = verify(readToken(req));
+  let user = null;
+  if (payload) {
+    try { user = db.prepare('SELECT id, username, role, tenant_id FROM users WHERE id=? AND status=1').get(payload.uid); } catch { user = null; }
+  }
+  if (user && isPlatformSuperadmin(user)) {
+    const r = resolveTenantId(req);
+    const tid = (r && Number.isFinite(r.id) && r.id > 0) ? r.id : (user.tenant_id || DEFAULT_TENANT_ID);
+    req.tenant = { id: tid, source: r ? r.source : 'superadmin-default', bypass: true };
+    auditTenantBypass(req, user, tid);
+    return next();
+  }
+  // 已认证普通用户：以其 users.tenant_id 为权威（防头伪造跨租户）
+  if (user) {
+    const tid = user.tenant_id || DEFAULT_TENANT_ID;
+    req.tenant = { id: tid, source: 'user' };
+    return next();
+  }
+  // 未认证（API Key/Agent 调用等）：JWT/头/子域，缺则拒绝
+  const r = resolveTenantId(req);
+  if (!r || !Number.isFinite(r.id) || r.id <= 0) {
+    return res.status(403).json({ code: 403, msg: '缺少租户上下文（tenant_id）' });
+  }
+  req.tenant = { id: r.id, source: r.source };
+  return next();
+}
+
+module.exports = { sign, verify, auth, adminOnly, revokeToken, bumpTokenVersion, cleanBlacklist, tenantContext, isPlatformSuperadmin, MULTI_TENANT, TOKEN_TTL_MS, readToken, setAuthCookie, clearAuthCookie };

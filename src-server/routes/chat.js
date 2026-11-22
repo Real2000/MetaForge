@@ -96,8 +96,11 @@ async function genSessionTitle(sessionId, userInput, agentName) {
 // 会话列表（P3：支持 keyword 关键词搜索——命中会话标题或任意消息内容）
 router.get('/sessions', (req, res) => {
   const { agent_id, keyword } = req.query;
+  // MT-05（2026-11-22）：多租户下强制注入 tenant_id（单租户 scope=null，零回归）。
+  const scope = require('../lib/dal').tenantScope(req);
   let sql = 'SELECT s.*, a.name AS agent_name FROM sessions s LEFT JOIN agents a ON a.id=s.agent_id WHERE s.username=?';
   const args = [req.user.username];
+  if (scope != null) { sql += ' AND s.tenant_id=?'; args.push(scope); }
   if (agent_id && agent_id !== 'home') { sql += ' AND s.agent_id=?'; args.push(agent_id); }
   else if (agent_id === 'home') {
     sql += ' AND s.agent_id IS NULL';

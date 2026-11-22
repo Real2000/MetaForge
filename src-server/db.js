@@ -191,6 +191,16 @@ CREATE TABLE IF NOT EXISTS spaces (
   members INTEGER DEFAULT 0,
   created_at TEXT
 );
+-- MT-02 租户一等实体（2026-11-22）：客户=独立租户，资源以 tenant_id 建立硬边界；spaces 降级为租户内软分组。
+-- 默认租户 id=1；单租户私有化部署下全部数据 tenant_id=1，业务行为与现状一致。
+CREATE TABLE IF NOT EXISTS tenants (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  status TEXT DEFAULT 'active',
+  plan TEXT DEFAULT 'free',
+  parent_tenant_id INTEGER DEFAULT NULL,
+  created_at TEXT
+);
 CREATE TABLE IF NOT EXISTS agents (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,

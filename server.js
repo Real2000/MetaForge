@@ -119,6 +119,11 @@ app.use('/uploads/sandbox', (req, res, next) => {
 // 通用静态文件服务
 app.use(expressStatic(path.join(__dirname, 'public'), staticOptions));
 
+// MT-03（2026-11-22）：租户上下文中间件——置于全部业务路由之前。
+// 单租户（默认）→ req.tenant={id:1}（零行为变更）；多租户（AGENT_MULTI_TENANT=1）→ 解析失败即 403。
+const { tenantContext } = require('./src-server/lib/auth');
+app.use(tenantContext);
+
 // API 路由
 app.use('/api/auth', require('./src-server/routes/auth'));
 app.use('/api/auth/sso', require('./src-server/routes/sso'));

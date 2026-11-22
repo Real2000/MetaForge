@@ -573,7 +573,9 @@ function t(name, fn) {
   // 【用例 1】spaceFilterSql 三态语义——企业空间/无归属回填行对普通用户可见，部门空间不可见
   await t('V2.4#9 收尾：企业空间智能体对普通用户可见，部门空间不可见', () => {
     const { spaceFilterSql } = require('../src-server/lib/space-utils');
-    const { sqlStr, args } = spaceFilterSql('a', { username: 'zhangsan', role: 'user' });
+    // MT-02b：spaces.owner 已由昵称归一到 username（产品部空间 owner=zhangsan）。
+    // 本用例改用非空间 owner 的 wangwu 验证「部门空间对非 owner 不可见」。
+    const { sqlStr, args } = spaceFilterSql('a', { username: 'wangwu', role: 'user' });
     const rows = db.prepare(`SELECT a.name, a.space_id FROM agents a WHERE 1=1 AND a.status='published' ${sqlStr}`).all(...args);
     const names = rows.map(r => r.name);
     assert.ok(names.includes('公司制度问答助手'), '企业空间智能体（space_id=1）应可见');
@@ -612,7 +614,7 @@ function t(name, fn) {
     assert.strictEqual(spaceVisibleTo(db, per.id, 'admin'), true, '个人空间 owner→可见');
     assert.strictEqual(spaceVisibleTo(db, per.id, 'zhangsan'), false, '个人空间非 owner→不可见');
     const dept = db.prepare("SELECT id FROM spaces WHERE type='dept' LIMIT 1").get();
-    assert.strictEqual(spaceVisibleTo(db, dept.id, 'zhangsan'), false, '部门空间非 owner→不可见（过渡语义）');
+    assert.strictEqual(spaceVisibleTo(db, dept.id, 'wangwu'), false, '部门空间非 owner→不可见（过渡语义；MT-02b 后 owner=zhangsan）');
   });
   // 【用例 5】knowledge 列表统一语义——企业空间知识库 JS 过滤放行（owner 第一关之外的空间维度）
   await t('V2.4#9 收尾：knowledge 列表空间过滤复用统一语义', () => {
@@ -624,6 +626,79 @@ function t(name, fn) {
       assert.ok(k.space_id, `知识库「${k.name}」应已完成空间回填`);
       assert.strictEqual(spaceVisibleTo(db, k.space_id, 'zhangsan'), true, `企业空间知识库「${k.name}」空间维度应放行`);
     }
+  });
+
+  // 【MT-03】租户上下文中间件：单租户默认注入默认租户
+  await t('MT-03：单租户模式下 tenantContext 注入默认租户（零行为变更）', () => {
+    const { tenantContext } = require('../src-server/lib/auth');
+    const req = { headers: {} };
+    let called = false;
+    const res = { status() { return this; }, json() { return this; } };
+    tenantContext(req, res, () => { called = true; });
+    assert.ok(called, '应放行');
+    assert.strictEqual(req.tenant.id, 1, '默认租户 id=1');
+    assert.strictEqual(req.tenant.single, true, 'single 标记为真');
+  });
+
+  // 【MT-04】多租户空间过滤「两段判定」
+  await t('MT-04：多租户空间过滤——跨租户不可见 / admin 受租户边界 / 单租户不变', () => {
+    const { spaceFilterSql, spaceVisibleTo } = require('../src-server/lib/space-utils');
+    db.prepare("INSERT INTO spaces (name,type,owner,members,created_at,tenant_id) VALUES ('他租户企业空间','enterprise','admin',1,'2026-11-22',2)").run();
+    const sp2 = db.prepare("SELECT id FROM spaces WHERE name='他租户企业空间'").get().id;
+    db.prepare("INSERT INTO agents (name,type,space_id,owner,status,visibility,tenant_id) VALUES ('他租户智能体','other',?,'admin','published','public',2)").run(sp2);
+    try {
+      // 单租户：不加租户条件，admin 零条件放行 → 与改造前一致
+      assert.strictEqual(spaceFilterSql('a', { username: 'admin', role: 'admin' }).sqlStr, '', '单租户 admin 无过滤（回归不变）');
+      // 多租户 tenant=1 视角：跨租户资源不可见
+      const { sqlStr, args } = spaceFilterSql('a', { username: 'zhangsan', role: 'user' }, { tenantId: 1 });
+      const names = db.prepare(`SELECT a.name FROM agents a WHERE 1=1 ${sqlStr}`).all(...args).map(r => r.name);
+      assert.ok(!names.includes('他租户智能体'), '跨租户智能体不可见（tenant=1 视角）');
+      // admin 多租户视角亦受租户边界
+      const am = spaceFilterSql('a', { username: 'admin', role: 'admin' }, { tenantId: 1 });
+      const an = db.prepare(`SELECT a.name FROM agents a WHERE 1=1 ${am.sqlStr}`).all(...am.args).map(r => r.name);
+      assert.ok(!an.includes('他租户智能体'), 'admin 多租户下也看不到他租户资源');
+      // spaceVisibleTo 跨租户判定
+      assert.strictEqual(spaceVisibleTo(db, sp2, 'zhangsan', { tenantId: 1 }), false, '跨租户空间不可见');
+      assert.strictEqual(spaceVisibleTo(db, sp2, 'zhangsan', { tenantId: 2 }), true, '本租户企业空间可见');
+    } finally {
+      db.prepare("DELETE FROM agents WHERE name='他租户智能体'").run();
+      db.prepare("DELETE FROM spaces WHERE name='他租户企业空间'").run();
+    }
+  });
+
+  // 【MT-05】租户出口接线：reqTenantOpt 由 req.tenant 生成过滤 opts
+  await t('MT-05：reqTenantOpt——单租户→{} / 多租户→{tenantId}', () => {
+    const { reqTenantOpt } = require('../src-server/lib/space-utils');
+    assert.deepStrictEqual(reqTenantOpt({ tenant: { id: 1, single: true } }), {}, '单租户不启用边界');
+    assert.deepStrictEqual(reqTenantOpt({ tenant: { id: 5 } }), { tenantId: 5 }, '多租户启用边界');
+    assert.deepStrictEqual(reqTenantOpt({}), {}, '无租户上下文→不启用');
+  });
+
+  // 【BE-C1】DAL 统一出口：方言翻译 + 租户片段
+  await t('BE-C1：DAL q/tenantWhere/translateSql 出口语义', () => {
+    const dal = require('../src-server/lib/dal');
+    assert.strictEqual(dal.translateSql('SELECT 1'), 'SELECT 1', 'sqlite 方言恒等');
+    assert.strictEqual(dal.q('SELECT 1 AS one')[0].one, 1, 'q() 可查询');
+    assert.strictEqual(dal.tenantScope({ tenant: { id: 1, single: true } }), null, '单租户 scope=null');
+    assert.strictEqual(dal.tenantScope({ tenant: { id: 3 } }), 3, '多租户 scope=id');
+    assert.deepStrictEqual(dal.tenantWhere('a', null), { sqlStr: '', args: [] });
+    assert.deepStrictEqual(dal.tenantWhere('a', 3), { sqlStr: ' AND a.tenant_id=?', args: [3] });
+  });
+
+  // 【BE-C2】SQL 方言闭环：translate 等价改写 + 未映射告警
+  await t('BE-C2：SQL 方言 translate——sqlite 恒等 / dm / kingbase 等价改写', () => {
+    const { translate } = require('../src-server/lib/sql-dialect');
+    assert.strictEqual(translate('SELECT 1', 'sqlite').sql, 'SELECT 1', 'sqlite 恒等');
+    const dm = translate("SELECT datetime('now','localtime')", 'dm');
+    assert.ok(/CURRENT_TIMESTAMP/.test(dm.sql), 'datetime→CURRENT_TIMESTAMP：' + dm.sql);
+    const kb = translate("SELECT strftime('%s','now','localtime') - strftime('%s', t)", 'kingbase');
+    assert.ok(/EXTRACT\(EPOCH FROM/.test(kb.sql), 'strftime %s→epoch：' + kb.sql);
+    const kbDate = translate("SELECT strftime('%Y-%m-%d', t)", 'kingbase');
+    assert.ok(/to_char\(t, 'YYYY-MM-DD'\)/.test(kbDate.sql), 'strftime 日期→to_char：' + kbDate.sql);
+    assert.ok(/IDENTITY/.test(translate('CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT)', 'dm').sql), 'dm AUTOINCREMENT→IDENTITY');
+    assert.ok(/SERIAL/.test(translate('CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT)', 'kingbase').sql), 'kingbase AUTOINCREMENT→SERIAL');
+    const warn = translate('INSERT OR REPLACE INTO t (a) VALUES (?)', 'kingbase');
+    assert.ok(warn.warnings.length > 0, '未映射构造应产出告警');
   });
 
   // ================ P3 扩展工具（2026-10-22）：Text2SQL / 图表 / Word / MCP Server / 分类器路由 ================
@@ -8484,8 +8559,9 @@ print('PY_OK')
 
     await t('U2-1/N7-P4: SQL 方言 —— 未映射构造产出 warning 不静默', () => {
       const d = require(path.join(__dirname, '..', 'src-server', 'lib', 'sql-dialect'));
-      const r = d.translate("SELECT strftime('%Y', created_at) FROM t", 'dm');
-      assert.ok(r.warnings.some(w => /strftime/.test(w)), 'strftime 未映射应告警');
+      // BE-C2（2026-11-22）：strftime 已建立映射（→ to_char / epoch），改用仍属未映射的 julianday 验证「不静默」。
+      const r = d.translate('SELECT julianday(created_at) FROM t', 'dm');
+      assert.ok(r.warnings.some(w => /julianday/.test(w)), 'julianday 未映射应告警');
       const r2 = d.translate('INSERT OR REPLACE INTO t VALUES (1)', 'kingbase');
       assert.ok(r2.warnings.some(w => /ON CONFLICT/.test(w)), 'INSERT OR REPLACE 应告警需人工改写');
     });

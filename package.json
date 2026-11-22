@@ -27,7 +27,12 @@
   "scripts": {
     "start": "node server.js",
     "reset": "node scripts/reset.js",
-    "test": "node test/smoke.js",
+    "test": "node test/smoke.js && node test/tenant-e2e.js",
+    "test:smoke": "node test/smoke.js",
+    "test:tenant": "node test/tenant-e2e.js",
+    "lint:sql": "node scripts/lint-bare-prepare.js",
+    "lint:sql:update": "node scripts/lint-bare-prepare.js --update",
+    "dialect:audit": "node scripts/dialect-audit.js",
     "package": "node scripts/package.js",
     "package:version": "node scripts/package.js --version",
     "deploy:check": "node scripts/deploy-check.js",
