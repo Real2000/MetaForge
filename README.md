@@ -2969,4 +2969,14 @@ R5 远期生态首项。**先做 3D 资产生成与导出（新增资产类型 +
 - `npm test`：冒烟 **616/0 全绿**（+3 新增：共享计数原语+共享限流器 200/200/429、日配额守卫放行额度后 429、**双实例共享额度不放大**——两子进程同库同 Key 12 连发恰放行 6 次=配额、其余 429）；双租户 E2E **26/0 全绿**。
 - 更新 1 处既有断言：`/v1/models` 路由栈由 limiter+handler 两层变为 limiter+quota+handler 三层。
 
+**BE-B4 对外契约文档化（OpenAPI 3.1）**
+- 新增 `lib/version.js`：平台版本单一来源（`PLATFORM_VERSION=p5.37` / `API_VERSION=1.0.0` / `OPENAPI_VERSION=3.1.0` / `SDK_VERSION=1.0.0`）；`routes/a2a.js`（Agent Card）、`routes/api-docs.js`、`routes/openapi.js`、`cli/cli.js` 全部改从此读取，消除多处硬编码漂移。
+- `lib/api-doc.js` 新增 `collectRoutes(app)`：**运行时递归采集 Express 路由表**（含二级嵌套 router，从层 `regexp` 还原挂载前缀、`route.methods` 取方法），替代早前硬编码 `ROUTE_MAP`——spec 天然覆盖全部已注册路由，增删路由零维护自动同步；新增 `buildGlobalOpenApi(app)`：产出 **OpenAPI 3.1.0** 全站规范，方法级补 `tags`/`summary`/path 参数（`:id`→`{id}`）/标准错误码（200/400/401/403/404/500，与 BE-B1 真实状态码一致），开放端点 `/openapi/*` 叠加手写富定义（请求体、示例、细分错误码）；智能体级 `buildOpenApi` 亦统一到 `OPENAPI_VERSION`。
+- `routes/api-docs.js` 重写：`GET /api/api-docs/openapi.json` 返回 3.1 规范（自动采集，实测 **436 路径 / 542 操作 / 58 分组**）；文档页自带**零 CDN、离线可用的「Try it」试调控制台**（选端点→填路径参数/请求体→发送→查看真实 HTTP 状态码与响应），无需外部 Swagger UI 资源。
+- `routes/openapi.js` 新增公开 `GET /openapi/openapi.json`，与 `/api/api-docs/openapi.json` **同源同规范**，便于 CI/SDK 消费。
+
+**验证（BE-B4）**
+- `npm test`：冒烟 **619/0 全绿**（+3 新增：`collectRoutes` 嵌套路由采集、`buildGlobalOpenApi` 3.1+参数+错误码+tag、版本单一来源无硬编码；并扩展 U1-8 断言——规范升级 3.1、路径 >100、两个入口路径集合一致）；双租户 E2E **26/0 全绿**。
+- 隔离实例实测：`/api/api-docs/openapi.json` 与 `/openapi/openapi.json` 均 `openapi:3.1.0`、`x-platform-version:p5.37`、`x-sdk` 完整；浏览器实测文档页 59 分组 / 436 端点链接、点开 `/api/agents` 显示 2 个操作、试调 `/api/agents` 返回 `HTTP 401 {"code":401,"msg":"未登录或登录已过期"}`（既证明试调通路，也印证 BE-B1 错误码契约），产物截图排版正常、无控制台脚本错误。
+
 > AI生成

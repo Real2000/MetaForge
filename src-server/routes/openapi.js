@@ -16,8 +16,19 @@ const { getq } = require('../lib/dal'); // BE-B3：配额读取走统一出口
 const { hashKey } = require('../lib/apikey'); // SEC-02a：按哈希比对 API Key
 const { addUsage } = require('../lib/quota');
 const { recordModelUsage } = require('../lib/billing'); // U1-6：开放 API 调用成本归因（归智能体发布者）
+const { buildGlobalOpenApi } = require('../lib/api-doc'); // BE-B4：运行时自动采集的全站规范
+const { API_VERSION, PLATFORM_VERSION } = require('../lib/version'); // BE-B4：版本单一来源
 
 const router = express.Router();
+
+// BE-B4（M2 批次3）：对外契约文档——/openapi/openapi.json 与 /api/api-docs 同源（运行时自动采集）。
+// 公开无鉴权（规范本身非敏感），置于鉴权端点之前。
+router.get('/openapi.json', (req, res) => {
+  res.json(buildGlobalOpenApi(req.app, {
+    version: API_VERSION,
+    extra: { 'x-platform-version': PLATFORM_VERSION },
+  }));
+});
 
 /** 提取密钥尾段（不落全量密钥） */
 const keyTail = req => (req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim().slice(-16);

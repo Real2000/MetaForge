@@ -8,6 +8,7 @@
  * 用户零手写：画布上改变量 → 文档/MCP schema 即时同步，发布即有。
  */
 const { getNodeOutputs } = require('./workflow-schema');
+const { OPENAPI_VERSION, API_VERSION } = require('./version');
 
 /** OpenAPI 类型映射：画布变量类型 → { type, format, hint } */
 const TYPE_MAP_OPENAPI = {
@@ -131,7 +132,7 @@ function buildOpenApi(agent, host) {
   const outputProps = {};
   for (const o of c.output) outputProps[o.name] = { type: o.type, description: `${o.desc}（${o.source}）` };
   return {
-    openapi: '3.0.3',
+    openapi: OPENAPI_VERSION,
     info: {
       title: `智能体 API：${agent.name}`,
       description: (agent.description || '专业智能体') + (c.isCanvas ? `\n\n画布工作流（${c.flowType === 'chatflow' ? 'Chatflow 多轮对话式' : 'Workflow 一次性执行'}）——参数与输出由 Start/End 节点自动生成。` : '\n\n表单模式（提示词+知识库检索增强）。'),
@@ -261,4 +262,269 @@ function buildApiDoc(agent, host) {
   };
 }
 
-module.exports = { extractApiContract, buildMcpInputSchema, buildApiDoc, buildOpenApi, buildMcpCallExample, inferOutType };
+/* ================================================================
+ * 全站 OpenAPI 3.1 契约（BE-B4 / M2 批次3，2026-11-22）
+ *
+ * 由 Express 运行时路由表自动采集（collectRoutes）——替代早前硬编码的
+ * ROUTE_MAP：spec 天然覆盖全部已注册路由，新增/删除路由零维护自动同步。
+ * 方法级 operation 补 tags / summary / path 参数 / 标准错误码；开放端点
+ * /openapi/* 叠加手写的富定义（请求体、示例、细分错误码）。
+ * ================================================================ */
+
+/** 路由前缀 → 分组标签（tag）：/api|/openapi 取第二段，其余取首段 */
+function tagFor(p) {
+  const segs = String(p).replace(/^\//, '').split('/');
+  if ((segs[0] === 'api' || segs[0] === 'openapi') && segs[1]) return segs[1];
+  return segs[0] || 'root';
+}
+
+/** 路由前缀 → 中文描述（仅用于 summary 富化，非路由存在性来源） */
+const ROUTE_DESC = {
+  '/api/auth': '认证接口：登录/登出/刷新 Token',
+  '/api/agents': '智能体管理：CRUD、版本管理、发布审核',
+  '/api/memories': '记忆管理：会话记忆的查看/合并/删除/导出',
+  '/api/channel': '渠道适配：IM 渠道状态/入站出站/消息审计',
+  '/api/sandbox': '沙箱执行：代码执行/远程主机/运行审计/HITL 审批',
+  '/api/chat': '对话接口：SSE 流式对话、消息历史、审批流',
+  '/api/knowledge': '知识库管理：库/文件/分块/召回测试/评测集',
+  '/api/tasks': '定时任务管理：CRUD 及调度启停',
+  '/api/providers': 'LLM 模型供应商配置',
+  '/api/platforms': '外部平台管理（Dify、Coze 等）',
+  '/api/security': '安全配置：IP 白名单/登录锁定/审计事件',
+  '/api/monitor': '系统监控：操作日志/错误日志',
+  '/api/stats': '数据统计：对话/智能体/用量维度的总数统计',
+  '/openapi': 'OpenAI 兼容开放接口（对外商用契约）',
+  '/api/share': '分享会话接口',
+  '/api/departments': '组织架构：部门树管理',
+  '/api/dingtalk': '钉钉集成回调（验签/解压/组织同步）',
+  '/api/files': '工作流文件管理',
+  '/api/doc': '文档预览（受控原文流+权限校验）',
+  '/api/config': '配置管理（运行时配置查看/更新）',
+  '/api/secrets': '密钥管理（画布 env.XXX 占位符运行注入）',
+  '/api/mcp': 'MCP 服务管理',
+  '/api/templates': '工作流模板库',
+  '/api/notify': '通知中心（系统公告消息）',
+  '/api/quota': '用量与配额管理',
+  '/api/usermodels': '用户自有模型源',
+  '/api/tool-keys': '用户级工具 API Key',
+  '/api/skillassets': '技能资产管理',
+  '/api/skills-market': '技能/模板市场',
+  '/api/edition': '版本/License 管理',
+  '/api/users': '用户管理（CRUD）',
+  '/api/tenants': '多租户管理：租户开通/停用/概览',
+  '/api/platform-admin': '平台超管运维台',
+  '/api/billing': '计费用量：预检/预留/结算/对账',
+  '/api/payment': '支付与订阅：下单/回调/套餐',
+  '/api/feedback': '意见反馈',
+  '/api/a2a': 'A2A 智能体互操作（Agent-to-Agent）',
+};
+
+/** 取某完整路径最长匹配前缀的描述 */
+function descFor(p) {
+  let best = '';
+  for (const k of Object.keys(ROUTE_DESC)) {
+    if ((p === k || p.startsWith(k + '/')) && k.length > best.length) best = k;
+  }
+  return best ? ROUTE_DESC[best] : '';
+}
+
+/** 路由路径 → OpenAPI 路径：`:id` → `{id}` */
+function toOapiPath(p) {
+  return String(p).replace(/:([A-Za-z0-9_]+)/g, '{$1}').replace(/\*([A-Za-z0-9_]*)/g, '{wildcard}');
+}
+
+/** 从路由路径提取 path 参数 */
+function pathParams(p) {
+  const out = [];
+  const re = /:([A-Za-z0-9_]+)/g;
+  let m;
+  while ((m = re.exec(p))) out.push({ name: m[1], in: 'path', required: true, schema: { type: 'string' } });
+  if (/\*/.test(p)) out.push({ name: 'wildcard', in: 'path', required: true, schema: { type: 'string' } });
+  return out;
+}
+
+/** 标准响应集（BE-B1 后错误一律以对应 HTTP 状态码返回，故此处列真实错误码） */
+function defaultResponses(hasPathParam) {
+  const r = {
+    200: { description: '成功', content: { 'application/json': { schema: { $ref: '#/components/schemas/ApiResponse' } } } },
+    400: { description: '请求参数错误 / 业务校验失败' },
+    401: { description: '未认证（缺少或无效凭据）' },
+    403: { description: '无权限 / 租户或作用域拒绝' },
+    500: { description: '服务端错误' },
+  };
+  if (hasPathParam) r[404] = { description: '资源不存在' };
+  return r;
+}
+
+/** 拼接挂载前缀与子路径，规范化斜杠 */
+function joinSeg(prefix, seg) {
+  const p = (prefix || '').replace(/\/+$/, '');
+  let s = String(seg == null ? '' : seg);
+  if (!s.startsWith('/')) s = '/' + s;
+  let full = (p + s).replace(/\/{2,}/g, '/');
+  if (full.length > 1) full = full.replace(/\/+$/, '');
+  return full || '/';
+}
+
+/** 从 Express 层 regexp 还原挂载路径（如 `^\/api\/auth\/?(?=\/|$)` → `/api/auth`） */
+function mountPathOf(layer) {
+  const src = (layer.regexp && layer.regexp.source) || '';
+  if (/^\^\\\/\?\(\?=\\\/\|\$\)$/.test(src)) return ''; // 根挂载
+  const m = /^\^\\\/(.*?)\\\/\?\(\?=\\\/\|\$\)$/.exec(src);
+  return m ? '/' + m[1].replace(/\\\//g, '/') : '';
+}
+
+/**
+ * 运行时采集 Express 全部已注册路由（含多级 router 嵌套）。
+ * @returns [{ path, method }]  method 为小写
+ */
+function collectRoutes(app) {
+  const out = [];
+  const root = app && (app._router || app.router);
+  const stack = root && root.stack;
+  if (Array.isArray(stack)) walk(stack, '');
+  return out;
+  function walk(layers, prefix) {
+    for (const layer of layers) {
+      if (layer.route) {
+        const rp = layer.route.path;
+        const methods = Object.keys(layer.route.methods || {}).filter(k => layer.route.methods[k]);
+        const ps = Array.isArray(rp) ? rp : [rp];
+        for (const p of ps) for (const m of methods) if (p) out.push({ path: joinSeg(prefix, p), method: m.toLowerCase() });
+      } else if (layer.name === 'router' && layer.handle && Array.isArray(layer.handle.stack)) {
+        walk(layer.handle.stack, joinSeg(prefix, mountPathOf(layer)));
+      }
+    }
+  }
+}
+
+function operationFor(route) {
+  const params = pathParams(route.path);
+  const desc = descFor(route.path);
+  const op = {
+    tags: [tagFor(route.path)],
+    summary: desc || `${route.method.toUpperCase()} ${route.path}`,
+    responses: defaultResponses(params.length > 0),
+  };
+  if (params.length) op.parameters = params;
+  return op;
+}
+
+/** 开放端点 /openapi/* 富定义（SDK 对接正式契约；自动采集后叠加覆盖） */
+function openApiSdkPaths() {
+  const json = (obj) => ({ 'application/json': { schema: obj } });
+  return {
+    '/openapi/openapi.json': {
+      get: {
+        summary: '本服务 OpenAPI 3.1 规范（本文档数据源）',
+        tags: ['openapi'],
+        responses: { 200: { description: 'OpenAPI 3.1 JSON', content: json({ type: 'object' }) } },
+      },
+    },
+    '/openapi/v1/models': {
+      get: {
+        summary: '列出可用智能体（model id = agent-<id>-<名称>）',
+        tags: ['openapi'],
+        description: 'SDK：`ap.listModels()`。鉴权 Bearer sk-ap-xxx；绑定 agent_id 的密钥仅见绑定智能体。',
+        security: [{ apiKeyAuth: [] }],
+        responses: {
+          200: { description: 'OpenAI models 格式', content: json({ type: 'object', properties: { object: { type: 'string' }, data: { type: 'array', items: { $ref: '#/components/schemas/AgentModel' } } } }) },
+          401: { description: '密钥无效或已停用' },
+          429: { description: '频率限制（每 Key 60 次/分钟）或日/月配额超限' },
+        },
+      },
+    },
+    '/openapi/v1/chat/completions': {
+      post: {
+        summary: '对话补全（OpenAI 兼容；SDK 主入口）',
+        tags: ['openapi'],
+        description: 'SDK：`new AgentPlatform({baseUrl, apiKey}).chat.completions.create({model, messages})`。model 形如 agent-<id>-<名称>；messages 取最后一条 user 作为输入；支持 stream（SSE）。',
+        security: [{ apiKeyAuth: [] }],
+        requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['model', 'messages'], properties: { model: { type: 'string', example: 'agent-1-智能体名称' }, messages: { type: 'array', items: { type: 'object', properties: { role: { type: 'string', enum: ['system', 'user', 'assistant'] }, content: { type: 'string' } } } }, stream: { type: 'boolean' } } } } } },
+        responses: {
+          200: { description: 'ChatCompletion 或 SSE 流', content: json({ $ref: '#/components/schemas/ChatCompletion' }) },
+          400: { description: '消息为空 / 输入含违规词汇被拦截' },
+          401: { description: '密钥无效或已停用' },
+          403: { description: '密钥作用域不含目标智能体（key_scope_denied）' },
+          404: { description: 'model 不存在或未发布（model_not_found）' },
+          429: { description: '频率限制（每 Key 20 次/分钟）或日/月配额超限' },
+        },
+      },
+    },
+  };
+}
+
+/** 全站 OpenAPI 组件（安全方案 + 通用 Schema） */
+function globalComponents() {
+  return {
+    securitySchemes: {
+      bearerAuth: { type: 'http', scheme: 'bearer', bearerFormat: 'JWT' },
+      cookieAuth: { type: 'apiKey', in: 'cookie', name: 'token' },
+      apiKeyAuth: { type: 'http', scheme: 'bearer', description: '智能体 API 密钥（sk-ap-xxx，agent_api_keys 表；后台「智能体管理→API」创建）——开放端点 /openapi/* 与 SDK 使用' },
+    },
+    schemas: {
+      ApiResponse: {
+        type: 'object',
+        properties: {
+          code: { type: 'integer', description: '0=成功，非 0=业务错误码（错误时 HTTP 状态码同步为对应 4xx/5xx）' },
+          msg: { type: 'string', description: '错误信息' },
+          data: { type: 'object', description: '响应数据' },
+        },
+      },
+      AgentModel: { type: 'object', properties: { id: { type: 'string', example: 'agent-1-智能体名称' }, object: { type: 'string', example: 'model' }, owned_by: { type: 'string', example: 'agent-platform' }, description: { type: 'string' } } },
+      ChatCompletion: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', example: 'chatcmpl-ap-1700000000' },
+          object: { type: 'string', example: 'chat.completion' },
+          created: { type: 'integer' }, model: { type: 'string' },
+          choices: { type: 'array', items: { type: 'object', properties: { index: { type: 'integer' }, message: { type: 'object', properties: { role: { type: 'string' }, content: { type: 'string' } } }, finish_reason: { type: 'string' } } } },
+          usage: { type: 'object', properties: { prompt_tokens: { type: 'integer' }, completion_tokens: { type: 'integer' }, total_tokens: { type: 'integer' } } },
+        },
+      },
+      Pagination: { type: 'object', properties: { page: { type: 'integer' }, pageSize: { type: 'integer' }, total: { type: 'integer' } } },
+    },
+  };
+}
+
+/**
+ * 构建全站 OpenAPI 3.1 规范（自动采集 + 富定义叠加）。
+ * @param app Express 应用实例
+ * @param opts { title, version, description, extra }
+ */
+function buildGlobalOpenApi(app, opts = {}) {
+  const routes = collectRoutes(app);
+  const paths = {};
+  for (const r of routes) {
+    const op = toOapiPath(r.path);
+    if (!paths[op]) paths[op] = {};
+    if (!paths[op][r.method]) paths[op][r.method] = operationFor(r);
+  }
+  // 叠加开放端点富定义（即使未被采集亦保留，保证 SDK 契约稳定）
+  for (const [p, methods] of Object.entries(openApiSdkPaths())) {
+    if (!paths[p]) paths[p] = {};
+    Object.assign(paths[p], methods);
+  }
+  const tags = [...new Set(Object.values(paths).flatMap(m => Object.values(m).flatMap(o => o.tags || [])))].sort();
+  const spec = {
+    openapi: OPENAPI_VERSION,
+    info: {
+      title: opts.title || '智能体开发平台 API',
+      version: opts.version || API_VERSION,
+      description: opts.description || ('企业级智能体开发平台 REST API。本文档由服务端在运行时自动采集 Express 路由表生成，覆盖全部已注册路由。\n\n' +
+        '认证：HttpOnly Cookie（推荐）或 Bearer Token（JWT）；开放端点 /openapi/* 用智能体 API 密钥（sk-ap-xxx）。\n' +
+        '响应：统一 `{ code: 0, data }` 包裹，code !== 0 时 HTTP 状态码同步为对应 4xx/5xx（BE-B1 统一响应契约）。'),
+      contact: { url: 'https://github.com/Real2000/MetaForge' },
+      license: { name: 'Apache-2.0', url: 'https://www.apache.org/licenses/LICENSE-2.0' },
+    },
+    servers: [{ url: '/', description: '当前部署服务' }],
+    tags: tags.map(t => ({ name: t })),
+    paths,
+    components: globalComponents(),
+    security: [{ bearerAuth: [] }, { cookieAuth: [] }],
+  };
+  if (opts.extra) Object.assign(spec, opts.extra);
+  return spec;
+}
+
+module.exports = { extractApiContract, buildMcpInputSchema, buildApiDoc, buildOpenApi, buildMcpCallExample, inferOutType, collectRoutes, buildGlobalOpenApi, openApiSdkPaths };

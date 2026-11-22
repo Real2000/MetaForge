@@ -1,167 +1,24 @@
 /**
- * P1-21 API 文档站（2026-11-13）
+ * API 文档站（BE-B4 / M2 批次3，2026-11-22）
  *
- * 自动生成平台 OpenAPI 3.0 文档并提供可浏览的 HTML 页面。
+ * GET  /api/api-docs/openapi.json — OpenAPI 3.1 JSON 规范（运行时自动采集）
+ * GET  /api/api-docs/            — 自带「试调」控制台的文档页（零 CDN、离线可用）
+ * GET  /api/api-docs/sdk         — SDK 下载清单
  *
- * GET  /api/api-docs/openapi.json — 返回 OpenAPI 3.0 JSON 规范
- * GET  /api/api-docs/            — 返回 Redoc 渲染的 HTML 文档页
- *
- * 扫描 routes/ 目录下的路由文件，从 Express 路由表 + JSDoc 注释中提取接口定义。
- * 当前为自动生成的基线版本，后续可扩展为手写补全方式。
+ * 变更（BE-B4）：
+ *  - 由 Express 运行时路由表自动采集替代硬编码 ROUTE_MAP（spec 覆盖全部已注册路由）
+ *  - 升级 OpenAPI 3.0.3 → 3.1.0
+ *  - 版本号单一来源（lib/version.js）
+ *  - 文档页内置轻量「Try it」控制台（填参 → 发送 → 看响应），无需外部 Swagger UI 资源
+ *  - 同一规范亦暴露为 /openapi/openapi.json（见 routes/openapi.js）
  */
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
-const { auth } = require('../lib/auth');
+const { buildGlobalOpenApi } = require('../lib/api-doc');
+const { PLATFORM_VERSION, API_VERSION, OPENAPI_VERSION, SDK_VERSION } = require('../lib/version');
 
 const router = express.Router();
-
-/* ---------- OpenAPI 规范定义 ---------- */
-
-/** 逐个手动扫描路由文件（生成完整 OpenAPI 规范需要真实解析 Express 路由表） */
-function buildOpenApiSpec() {
-  return {
-    openapi: '3.0.3',
-    info: {
-      title: '智能体开发平台 API',
-      version: 'u1.8',
-      description: '企业级智能体开发平台 REST API。本文档由服务端自动生成，覆盖全部已注册路由。\n\n' +
-        '认证方式：HttpOnly Cookie（推荐）或 Bearer Token（登录返回的 JWT）。\n' +
-        '响应格式：统一 `{ code: 0, data: ... }` 包裹，code !== 0 时 msg 包含错误信息。',
-      contact: { url: 'https://github.com/TeleAgent' },
-    },
-    servers: [{ url: '/', description: '当前部署服务' }],
-    paths: collectPaths(),
-    components: {
-      securitySchemes: {
-        bearerAuth: { type: 'http', scheme: 'bearer', bearerFormat: 'JWT' },
-        cookieAuth: { type: 'apiKey', in: 'cookie', name: 'token' },
-        apiKeyAuth: { type: 'http', scheme: 'bearer', description: '智能体 API 密钥（sk-ap-xxx，agent_api_keys 表；后台「智能体管理→API」创建）——开放端点 /openapi/* 与 SDK 使用' },
-      },
-      schemas: {
-        AgentModel: { type: 'object', properties: { id: { type: 'string', example: 'agent-1-智能体名称' }, object: { type: 'string', example: 'model' }, owned_by: { type: 'string', example: 'agent-platform' }, description: { type: 'string' } } },
-        ChatCompletion: {
-          type: 'object',
-          properties: {
-            id: { type: 'string', example: 'chatcmpl-ap-1700000000' },
-            object: { type: 'string', example: 'chat.completion' },
-            created: { type: 'integer' },
-            model: { type: 'string' },
-            choices: { type: 'array', items: { type: 'object', properties: { index: { type: 'integer' }, message: { type: 'object', properties: { role: { type: 'string' }, content: { type: 'string' } } }, finish_reason: { type: 'string' } } } },
-            usage: { type: 'object', properties: { prompt_tokens: { type: 'integer' }, completion_tokens: { type: 'integer' }, total_tokens: { type: 'integer' } } },
-          },
-        },
-        ApiResponse: {
-          type: 'object',
-          properties: {
-            code: { type: 'integer', description: '0=成功，非0=错误码' },
-            msg: { type: 'string', description: '错误信息' },
-            data: { type: 'object', description: '响应数据' },
-          },
-        },
-        Pagination: {
-          type: 'object',
-          properties: {
-            page: { type: 'integer' },
-            pageSize: { type: 'integer' },
-            total: { type: 'integer' },
-          },
-        },
-      },
-    },
-    security: [{ bearerAuth: [] }, { cookieAuth: [] }],
-  };
-}
-
-/** 扫描 routes 目录，提取路由前缀+方法 */
-function collectPaths() {
-  const routesDir = path.join(__dirname, '..', 'routes');
-  const paths = {};
-
-  // 已知路由（按 server.js 中实际注册的顺序维护，从注释描述）
-  const ROUTE_MAP = [
-    { path: '/api/auth', file: 'auth', desc: '认证接口：登录/登出/刷新Token' },
-    { path: '/api/auth/sso', file: 'sso', desc: '单点登录接口：OIDC/SSO 流程' },
-    { path: '/api/agents', file: 'agents', desc: '智能体管理：CRUD、版本管理、发布审核' },
-    { path: '/api/memories', file: 'memories', desc: '记忆管理：会话记忆的查看/合并/删除/导出' },
-    { path: '/api/channel', file: 'channel', desc: '渠道适配：IM渠道状态/入站出站/消息审计' },
-    { path: '/api/sandbox', file: 'sandbox', desc: '沙箱执行：代码执行/远程主机/运行审计/HITL审批' },
-    { path: '/api/chat', file: 'chat', desc: '对话接口：SSE 流式对话、消息历史、审批流' },
-    { path: '/api/knowledge', file: 'knowledge', desc: '知识库管理：库/文件/分块/召回测试/评测集' },
-    { path: '/api/tasks', file: 'tasks', desc: '定时任务管理：CRUD 及调度启停' },
-    { path: '/api/providers', file: 'providers', desc: 'LLM 模型供应商配置' },
-    { path: '/api/platforms', file: 'platforms', desc: '外部平台管理（Dify、Coze 等）' },
-    { path: '/api/security', file: 'security', desc: '安全配置：IP 白名单/登录锁定/审计事件' },
-    { path: '/api/monitor', file: 'logs', desc: '系统监控：操作日志/错误日志' },
-    { path: '/api/stats', file: 'stats', desc: '数据统计：对话/智能体/用量维度的总数统计' },
-    { path: '/api/openapi', file: 'openapi', desc: 'OpenAI 兼容接口' },
-    { path: '/api/share', file: 'share', desc: '分享会话接口' },
-    { path: '/api/departments', file: 'departments', desc: '组织架构：部门树管理' },
-    { path: '/api/dingtalk', file: 'dingtalk', desc: '钉钉集成回调（验签/解压/组织同步）' },
-    { path: '/api/files', file: 'files', desc: '工作流文件管理' },
-    { path: '/api/doc', file: 'doc', desc: '文档预览（受控原文流+权限校验）' },
-    { path: '/api/config', file: 'config', desc: '配置管理（运行时配置查看/更新）' },
-    { path: '/api/secrets', file: 'secrets', desc: '密钥管理（用于画布 env.XXX 占位符运行注入）' },
-    { path: '/api/mcp', file: 'mcp', desc: 'MCP 服务管理' },
-    { path: '/api/templates', file: 'templates', desc: '工作流模板库' },
-    { path: '/api/notify', file: 'notify', desc: '通知中心（系统公告消息）' },
-    { path: '/api/quota', file: 'quota', desc: '用量与配额管理' },
-    { path: '/api/usermodels', file: 'usermodels', desc: '用户自有模型源' },
-    { path: '/api/tool-keys', file: 'tool-keys', desc: '用户级工具 API Key' },
-    { path: '/api/skillassets', file: 'skillassets', desc: '技能资产管理' },
-    { path: '/api/skills-market', file: 'skills-market', desc: '技能/模板市场' },
-    { path: '/api/edition', file: 'edition', desc: '版本/License 管理' },
-    { path: '/api/users', file: 'users', desc: '用户管理（CRUD）' },
-    { path: '/api/feedback', file: 'feedback', desc: '意见反馈' },
-    { path: '/api/localbridge', file: 'localbridge', desc: '本地桥接' },
-    { path: '/api/biz', file: 'biz', desc: '业务扩展（趋势数据等）' },
-  ];
-
-  for (const r of ROUTE_MAP) {
-    const filePath = path.join(routesDir, r.file + '.js');
-    const exists = fs.existsSync(filePath);
-    paths[r.path] = {
-      get: {
-        summary: exists ? `📄 ${r.desc}` : `⚠️ ${r.desc}（文件 ${r.file}.js 不存在）`,
-        description: `路由文件：${r.file}.js${exists ? '' : '（文件缺失）'}`,
-        responses: { '200': { description: 'ApiResponse' } },
-      },
-    };
-  }
-
-  return paths;
-}
-
-/** OpenAI 兼容开放端点（/openapi/*，SDK 对接的正式契约）——U1-8 补全为真实可调试定义 */
-function openApiPaths() {
-  const json = (obj) => ({ 'application/json': { schema: obj } });
-  return {
-    '/openapi/v1/models': {
-      get: {
-        summary: '列出可用智能体（model id = agent-<id>-<名称>）',
-        description: 'SDK：`ap.listModels()` / `GET /openapi/v1/models`。鉴权 Bearer sk-ap-xxx；全域密钥可见全部已发布智能体，绑定 agent_id 的密钥仅见绑定智能体。',
-        security: [{ apiKeyAuth: [] }],
-        responses: { '200': { description: 'OpenAI models 格式', content: json({ type: 'object', properties: { object: { type: 'string' }, data: { type: 'array', items: { $ref: '#/components/schemas/AgentModel' } } } }) }, '401': { description: '密钥无效或已停用' }, '429': { description: '频率限制（每 Key 60 次/分钟）' } },
-      },
-    },
-    '/openapi/v1/chat/completions': {
-      post: {
-        summary: '对话补全（OpenAI 兼容；SDK 主入口）',
-        description: 'SDK 三行代码：`new AgentPlatform({baseUrl, apiKey}).chat.completions.create({model, messages})`。model 形如 agent-<id>-<名称>；messages 取最后一条 user 作为输入；支持 stream（SSE，data: chunk + data: [DONE]）。',
-        security: [{ apiKeyAuth: [] }],
-        requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['model', 'messages'], properties: { model: { type: 'string', example: 'agent-1-智能体名称' }, messages: { type: 'array', items: { type: 'object', properties: { role: { type: 'string', enum: ['system', 'user', 'assistant'] }, content: { type: 'string' } } } }, stream: { type: 'boolean' } } } } } },
-        responses: {
-          '200': { description: 'ChatCompletion 或 SSE 流', content: json({ $ref: '#/components/schemas/ChatCompletion' }) },
-          '400': { description: '消息为空 / 输入含违规词汇被拦截' },
-          '401': { description: '密钥无效或已停用' },
-          '403': { description: '密钥作用域不含目标智能体（key_scope_denied）' },
-          '404': { description: 'model 不存在或未发布（model_not_found）' },
-          '429': { description: '频率限制（每 Key 20 次/分钟）' },
-        },
-      },
-    },
-  };
-}
 
 /** SDK 信息区块（文档页展示下载与三行代码用法） */
 function sdkDownloads() {
@@ -176,14 +33,10 @@ function sdkDownloads() {
   return out;
 }
 
-/* ---------- 路由 ---------- */
-
-router.get('/openapi.json', (req, res) => {
-  const spec = buildOpenApiSpec();
-  // U1-8：合并真实可调试的 /openapi/* 端点定义（SDK 对接契约；SDK 元数据）
-  Object.assign(spec.paths, openApiPaths());
-  spec['x-sdk'] = {
-    name: 'agent-platform-sdk', version: '1.0.0',
+/** SDK 元数据区块（spec.x-sdk） */
+function sdkMeta() {
+  return {
+    name: 'agent-platform-sdk', version: SDK_VERSION,
     languages: ['TypeScript/Node', 'Python'],
     auth: 'agent_api_keys（Bearer sk-ap-xxx）',
     downloads: sdkDownloads(),
@@ -192,12 +45,24 @@ router.get('/openapi.json', (req, res) => {
       python: "from agent_platform import AgentPlatform; ap = AgentPlatform(base_url, 'sk-ap-xxx'); r = ap.chat.completions.create(model='agent-1-名称', messages=[{'role': 'user', 'content': '你好'}])",
     },
   };
-  res.json(spec);
+}
+
+/** 构建全站规范（含 x-sdk 扩展） */
+function buildSpec(app) {
+  return buildGlobalOpenApi(app, {
+    version: API_VERSION,
+    extra: { 'x-sdk': sdkMeta(), 'x-platform-version': PLATFORM_VERSION },
+  });
+}
+
+/* ---------- 路由 ---------- */
+
+router.get('/openapi.json', (req, res) => {
+  res.json(buildSpec(req.app));
 });
 
-// U1-8：SDK 下载清单（前端「API 密钥」弹窗消费）
 router.get('/sdk', (req, res) => {
-  res.json({ code: 0, data: { name: 'agent-platform-sdk', version: '1.0.0', downloads: sdkDownloads() } });
+  res.json({ code: 0, data: { name: 'agent-platform-sdk', version: SDK_VERSION, downloads: sdkDownloads() } });
 });
 
 router.get('/', (req, res) => {
@@ -205,81 +70,137 @@ router.get('/', (req, res) => {
 <html lang="zh-CN">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>API 文档 - 智能体开发平台</title>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:Inter,system-ui,-apple-system,sans-serif;background:#0b0e15;color:#e8ecf5}
-header{padding:20px 32px;border-bottom:1px solid #252a38;background:#0f1219;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px}
-header h1{font-size:18px;font-weight:700;background:linear-gradient(135deg,#818cf8,#38bdf8);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
-header .sub{font-size:13px;color:#8b93a7}
+body{font-family:system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:#0b0e15;color:#e8ecf5}
+header{padding:16px 24px;border-bottom:1px solid #252a38;background:#0f1219;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px}
+header h1{font-size:17px;font-weight:700;background:linear-gradient(135deg,#818cf8,#38bdf8);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+header .sub{font-size:12px;color:#8b93a7;margin-top:2px}
 header a{font-size:13px;color:#818cf8;text-decoration:none;padding:6px 14px;border:1px solid rgba(129,140,248,.3);border-radius:6px}
 header a:hover{background:rgba(129,140,248,.1)}
-.container{display:flex;height:calc(100vh - 70px)}
-.side{width:240px;min-width:200px;border-right:1px solid #252a38;overflow-y:auto;padding:12px 0}
-.side a{display:block;padding:6px 16px;font-size:13px;color:#a8b0c4;text-decoration:none;border-left:3px solid transparent}
+.container{display:flex;height:calc(100vh - 66px)}
+.side{width:280px;min-width:220px;border-right:1px solid #252a38;overflow-y:auto;padding:8px 0}
+.side .grp{font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:#5f6880;padding:10px 16px 4px}
+.side a{display:block;padding:5px 16px;font-size:12.5px;color:#a8b0c4;text-decoration:none;border-left:3px solid transparent;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .side a:hover,.side a.active{color:#e8ecf5;background:rgba(129,140,248,.06);border-left-color:#818cf8}
-.main{flex:1;overflow-y:auto;padding:24px 32px}
-.redoc-wrap{width:100%;height:100%}
-.redoc-wrap iframe{border:none;width:100%;height:100%}
-.badge{display:inline-block;font-size:10px;padding:2px 7px;border-radius:999px;background:rgba(129,140,248,.16);color:#a5b4fc;border:1px solid rgba(129,140,248,.3);margin-left:8px;vertical-align:middle}
-code{background:#1a1e2b;padding:1px 5px;border-radius:4px;font-size:12px;color:#f472b6}
-@media(max-width:768px){.container{flex-direction:column;height:auto}.side{width:100%;border-right:none;border-bottom:1px solid #252a38;padding:8px 0;max-height:200px;overflow-y:auto}.main{padding:16px}.container nav{display:flex;gap:4px;flex-wrap:wrap}.side a{display:inline;padding:4px 10px;border-left:none;border-bottom:2px solid transparent;font-size:12px}}
+.main{flex:1;overflow-y:auto;padding:20px 28px}
+.op{border:1px solid #252a38;border-radius:8px;margin-bottom:16px;overflow:hidden}
+.op .head{display:flex;align-items:center;gap:10px;padding:10px 14px;background:#12161f}
+.m{font-size:11px;font-weight:700;padding:2px 9px;border-radius:5px;color:#fff;text-transform:uppercase}
+.m.get{background:#2563eb}.m.post{background:#16a34a}.m.put{background:#d97706}.m.patch{background:#7c3aed}.m.delete{background:#dc2626}
+.op .path{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px;color:#cbd5e1}
+.op .sum{font-size:12px;color:#8b93a7;margin-left:auto;max-width:46%;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.op .body{padding:12px 14px;border-top:1px solid #252a38}
+.op .body h4{font-size:12px;color:#a5b4fc;margin:10px 0 6px}
+.op .body h4:first-child{margin-top:0}
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th,td{padding:5px 9px;border:1px solid #252a38;text-align:left}
+th{background:#1a1e2b;color:#c3cadd}
+textarea,input{width:100%;background:#0b0e15;border:1px solid #303747;color:#e8ecf5;border-radius:6px;padding:7px 9px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px}
+button{padding:6px 14px;border-radius:5px;border:1px solid #303747;background:#1a1e2b;color:#e8ecf5;cursor:pointer;font-size:12.5px}
+button:hover{background:#232936}
+.btn-run{margin-top:10px;background:#4338ca;border-color:#4338ca}
+.btn-run:hover{background:#4f46e5}
+.resp{margin-top:10px;background:#0b0e15;border:1px solid #303747;border-radius:6px;padding:10px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;white-space:pre-wrap;word-break:break-all;max-height:320px;overflow:auto;color:#a8b0c4}
+.resp.ok{border-color:#166534}.resp.bad{border-color:#7f1d1d}
+.badge{display:inline-block;font-size:10px;padding:1px 7px;border-radius:999px;background:rgba(129,140,248,.16);color:#a5b4fc;border:1px solid rgba(129,140,248,.3);margin-left:8px}
+.hint{font-size:12px;color:#6b7385;margin:6px 0 0;line-height:1.6}
+@media(max-width:768px){.container{flex-direction:column;height:auto}.side{width:100%;max-height:180px;border-right:none;border-bottom:1px solid #252a38}.main{padding:14px}}
 </style>
 </head>
 <body>
 <header>
-<div><h1>🚀 智能体开发平台 API</h1><div class="sub">版本 p5.37 · 自动生成 · OpenAPI 3.0</div></div>
+<div><h1>🚀 智能体开发平台 API</h1><div class="sub">平台 ${PLATFORM_VERSION} · OpenAPI ${OPENAPI_VERSION} · 运行时自动采集</div></div>
 <a href="/api/api-docs/openapi.json" download>📥 下载 openapi.json</a>
 </header>
 <div class="container">
 <nav class="side" id="nav"></nav>
-<main class="main">
-<div id="redoc-root" class="redoc-wrap">
-<div id="loading" style="text-align:center;padding:60px;color:#8b93a7">
-<div style="width:32px;height:32px;border:3px solid rgba(129,140,248,.2);border-top-color:#818cf8;border-radius:50%;animation:spin .8s linear infinite;margin:0 auto 16px"></div>
-<div>正在加载 API 文档…</div>
-<style>@keyframes spin{to{transform:rotate(360deg)}}</style>
-</div>
-</div>
-</main>
+<main class="main" id="main"><p class="hint">从左侧选择一个端点查看详情与试调。</p></main>
 </div>
 <script>
-const base = '/api/api-docs';
-const navEl = document.getElementById('nav');
-let spec;
-let list = [];
+let spec = null;
+const $ = (s) => document.querySelector(s);
 
-async function load() {
-  spec = await (await fetch(base + '/openapi.json')).json();
-  list = Object.entries(spec.paths).map(([k,v]) => k);
-  navEl.innerHTML = list.map(p => \`<a href="#" data-path="\${p}" onclick="show(\$(p))">\${p}</a>\`).join('');
-  // 默认选中第一个
-  if (list.length) show(list[0]);
+async function boot() {
+  spec = await (await fetch('/api/api-docs/openapi.json')).json();
+  renderNav();
 }
 
-function show(path) {
-  document.querySelectorAll('.side a').forEach(a => a.classList.toggle('active', a.dataset.path === path));
-  const doc = spec.paths[path];
-  const method = Object.keys(doc)[0];
-  const info = doc[method];
-  const html = [
-    '<h2>' + (info.summary || path) + ' <code>' + method.toUpperCase() + '</code><span class="badge">' + path + '</span></h2>',
-    '<p style="color:#8b93a7;margin:8px 0 20px;line-height:1.6">' + (info.description || '') + '</p>',
-    '<h3 style="margin:16px 0 8px">请求参数</h3>',
-    '<table style="width:100%;border-collapse:collapse;font-size:13px"><tr style="background:#1a1e2b"><th style="padding:6px 10px;border:1px solid #252a38;text-align:left">名称</th><th style="padding:6px 10px;border:1px solid #252a38;text-align:left">位置</th><th style="padding:6px 10px;border:1px solid #252a38;text-align:left">类型</th><th style="padding:6px 10px;border:1px solid #252a38;text-align:left">说明</th></tr>',
-    '<tr><td style="padding:6px 10px;border:1px solid #252a38">—</td><td style="padding:6px 10px;border:1px solid #252a38" colspan="3">详情请查看 OpenAPI 规范</td></tr>',
-    '</table>',
-    '<h3 style="margin:16px 0 8px">响应格式</h3>',
-    '<div style="background:#1a1e2b;border-radius:8px;padding:12px 16px;font-size:12px;line-height:1.8;color:#a8b0c4"><pre>{<br>  "code": 0,<br>  "data": { ... },<br>  "msg": "success"<br>}</pre></div>',
-  ].join('\\n');
-  const root = document.getElementById('redoc-root');
-  root.innerHTML = html;
-  document.getElementById('loading').style.display = 'none';
+function renderNav() {
+  const groups = {};
+  for (const p of Object.keys(spec.paths).sort()) {
+    const seg = p.replace(/^\\//,'').split('/');
+    const t = ((seg[0] === 'api' || seg[0] === 'openapi') && seg[1]) ? seg[1] : (seg[0] || 'root');
+    (groups[t] = groups[t] || []).push(p);
+  }
+  const html = [];
+  for (const t of Object.keys(groups).sort()) {
+    html.push('<div class="grp">' + t + ' (' + groups[t].length + ')</div>');
+    for (const p of groups[t]) html.push('<a href="#" data-path="' + p + '">' + p + '</a>');
+  }
+  $('#nav').innerHTML = html.join('');
+  $('#nav').querySelectorAll('a').forEach(a => a.onclick = (e) => { e.preventDefault(); show(a.dataset.path); });
 }
 
-function $(s) { return s; } // 避免 vs code 误报
+function esc(s){return String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
 
-load();
+function show(p) {
+  $('#nav').querySelectorAll('a').forEach(a => a.classList.toggle('active', a.dataset.path === p));
+  const methods = spec.paths[p];
+  const out = [];
+  for (const m of Object.keys(methods)) {
+    const op = methods[m];
+    const params = (op.parameters || []).filter(x => x.in === 'path');
+    const id = 'op-' + Math.random().toString(36).slice(2, 8);
+    const rows = params.map(x =>
+      '<tr><td><code>' + x.name + '</code></td><td>path</td><td>' + (x.schema && x.schema.type || 'string') + '</td><td>' +
+      '<input data-role="param" data-name="' + x.name + '" placeholder="' + x.name + '"></td></tr>').join('');
+    const hasBody = m === 'post' || m === 'put' || m === 'patch';
+    out.push(
+      '<div class="op"><div class="head"><span class="m ' + m + '">' + m + '</span><span class="path">' + esc(p) + '</span><span class="sum">' + esc(op.summary || '') + '</span></div>' +
+      '<div class="body">' +
+      (op.description ? '<p class="hint">' + esc(op.description) + '</p>' : '') +
+      (rows ? '<h4>路径参数</h4><table><tr><th>名称</th><th>位置</th><th>类型</th><th>值</th></tr>' + rows + '</table>' : '') +
+      (hasBody ? '<h4>请求体（JSON）</h4><textarea data-role="body" rows="5" placeholder="{ }"></textarea>' : '') +
+      '<h4>响应</h4><table><tr><th>状态码</th><th>说明</th></tr>' +
+        Object.keys(op.responses || {}).sort().map(c => '<tr><td>' + c + '</td><td>' + esc((op.responses[c] || {}).description || '') + '</td></tr>').join('') +
+      '</table>' +
+      '<button class="btn-run" data-method="' + m + '" data-path="' + esc(p) + '">▶ 试调</button>' +
+      '<div class="resp" style="display:none"></div>' +
+      '</div></div>');
+  }
+  $('#main').innerHTML = out.join('');
+  $('#main').querySelectorAll('.btn-run').forEach(b => b.onclick = () => tryIt(b));
+}
+
+async function tryIt(btn) {
+  const op = btn.closest('.op');
+  const respEl = op.querySelector('.resp');
+  let url = btn.dataset.path;
+  op.querySelectorAll('input[data-role="param"]').forEach(inp => {
+    url = url.replace('{' + inp.dataset.name + '}', encodeURIComponent(inp.value || inp.dataset.name));
+  });
+  const bodyEl = op.querySelector('[data-role="body"]');
+  const opt = { method: btn.dataset.method.toUpperCase(), headers: { 'Accept': 'application/json' }, credentials: 'include' };
+  if (bodyEl && bodyEl.value.trim()) {
+    opt.headers['Content-Type'] = 'application/json';
+    opt.body = bodyEl.value.trim();
+  }
+  btn.disabled = true; respEl.style.display = 'block'; respEl.className = 'resp'; respEl.textContent = '请求中…';
+  try {
+    const r = await fetch(url, opt);
+    const text = await r.text();
+    let pretty = text;
+    try { pretty = JSON.stringify(JSON.parse(text), null, 2); } catch (e) {}
+    respEl.className = 'resp ' + (r.ok ? 'ok' : 'bad');
+    respEl.textContent = 'HTTP ' + r.status + ' ' + r.statusText + '\\n\\n' + pretty;
+  } catch (e) {
+    respEl.className = 'resp bad';
+    respEl.textContent = '请求失败：' + e.message;
+  } finally { btn.disabled = false; }
+}
+
+boot();
 </script>
 </body>
 </html>`;

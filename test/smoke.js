@@ -2381,7 +2381,7 @@ function t(name, fn) {
       assert.strictEqual(d.channels.length, 2, 'MCP + OpenAI 双通道');
       assert.ok(d.channels[0].curl.includes('tools/call'), 'MCP curl 示例');
       assert.ok(d.channels[0].curl.includes('agent_9'), '工具名 agent_9');
-      assert.strictEqual(d.openapi.openapi, '3.0.3');
+      assert.strictEqual(d.openapi.openapi, require('../src-server/lib/version').OPENAPI_VERSION);
       assert.ok(d.openapi.paths['/mcp'], '/mcp 路径');
       assert.ok(d.openapi.paths['/openapi/v1/chat/completions'], 'openai 路径');
       assert.ok(d.openapi.components.schemas.AgentInput.properties.contract, 'AgentInput 含 contract');
@@ -6709,10 +6709,17 @@ print('PY_OK')
         const sdkJ = await (await fetch(base + '/api/api-docs/sdk')).json();
         assert.ok(sdkJ.code === 0 && sdkJ.data.downloads.length >= 2, 'SDK 清单应含两个产物');
         const spec = await (await fetch(base + '/api/api-docs/openapi.json')).json();
+        assert.strictEqual(spec.openapi, '3.1.0', 'BE-B4：全站规范应升级为 OpenAPI 3.1');
         assert.ok(spec.paths['/openapi/v1/chat/completions'] && spec.paths['/openapi/v1/chat/completions'].post, '规范应含 chat/completions POST 定义');
         assert.ok(spec.paths['/openapi/v1/models'] && spec.paths['/openapi/v1/models'].get, '规范应含 models GET 定义');
+        assert.ok(Object.keys(spec.paths).length > 100, 'BE-B4：自动采集应覆盖全部已注册路由（>100）');
+        assert.ok(spec.paths['/api/agents'], 'BE-B4：应含 /api/agents');
         assert.strictEqual(spec['x-sdk'].name, 'agent-platform-sdk', '规范应含 SDK 元数据');
         assert.ok(spec.components.securitySchemes.apiKeyAuth, '规范应含 apiKeyAuth 安全方案');
+        // BE-B4：两个规范入口同源（/openapi/openapi.json 与 /api/api-docs/openapi.json）
+        const spec2 = await (await fetch(base + '/openapi/openapi.json')).json();
+        assert.strictEqual(spec2.openapi, '3.1.0', 'BE-B4：/openapi/openapi.json 应为 OpenAPI 3.1');
+        assert.deepStrictEqual(Object.keys(spec2.paths).sort(), Object.keys(spec.paths).sort(), 'BE-B4：两个入口路径集合应一致');
       } finally {
         try { child.kill('SIGTERM'); } catch { }
         try { child.kill('SIGKILL'); } catch { }
@@ -10249,6 +10256,58 @@ print('PY_OK')
       try { cB.kill('SIGKILL'); } catch { }
       db.prepare('DELETE FROM agent_api_keys WHERE agent_id=?').run(agId);
       db.prepare('DELETE FROM agents WHERE id=?').run(agId);
+    }
+  });
+
+  // BE-B4：对外契约文档化——Express 路由表自动采集 + OpenAPI 3.1 + 版本单一来源
+  await t('BE-B4：collectRoutes 运行时采集 Express 路由表（嵌套 router 方法与路径还原）', async () => {
+    const express = require('express');
+    const { collectRoutes } = require('../src-server/lib/api-doc');
+    const app = express();
+    const r1 = express.Router();
+    r1.get('/login', (q, s) => s.end());
+    r1.post('/logout', (q, s) => s.end());
+    const inner = express.Router();
+    inner.put('/:id', (q, s) => s.end());
+    const r2 = express.Router();
+    r2.use('/nested', inner); // 二级嵌套
+    app.use('/api/auth', r1);
+    app.use('/api/agents', r2);
+    const routes = collectRoutes(app);
+    const set = new Set(routes.map(r => r.method + ' ' + r.path));
+    assert.ok(set.has('get /api/auth/login'), '应采集 GET /api/auth/login');
+    assert.ok(set.has('post /api/auth/logout'), '应采集 POST /api/auth/logout');
+    assert.ok(set.has('put /api/agents/nested/:id'), '应采集二级嵌套路由');
+  });
+
+  await t('BE-B4：buildGlobalOpenApi 产出 3.1 + 方法级 operation/参数/错误码 + tag 分组', async () => {
+    const express = require('express');
+    const { buildGlobalOpenApi } = require('../src-server/lib/api-doc');
+    const app = express();
+    const r = express.Router();
+    r.get('/:id', (q, s) => s.end());
+    app.use('/api/agents', r);
+    const spec = buildGlobalOpenApi(app);
+    assert.strictEqual(spec.openapi, '3.1.0', '应为 OpenAPI 3.1');
+    assert.ok(spec.info.version, 'info.version 来自版本单一来源');
+    assert.ok(spec.components.securitySchemes.cookieAuth, '应含 cookieAuth');
+    const op = spec.paths['/api/agents/{id}'].get;
+    assert.ok(op, '路径参数应转为 {id}');
+    assert.deepStrictEqual(op.parameters[0], { name: 'id', in: 'path', required: true, schema: { type: 'string' } }, 'path 参数应被提取');
+    assert.ok(op.responses['200'] && op.responses['400'] && op.responses['401'], '应含标准错误码');
+    assert.ok(op.tags && op.tags.includes('agents'), 'tag 取 /api 第二段');
+    // 开放端点富定义叠加
+    assert.ok(spec.paths['/openapi/v1/chat/completions'].post.requestBody, '开放端点应叠加手写富定义');
+  });
+
+  await t('BE-B4：版本号单一来源——关键文件不再硬编码平台版本', async () => {
+    const v = require('../src-server/lib/version');
+    assert.strictEqual(v.PLATFORM_VERSION, 'p5.37', '平台版本常量');
+    assert.strictEqual(v.OPENAPI_VERSION, '3.1.0', 'OpenAPI 版本常量');
+    for (const f of ['src-server/routes/a2a.js', 'src-server/routes/api-docs.js', 'src-server/routes/openapi.js', 'cli/cli.js']) {
+      const src = fs.readFileSync(path.join(__dirname, '..', f), 'utf8');
+      assert.ok(/require\(['"][^'"]*lib\/version['"]\)/.test(src), f + ' 应从 lib/version 读取版本');
+      assert.ok(!/['"]p5\.\d+['"]/.test(src), f + ' 不应再硬编码 p5.xx 版本');
     }
   });
 

@@ -16,6 +16,7 @@
  */
 const express = require('express');
 const { db, now } = require('../db');
+const { PLATFORM_VERSION } = require('../lib/version'); // BE-B4：版本单一来源
 const { runAgent } = require('../lib/workflow');
 const { auth, adminOnly, readToken, verify } = require('../lib/auth');
 const jws = require('../lib/a2a-jws');
@@ -81,7 +82,7 @@ publicRouter.get('/.well-known/agent-card.json', (req, res) => {
   const cards = agents.map(a => buildAgentCard(a));
   res.json({
     schema: 'agent-card-v1',
-    platform: { name: '智能体开发平台', version: 'p5.37', a2a_version: '1.0' },
+    platform: { name: '智能体开发平台', version: PLATFORM_VERSION, a2a_version: '1.0' },
     agents: cards,
     total: cards.length,
     generated_at: new Date().toISOString(),

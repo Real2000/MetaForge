@@ -19,11 +19,12 @@ const program = new Command();
 process.env.AGENT_DATA_DIR = process.env.AGENT_DATA_DIR || path.join(__dirname, '..', 'data');
 const { db, now } = require('../src-server/db');
 const config = require('../src-server/lib/config');
+const { PLATFORM_VERSION } = require('../src-server/lib/version');
 
 program
   .name('cli')
   .description('智能体开发平台 CLI 管理工具')
-  .version('p5.37');
+  .version(PLATFORM_VERSION);
 
 /* ========== 用户管理 ========== */
 
