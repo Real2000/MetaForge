@@ -5859,8 +5859,9 @@ function t(name, fn) {
       const openapiRouter = require('../src-server/routes/openapi');
       const layer = openapiRouter.stack.find(l => l.route && l.route.path === '/v1/models');
       assert.ok(layer, '/v1/models 路由应存在');
-      // handler 前应有 1 层限流中间件（route.stack = [limiter, handler]）
-      assert.strictEqual(layer.route.stack.length, 2, `/v1/models 应挂限流中间件（当前 ${layer.route.stack.length} 层，预期 limiter+handler=2）`);
+      // handler 前应有中间件（routes 层：限流 + BE-B3 配额守卫 + handler）
+      assert.ok(layer.route.stack.length >= 2, `/v1/models 应挂限流中间件（当前 ${layer.route.stack.length} 层，预期 ≥2：limiter(+quota)+handler）`);
+      assert.strictEqual(layer.route.stack.length, 3, `/v1/models 应为 limiter+quota+handler=3 层（当前 ${layer.route.stack.length}）`);
     });
     await t('P2-3 / P2-3：A1 op 扩展 + D1-1 新 op + 三档权限模型', () => {
       const lb = require('../src-server/routes/localbridge');
@@ -10180,6 +10181,74 @@ print('PY_OK')
       try { child.kill('SIGTERM'); } catch { }
       try { child.kill('SIGKILL'); } catch { }
       db1.prepare('DELETE FROM users WHERE username=?').run('beb1user');
+    }
+  });
+
+  // BE-B3：对外 API 分布式限流与每 Key 日/月配额
+  await t('BE-B3：共享存储计数——UPSERT..RETURNING 原子自增 + 共享限流器 200/200/429', async () => {
+    const rl = require('../src-server/lib/rate-limit');
+    const bk = 'smoke-beb3-' + Date.now();
+    assert.strictEqual(rl.dbIncr(bk, Date.now() + 60000).count, 1);
+    assert.strictEqual(rl.dbIncr(bk, Date.now() + 60000).count, 2);
+    assert.strictEqual(rl.dbPeek(bk).count, 2);
+    const lim = rl.createLimiter({ name: 'smoke-shared', windowMs: 60000, max: 2, keyFn: () => 'X', shared: true });
+    const call = () => new Promise(res => {
+      const req = { headers: {}, path: '/openapi/v1/x', socket: {} };
+      const res2 = { _h: {}, setHeader(a, b) { this._h[a] = b; }, status(c) { this.code = c; return this; }, json(j) { this.body = j; res(this); } };
+      lim(req, res2, () => res({ code: 200 }));
+    });
+    assert.strictEqual((await call()).code, 200);
+    assert.strictEqual((await call()).code, 200);
+    const c = await call();
+    assert.strictEqual(c.code, 429, '第 3 次应 429');
+    assert.ok(Number(c._h['Retry-After']) >= 1, '应带 Retry-After');
+  });
+
+  await t('BE-B3：每 Key 日配额守卫——放行额度后 429 + Retry-After', async () => {
+    const rl = require('../src-server/lib/rate-limit');
+    const qg = rl.createQuotaGuard({ name: 'smoke-q-' + Date.now(), keyFn: () => 'K', limitsFn: () => ({ daily: 3, monthly: 0 }) });
+    const callQ = () => new Promise(res => {
+      const req = { headers: {}, path: '/openapi/v1/y', socket: {} };
+      const res2 = { _h: {}, setHeader(a, b) { this._h[a] = b; }, status(c) { this.code = c; return this; }, json(j) { this.body = j; res(this); } };
+      qg(req, res2, () => res({ code: 200 }));
+    });
+    const codes = [];
+    for (let i = 0; i < 5; i++) codes.push((await callQ()).code);
+    assert.deepStrictEqual(codes, [200, 200, 200, 429, 429], '日配额 3：前 3 放行，其后 429');
+  });
+
+  await t('BE-B3：双实例共享额度不放大——同 Key 总额度与配置一致，超限 429', async () => {
+    const { spawn } = require('child_process');
+    const crypto = require('crypto');
+    const sp = db.prepare("SELECT id FROM spaces WHERE type='enterprise' LIMIT 1").get() || db.prepare('SELECT id FROM spaces LIMIT 1').get();
+    const agId = db.prepare(`INSERT INTO agents (name,type,space_id,owner,status,visibility,prompt,created_at) VALUES ('BEB3智能体','other',?,'admin','published','public','测试',datetime('now','localtime'))`).run(sp.id).lastInsertRowid;
+    const rawKey = 'sk-ap-beb3-' + crypto.randomBytes(8).toString('hex');
+    // 明文入库：子进程启动期 SEC-02a 迁移会哈希之（同 U1-8 流程）；quota_daily=6 作为双实例合计额度
+    db.prepare("INSERT INTO agent_api_keys (agent_id,key,key_prefix,name,status,quota_daily,quota_monthly,created_at) VALUES (?,?,?,?,1,6,0,datetime('now','localtime'))").run(agId, rawKey, 'sk-ap-be****', 'BEB3配额密钥');
+    const pA = 41000 + Math.floor(Math.random() * 400);
+    const pB = 41600 + Math.floor(Math.random() * 400);
+    const spawnSrv = (port) => spawn(process.execPath, ['server.js'], { cwd: path.join(__dirname, '..'), env: { ...process.env, PORT: String(port), AGENT_DATA_DIR: process.env.AGENT_DATA_DIR }, stdio: 'ignore' });
+    const cA = spawnSrv(pA), cB = spawnSrv(pB);
+    const hit = async (port) => (await fetch(`http://127.0.0.1:${port}/openapi/v1/models`, { headers: { Authorization: 'Bearer ' + rawKey } })).status;
+    try {
+      for (const port of [pA, pB]) {
+        let up = false;
+        for (let i = 0; i < 120 && !up; i++) { await new Promise(r => setTimeout(r, 250)); try { up = (await fetch(`http://127.0.0.1:${port}/api/health`)).ok; } catch { } }
+        assert.ok(up, '实例 ' + port + ' 应在 30s 内就绪');
+      }
+      const statuses = [];
+      for (let i = 0; i < 12; i++) statuses.push(await hit(i % 2 ? pB : pA));
+      const ok200 = statuses.filter(s => s === 200).length;
+      const n429 = statuses.filter(s => s === 429).length;
+      assert.strictEqual(ok200, 6, '双实例合计放行应恰为配额 6，实际 ' + ok200 + '（' + statuses.join(',') + '）');
+      assert.strictEqual(n429, 6, '其余请求应 429');
+    } finally {
+      try { cA.kill('SIGTERM'); } catch { }
+      try { cB.kill('SIGTERM'); } catch { }
+      try { cA.kill('SIGKILL'); } catch { }
+      try { cB.kill('SIGKILL'); } catch { }
+      db.prepare('DELETE FROM agent_api_keys WHERE agent_id=?').run(agId);
+      db.prepare('DELETE FROM agents WHERE id=?').run(agId);
     }
   });
 

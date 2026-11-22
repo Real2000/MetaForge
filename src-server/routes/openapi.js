@@ -11,19 +11,25 @@ const { retrieve } = require('../lib/retriever');
 const { resolveKbFilter } = require('../lib/kb-metadata'); // V1.2 审查加固 2026-10-30：开放 API 检索过滤收口
 const { check, countHits, mask } = require('../lib/security');
 const dify = require('../lib/dify');
-const { createLimiter } = require('../lib/rate-limit');
+const { createLimiter, createQuotaGuard } = require('../lib/rate-limit');
+const { getq } = require('../lib/dal'); // BE-B3：配额读取走统一出口
 const { hashKey } = require('../lib/apikey'); // SEC-02a：按哈希比对 API Key
 const { addUsage } = require('../lib/quota');
 const { recordModelUsage } = require('../lib/billing'); // U1-6：开放 API 调用成本归因（归智能体发布者）
 
 const router = express.Router();
 
+/** 提取密钥尾段（不落全量密钥） */
+const keyTail = req => (req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim().slice(-16);
+
 // API Key 限流（2026-10-20 P0）：每 Key 每分钟最多 20 次对话，防密钥泄露后被脚本刷爆网关
+// BE-B3（2026-11-22）：改共享存储（rate_limit_counters）——多实例同库合计额度，不再各实例独立放大
 const keyChatLimit = createLimiter({
   name: 'openapi-chat',
   windowMs: 60000,
   max: 20,
-  keyFn: req => (req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim().slice(-16), // 用 Key 尾段（不落全量密钥）
+  keyFn: keyTail,
+  shared: true,
   msg: 'API 调用超过频率限制（20 次/分钟），请稍后重试或联系管理员调整',
 });
 
@@ -33,8 +39,22 @@ const keyModelsLimit = createLimiter({
   name: 'openapi-models',
   windowMs: 60000,
   max: 60,
-  keyFn: req => (req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim().slice(-16),
+  keyFn: keyTail,
+  shared: true,
   msg: '模型列表查询超过频率限制（60 次/分钟），请稍后重试',
+});
+
+// BE-B3：每 Key 日/月调用配额（agent_api_keys.quota_daily/quota_monthly，0=不限）。
+// 原子「自增后判超」，多实例下放行总次数恒等于配置额度；无效密钥（无库记录）不计数。
+const keyQuota = createQuotaGuard({
+  name: 'openapi',
+  keyFn: keyTail,
+  limitsFn: req => {
+    const raw = (req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
+    if (!raw) return {};
+    const row = getq('SELECT quota_daily, quota_monthly FROM agent_api_keys WHERE key=? AND status=1', [hashKey(raw)]);
+    return row ? { daily: row.quota_daily, monthly: row.quota_monthly } : {};
+  },
 });
 
 // CORS（供外部系统/网页直调）
@@ -73,7 +93,7 @@ function unauthorized(res) {
 }
 
 // 模型列表：每个已发布智能体对外即一个"模型"
-router.get('/v1/models', keyModelsLimit, (req, res) => {
+router.get('/v1/models', keyModelsLimit, keyQuota, (req, res) => {
   const h = authKey(req);
   if (!h) return unauthorized(res);
   const agents = db.prepare("SELECT id,name,description FROM agents WHERE status='published' AND (source='self' OR source='dify')").all();
@@ -94,7 +114,7 @@ router.get('/v1/models', keyModelsLimit, (req, res) => {
  * POST /openapi/v1/chat/completions
  * body 兼容 OpenAI：{ model: "agent-<id>-<名称>", messages: [{role, content}], stream? }
  */
-router.post('/v1/chat/completions', keyChatLimit, async (req, res) => {
+router.post('/v1/chat/completions', keyChatLimit, keyQuota, async (req, res) => {
   const h = authKey(req);
   if (!h) return unauthorized(res);
   const { model, messages, stream } = req.body || {};

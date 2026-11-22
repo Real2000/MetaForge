@@ -594,6 +594,15 @@ const ALL_MIGRATIONS = [
     raw TEXT DEFAULT '',
     created_at TEXT
   );` },
+  // === M2 / BE-B3 对外限流与配额（2026-11-22）===
+  { id: 121, name: 'rate_limit_counters - 共享限流/配额计数（BE-B3 多实例）', table: 'rate_limit_counters', createSql: `CREATE TABLE IF NOT EXISTS rate_limit_counters (
+    bucket_key TEXT PRIMARY KEY,
+    count INTEGER DEFAULT 0,
+    reset_at INTEGER,
+    updated_at TEXT
+  );` },
+  { id: 122, name: 'agent_api_keys 日/月配额（BE-B3）', table: 'agent_api_keys', column: 'quota_daily', def: 'INTEGER DEFAULT 0' },
+  { id: 123, name: 'agent_api_keys.quota_monthly（BE-B3）', table: 'agent_api_keys', column: 'quota_monthly', def: 'INTEGER DEFAULT 0' },
 ];
 
 module.exports = {

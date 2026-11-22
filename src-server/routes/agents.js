@@ -851,7 +851,7 @@ router.get('/:id/api-keys', (req, res) => {
   if (!agent) return res.json({ code: 404, msg: '智能体不存在' });
   if (!isOwnerLevel(agent, req.user)) return res.json({ code: 403, msg: '无权限（API 密钥仅创建者与管理员可管理）' });
   // SEC-02a：库中 key 列为 HMAC 哈希，不回传；仅回前缀掩码（key 字段沿用掩码，兼容前端展示）
-  const rows = db.prepare('SELECT id,agent_id,key_prefix,name,status,created_at,last_used_at FROM agent_api_keys WHERE agent_id=? ORDER BY id DESC').all(req.params.id)
+  const rows = db.prepare('SELECT id,agent_id,key_prefix,name,status,quota_daily,quota_monthly,created_at,last_used_at FROM agent_api_keys WHERE agent_id=? ORDER BY id DESC').all(req.params.id)
     .map(r => ({ ...r, key: r.key_prefix || '' }));
   res.json({ code: 0, data: rows });
 });
@@ -862,11 +862,29 @@ router.post('/:id/api-keys', (req, res) => {
   if (!isOwnerLevel(agent, req.user)) return res.json({ code: 403, msg: '无权限（API 密钥仅创建者与管理员可管理）' });
   const key = 'sk-ap-' + crypto.randomBytes(20).toString('hex');
   const name = (req.body || {}).name || '默认密钥';
+  // BE-B3：可选日/月调用配额（0=不限）
+  const qDaily = Math.max(0, parseInt((req.body || {}).quota_daily, 10) || 0);
+  const qMonthly = Math.max(0, parseInt((req.body || {}).quota_monthly, 10) || 0);
   // SEC-02a：仅存哈希 + 前缀掩码；完整 Key 仅本次一次性返回
-  const info = db.prepare('INSERT INTO agent_api_keys (agent_id,key,key_prefix,name,status,created_at) VALUES (?,?,?,?,1,datetime(\'now\',\'localtime\'))')
-    .run(agent.id, hashKey(key), maskPrefix(key), name);
+  const info = db.prepare('INSERT INTO agent_api_keys (agent_id,key,key_prefix,name,status,quota_daily,quota_monthly,created_at) VALUES (?,?,?,?,1,?,?,datetime(\'now\',\'localtime\'))')
+    .run(agent.id, hashKey(key), maskPrefix(key), name, qDaily, qMonthly);
   db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)').run(req.user.username, '创建智能体API密钥', `${agent.name}（${name}）`, req.ip, now());
   res.json({ code: 0, data: { id: info.lastInsertRowid, key } });
+});
+
+// BE-B3：更新密钥日/月调用配额（0=不限）——新增语句走 DAL 出口（不增裸查门禁计数）
+router.put('/:id/api-keys/:kid/quota', (req, res) => {
+  const { getq, runq } = require('../lib/dal');
+  const agent = getq('SELECT * FROM agents WHERE id=?', [req.params.id]);
+  if (!agent) return res.json({ code: 404, msg: '智能体不存在' });
+  if (!isOwnerLevel(agent, req.user)) return res.json({ code: 403, msg: '无权限（API 密钥仅创建者与管理员可管理）' });
+  const k = getq('SELECT * FROM agent_api_keys WHERE id=? AND agent_id=?', [req.params.kid, req.params.id]);
+  if (!k) return res.json({ code: 404, msg: '密钥不存在' });
+  const qDaily = Math.max(0, parseInt((req.body || {}).quota_daily, 10) || 0);
+  const qMonthly = Math.max(0, parseInt((req.body || {}).quota_monthly, 10) || 0);
+  runq('UPDATE agent_api_keys SET quota_daily=?, quota_monthly=? WHERE id=?', [qDaily, qMonthly, k.id]);
+  runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '设置API密钥配额', `${agent.name}（日 ${qDaily || '不限'} / 月 ${qMonthly || '不限'}）`, req.ip, now()]);
+  res.json({ code: 0, msg: '配额已更新', data: { quota_daily: qDaily, quota_monthly: qMonthly } });
 });
 
 router.post('/:id/api-keys/:kid/toggle', (req, res) => {

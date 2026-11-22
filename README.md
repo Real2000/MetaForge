@@ -2959,4 +2959,14 @@ R5 远期生态首项。**先做 3D 资产生成与导出（新增资产类型 +
 - `npm test`：冒烟 **613/0 全绿**（+1 新增 BE-B1 用例：子进程实测「业务码 404 → HTTP 404 / 成功仍 200+code0 / 登录失败保持 200+code401 豁免」）；双租户 E2E **26/0 全绿**。
 - 同步更新 1 处既有断言：`/api/files/:id` 元数据越权由旧「HTTP 200 + code 403」统一为 HTTP 403（与其同类下载接口一致，正是 BE-B1 要消除的不一致）。
 
+**BE-B3 对外 API 分布式限流与每 Key 配额**
+- 新增共享计数表 `rate_limit_counters`（`bucket_key` 主键 / `count` / `reset_at` / `updated_at`，迁移 **121**）+ `agent_api_keys.quota_daily`/`quota_monthly`（迁移 **122/123**，`db.js` 内联建表/加列）。
+- `lib/rate-limit.js` 扩展：`createLimiter({ shared:true })` 计数落库（`rate_limit_counters`，固定窗口），多实例同库合计额度不再各自放大；新增 `createQuotaGuard()` 每 Key 日/月配额守卫——**原子「自增后判超」**（`INSERT..ON CONFLICT DO UPDATE..RETURNING` 单语句，多实例写串行化后放行总次数恒等于配置额度），超限 429 + `Retry-After`，`0`=不限（向后兼容）；新增 `dbIncr/dbPeek` 原语，计数行低概率清理防膨胀。全部经 DAL 出口（`getq/runq`），不增裸查门禁计数。
+- `routes/openapi.js`：`/v1/models`、`/v1/chat/completions` 两个限流器改 `shared:true` 并叠加 `keyQuota` 配额守卫（无效密钥不计数）。
+- `routes/agents.js`：密钥列表回传 `quota_daily/quota_monthly`、创建时可传配额、新增 `PUT /:id/api-keys/:kid/quota` 更新配额（新增语句走 DAL）。
+
+**验证（BE-B3）**
+- `npm test`：冒烟 **616/0 全绿**（+3 新增：共享计数原语+共享限流器 200/200/429、日配额守卫放行额度后 429、**双实例共享额度不放大**——两子进程同库同 Key 12 连发恰放行 6 次=配额、其余 429）；双租户 E2E **26/0 全绿**。
+- 更新 1 处既有断言：`/v1/models` 路由栈由 limiter+handler 两层变为 limiter+quota+handler 三层。
+
 > AI生成

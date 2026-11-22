@@ -617,6 +617,18 @@ db.exec(`CREATE TABLE IF NOT EXISTS agent_api_keys (
     console.log('[db] agent_api_keys 表已迁移：新增 key_prefix 字段（SEC-02a 哈希存储）');
   }
 }
+// BE-B3（M2 批次3，2026-11-22）：对外 API 每 Key 日/月调用配额（0 = 不限，向后兼容）
+{
+  const akCols = db.prepare('PRAGMA table_info(agent_api_keys)').all().map(c => c.name);
+  if (!akCols.includes('quota_daily')) {
+    db.exec('ALTER TABLE agent_api_keys ADD COLUMN quota_daily INTEGER DEFAULT 0');
+    console.log('[db] agent_api_keys 表已迁移：新增 quota_daily 字段（BE-B3 日配额）');
+  }
+  if (!akCols.includes('quota_monthly')) {
+    db.exec('ALTER TABLE agent_api_keys ADD COLUMN quota_monthly INTEGER DEFAULT 0');
+    console.log('[db] agent_api_keys 表已迁移：新增 quota_monthly 字段（BE-B3 月配额）');
+  }
+}
 // 分享会话表（免登录访问，与内部 sessions 隔离）
 db.exec(`CREATE TABLE IF NOT EXISTS share_sessions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1460,6 +1472,16 @@ db.exec(`CREATE TABLE IF NOT EXISTS payment_events (
 db.exec('CREATE INDEX IF NOT EXISTS idx_po_tenant ON payment_orders(tenant_id, status);');
 db.exec('CREATE INDEX IF NOT EXISTS idx_po_created ON payment_orders(created_at);');
 db.exec('CREATE INDEX IF NOT EXISTS idx_ts_tenant ON tenant_subscriptions(tenant_id);');
+
+// BE-B3（M2 批次3，2026-11-22）：共享限流/配额计数（多实例同库不放大额度）
+// bucket_key 形如 rl:<name>:<key尾>:<窗口起点> 或 rq:<name>:<key尾>:d|m:<周期>；reset_at 为失效毫秒时间戳
+db.exec(`CREATE TABLE IF NOT EXISTS rate_limit_counters (
+  bucket_key TEXT PRIMARY KEY,
+  count INTEGER DEFAULT 0,
+  reset_at INTEGER,
+  updated_at TEXT
+);`);
+db.exec('CREATE INDEX IF NOT EXISTS idx_rlc_reset ON rate_limit_counters(reset_at);');
 
 // D2-4 MCP 与连接器广场：服务凭据托管（AES-256-GCM 加密落盘，掩码回显，按服务隔离）
 db.exec(`CREATE TABLE IF NOT EXISTS mcp_credentials (
