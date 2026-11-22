@@ -140,6 +140,9 @@ function t(name, fn) {
     try { child.kill('SIGKILL'); } catch { }
   }
 
+  // 清理独立临时库
+  try { require('fs').rmSync(process.env.AGENT_DATA_DIR, { recursive: true, force: true }); } catch { }
+
   console.log('———————————————');
   console.log(`结果：${passed} 通过 / ${failed} 失败`);
   process.exit(failed ? 1 : 0);
