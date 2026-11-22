@@ -382,11 +382,16 @@ CREATE TABLE IF NOT EXISTS op_logs (
   action TEXT,
   detail TEXT DEFAULT '',
   ip TEXT,
-  created_at TEXT
+  created_at TEXT,
+  prev_hash TEXT DEFAULT '',
+  record_hash TEXT DEFAULT ''
 );
 `);
 // P4 本地桥 A2（2026-11-09）：op_logs 加持续时间列——local_exec run 实测精度 ±5ms 以内；已存在则忽略（幂等）
 try { db.exec("ALTER TABLE op_logs ADD COLUMN duration_ms INTEGER DEFAULT NULL"); } catch { }
+// SEC-11（M2 批次4）：审计日志防篡改哈希链列（幂等补列，存量库平滑升级）
+try { db.exec("ALTER TABLE op_logs ADD COLUMN prev_hash TEXT DEFAULT ''"); } catch { }
+try { db.exec("ALTER TABLE op_logs ADD COLUMN record_hash TEXT DEFAULT ''"); } catch { }
 db.exec(`CREATE TABLE IF NOT EXISTS err_logs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   source TEXT,
@@ -1263,8 +1268,13 @@ db.exec(`CREATE TABLE IF NOT EXISTS security_events (
   detail TEXT DEFAULT '',
   action TEXT DEFAULT '',
   source TEXT DEFAULT '',
-  created_at TEXT
+  created_at TEXT,
+  prev_hash TEXT DEFAULT '',
+  record_hash TEXT DEFAULT ''
 );`);
+// SEC-11（M2 批次4）：安全事件表防篡改哈希链列（幂等补列）
+try { db.exec("ALTER TABLE security_events ADD COLUMN prev_hash TEXT DEFAULT ''"); } catch { }
+try { db.exec("ALTER TABLE security_events ADD COLUMN record_hash TEXT DEFAULT ''"); } catch { }
 // 用户自有模型供应商表（2026-10-20 P3：用户自带 API Key 接入 OpenAI 兼容模型源，与平台供应商隔离，仅本人可见可用）
 db.exec(`CREATE TABLE IF NOT EXISTS user_providers (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1896,34 +1906,51 @@ const dbRead = new Proxy({}, {
     return typeof v === 'function' ? v.bind(target) : v;
   },
 });
+// SEC-11 / SEC-12（M2 批次4）：装配审计日志写入守卫——op_logs / security_events 的一切插入
+// 强制经 lib/audit 过「脱敏 + UTC + 哈希链」，调用方无从绕过（含直接 db.prepare 写入）。
+try { require('./lib/audit').installGuard(db); } catch (e) { console.error('[db][SEC-12] 审计日志守卫装配失败：' + e.message); }
+
 module.exports = { db, dbRead, hashPwd, hashPwdAsync, verifyPwd, now, daysAgo, tableEntities, tableEntityRelations, upsertCheckpoint, getCheckpoint, deleteCheckpoint };
 
-// ---------- P1-4 修复 2026-11-09：ENCRYPTION_KEY 自动初始化（secrets 表建表后幂等注入） ----------
-// 若 secrets 表中尚无 ENCRYPTION_KEY，自动生成 32 字节（64 hex）随机密钥写入。
-// 确保 encrypt() 始终有密钥可用——此前需管理员手动配置，缺省时 encrypt() 返回明文导致 API Key 明文落盘。
-// 仅当 secrets 表已创建且存在 name='ENCRYPTION_KEY' 的行时才视为已配置。
+// ---------- P1-4 修复 2026-11-09 / SEC-10（M2 批次4）：加密密钥初始化与校验 ----------
+// 密钥来源优先级（SEC-10，同 crypto-util）：环境变量 AGENT_ENCRYPTION_KEY > 文件 <DATA_DIR>/encryption.key(0600) > secrets 表（兼容）
+// 首次启动（三来源皆无）时生成 32 字节密钥写入 **文件**（0600）——使「加密密钥」与「密文」不同源（不再同存 secrets 表）。
+// 存量库（secrets 表已有 ENCRYPTION_KEY）继续沿用 DB 来源，零回归；可用 scripts/migrate-encryption-key.js 主动迁出到文件。
 {
-  try {
-    const row = db.prepare("SELECT value FROM secrets WHERE name='ENCRYPTION_KEY'").pluck().get();
-    if (!row || row.length !== 64) {
+  const cu = require('./lib/crypto-util');
+  let info = { source: 'none', hasPrimary: false, kid: null, versions: [] };
+  try { info = cu.keyInfo(); } catch (e) { console.warn('[db][SEC-10] 读取加密密钥状态失败：' + e.message); }
+  if (!info.hasPrimary) {
+    try {
+      // 主选：生成到文件（0600）——密钥与密文不同源
       const key = crypto.randomBytes(32).toString('hex');
-      db.prepare('INSERT OR REPLACE INTO secrets (name,value,remark,created_at,updated_at) VALUES (?,?,?,?,?)')
-        .run('ENCRYPTION_KEY', key, 'AES-256-GCM 加密密钥（首次启动自动生成）', now(), now());
-      console.log('[db] 已自动初始化 ENCRYPTION_KEY（AES-256-GCM 加密密钥）');
+      const kf = cu.keyFilePath();
+      fs.mkdirSync(path.dirname(kf), { recursive: true });
+      fs.writeFileSync(kf, key, { mode: 0o600 });
+      try { fs.chmodSync(kf, 0o600); } catch { /* 平台差异忽略 */ }
+      cu.resetKeyCache();
+      info = cu.keyInfo();
+      console.log('[db][SEC-10] 已生成加密密钥到文件：' + kf + '（0600，密钥与密文不同源）');
+    } catch (e) {
+      // 文件不可写时回退 secrets 表（兼容旧部署形态）
+      console.error('[db][SEC-10] 生成文件加密密钥失败（回退 secrets 表）：' + e.message);
+      try {
+        const key = crypto.randomBytes(32).toString('hex');
+        db.prepare('INSERT OR REPLACE INTO secrets (name,value,remark,created_at,updated_at) VALUES (?,?,?,?,?)')
+          .run('ENCRYPTION_KEY', key, 'AES-256-GCM 加密密钥（文件不可用回退）', now(), now());
+        cu.resetKeyCache();
+        info = cu.keyInfo();
+        console.log('[db] 已回退初始化 ENCRYPTION_KEY（secrets 表）');
+      } catch (e2) {
+        console.warn('[db] ENCRYPTION_KEY 回退初始化跳过（secrets 表不可用）：' + e2.message);
+      }
     }
-  } catch (e) {
-    // secrets 表不存在时跳过（保守兜底，release 构建一定有该表）
-    console.warn('[db] ENCRYPTION_KEY 自动初始化跳过（secrets 表不可用）:', e.message);
   }
-  // SEC-03（2026-11-22 安全止血）：启动期断言——密钥缺失即告警。
-  // 配合 crypto-util.encrypt 的 fail-closed（缺钥抛错拒绝明文落盘），此处给出显式、可检索的启动告警。
-  try {
-    const chk = db.prepare("SELECT value FROM secrets WHERE name='ENCRYPTION_KEY'").pluck().get();
-    if (!chk || chk.length !== 64) {
-      console.error('[db][SEC-03] 致命：ENCRYPTION_KEY 缺失或长度非法——加密写入将 fail-closed 拒绝（API Key/密钥无法保存）。请确认 secrets 表可用。');
-    }
-  } catch (e) {
-    console.error('[db][SEC-03] 致命：无法校验 ENCRYPTION_KEY（secrets 表不可用）——加密写入将 fail-closed 拒绝。', e.message);
+  // SEC-03（2026-11-22 安全止血）：启动期断言——密钥缺失即告警（配合 crypto-util.encrypt 的 fail-closed）
+  if (info.hasPrimary) {
+    console.log(`[db][SEC-10] 加密密钥就绪：来源=${info.source}，kid=${info.kid}，版本数=${(info.versions || []).length || 1}`);
+  } else {
+    console.error('[db][SEC-03] 致命：ENCRYPTION_KEY 缺失——加密写入将 fail-closed 拒绝（API Key/密钥无法保存）。请设置 AGENT_ENCRYPTION_KEY、写入 ' + cu.keyFilePath() + ' 或确保 secrets 表可用。');
   }
 }
 

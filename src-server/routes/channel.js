@@ -12,9 +12,13 @@ const { loadSecrets } = require('../lib/secrets');
 const { upsertBind, deleteBind, listBinds, addWhitelist, removeWhitelist, listWhitelist, inbound } = require('../lib/group-context');
 const { getAdapter, listAdapterStatus } = require('../lib/im-adapters');
 const { verifyCardCallback } = require('../lib/card-callback-verify'); // U0-5 P3 回调验签
+const { createLimiter, clientIp } = require('../lib/rate-limit'); // SEC-09：回调限流
 const { buildPassiveReply } = require('../lib/im-wechat-mp'); // U0-1③ 公众号被动回复（N4）
 
 const router = express.Router();
+
+// SEC-09（M2 批次4）：卡片回调限流——防伪造/未验签回调高频尝试（每 IP 60 次/分钟）
+const cardCbLimit = createLimiter({ name: 'channel-card-callback', windowMs: 60000, max: 60, keyFn: clientIp, msg: '卡片回调过于频繁，请稍后重试' });
 
 // 渠道事件回调体解析：XML（企微/公众号，安全模式为 Encrypt 包裹的 XML 文本）
 // 全局仅挂 express.json()，XML 请求体不被解析；此处按内容类型补 text 解析（挂在免 auth 回调端点前）
@@ -159,8 +163,8 @@ async function handleCardCallback(req, res) {
     res.status(500).json({ code: 500, msg: '卡片回调处理失败：' + e.message });
   }
 }
-router.post('/card-callback', handleCardCallback);
-router.get('/card-callback', handleCardCallback);
+router.post('/card-callback', cardCbLimit, handleCardCallback);
+router.get('/card-callback', cardCbLimit, handleCardCallback);
 
 router.use(auth);
 

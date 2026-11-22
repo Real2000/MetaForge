@@ -19,8 +19,9 @@ const fs = require('fs');
 const DATA_DIR = process.env.AGENT_DATA_DIR || path.join(__dirname, '..', 'data');
 const DB_PATH = path.join(DATA_DIR, 'platform.db');
 
-// 密文形态：iv(32hex).authTag(32hex).ciphertext(hex+)
-const CIPHER_RE = /^[0-9a-f]{32}\.[0-9a-f]{32}\.[0-9a-f]+$/i;
+// 密文形态（SEC-10 起带 kid 前缀）：[kid(8hex).]iv(32hex).authTag(32hex).ciphertext(hex+)
+// 兼容旧三段 iv.authTag.ciphertext 与新版四段 kid.iv.authTag.ciphertext
+const CIPHER_RE = /^(?:[0-9a-f]{8}\.)?[0-9a-f]{32}\.[0-9a-f]{32}\.[0-9a-f]+$/i;
 
 function looksPlain(v) {
   const s = String(v ?? '');

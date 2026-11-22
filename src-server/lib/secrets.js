@@ -14,7 +14,7 @@
  *   - 唯一键为 (name, tenant_id)，同一密钥名可在不同租户各自定义
  */
 const { db } = require('../db');
-const { encrypt, decrypt } = require('./crypto-util'); // V2.4 #4 加密工具
+const { encrypt, decrypt, resetKeyCache } = require('./crypto-util'); // V2.4 #4 加密工具（resetKeyCache：SEC-10 密钥热更新）
 
 const CACHE_TTL = 60 * 1000;
 const _cache = new Map();      // tenantId -> { data, at }
@@ -87,6 +87,7 @@ function upsert(name, value, remark, tenantId) {
   if (value == null || value === '') {
     if (old) db.prepare('DELETE FROM secrets WHERE id=?').run(old.id);
     invalidate();
+    if (name === 'ENCRYPTION_KEY') { try { resetKeyCache(); } catch { /* 忽略 */ } }
     return old ? 'deleted' : 'noop';
   }
   // V2.4 #4：对值加密后存储；ENCRYPTION_KEY 自身不加密（保持明文）
@@ -94,6 +95,8 @@ function upsert(name, value, remark, tenantId) {
   if (old) db.prepare("UPDATE secrets SET value=?, remark=?, updated_at=datetime('now','localtime') WHERE id=?").run(storedValue, remark || old.remark || '', old.id);
   else db.prepare("INSERT INTO secrets (name, value, remark, tenant_id, created_at, updated_at) VALUES (?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))").run(name, storedValue, remark || '', tid);
   invalidate();
+  // SEC-10：ENCRYPTION_KEY 变更后立即失效 crypto-util 密钥缓存，保证热更新（否则 60s 内仍用旧钥）
+  if (name === 'ENCRYPTION_KEY') { try { resetKeyCache(); } catch { /* 忽略 */ } }
   return old ? 'updated' : 'created';
 }
 

@@ -7,7 +7,8 @@
  *   - 不用 bcrypt/argon2（Key 为高熵随机串，无需慢哈希抗离线爆破）；
  *   - 不用随机盐（需逐行查询才可校验，HMAC 固定 pepper 支持按哈希直达索引查询）。
  * pepper 取值（稳定即可，跨重启须一致，否则历史 Key 全部失效）：
- *   AGENT_APIKEY_PEPPER 环境变量 > secrets 表 ENCRYPTION_KEY > data/secrets.json 的 jwt_secret。
+ *   AGENT_APIKEY_PEPPER 环境变量 > 主加密密钥（SEC-10：env/文件/DB 同源，AES 层 primaryKey）
+ *   > data/secrets.json 的 jwt_secret。
  */
 const crypto = require('crypto');
 
@@ -16,12 +17,12 @@ let _pepper = null;
 function pepper() {
   if (_pepper) return _pepper;
   if (process.env.AGENT_APIKEY_PEPPER) return (_pepper = Buffer.from(process.env.AGENT_APIKEY_PEPPER));
-  // 主选：AES 加密密钥（已由 db.js 启动期保证存在，且跨重启稳定）
+  // 主选：主加密密钥（SEC-10 与加密层同源：环境变量 > 文件 > DB；已由 db.js 启动期保证存在，跨重启稳定）
   try {
-    const { db } = require('../db');
-    const row = db.prepare("SELECT value FROM secrets WHERE name='ENCRYPTION_KEY'").pluck().get();
-    if (row && String(row).length === 64) return (_pepper = Buffer.from(String(row), 'hex'));
-  } catch { /* 忽略：db 未就绪时回退 */ }
+    const { primaryKey } = require('./crypto-util');
+    const k = primaryKey();
+    if (k) return (_pepper = Buffer.from(k));
+  } catch { /* 忽略：crypto-util 未就绪时回退 */ }
   // 兜底：JWT 密钥文件
   try {
     const fs = require('fs');

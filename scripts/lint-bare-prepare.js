@@ -21,8 +21,8 @@ const path = require('path');
 const ROOT = path.join(__dirname, '..');
 const SCAN_DIRS = ['src-server'];
 const BASELINE = path.join(__dirname, 'dal-baseline.json');
-// 允许「出口/框架」层直接持有裸查
-const ALLOWLIST = new Set(['src-server/db.js', 'src-server/lib/dal.js', 'src-server/lib/migrate.js', 'src-server/lib/sql-dialect.js', 'src-server/lib/db-driver.js']);
+// 允许「出口/框架」层直接持有裸查（db.js/dal.js 等为方言与租户出口自身；audit.js 为审计写入/校验底层，须对任意 db 实例工作）
+const ALLOWLIST = new Set(['src-server/db.js', 'src-server/lib/dal.js', 'src-server/lib/migrate.js', 'src-server/lib/sql-dialect.js', 'src-server/lib/db-driver.js', 'src-server/lib/audit.js']);
 
 function walk(dir, out = []) {
   for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {

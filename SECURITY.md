@@ -33,7 +33,11 @@
 ## 安全设计基线（供参考）
 
 - 密钥与私钥不入库：`data/` 目录（含 `platform.db`、`secrets.json`）已被 `.gitignore` 排除，生产部署请显式设置 `AGENT_JWT_SECRET` 等环境变量。
-- 敏感信息只在服务端处理；对外输入经敏感词检测、输出自动脱敏。敏感值（API Key、供应商密钥、SSO 密钥等）以 AES-256-GCM 加密落库；加密密钥 `ENCRYPTION_KEY` 缺失时写入 **fail-closed 拒绝**（不再静默明文落库），并提供存量明文巡检脚本 `scripts/scan-plaintext-secrets.js`。
+- 敏感信息只在服务端处理；对外输入经敏感词检测、输出自动脱敏。敏感值（API Key、供应商密钥、SSO 密钥等）以 AES-256-GCM 加密落库，密文带 `kid` 前缀以支持密钥多版本与轮换。
+- 加密密钥管理（SEC-10）：加密密钥来源优先级 `AGENT_ENCRYPTION_KEY` 环境变量 > 文件 `<DATA_DIR>/encryption.key`（0600）> `secrets` 表（兼容旧部署）；首次启动无任何来源时生成到文件，使**加密密钥与密文不同源**。支持轮换（旧密钥置 `AGENT_ENCRYPTION_KEY_PREV`，仅用于解密，历史密文仍可解）；可用 `scripts/migrate-encryption-key.js` 把存量 DB 密钥平滑迁出到文件。加密密钥缺失时写入 **fail-closed 拒绝**（不再静默明文落库），并提供存量明文巡检脚本 `scripts/scan-plaintext-secrets.js`。
+- 审计日志防篡改（SEC-11）：`op_logs` / `security_events` 每次写入构建 SHA-256 哈希链（`prev_hash` / `record_hash`），时间统一为 UTC ISO8601；`scripts/verify-audit-chain.js` 可校验链完整性并定位被篡改行。
+- 日志落库强制脱敏（SEC-12）：审计日志写入层统一经 `lib/audit` 过 `maskSecrets` + `maskPII`，密钥 / PII 在落库前自动掩码，任何调用方（含直接 `db.prepare` 写入）都无法绕过。
+- 卡片回调验签（SEC-09）：通用 HMAC-SHA256 / 钉钉·企微 sha1 / 飞书令牌三类验签，飞书令牌用恒时比较防时序侧信道；**未配置验签材料时生产环境一律拒绝**（fail-closed，非生产放行并标注 unverified），回调端点加 IP 限流。
 - 数据库操作参数绑定，防 SQL 注入；用户输入展示转义，防 XSS。
 - 网络出口具备 SSRF 防护：统一由 `src-server/lib/ssrf-guard.js` 实现（仅允许 http(s) + 字面量/解析后 IP 的私网、环回、链路本地、云元数据黑名单 + 重定向逐跳校验）。已接入点：工具 `web_fetch`、工作流 `http_request` 节点、用户自有模型源（`usermodels`）、平台模型供应商（`providers`）、SSO 端点（`sso`）、MCP 服务 URL（`mcp`）、向量/重排网关（`retriever`）。内网地址场景需管理员显式设 `AGENT_FETCH_ALLOW_PRIVATE=1` 放行。
 - 会话安全：认证 Cookie（`ap_token`）为 HttpOnly + SameSite=Lax，生产环境强制 `Secure`；支持用户级令牌吊销（改密 / 管理员重置密码 / 停用账号即踢出该用户全部登录端）；按 IP 限流仅在配置受信代理（`AGENT_TRUST_PROXY`）后采信 `X-Forwarded-For`，默认直连以 TCP 源地址为准（防伪造 XFF 绕过爆破锁定）。

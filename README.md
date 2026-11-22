@@ -2979,4 +2979,35 @@ R5 远期生态首项。**先做 3D 资产生成与导出（新增资产类型 +
 - `npm test`：冒烟 **619/0 全绿**（+3 新增：`collectRoutes` 嵌套路由采集、`buildGlobalOpenApi` 3.1+参数+错误码+tag、版本单一来源无硬编码；并扩展 U1-8 断言——规范升级 3.1、路径 >100、两个入口路径集合一致）；双租户 E2E **26/0 全绿**。
 - 隔离实例实测：`/api/api-docs/openapi.json` 与 `/openapi/openapi.json` 均 `openapi:3.1.0`、`x-platform-version:p5.37`、`x-sdk` 完整；浏览器实测文档页 59 分组 / 436 端点链接、点开 `/api/agents` 显示 2 个操作、试调 `/api/agents` 返回 `HTTP 401 {"code":401,"msg":"未登录或登录已过期"}`（既证明试调通路，也印证 BE-B1 错误码契约），产物截图排版正常、无控制台脚本错误。
 
+## M2 对外商用功能闭环 · 批次4：安全中期专项（SEC-09~12/14）（2026-11-22）
+
+**目标**：M2 安全中期——卡片回调验签 fail-closed（SEC-09）、密钥管理规范化（SEC-10）、审计日志防篡改 + UTC（SEC-11）、日志落库强制脱敏（SEC-12）、越权与安全专项回归（SEC-14）（对应《开发计划表 v1.1》）。
+
+**SEC-09 卡片回调验签 fail-closed**
+- `lib/card-callback-verify.js`：未配置任何验签材料时，**生产环境一律拒绝**（fail-closed；`NODE_ENV=production` 或 `AGENT_ENABLE_HSTS=1` 判定为生产安全档），非生产放行并标注 `unverified`（mock/未接入期不中断链路）；逃生阀 `AGENT_CALLBACK_ALLOW_UNVERIFIED=1` 可临时放行（不推荐）。飞书 `verificationToken` 比对改用恒时比较（`safeEqualHex`）防时序侧信道。
+- `routes/channel.js`：`GET/POST /card-callback` 挂 IP 限流（60 次/分钟），防伪造/未验签回调高频尝试。
+
+**SEC-10 密钥管理规范化**
+- `lib/crypto-util.js` 重构：密钥来源优先级 `AGENT_ENCRYPTION_KEY` 环境变量 > 文件 `<DATA_DIR>/encryption.key`（0600）> `secrets` 表（兼容旧部署）；密文升级为 **`kid.iv.authTag.ciphertext` 四段**（`kid=sha256(key)` 前 8 位），解密按 `kid` 命中密钥环；支持轮换——旧密钥置 `AGENT_ENCRYPTION_KEY_PREV`（仅解密），历史密文仍可解；新增 `keyInfo()/resetKeyCache()/keyFilePath()/kidOf()/primaryKey()`。
+- `db.js`：启动期密钥初始化统一走 `keyInfo()`——**三来源皆无时生成到文件（0600）**，使加密密钥与密文不同源；存量库（`secrets` 表已有密钥）继续沿用 DB 来源，零回归。
+- `lib/secrets.js`：`ENCRYPTION_KEY` 变更后联动 `resetKeyCache()`，恢复密钥热更新（否则 60s 缓存内仍用旧钥——新引入缓存的隐藏回归，已修）。
+- `lib/apikey.js`：API Key pepper 与加密层同源（`AGENT_APIKEY_PEPPER` > 主加密密钥 env/文件/DB > `jwt_secret`），避免密钥来源漂移。
+- 新增 `scripts/migrate-encryption-key.js`：把存量 DB 密钥平滑迁出到文件（值不变 → 历史密文与 pepper 不受影响）。`scripts/scan-plaintext-secrets.js` 密文正则兼容 3/4 段。
+
+**SEC-11 审计日志防篡改 + UTC**
+- 新增 `lib/audit.js`：`installGuard(db)` 包装 `db.prepare`，凡写入 `op_logs` / `security_events` 的 INSERT 一律接管——`created_at` 统一写 **UTC ISO8601**，并写 `prev_hash`（上一行 `record_hash`，首行 GENESIS）与 `record_hash = sha256(prev_hash | 规范化JSON(实际存储行))`，构成防篡改哈希链；`verifyChain(db, table)` 重算链并定位首个被篡改行。`db.js` 装配守卫，任何调用方（含直接 `db.prepare`）无从绕过（`db.js` 自身加载期种子写入早于守卫装配，作为历史基线行跳过校验）。
+- `op_logs` / `security_events` 增 `prev_hash` / `record_hash` 列（幂等补列）；新增 `scripts/verify-audit-chain.js` 链完整性校验工具（退出码 0=完整 / 1=断裂）。
+
+**SEC-12 日志落库强制脱敏**
+- 同 `lib/audit.js` 守卫：所有字符串字段落库前统一过 `maskSecrets` + `maskPII`——密钥掩码为 `{{env.NAME}}`、PII 保留首尾打码，调用方无从绕过。
+
+**SEC-14 越权与安全专项回归 + 文档对齐**
+- `test/smoke.js` 新增「【SEC-M2】」段（9 用例）：SEC-09 fail-closed/逃生阀/HMAC/飞书恒时/限流接线；SEC-10 kid 版本化/轮换/不同源/热更新；SEC-11 建链+UTC+篡改定位+工具存在；SEC-12 密钥/PII 落库掩码；SEC-14 越权矩阵（空间/限流/SSRF/密钥/回调）。
+- `SECURITY.md` 补 SEC-09~12 声明，与实现逐条对齐。
+
+**验证（SEC-M2）**
+- `npm test`：冒烟 **628/0 全绿**（+9 新增；另修复 2 处既有断言——SEC-03 / P3-4 密文由三段改四段并校验 kid/UTC/PREV 轮换）；双租户 E2E **26/0 全绿**。
+- `npm run lint:sql`：通过（`lib/audit.js` 作为审计底层帧出口加入豁免名单，其余未超基线）。
+- 隔离生产档实例实测：`encryption.key` 落盘权限 0600、`keyInfo` 来源 `file`；生产档未验签回调 `POST /api/channel/card-callback` → **HTTP 401**（原因可检索）；运行期审计写入 `op_logs` 的 `created_at=2026-11-22T15:29:57Z`（UTC）、`scripts/verify-audit-chain.js` 校验链完整。
+
 > AI生成

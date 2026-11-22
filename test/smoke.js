@@ -4825,11 +4825,13 @@ function t(name, fn) {
       db.prepare(`DELETE FROM agent_api_keys WHERE name='SEC02a测试'`).run();
     });
     await t('SEC-03：加密往返且密文 ≠ 明文（密钥缺失 fail-closed 前置）', () => {
-      const { encrypt, decrypt } = require('../src-server/lib/crypto-util');
+      const { encrypt, decrypt, keyInfo } = require('../src-server/lib/crypto-util');
       const enc = encrypt('sk-secret-value');
       assert.ok(enc && enc !== 'sk-secret-value', '密文不应等于明文');
-      assert.ok(/^[0-9a-f]{32}\.[0-9a-f]{32}\.[0-9a-f]+$/i.test(enc), '密文为 IV.authTag.ciphertext 三段形态');
+      assert.ok(/^[0-9a-f]{8}\.[0-9a-f]{32}\.[0-9a-f]{32}\.[0-9a-f]+$/i.test(enc), '密文为 kid.iv.authTag.ciphertext 四段形态（SEC-10 版本化）');
       assert.strictEqual(decrypt(enc), 'sk-secret-value', '解密可还原明文');
+      const info = keyInfo();
+      assert.ok(info.hasPrimary && info.source !== 'none', '启动期应已就绪加密密钥（来源=' + info.source + '）');
     });
     await t('SEC-04：空间不存在 fail-closed（与 spaceFilterSql 的 SQL 语义一致）', () => {
       const { spaceVisibleTo } = require('../src-server/lib/space-utils');
@@ -4893,6 +4895,175 @@ function t(name, fn) {
       assert.strictEqual(db.prepare(`SELECT COUNT(*) c FROM token_blacklist WHERE jti='sec08-expired'`).get().c, 0, '过期条目应被清理');
       assert.strictEqual(db.prepare(`SELECT COUNT(*) c FROM token_blacklist WHERE jti='sec08-fresh'`).get().c, 1, '未过期条目应保留');
       db.prepare(`DELETE FROM token_blacklist WHERE jti='sec08-fresh'`).run();
+    });
+  }
+
+  console.log('【SEC-M2】对外商用安全中期（SEC-09~12/14 单元级验收，2026-11-22）');
+  {
+    // ---------- SEC-09 卡片回调验签 fail-closed ----------
+    await t('SEC-09：生产未配置验签材料 → 拒绝（fail-closed）；非生产放行标注；逃生阀可控', () => {
+      const { verifyCardCallback } = require('../src-server/lib/card-callback-verify');
+      const sN = process.env.NODE_ENV, sH = process.env.AGENT_ENABLE_HSTS, sA = process.env.AGENT_CALLBACK_ALLOW_UNVERIFIED;
+      try {
+        delete process.env.NODE_ENV; delete process.env.AGENT_ENABLE_HSTS; delete process.env.AGENT_CALLBACK_ALLOW_UNVERIFIED;
+        const dev = verifyCardCallback({ type: 'feishu', config: {} }, {}, {}, {});
+        assert.strictEqual(dev.ok, true, '非生产未验签应放行（不中断 mock 链路）');
+        assert.strictEqual(dev.unverified, true, '应标注 unverified');
+        process.env.NODE_ENV = 'production';
+        const prod = verifyCardCallback({ type: 'feishu', config: {} }, {}, {}, {});
+        assert.strictEqual(prod.ok, false, '生产未验签应拒绝');
+        assert.ok(/未验签|未配置/.test(prod.reason), '拒绝原因应可检索');
+        delete process.env.NODE_ENV; process.env.AGENT_ENABLE_HSTS = '1';
+        assert.strictEqual(verifyCardCallback({ type: 'feishu', config: {} }, {}, {}, {}).ok, false, 'HSTS 生产档同样拒绝');
+        process.env.NODE_ENV = 'production'; process.env.AGENT_CALLBACK_ALLOW_UNVERIFIED = '1';
+        assert.strictEqual(verifyCardCallback({ type: 'feishu', config: {} }, {}, {}, {}).ok, true, '逃生阀显式放行（不推荐）');
+      } finally {
+        if (sN === undefined) delete process.env.NODE_ENV; else process.env.NODE_ENV = sN;
+        if (sH === undefined) delete process.env.AGENT_ENABLE_HSTS; else process.env.AGENT_ENABLE_HSTS = sH;
+        if (sA === undefined) delete process.env.AGENT_CALLBACK_ALLOW_UNVERIFIED; else process.env.AGENT_CALLBACK_ALLOW_UNVERIFIED = sA;
+      }
+    });
+    await t('SEC-09：通用 HMAC 验签 + 飞书恒时令牌比对（通过 / 拒绝）', () => {
+      const { verifyCardCallback } = require('../src-server/lib/card-callback-verify');
+      const crypto = require('crypto');
+      const secret = 'sec09-callback-secret';
+      const raw = JSON.stringify({ event: 'card_action', action: 'approve' });
+      const sig = crypto.createHmac('sha256', secret).update(raw).digest('hex');
+      const ch = { type: 'custom', config: { callbackSecret: secret } };
+      assert.strictEqual(verifyCardCallback(ch, { 'x-callback-signature': sig }, raw, {}).ok, true, '正确签名放行');
+      assert.strictEqual(verifyCardCallback(ch, { 'x-callback-signature': sig }, raw + 'x', {}).ok, false, '正文被改签名应拒绝');
+      assert.strictEqual(verifyCardCallback(ch, {}, raw, {}).ok, false, '缺签名应拒绝');
+      const fch = { type: 'feishu', config: { verificationToken: 'fs-token-abc' } };
+      assert.strictEqual(verifyCardCallback(fch, {}, { token: 'fs-token-abc' }, {}).ok, true, '飞书令牌匹配放行');
+      assert.strictEqual(verifyCardCallback(fch, {}, { token: 'fs-token-wrong' }, {}).ok, false, '飞书令牌不匹配拒绝');
+    });
+    await t('SEC-09：卡片回调 GET/POST 端点均挂限流（接线断言）', () => {
+      const src = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'routes', 'channel.js'), 'utf8');
+      assert.ok(/cardCbLimit/.test(src), 'channel.js 应定义回调限流器');
+      assert.ok(/router\.post\('\/card-callback', cardCbLimit/.test(src), 'POST 回调应挂限流');
+      assert.ok(/router\.get\('\/card-callback', cardCbLimit/.test(src), 'GET 回调应挂限流');
+    });
+
+    // ---------- SEC-10 密钥管理规范 ----------
+    await t('SEC-10：密钥来源 / kid 版本化 / 预留轮换——旧密文在 PREV 存在时仍可解', () => {
+      const cu = require('../src-server/lib/crypto-util');
+      const crypto = require('crypto');
+      const sE = process.env.AGENT_ENCRYPTION_KEY, sP = process.env.AGENT_ENCRYPTION_KEY_PREV;
+      try {
+        const k1 = crypto.randomBytes(32).toString('hex');
+        process.env.AGENT_ENCRYPTION_KEY = k1; delete process.env.AGENT_ENCRYPTION_KEY_PREV; cu.resetKeyCache();
+        const i1 = cu.keyInfo();
+        assert.strictEqual(i1.source, 'env', '环境变量为最高优先级来源');
+        assert.strictEqual(i1.kid, cu.kidOf(Buffer.from(k1, 'hex')), 'kid = sha256(key) 前 8 位');
+        const enc = cu.encrypt('v1-secret');
+        assert.ok(enc.startsWith(i1.kid + '.'), '密文应以当前 kid 为前缀');
+        assert.strictEqual(cu.decrypt(enc), 'v1-secret', '往返一致');
+        const k2 = crypto.randomBytes(32).toString('hex');
+        process.env.AGENT_ENCRYPTION_KEY = k2; process.env.AGENT_ENCRYPTION_KEY_PREV = k1; cu.resetKeyCache();
+        const i2 = cu.keyInfo();
+        assert.notStrictEqual(i2.kid, i1.kid, '轮换后 kid 应变化');
+        assert.ok(i2.versions.length >= 2, '密钥环应含新旧版本');
+        assert.strictEqual(cu.decrypt(enc), 'v1-secret', '旧密钥列入 PREV 后旧密文仍可解（预留轮换）');
+        assert.ok(cu.keyFilePath().endsWith('encryption.key'), '密钥文件路径规范');
+      } finally {
+        if (sE === undefined) delete process.env.AGENT_ENCRYPTION_KEY; else process.env.AGENT_ENCRYPTION_KEY = sE;
+        if (sP === undefined) delete process.env.AGENT_ENCRYPTION_KEY_PREV; else process.env.AGENT_ENCRYPTION_KEY_PREV = sP;
+        cu.resetKeyCache();
+      }
+    });
+    await t('SEC-10：密钥与密文不同源——文件密钥落 0600、密钥不入库、变更即刻热更新', () => {
+      const cu = require('../src-server/lib/crypto-util');
+      const { upsert, invalidate } = require('../src-server/lib/secrets');
+      const fsx = require('fs');
+      const kf = cu.keyFilePath();
+      assert.ok(fsx.existsSync(kf), '测试库启动应生成文件密钥：' + kf);
+      assert.strictEqual(fsx.statSync(kf).mode & 0o777, 0o600, '密钥文件权限应为 0600');
+      assert.strictEqual(db.prepare("SELECT COUNT(*) c FROM secrets WHERE name='ENCRYPTION_KEY'").get().c, 0, '密钥不应存 secrets 表（与密文不同源）');
+      // 热更新：DB 密钥变更后 crypto 缓存应立即失效（secrets.upsert → resetKeyCache 联动）
+      const savedFile = fsx.readFileSync(kf, 'utf8');
+      const k = require('crypto').randomBytes(32).toString('hex');
+      const sE = process.env.AGENT_ENCRYPTION_KEY;
+      try {
+        delete process.env.AGENT_ENCRYPTION_KEY;
+        fsx.unlinkSync(kf); // 移除文件来源，令 DB 成为主来源（验证 DB 变更热更新 + resetKeyCache 联动）
+        upsert('ENCRYPTION_KEY', k, 'SEC-10 热更新');
+        assert.strictEqual(cu.keyInfo().source, 'db', '移除文件后来源应回落 DB');
+        assert.strictEqual(cu.keyInfo().kid, cu.kidOf(Buffer.from(k, 'hex')), 'DB 密钥变更后应立即生效（缓存已失效）');
+      } finally {
+        if (sE === undefined) delete process.env.AGENT_ENCRYPTION_KEY; else process.env.AGENT_ENCRYPTION_KEY = sE;
+        db.prepare("DELETE FROM secrets WHERE name='ENCRYPTION_KEY'").run();
+        fsx.writeFileSync(kf, savedFile, { mode: 0o600 });
+        try { fsx.chmodSync(kf, 0o600); } catch { /* 忽略 */ }
+        invalidate(); cu.resetKeyCache();
+      }
+    });
+
+    // ---------- SEC-11 审计日志防篡改 + UTC ----------
+    await t('SEC-11：审计写入即建哈希链 + created_at 归 UTC ISO8601', () => {
+      const Database = require('better-sqlite3');
+      const { installGuard, verifyChain } = require('../src-server/lib/audit');
+      const tmp = new Database(':memory:');
+      tmp.exec("CREATE TABLE op_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, action TEXT, detail TEXT, ip TEXT, created_at TEXT, prev_hash TEXT DEFAULT '', record_hash TEXT DEFAULT '')");
+      installGuard(tmp);
+      tmp.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)').run('u1', '动1', '明细1', '1.1.1.1', '2020-01-01 00:00:00');
+      tmp.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)').run('u2', '动2', '明细2', '2.2.2.2', '2020-01-01 00:00:00');
+      const rows = tmp.prepare('SELECT id,created_at,prev_hash,record_hash FROM op_logs ORDER BY id').all();
+      assert.strictEqual(rows.length, 2, '两行均已插入');
+      assert.ok(rows[0].record_hash && rows[1].record_hash, '均写入 record_hash');
+      assert.ok(/Z$/.test(rows[0].created_at), 'created_at 应为 UTC ISO8601（Z 结尾），覆盖传入的 localtime');
+      assert.strictEqual(rows[1].prev_hash, rows[0].record_hash, '第二行 prev_hash 应指向首行 record_hash');
+      assert.strictEqual(verifyChain(tmp, 'op_logs').ok, true, '链应完整');
+      tmp.prepare('UPDATE op_logs SET detail=? WHERE id=?').run('被篡改', rows[0].id);
+      const r2 = verifyChain(tmp, 'op_logs');
+      assert.strictEqual(r2.ok, false, '篡改后链应断裂');
+      assert.strictEqual(r2.brokenAt, rows[0].id, '应定位到被篡改行');
+      tmp.close();
+    });
+    await t('SEC-11：哈希链校验工具存在（scripts/verify-audit-chain.js）', () => {
+      assert.ok(fs.existsSync(path.join(__dirname, '..', 'scripts', 'verify-audit-chain.js')), '应有链校验工具');
+    });
+
+    // ---------- SEC-12 日志落库强制脱敏 ----------
+    await t('SEC-12：日志写入层强制脱敏——密钥/PII 落库前自动掩码（调用方无从绕过）', () => {
+      const { upsert } = require('../src-server/lib/secrets');
+      const secretVal = 'sk-live-ABCDEFGHIJKLMNOP-987654';
+      upsert('SEC12_LOGSECRET', secretVal, 'SEC-12 测试');
+      // 直接 db.prepare 写入（模拟任意调用方），应由守卫强制脱敏
+      db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
+        .run('sec12u', '日志脱敏', 'Authorization: ' + secretVal + ' 联系 13800138000', '127.0.0.1', new Date().toISOString());
+      const row = db.prepare("SELECT detail FROM op_logs WHERE username='sec12u'").get();
+      assert.ok(!row.detail.includes(secretVal), '密钥明文不得落库');
+      assert.ok(row.detail.includes('{{env.SEC12_LOGSECRET}}'), '密钥应掩码为 {{env.NAME}}');
+      assert.ok(!row.detail.includes('13800138000'), '手机号不得明文落库');
+      assert.ok(row.detail.includes('138') && row.detail.includes('8000'), 'PII 应保留首尾打码（138****8000）');
+      db.prepare("DELETE FROM op_logs WHERE username='sec12u'").run();
+      upsert('SEC12_LOGSECRET', '', 'SEC-12 清理');
+    });
+
+    // ---------- SEC-14 越权与安全专项回归 ----------
+    await t('SEC-14：越权/绕过防护矩阵（空间 / 限流 / SSRF / 密钥 / 回调逐项 fail-closed）', () => {
+      const { spaceVisibleTo } = require('../src-server/lib/space-utils');
+      assert.strictEqual(spaceVisibleTo(db, 987654321, 'nobody'), false, '不存在的空间 → 非属主不可见');
+      const { clientIp, trustHops } = require('../src-server/lib/rate-limit');
+      const sT = process.env.AGENT_TRUST_PROXY;
+      try {
+        delete process.env.AGENT_TRUST_PROXY;
+        assert.strictEqual(trustHops(), 0, '默认不信任代理');
+        assert.strictEqual(clientIp({ headers: { 'x-forwarded-for': '9.9.9.9' }, socket: { remoteAddress: '127.0.0.1' }, ip: '127.0.0.1' }), '127.0.0.1', '默认忽略伪造 XFF（防限流绕过）');
+      } finally { if (sT === undefined) delete process.env.AGENT_TRUST_PROXY; else process.env.AGENT_TRUST_PROXY = sT; }
+      const { ipIsPrivate } = require('../src-server/lib/ssrf-guard');
+      for (const ip of ['127.0.0.1', '169.254.169.254', '10.0.0.1', '192.168.1.1']) assert.strictEqual(ipIsPrivate(ip), true, ip + ' 应拒绝');
+      const { hashKey, looksHashed, maskPrefix } = require('../src-server/lib/apikey');
+      assert.ok(looksHashed(hashKey('sk-x')) && !maskPrefix('sk-1234567890ab').includes('567890'), '对外密钥哈希存储 + 掩码不含中段');
+      const { verifyCardCallback } = require('../src-server/lib/card-callback-verify');
+      const sN = process.env.NODE_ENV, sA = process.env.AGENT_CALLBACK_ALLOW_UNVERIFIED;
+      try {
+        process.env.NODE_ENV = 'production'; delete process.env.AGENT_CALLBACK_ALLOW_UNVERIFIED;
+        assert.strictEqual(verifyCardCallback({ type: 'feishu', config: {} }, {}, {}, {}).ok, false, '生产未验签回调拒绝');
+      } finally {
+        if (sN === undefined) delete process.env.NODE_ENV; else process.env.NODE_ENV = sN;
+        if (sA === undefined) delete process.env.AGENT_CALLBACK_ALLOW_UNVERIFIED; else process.env.AGENT_CALLBACK_ALLOW_UNVERIFIED = sA;
+      }
     });
   }
 
@@ -5814,31 +5985,32 @@ function t(name, fn) {
       assert.deepStrictEqual(g, { sources: ['world', 'fixed'] }, 'aggregator 应逐项渲染 sources');
     });
     await t('P3-4：decrypt 密钥轮换后返回空串（不得把密文当明文外发）+ 旧明文兼容', async () => {
-      const { encrypt, decrypt } = require('../src-server/lib/crypto-util');
-      const { upsert } = require('../src-server/lib/secrets');
+      const cu = require('../src-server/lib/crypto-util');
       const crypto = require('crypto');
-      // 保存原密钥状态（P1-4：启动自动初始化，正常应已存在）
-      const orig = db.prepare("SELECT value FROM secrets WHERE name='ENCRYPTION_KEY'").pluck().get();
+      const savedEnv = process.env.AGENT_ENCRYPTION_KEY, savedPrev = process.env.AGENT_ENCRYPTION_KEY_PREV;
       try {
+        // SEC-10：密钥来源含环境变量，轮换以 env + resetKeyCache 演示（file > db 之外的最高优先级来源）
         const k1 = crypto.randomBytes(32).toString('hex');
-        upsert('ENCRYPTION_KEY', k1, 'P3-4 回归');
-        const enc = encrypt('P3-4-secret-明文-value');
-        // 加密形态生效（三段 hex）且往返一致
-        assert.ok(/^[0-9a-f]{32}\.[0-9a-f]{32}\.[0-9a-f]+$/i.test(enc), 'encrypt 应产出 IV.tag.cipher 三段 hex 形态');
-        assert.strictEqual(decrypt(enc), 'P3-4-secret-明文-value', '正确密钥下往返应得原文');
+        process.env.AGENT_ENCRYPTION_KEY = k1; delete process.env.AGENT_ENCRYPTION_KEY_PREV; cu.resetKeyCache();
+        const enc = cu.encrypt('P3-4-secret-明文-value');
+        // 加密形态生效（kid.iv.tag.cipher 四段 hex）且往返一致
+        assert.ok(/^[0-9a-f]{8}\.[0-9a-f]{32}\.[0-9a-f]{32}\.[0-9a-f]+$/i.test(enc), 'encrypt 应产出 kid.iv.tag.cipher 四段 hex 形态（SEC-10）');
+        assert.strictEqual(cu.decrypt(enc), 'P3-4-secret-明文-value', '正确密钥下往返应得原文');
         // 密钥轮换：同密文换钥解密 → 必须返回空串（原实现返回密文串，会被当明文 API Key 发给上游）
         const k2 = crypto.randomBytes(32).toString('hex');
-        upsert('ENCRYPTION_KEY', k2, 'P3-4 回归-轮换');
-        const wrong = decrypt(enc);
-        assert.strictEqual(wrong, '', '密钥不匹配时应返回空串，而不是把密文串当明文返回');
+        process.env.AGENT_ENCRYPTION_KEY = k2; delete process.env.AGENT_ENCRYPTION_KEY_PREV; cu.resetKeyCache();
+        assert.strictEqual(cu.decrypt(enc), '', '密钥不匹配时应返回空串，而不是把密文串当明文返回');
+        // SEC-10 预留轮换：旧密钥列入 AGENT_ENCRYPTION_KEY_PREV → 旧密文仍可解
+        process.env.AGENT_ENCRYPTION_KEY = k2; process.env.AGENT_ENCRYPTION_KEY_PREV = k1; cu.resetKeyCache();
+        assert.strictEqual(cu.decrypt(enc), 'P3-4-secret-明文-value', '旧密钥列入 PREV 时旧密文应可解（预留轮换）');
         // 旧明文兼容：形态不像密文的值原样返回（历史明文数据不破坏）
-        assert.strictEqual(decrypt('legacy-plain-key'), 'legacy-plain-key', '旧明文应原样返回');
-        assert.strictEqual(decrypt('a.b.c'), 'a.b.c', '三点分隔但非密文形态（前两段非 32hex）应按旧明文返回');
-        assert.strictEqual(decrypt(''), '', '空值应返回空串');
+        assert.strictEqual(cu.decrypt('legacy-plain-key'), 'legacy-plain-key', '旧明文应原样返回');
+        assert.strictEqual(cu.decrypt('a.b.c'), 'a.b.c', '三点分隔但非密文形态应按旧明文返回');
+        assert.strictEqual(cu.decrypt(''), '', '空值应返回空串');
       } finally {
-        // 还原密钥状态，避免污染后续用例
-        if (orig) upsert('ENCRYPTION_KEY', orig, 'P3-4 回归-还原');
-        else db.prepare("DELETE FROM secrets WHERE name='ENCRYPTION_KEY'").run();
+        if (savedEnv === undefined) delete process.env.AGENT_ENCRYPTION_KEY; else process.env.AGENT_ENCRYPTION_KEY = savedEnv;
+        if (savedPrev === undefined) delete process.env.AGENT_ENCRYPTION_KEY_PREV; else process.env.AGENT_ENCRYPTION_KEY_PREV = savedPrev;
+        cu.resetKeyCache();
       }
     });
     await t('P3-5：视频任务归属记忆 + 轮询/拉内容端点归属校验接线', () => {
