@@ -34,6 +34,7 @@ const routes = {
   '/admin/dashboard': { page: () => import('./admin/dashboard.js'), layout: 'admin', title: '数据看板', admin: true },
   '/admin/agents': { page: () => import('./admin/agents.js'), layout: 'admin', title: '智能体管理', admin: true },
   '/admin/users': { page: () => import('./admin/users.js'), layout: 'admin', title: '用户管理', admin: true },
+  '/admin/tenants': { page: () => import('./admin/tenants.js'), layout: 'admin', title: '租户与平台运维', admin: true }, // MT-09/10 平台超管专属
   '/admin/departments': { page: () => import('./admin/departments.js'), layout: 'admin', title: '组织架构', admin: true }, // P0-3b 组织架构管理页
   '/admin/sso': { page: () => import('./admin/sso.js'), layout: 'admin', title: 'SSO 企业登录', admin: true }, // P1-1b SSO 配置页
   '/admin/studio': { page: () => import('./admin/studio.js'), layout: 'none', title: '智能体编排' }, // P3：协作者（非管理员）可进入，页面内经详情接口鉴权
@@ -78,6 +79,7 @@ const adminNav = [
   { href: '#/admin/dashboard', ic: '📊', label: '数据看板' },
   { href: '#/admin/agents', ic: '🤖', label: '智能体管理' },
   { href: '#/admin/users', ic: '👥', label: '用户管理' },
+  { href: '#/admin/tenants', ic: '🏢', label: '租户与平台运维', pa: true }, // MT-09/10 仅平台超管可见
   { href: '#/admin/departments', ic: '🏢', label: '组织架构' },
   { href: '#/admin/sso', ic: '🔐', label: 'SSO 企业登录' },
   { href: '#/admin/knowledge', ic: '📚', label: '知识库管理' },
@@ -103,7 +105,8 @@ const adminNav = [
 ];
 
 function renderNav(list, currentPath) {
-  return list.map(n => `<a class="nav-item ${currentPath.startsWith(n.href.slice(1)) ? 'active' : ''}" href="${n.href}"><i class="ic">${n.ic}</i>${t(n.label)}</a>`).join('');
+  const u = getUser() || {};
+  return list.filter(n => !n.pa || u.platform_admin).map(n => `<a class="nav-item ${currentPath.startsWith(n.href.slice(1)) ? 'active' : ''}" href="${n.href}"><i class="ic">${n.ic}</i>${t(n.label)}</a>`).join('');
 }
 
 /** 语言切换按钮（顶栏与对话页侧栏共用） */

@@ -81,15 +81,24 @@ router.post('/login', loginLimiter, async (req, res) => {
     if (lockAfter.locked) return res.json({ code: 401, msg: lockAfter.msg });
     return res.json({ code: 401, msg: lock.remaining > 0 ? `账号或密码错误（还剩 ${lock.remaining - 1} 次尝试机会）` : '账号或密码错误' });
   }
+  // MT-10（2026-11-22）：租户停用拦截——停用租户下全部账号一律拒绝登录（fail-closed）
+  const utid = user.tenant_id || 1;
+  const tenant = db.prepare('SELECT status FROM tenants WHERE id=?').get(utid);
+  if (tenant && tenant.status === 'disabled') {
+    db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
+      .run(username, '登录失败', `租户 #${utid} 已停用`, ip, now());
+    return res.json({ code: 403, msg: '所属租户已停用，请联系平台管理员' });
+  }
   // 登录成功：清除失败计数
   clearLoginAttempts(username);
   // 旧 SALT 密码平滑迁移：登录成功即重写为新 SALT 哈希（一次性，用户无感）
   if (v.legacy) db.prepare('UPDATE users SET password=? WHERE id=?').run(await hashPwdAsync(password), user.id);
-  const token = sign({ uid: user.id, exp: Date.now() + TOKEN_TTL_MS, tv: user.token_version || 0 });
+  // MT-08：token 内嵌 tenant_id claim（多租户解析的次要来源，服务端 users.tenant_id 仍为权威）
+  const token = sign({ uid: user.id, exp: Date.now() + TOKEN_TTL_MS, tv: user.token_version || 0, tenant_id: utid });
   db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
     .run(user.username, '登录系统', '密码登录成功', ip, now());
   setAuthCookie(res, token); // P2-3：HttpOnly Cookie 签发（token 不再依赖前端 storage 持久化）
-  res.json({ code: 0, data: { token, user: { id: user.id, username: user.username, nickname: user.nickname, role: user.role, dept: user.dept, onboarded: user.onboarded ? 1 : 0 }, must_change_pwd: user.must_change_pwd ? 1 : 0 } });
+  res.json({ code: 0, data: { token, user: { id: user.id, username: user.username, nickname: user.nickname, role: user.role, dept: user.dept, onboarded: user.onboarded ? 1 : 0, tenant_id: utid, platform_admin: user.platform_admin ? 1 : 0 }, must_change_pwd: user.must_change_pwd ? 1 : 0 } });
 });
 
 router.get('/me', auth, (req, res) => res.json({ code: 0, data: req.user }));

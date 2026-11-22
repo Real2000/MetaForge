@@ -2904,4 +2904,22 @@ R5 远期生态首项。**先做 3D 资产生成与导出（新增资产类型 +
 - BE-C2 的 `PRAGMA`/`AUTOINCREMENT`/`lastInsertRowid` 多在框架与 DDL 层，属「收敛抽象」而非清零；`INSERT OR REPLACE` 因缺冲突目标仍显式告警。
 - BE-C1 的 `q/getq/runq` 已具备方言能力，但尚未替换全部路由裸查。
 
+## M2 对外商用功能闭环 · 批次1：租户账号/开通/运维台（2026-11-22）
+
+**目标**：M2 商用地基——账号角色分层、租户开通闭环、平台超管跨租户运维（对应《开发计划表 v1.1》MT-08/MT-09/MT-10）。
+
+**交付**
+- **MT-08 账号/角色分层**：`users` 新增 `platform_admin` 标记（迁移 **113**，回填 AGENT_PLATFORM_ADMINS 清单账号）；`lib/auth.js` 拆分 `adminOnly`（租户管理员·域内）与 `platformAdminOnly`（平台超管·跨租户），`isPlatformSuperadmin` 以 DB 标记为准、配置清单兜底；`req.user` 补 `tenant_id/platform_admin`；`routes/users.js` 全面租户域内收敛——租户管理员仅见/可管本租户用户，平台超管可跨租户（`?tenant_id=` 过滤）并授予平台超管；防锁死护栏升级为「本租户至少一名管理员 + 平台至少一名超管」；登录 token 内嵌 `tenant_id` claim。
+- **MT-10 租户开通闭环**：新增 `lib/tenant.js`（`createTenant` 建租户 + 派生首个管理员·事务回滚 / `setTenantStatus` 启停 + 踢出在线会话 / 列表统计）与 `routes/tenants.js`（平台超管专属：列表/详情/开通/启停，写操作落 `op_logs`）；`tenants` 补 `admin_username/note`（迁移 **114**）；登录新增「租户停用即拒登」fail-closed。
+- **MT-09 平台超管跨租户运维台**：新增 `routes/platform-admin.js`（跨租户只读统计 / 带审计 impersonation 签发 30 分钟短时令牌·须 `confirm=true` / 租户成员只读 / 审计查询），全部跨租户动作落 `security_events`。
+- **前端**：新增后台页 `public/js/admin/tenants.js`「租户与平台运维」（平台超管专属，导航项按 `platform_admin` 过滤）；`public/sw.js` bump `m2-v1`。
+
+**验证**
+- `npm test`：冒烟 **604/0 全绿**（600 基线 + 4 新增：`isPlatformSuperadmin` / `createTenant` / 入参校验 / 停用踢会话）+ 双租户 E2E **19/0 全绿**（13 基线 + 6 新增：平台超管登录标记 / 开通租户 / 重名拒绝 / 租户管理员域内隔离 / impersonation + 未确认拒绝 / 停用拒登+旧令牌失效）。
+- 隔离实例（多租户 + 单租户双模式）HTTP 实测 + Playwright 端到端：admin 平台超管可见导航并进页 → UI 开通「星辰科技」（派生 xadm）→ 列表/审计表渲染正确 → 停用/启用切换 → 租户成员借用登录（审计落 `impersonation`）→ 控制台 0 业务错误；单租户模式（生产默认）零回归。
+
+**已知边界（M2 后续批次）**
+- 本批为 M2 商用地基；**MT-11 配额账单 / MT-12 密钥隔离 / MT-13 支付订阅 / BE-B1 响应契约 / BE-B3 限流配额 / BE-B4 OpenAPI / SEC-09~12/14** 待在后续批次交付。
+- impersonation 令牌经剪贴板交付（运维排障用，非对外接口）；B 端「单点登录式」切换台未做。
+
 > AI生成

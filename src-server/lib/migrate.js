@@ -485,7 +485,7 @@ const ALL_MIGRATIONS = [
   { id: 112, name: 'spaces.owner 昵称归一化为 username', up: (ctx) => {
     // 依据 users 的 nickname→username 映射，将 spaces.owner 中的昵称改写为用户名。
     // 若某昵称与任何用户名冲突，跳过以避免误改；已是用户名的值不变。
-    const users = ctx.db.prepare('SELECT username, nickname FROM users').all();
+     const users = ctx.db.prepare('SELECT username, nickname FROM users').all();
     const usernames = new Set(users.map(u => u.username));
     let n = 0;
     for (const u of users) {
@@ -493,6 +493,22 @@ const ALL_MIGRATIONS = [
       n += ctx.db.prepare('UPDATE spaces SET owner=? WHERE owner=?').run(u.username, u.nickname).changes;
     }
     if (n) console.log(`[migrate] spaces.owner 昵称归一化 ${n} 行`);
+  } },
+  // MT-08（2026-11-22）：账号/角色分层——新增平台超管标记列。
+  //   platform_admin=1 → 平台超管（全局免隔离，可跨租户运维）；role='admin' 且非平台超管 → 租户管理员（域内）。
+  //   回填：AGENT_PLATFORM_ADMINS 清单（默认 admin）中且当前为 admin 的账号标为平台超管。
+  { id: 113, name: 'users.platform_admin - 平台超管标记（MT-08）', up: (ctx) => {
+    ctx.addColumn('users', 'platform_admin', 'INTEGER DEFAULT 0');
+    const names = String(process.env.AGENT_PLATFORM_ADMINS || 'admin').split(',').map(s => s.trim()).filter(Boolean);
+    if (!names.length) return;
+    const ph = names.map(() => '?').join(',');
+    const n = ctx.db.prepare(`UPDATE users SET platform_admin=1 WHERE role='admin' AND username IN (${ph}) AND COALESCE(platform_admin,0)=0`).run(...names).changes;
+    if (n) console.log(`[migrate] 平台超管标记回填 ${n} 个账号`);
+  } },
+  // MT-10（2026-11-22）：租户表补运营字段——开通时记录首个管理员与备注，便于运维台回显。
+  { id: 114, name: 'tenants 补 admin_username/note（MT-10）', up: (ctx) => {
+    ctx.addColumn('tenants', 'admin_username', "TEXT DEFAULT ''");
+    ctx.addColumn('tenants', 'note', "TEXT DEFAULT ''");
   } },
 ];
 

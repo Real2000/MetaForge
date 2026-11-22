@@ -11,7 +11,7 @@
  *   （即任何会被 STATIC_CACHE 缓存的资源变更），发版前必须 bump SW_VERSION，否则用户端拿旧缓存。
  * 提交前自检：git diff --name-only HEAD~1 | grep -E '^public/(js|css|vendor|sw\.js|index\.html)' 命中则必须改本常量。
  */
-const SW_VERSION = 'm0-v2'; // 2026-11-22 bump：M0 安全止血（admin/agents.js 密钥掩码 + loadKeys 作用域修复、admin/mcp.js 令牌绑定）
+const SW_VERSION = 'm2-v1'; // 2026-11-22 bump：M2 商用闭环批次1——新增「租户与平台运维」后台页（MT-09/10）+ 平台超管导航过滤
 const STATIC_CACHE = `ap-static-${SW_VERSION}`;
 const NEVER_CACHE = [/^\/api\//, /\/sse/, /\/stream/, /\/files\/download/, /\?[^\s]*download/];
 

@@ -171,6 +171,10 @@ app.use('/api/skills-market', require('./src-server/routes/skills-market'));
 app.use('/api/edition', require('./src-server/routes/edition'));
 // 用户管理：管理员对用户的增删改查/角色管理/重置密码/启停
 app.use('/api/users', require('./src-server/routes/users'));
+// MT-10 租户开通闭环（2026-11-22）：平台超管开通/停用租户（建租户 + 派生首个管理员）
+app.use('/api/tenants', require('./src-server/routes/tenants'));
+// MT-09 平台超管跨租户运维台（2026-11-22）：跨租户只读统计 / 带审计 impersonation / 审计查询
+app.use('/api/platform-admin', require('./src-server/routes/platform-admin'));
 // 意见反馈（帮助体系）：全站反馈通道 + 管理员闭环处理（站内信回告提交者）
 app.use('/api/feedback', require('./src-server/routes/feedback'));
 // P5.27 本地桥（桌面操控客户端服务）：设备配对 + 任务队列（轮询模式，桥端 device_token 鉴权）

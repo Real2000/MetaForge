@@ -134,6 +134,68 @@ function t(name, fn) {
       const r = await fetch(origin + '/api/agents', { headers: { 'X-Tenant-Id': '2' } });
       assert.strictEqual(r.status, 401, `带租户头未认证应 401，实际 ${r.status}`);
     });
+
+    // ---------- 7. MT-08/09/10 租户商用闭环 ----------
+    const login = async (username, password) => {
+      const r = await fetch(origin + '/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password }) });
+      return r.json();
+    };
+    const jpost = async (url, token, body) => (await fetch(origin + url, { method: 'POST', headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}) }, body: JSON.stringify(body || {}) })).json();
+    let adminTok = '';
+
+    await t('MT-08：平台超管登录返回 tenant_id 与 platform_admin 标记', async () => {
+      const j = await login('admin', 'admin123');
+      assert.strictEqual(j.code, 0, JSON.stringify(j));
+      assert.strictEqual(j.data.user.platform_admin, 1, 'admin 应为平台超管');
+      assert.strictEqual(j.data.user.tenant_id, 1);
+      adminTok = j.data.token;
+    });
+
+    await t('MT-10：平台超管开通租户并派生首个管理员', async () => {
+      const j = await jpost('/api/tenants', adminTok, { name: 'E2E客户X', plan: 'pro', adminUsername: 'e2eadm', adminPassword: 'E2e@2026' });
+      assert.strictEqual(j.code, 0, JSON.stringify(j));
+      const list = await (await fetch(origin + '/api/tenants', { headers: { Authorization: 'Bearer ' + adminTok } })).json();
+      assert.ok(list.data.some(x => x.name === 'E2E客户X'), '新租户应出现在列表');
+    });
+
+    await t('MT-10：重名开通被拒（用户名全局唯一）', async () => {
+      const j = await jpost('/api/tenants', adminTok, { name: 'X2', adminUsername: 'e2eadm', adminPassword: 'E2e@2026' });
+      assert.strictEqual(j.code, 400, JSON.stringify(j));
+    });
+
+    await t('MT-08：租户管理员仅见本租户用户、无权访问租户本体', async () => {
+      const j = await login('e2eadm', 'E2e@2026');
+      assert.strictEqual(j.code, 0, JSON.stringify(j));
+      assert.strictEqual(j.data.user.tenant_id, 2, '派生管理员应属新租户');
+      assert.strictEqual(j.data.user.platform_admin, 0, '派生管理员非平台超管');
+      const btok = j.data.token;
+      const uj = await (await fetch(origin + '/api/users', { headers: { Authorization: 'Bearer ' + btok } })).json();
+      assert.ok(uj.data.length >= 1 && uj.data.every(u => u.tenant_id === 2), '应仅见本租户用户：' + JSON.stringify(uj.data.map(u => u.username)));
+      const tr = await fetch(origin + '/api/tenants', { headers: { Authorization: 'Bearer ' + btok } });
+      assert.strictEqual(tr.status, 403, '租户管理员访问租户列表应 403');
+    });
+
+    await t('MT-09：平台超管跨租户借用（impersonation）签发可用令牌；未确认被拒', async () => {
+      const uj = await (await fetch(origin + '/api/users?tenant_id=2', { headers: { Authorization: 'Bearer ' + adminTok } })).json();
+      const target = uj.data.find(u => u.username === 'e2eadm');
+      assert.ok(target, '应能跨租户检索到目标用户');
+      const noConfirm = await jpost('/api/platform-admin/impersonate', adminTok, { user_id: target.id });
+      assert.strictEqual(noConfirm.code, 400, '未 confirm 应被拒');
+      const j = await jpost('/api/platform-admin/impersonate', adminTok, { user_id: target.id, confirm: true });
+      assert.strictEqual(j.code, 0, JSON.stringify(j));
+      const mj = await (await fetch(origin + '/api/auth/me', { headers: { Authorization: 'Bearer ' + j.data.token } })).json();
+      assert.strictEqual(mj.data.username, 'e2eadm', '借用令牌应以目标用户身份生效');
+    });
+
+    await t('MT-10：停用租户后其账号登录被拒、旧令牌失效', async () => {
+      const btok = (await login('e2eadm', 'E2e@2026')).data.token;
+      const r = await fetch(origin + '/api/tenants/2/status', { method: 'PUT', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + adminTok }, body: JSON.stringify({ status: 'disabled' }) });
+      assert.strictEqual((await r.json()).code, 0);
+      const blocked = await login('e2eadm', 'E2e@2026');
+      assert.strictEqual(blocked.code, 403, '停用租户登录应 403：' + JSON.stringify(blocked));
+      const me = await fetch(origin + '/api/auth/me', { headers: { Authorization: 'Bearer ' + btok } });
+      assert.strictEqual(me.status, 401, '停用后旧令牌应失效');
+    });
   } finally {
     child.kill('SIGTERM');
     await new Promise(r => setTimeout(r, 300));

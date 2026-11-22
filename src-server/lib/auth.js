@@ -120,13 +120,20 @@ function auth(req, res, next) {
   if (!payload) return res.status(401).json({ code: 401, msg: '未登录或登录已过期' });
   // P0-3 收尾 2026-10-30：SELECT 补 dept_id——此前缺该字段导致 req.user.dept_id 恒 undefined，
   // visible_depts 纯数字 ID 模式在 HTTP 链路判定空转（部门树勾选保存正常但部门用户实际看不到智能体）
-  const user = db.prepare('SELECT id, username, nickname, role, dept, dept_id, onboarded FROM users WHERE id=? AND status=1').get(payload.uid);
+  const user = db.prepare('SELECT id, username, nickname, role, dept, dept_id, onboarded, tenant_id, COALESCE(platform_admin,0) AS platform_admin FROM users WHERE id=? AND status=1').get(payload.uid);
   if (!user) return res.status(401).json({ code: 401, msg: '账号不可用' });
   req.user = user;
   next();
 }
+// MT-08（2026-11-22）账号/角色分层：adminOnly 语义拆分。
+//   - adminOnly / tenantAdminOnly：租户管理员（role='admin'），仅在本人租户域内管理（默认，绝大多数后台路由沿用）。
+//   - platformAdminOnly：平台超管（platform_admin=1 或配置清单命中），可跨租户运维（平台级敏感操作）。
 function adminOnly(req, res, next) {
   if (req.user.role !== 'admin') return res.status(403).json({ code: 403, msg: '需要管理员权限' });
+  next();
+}
+function platformAdminOnly(req, res, next) {
+  if (!isPlatformSuperadmin(req.user)) return res.status(403).json({ code: 403, msg: '需要平台超管权限' });
   next();
 }
 /** P0-4 token 吊销：将当前请求携带的 token 加入黑名单（P2-3：双通道取 token——
@@ -175,9 +182,11 @@ const MULTI_TENANT = ['1', 'true', 'yes', 'on'].includes(String(process.env.AGEN
 const PLATFORM_ADMINS = String(process.env.AGENT_PLATFORM_ADMINS || 'admin').split(',').map(s => s.trim()).filter(Boolean);
 const DEFAULT_TENANT_ID = 1;
 
-/** 是否平台超管（role=admin 且在平台超管清单内） */
+/** 是否平台超管：platform_admin=1（DB 权威），或（向后兼容）role=admin 且用户名命中 AGENT_PLATFORM_ADMINS 清单 */
 function isPlatformSuperadmin(user) {
-  return !!(user && user.role === 'admin' && PLATFORM_ADMINS.includes(user.username));
+  if (!user) return false;
+  if (Number(user.platform_admin) === 1) return true;
+  return !!(user.role === 'admin' && PLATFORM_ADMINS.includes(user.username));
 }
 
 /** 从请求解析租户 ID（不读 DB 用户，仅取 JWT/头/子域） */
@@ -257,4 +266,4 @@ function tenantContext(req, res, next) {
   return next();
 }
 
-module.exports = { sign, verify, auth, adminOnly, revokeToken, bumpTokenVersion, cleanBlacklist, tenantContext, isPlatformSuperadmin, MULTI_TENANT, TOKEN_TTL_MS, readToken, setAuthCookie, clearAuthCookie };
+module.exports = { sign, verify, auth, adminOnly, platformAdminOnly, tenantAdminOnly: adminOnly, revokeToken, bumpTokenVersion, cleanBlacklist, tenantContext, isPlatformSuperadmin, MULTI_TENANT, TOKEN_TTL_MS, readToken, setAuthCookie, clearAuthCookie, PLATFORM_ADMINS, DEFAULT_TENANT_ID };

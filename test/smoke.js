@@ -9954,6 +9954,38 @@ print('PY_OK')
     });
   }
 
+  console.log('【MT-08/10】账号角色分层与租户开通闭环');
+  const tenantLib = require('../src-server/lib/tenant');
+  const authLib = require('../src-server/lib/auth');
+  await t('MT-08：isPlatformSuperadmin 识别 platform_admin=1 或配置清单', () => {
+    assert.strictEqual(authLib.isPlatformSuperadmin({ role: 'admin', username: 'admin', platform_admin: 1 }), true);
+    assert.strictEqual(authLib.isPlatformSuperadmin({ role: 'admin', username: 'admin', platform_admin: 0 }), true); // 名单兜底
+    assert.strictEqual(authLib.isPlatformSuperadmin({ role: 'user', username: 'admin', platform_admin: 0 }), false);
+    assert.strictEqual(authLib.isPlatformSuperadmin({ role: 'admin', username: 'other', platform_admin: 0 }), false);
+  });
+  await t('MT-10：createTenant 建租户 + 派生管理员（username 全局唯一、非平台超管）', () => {
+    const r = tenantLib.createTenant({ name: 'S客户', adminUsername: 'sadm', adminPassword: 'Sadm@2026' });
+    assert.strictEqual(r.ok, true, JSON.stringify(r));
+    const tn = tenantLib.getTenant(r.tenantId);
+    assert.strictEqual(tn.status, 'active');
+    const u = db.prepare('SELECT role, tenant_id, platform_admin FROM users WHERE username=?').get('sadm');
+    assert.strictEqual(u.role, 'admin'); assert.strictEqual(u.tenant_id, r.tenantId); assert.strictEqual(u.platform_admin, 0);
+  });
+  await t('MT-10：非法入参被拒（空名 / 弱口令 / 用户名重名）', () => {
+    assert.strictEqual(tenantLib.createTenant({ name: '', adminUsername: 'x1', adminPassword: 'abcd1234' }).ok, false);
+    assert.strictEqual(tenantLib.createTenant({ name: 'Y', adminUsername: 'yadm', adminPassword: '123456' }).ok, false);
+    assert.strictEqual(tenantLib.createTenant({ name: 'Z', adminUsername: 'sadm', adminPassword: 'Zadm@2026' }).ok, false);
+  });
+  await t('MT-10：停用租户踢出在线会话；默认租户不可停用', () => {
+    const r = tenantLib.createTenant({ name: 'D客户', adminUsername: 'dadm', adminPassword: 'Dadm@2026' });
+    const before = db.prepare('SELECT token_version FROM users WHERE username=?').get('dadm').token_version || 0;
+    assert.strictEqual(tenantLib.setTenantStatus(r.tenantId, 'disabled').ok, true);
+    const after = db.prepare('SELECT token_version FROM users WHERE username=?').get('dadm').token_version || 0;
+    assert.ok(after > before, '停用应 bump token_version');
+    assert.strictEqual(tenantLib.getTenant(r.tenantId).status, 'disabled');
+    assert.strictEqual(tenantLib.setTenantStatus(1, 'disabled').ok, false, '默认租户不可停用');
+  });
+
   try { db.close(); } catch { }
   fs.rmSync(process.env.AGENT_DATA_DIR, { recursive: true, force: true });
   console.log('\n———————————————');
