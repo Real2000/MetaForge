@@ -5761,9 +5761,9 @@ function t(name, fn) {
           try { up = (await fetch(base + '/api/health')).ok; } catch { }
         }
         assert.ok(up, '子进程服务应在 30s 内就绪（否则本用例断言无从执行）');
-        // user2 查看 user1 文件：HTTP 200 + body code 403（归属校验层拒绝，业务码语义）
+        // user2 查看 user1 文件：HTTP 403 + body code 403（归属校验层拒绝；BE-B1 统一响应契约后与下载接口一致）
         const r1 = await jfetch(`/api/files/${fid}`, t2);
-        assert.strictEqual(r1.status, 200, '元数据接口应返回 200');
+        assert.strictEqual(r1.status, 403, '越权元数据应返回 HTTP 403');
         assert.strictEqual(r1.j.code, 403, '越权元数据应返回 code 403');
         // user2 下载 user1 文件：HTTP 403
         const r2 = await jfetch(`/api/files/${fid}/download`, t2, true);
@@ -10141,6 +10141,46 @@ print('PY_OK')
       const rf2 = payLib.refund({ orderNo: no, operator: 'admin' });
       assert.strictEqual(rf2.idempotent, true, '重复退款应幂等');
     } finally { delete process.env.PAYMENT_CALLBACK_SECRET; }
+  });
+
+  // BE-B1：统一响应契约（M2 批次3）——业务错误码一律置对应 HTTP 状态码，成功仍 code:0，凭据端点豁免
+  await t('BE-B1：响应契约——业务错误码置对应 HTTP 状态码，成功与豁免端点不受影响', async () => {
+    const { spawn } = require('child_process');
+    const { db: db1, hashPwd, now } = require('../src-server/db');
+    const { sign } = require('../src-server/lib/auth');
+    db1.prepare('DELETE FROM users WHERE username=?').run('beb1user');
+    db1.prepare(`INSERT INTO users (username,nickname,password,status,role,must_change_pwd,created_at) VALUES (?,?,?,1,'user',0,?)`).run('beb1user', 'BEB1', hashPwd('Pass@2026'), now());
+    const uid = db1.prepare('SELECT id FROM users WHERE username=?').get('beb1user').id;
+    const tok = sign({ uid, exp: Date.now() + 3600000 });
+    const port = 37000 + Math.floor(Math.random() * 2000);
+    const base = `http://127.0.0.1:${port}`;
+    const child = spawn(process.execPath, ['server.js'], { cwd: path.join(__dirname, '..'), env: { ...process.env, PORT: String(port), AGENT_DATA_DIR: process.env.AGENT_DATA_DIR }, stdio: 'ignore' });
+    const jf = async (p, opts = {}) => {
+      const r = await fetch(base + p, { method: opts.method || 'GET', headers: { 'Content-Type': 'application/json', ...(opts.tok ? { authorization: 'Bearer ' + opts.tok } : {}) }, body: opts.body ? JSON.stringify(opts.body) : undefined });
+      let j = null; try { j = await r.json(); } catch { }
+      return { status: r.status, j };
+    };
+    try {
+      let up = false;
+      for (let i = 0; i < 150 && !up; i++) { await new Promise(r => setTimeout(r, 200)); try { up = (await fetch(base + '/api/health')).ok; } catch { } }
+      assert.ok(up, '子进程服务应在 30s 内就绪（否则本用例断言无从执行）');
+      // ① 业务错误码 404（文件不存在）→ HTTP 404，body code 保留
+      const f = await jf('/api/files/999999999', { tok });
+      assert.strictEqual(f.status, 404, '业务码 404 应置 HTTP 404，实际 ' + f.status);
+      assert.strictEqual(f.j.code, 404, 'body code 应保留 404');
+      // ② 成功仍 HTTP 200 + code 0
+      const h = await jf('/api/health');
+      assert.strictEqual(h.status, 200, '成功应 200');
+      assert.strictEqual(h.j.code, 0, '成功 code 应 0');
+      // ③ 凭据端点豁免：登录失败保持 HTTP 200 + code 401（前端据 body 提示「账号或密码错误」）
+      const bad = await jf('/api/auth/login', { method: 'POST', body: { username: 'beb1user', password: 'wrong-pass' } });
+      assert.strictEqual(bad.status, 200, '登录失败应保持 HTTP 200（豁免），实际 ' + bad.status);
+      assert.strictEqual(bad.j.code, 401, '登录失败 body code 应 401');
+    } finally {
+      try { child.kill('SIGTERM'); } catch { }
+      try { child.kill('SIGKILL'); } catch { }
+      db1.prepare('DELETE FROM users WHERE username=?').run('beb1user');
+    }
   });
 
   try { db.close(); } catch { }

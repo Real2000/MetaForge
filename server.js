@@ -89,6 +89,11 @@ app.use((req, res, next) => {
   next();
 });
 
+// BE-B1（M2 批次3，2026-11-22）：统一响应契约——错误一律以对应 HTTP 状态码返回（成功仍 code:0）。
+// 中央中间件一次性覆盖既有全部「HTTP 200 + 业务错误码」响应点，body 原样保留（前后端 j.code 逻辑零破坏）；
+// 凭据/机器协议/webhook 端点豁免（见 lib/response.js）。置于全部路由之前。
+app.use(require('./src-server/lib/response').contract());
+
 // U0-6 A2A Agent Card 公开发现端点（必须在任何鉴权中间件之前注册）
 const { publicRouter, authRouter, adminRouter } = require('./src-server/routes/a2a');
 app.use(publicRouter); // /.well-known/agent-card.json 公开访问

@@ -2945,4 +2945,18 @@ R5 远期生态首项。**先做 3D 资产生成与导出（新增资产类型 +
 - 订阅仅「单周期」（下月同日到期）+ 手动续费；未做自动续费扣款与到期降级任务。
 - **BE-B1 统一响应契约 / BE-B3 对外限流配额 / BE-B4 OpenAPI 3.1 / SEC-09~12/14** 待在后续批次交付。
 
+## M2 对外商用功能闭环 · 批次3：对外契约（2026-11-22）
+
+**目标**：M2 对外契约——统一响应契约（BE-B1）、对外 API 分布式限流与配额（BE-B3）、OpenAPI 3.1 契约文档化（BE-B4）（对应《开发计划表 v1.1》）。
+
+**BE-B1 统一响应契约**
+- 新增 `lib/response.js`：导出 `contract()` 中央响应契约中间件 + `ok()/fail()/failWith()` 及 `badRequest/unauthorized/paymentRequired/forbidden/notFound/conflict/tooMany/serverError` 助手。
+- `contract()` 一次性覆盖既有全部「HTTP 200 + 业务错误码」响应点（全站约 690 处 `res.json({ code: <非0> })`）：凡 body 含 `code !== 0` 且当前状态仍为 200，即按业务码映射为对应 HTTP 状态码，**body 原样保留**（前后端既有 `j.code` 判定零破坏）；`code === 0` 与已显式 `res.status(...)` 的响应透明无感。
+- 豁免（保留 HTTP 200）理由化：`/api/auth`（登录/改密等凭据失败须由前端据 body.code 401 提示「账号或密码错误」，置 401 会被前端 api() 误判为「登录已过期」跳转）、`/api/dingtalk`（钉钉回调非 200 触发 24h 重试风暴）、`/api/a2a`（机器协议）、渠道回调三端点（`/api/channel/event|card-callback|inbound`，IM webhook 防重试）。
+- `server.js` 于全部路由之前装配 `contract()`。
+
+**验证（BE-B1）**
+- `npm test`：冒烟 **613/0 全绿**（+1 新增 BE-B1 用例：子进程实测「业务码 404 → HTTP 404 / 成功仍 200+code0 / 登录失败保持 200+code401 豁免」）；双租户 E2E **26/0 全绿**。
+- 同步更新 1 处既有断言：`/api/files/:id` 元数据越权由旧「HTTP 200 + code 403」统一为 HTTP 403（与其同类下载接口一致，正是 BE-B1 要消除的不一致）。
+
 > AI生成
