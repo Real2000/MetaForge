@@ -34,57 +34,12 @@ function stripTags(s) {
 }
 const FETCH_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 
-/* ---------------- P5.33 审查修复（F2）：SSRF 防护 ----------------
- * web_fetch 此前仅校验 http(s) 前缀——私网/环回/链路本地/云元数据地址全部可达，且被 P5.31 引入
- * 无人值守执行链（系统任务智能体默认工具）放大。三层防护：
- *  ① 字面量 IP / DNS 解析后 IP 黑名单（私网、环回、链路本地 169.254、保留段、IPv6 本地）
- *  ② 重定向手动逐跳校验（防 302 跳入内网，上限 3 跳）
- *  ③ jina reader 前置校验（防内网目标地址外泄给第三方代理）
- * 内网知识源场景由管理员设 AGENT_FETCH_ALLOW_PRIVATE=1 显式放行 */
-const dns = require('dns');
-const FETCH_ALLOW_PRIVATE = process.env.AGENT_FETCH_ALLOW_PRIVATE === '1';
-function ipIsPrivate(ip) {
-  if (!ip) return true;
-  if (ip.includes(':')) {
-    const v6 = ip.toLowerCase();
-    return v6 === '::1' || v6 === '::' || v6.startsWith('fc') || v6.startsWith('fd') || v6.startsWith('fe80');
-  }
-  const parts = String(ip).split('.').map(Number);
-  if (parts.length !== 4 || parts.some(p => Number.isNaN(p))) return true;
-  const [a, b] = parts;
-  return a === 127 || a === 0 || a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168)
-    || (a === 169 && b === 254) || a >= 224; // 224+ 组播/保留段
-}
-async function assertPublicHttpUrl(rawUrl) {
-  if (!/^https?:\/\//i.test(rawUrl)) throw new Error('仅支持 http(s) 完整链接');
-  if (FETCH_ALLOW_PRIVATE) return; // 管理员显式放行（内网知识源场景）
-  let u;
-  try { u = new URL(rawUrl); } catch { throw new Error('链接格式非法'); }
-  const host = u.hostname.replace(/^\[|\]$/g, '');
-  const ips = /^\d+\.\d+\.\d+\.\d+$/.test(host)
-    ? [host]
-    : (await dns.promises.lookup(host, { all: true }).catch(() => [])).map(r => r.address);
-  if (!ips.length) throw new Error(`域名解析失败：${host}`);
-  for (const ip of ips) {
-    if (ipIsPrivate(ip)) throw new Error(`安全策略拒绝访问内网/本机地址（${host} → ${ip}）。如需抓取内网知识源，请管理员设置环境变量 AGENT_FETCH_ALLOW_PRIVATE=1 后重启服务`);
-  }
-}
-/** 手动逐跳重定向（每跳重新过私网校验；上限 3 跳） */
-async function fetchWithRedirectGuard(url, opts = {}, maxHops = 3) {
-  let cur = url;
-  for (let i = 0; i <= maxHops; i++) {
-    await assertPublicHttpUrl(cur);
-    const res = await fetch(cur, { ...opts, redirect: 'manual', signal: opts.signal || AbortSignal.timeout(15000) });
-    if ([301, 302, 303, 307, 308].includes(res.status)) {
-      const loc = res.headers.get('location');
-      if (!loc) return res;
-      cur = new URL(loc, cur).toString();
-      continue;
-    }
-    return res;
-  }
-  throw new Error('重定向次数过多（>3）');
-}
+/* ---------------- SSRF 防护（SEC-05 2026-11-22 收敛） ----------------
+ * 原先本文件内联实现私网校验 + 逐跳重定向；现统一收敛到 lib/ssrf-guard.js（一处实现，多处接入：
+ * usermodels/providers/sso/mcp/retriever 等一并接入）。此处保留同名转发以兼容既有引用（如 workflow.js 的 http_request 节点）。
+ * 内网知识源场景仍由管理员设 AGENT_FETCH_ALLOW_PRIVATE=1 显式放行。 */
+const { ipIsPrivate, assertPublicHttpUrl, fetchWithRedirectGuard } = require('./ssrf-guard');
+
 
 /* =============== ① db_query：Text2SQL =============== */
 /** 敏感表黑名单：含凭据/密钥/鉴权信息的表不允许 LLM 生成 SQL 访问

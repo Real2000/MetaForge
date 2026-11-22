@@ -82,9 +82,24 @@ function t(name, fn) {
     await new Promise(r => setTimeout(r, 350)); // 窗口过期
     assert.strictEqual(await call('a'), 200);   // 恢复
   });
-  await t('clientIp 取 X-Forwarded-For 首段', () => {
-    assert.strictEqual(clientIp({ headers: { 'x-forwarded-for': '1.2.3.4, 5.6.7.8' }, ip: '127.0.0.1' }), '1.2.3.4');
-    assert.strictEqual(clientIp({ headers: {}, ip: '127.0.0.1' }), '127.0.0.1');
+  await t('clientIp：默认直连忽略 XFF（防伪造绕过限流）；受信代理按跳数采信', () => {
+    const { trustHops } = require('../src-server/lib/rate-limit');
+    const req = { headers: { 'x-forwarded-for': '1.2.3.4, 5.6.7.8' }, socket: { remoteAddress: '127.0.0.1' }, ip: '127.0.0.1' };
+    const saved = process.env.AGENT_TRUST_PROXY;
+    try {
+      delete process.env.AGENT_TRUST_PROXY;
+      assert.strictEqual(trustHops(), 0, '未配置 → 0 跳');
+      assert.strictEqual(clientIp(req), '127.0.0.1', '默认不信任 XFF，以 TCP 源地址为准（SEC-01）');
+      assert.strictEqual(clientIp({ headers: {}, socket: { remoteAddress: '10.0.0.9' }, ip: '10.0.0.9' }), '10.0.0.9', '无 XFF → TCP 源地址');
+      process.env.AGENT_TRUST_PROXY = '1';
+      assert.strictEqual(clientIp(req), '5.6.7.8', '信任 1 跳 → 取 XFF 末段');
+      process.env.AGENT_TRUST_PROXY = '2';
+      assert.strictEqual(clientIp(req), '1.2.3.4', '信任 2 跳 → 取 XFF 首段');
+      process.env.AGENT_TRUST_PROXY = '3';
+      assert.strictEqual(clientIp(req), '127.0.0.1', '链路不足 N 跳 → 回落 TCP 源地址');
+    } finally {
+      if (saved === undefined) delete process.env.AGENT_TRUST_PROXY; else process.env.AGENT_TRUST_PROXY = saved;
+    }
   });
 
   console.log('【3】熔断器');
@@ -592,7 +607,7 @@ function t(name, fn) {
     assert.strictEqual(spaceVisibleTo(db, null, 'zhangsan'), true, 'NULL→全员可见');
     const ent = db.prepare("SELECT id FROM spaces WHERE type='enterprise' LIMIT 1").get();
     assert.strictEqual(spaceVisibleTo(db, ent.id, 'zhangsan'), true, '企业空间→全员可见');
-    assert.strictEqual(spaceVisibleTo(db, 99999, 'zhangsan'), true, '空间不存在→宽容放行（脏数据等效无归属）');
+    assert.strictEqual(spaceVisibleTo(db, 99999, 'zhangsan'), false, '空间不存在→fail-closed 不可见（SEC-04：与 spaceFilterSql 的 SQL 语义对齐，防内存过滤链路越权）');
     const per = db.prepare("SELECT id FROM spaces WHERE type='personal' AND owner='admin' LIMIT 1").get();
     assert.strictEqual(spaceVisibleTo(db, per.id, 'admin'), true, '个人空间 owner→可见');
     assert.strictEqual(spaceVisibleTo(db, per.id, 'zhangsan'), false, '个人空间非 owner→不可见');
@@ -4691,6 +4706,13 @@ function t(name, fn) {
           assert.ok(/超时|timeout/i.test((err.name || '') + ' ' + (err.message || '')), '应为超时类错误（TimeoutError）：' + err.name + ' ' + err.message);
           assert.ok(cost >= 1400 && cost <= 8000, `应在 ~1.5s 触发硬超时（含重试退避容差，实测 ${cost}ms）`);
         });
+        await t('SEC-06：全局安全响应头齐备（nosniff / Referrer-Policy / Permissions-Policy）', async () => {
+          const r = await fetch(base + '/api/health');
+          assert.strictEqual(r.headers.get('x-content-type-options'), 'nosniff', 'X-Content-Type-Options 应为 nosniff');
+          assert.strictEqual(r.headers.get('referrer-policy'), 'strict-origin-when-cross-origin', 'Referrer-Policy 就位');
+          assert.ok(r.headers.get('permissions-policy'), 'Permissions-Policy 就位');
+          assert.strictEqual(r.headers.get('x-frame-options'), 'SAMEORIGIN', '非 /share 路径应下发 X-Frame-Options');
+        });
         // LLMOps 组收尾：清走「版本记录测试」agent（防污染后续用例的 agents 统计）
         db.prepare(`DELETE FROM agents WHERE name='版本记录测试'`).run();
       } else {
@@ -4701,6 +4723,102 @@ function t(name, fn) {
       await new Promise(r2 => setTimeout(r2, 600));
       try { child.kill('SIGKILL'); } catch { }
     }
+  }
+
+  console.log('【SEC-M0】商用安全止血闸门（SEC-01~08 单元级验收，2026-11-22）');
+  {
+    await t('SEC-02a：Key HMAC 哈希稳定 / 掩码 / 形态判定', () => {
+      const { hashKey, maskPrefix, looksHashed } = require('../src-server/lib/apikey');
+      assert.strictEqual(hashKey('sk-ap-abc'), hashKey('sk-ap-abc'), '相同输入 → 稳定哈希（跨重启可复算）');
+      assert.notStrictEqual(hashKey('a'), hashKey('b'), '不同输入 → 不同哈希');
+      assert.ok(/^[0-9a-f]{64}$/.test(hashKey('x')), '哈希为 64 位小写 hex');
+      assert.ok(looksHashed(hashKey('x')), '哈希形态可识别（供存量迁移跳过）');
+      assert.ok(!looksHashed('sk-ap-plaintext'), '明文不可被识别为哈希');
+      assert.strictEqual(maskPrefix('sk-ap-1234567890abcdef'), 'sk-ap-12****cdef', '掩码保留前 8 后 4');
+      assert.ok(!maskPrefix('sk-ap-1234567890abcdef').includes('567890'), '掩码不含中段可用信息');
+    });
+    await t('SEC-02a：对外密钥库内存量即哈希（明文不落库、列表可掩码）', () => {
+      const { hashKey, maskPrefix, looksHashed } = require('../src-server/lib/apikey');
+      const raw = 'sk-ap-smoke-sec02a-raw';
+      const aid = (db.prepare(`SELECT id FROM agents LIMIT 1`).get() || {}).id || 1;
+      db.prepare(`INSERT INTO agent_api_keys (agent_id,key,key_prefix,name,status,created_at) VALUES (?,?,?,?,1,datetime('now','localtime'))`)
+        .run(aid, hashKey(raw), maskPrefix(raw), 'SEC02a测试');
+      const row = db.prepare(`SELECT key,key_prefix FROM agent_api_keys WHERE name='SEC02a测试'`).get();
+      assert.ok(looksHashed(row.key), 'key 列应为哈希形态');
+      assert.notStrictEqual(row.key, raw, 'key 列不得等于明文');
+      assert.strictEqual(row.key_prefix, maskPrefix(raw), '前缀掩码已落库（列表脱敏来源）');
+      db.prepare(`DELETE FROM agent_api_keys WHERE name='SEC02a测试'`).run();
+    });
+    await t('SEC-03：加密往返且密文 ≠ 明文（密钥缺失 fail-closed 前置）', () => {
+      const { encrypt, decrypt } = require('../src-server/lib/crypto-util');
+      const enc = encrypt('sk-secret-value');
+      assert.ok(enc && enc !== 'sk-secret-value', '密文不应等于明文');
+      assert.ok(/^[0-9a-f]{32}\.[0-9a-f]{32}\.[0-9a-f]+$/i.test(enc), '密文为 IV.authTag.ciphertext 三段形态');
+      assert.strictEqual(decrypt(enc), 'sk-secret-value', '解密可还原明文');
+    });
+    await t('SEC-04：空间不存在 fail-closed（与 spaceFilterSql 的 SQL 语义一致）', () => {
+      const { spaceVisibleTo } = require('../src-server/lib/space-utils');
+      assert.strictEqual(spaceVisibleTo(db, 987654321, 'zhangsan'), false, '脏空间/已删空间 → 不可见');
+      assert.strictEqual(spaceVisibleTo(db, 0, 'zhangsan'), true, '无归属(0) → 全员可见');
+      assert.strictEqual(spaceVisibleTo(db, null, 'zhangsan'), true, '无归属(NULL) → 全员可见');
+    });
+    await t('SEC-05：SSRF 私网/云元数据判定 + 出站拒绝（默认关闭私网）', async () => {
+      const { ipIsPrivate, assertPublicHttpUrl } = require('../src-server/lib/ssrf-guard');
+      const saved = process.env.AGENT_FETCH_ALLOW_PRIVATE;
+      delete process.env.AGENT_FETCH_ALLOW_PRIVATE;
+      try {
+        for (const ip of ['127.0.0.1', '10.1.2.3', '192.168.1.1', '172.16.0.1', '169.254.169.254', '::1', '0.0.0.0']) {
+          assert.strictEqual(ipIsPrivate(ip), true, `${ip} 应判为私网/受限地址`);
+        }
+        assert.strictEqual(ipIsPrivate('8.8.8.8'), false, '公网 IP 放行');
+        assert.strictEqual(ipIsPrivate('172.32.0.1'), false, '172.32 超出 172.16-31 私网段');
+        await assert.rejects(() => assertPublicHttpUrl('http://169.254.169.254/latest/meta-data/'), /内网|私网|拒绝/, '云元数据地址应拒绝');
+        await assert.rejects(() => assertPublicHttpUrl('http://127.0.0.1:8080/admin'), /内网|私网|拒绝/, '环回地址应拒绝');
+        await assert.rejects(() => assertPublicHttpUrl('ftp://8.8.8.8/x'), /http/, '非 http(s) 协议应拒绝');
+        await assertPublicHttpUrl(''); // 未配置 → 放行（交由调用方必填校验）
+      } finally {
+        if (saved === undefined) delete process.env.AGENT_FETCH_ALLOW_PRIVATE; else process.env.AGENT_FETCH_ALLOW_PRIVATE = saved;
+      }
+    });
+    await t('SEC-07：token_version 用户级吊销——改密后旧令牌立即失效', () => {
+      const { sign, verify, bumpTokenVersion } = require('../src-server/lib/auth');
+      db.prepare(`INSERT INTO users (username,password,nickname,role,status,must_change_pwd,created_at) VALUES ('sec07u','x','安全7','user',1,0,datetime('now','localtime'))`).run();
+      const u = db.prepare(`SELECT id, token_version FROM users WHERE username='sec07u'`).get();
+      const tv0 = u.token_version || 0;
+      const oldTk = sign({ uid: u.id, tv: tv0, exp: Date.now() + 60000 });
+      assert.ok(verify(oldTk), '初始令牌应通过校验');
+      const tv1 = bumpTokenVersion(u.id);
+      assert.strictEqual(tv1, tv0 + 1, '版本号应递增 +1');
+      assert.strictEqual(verify(oldTk), null, '改密后旧令牌（tv 落后）应被拒');
+      const newTk = sign({ uid: u.id, tv: tv1, exp: Date.now() + 60000 });
+      assert.ok(verify(newTk), '携带新版本号的令牌应通过');
+      db.prepare(`DELETE FROM users WHERE username='sec07u'`).run();
+    });
+    await t('SEC-07：生产/HTTPS 强制 Cookie Secure，开发默认不加', () => {
+      const { setAuthCookie } = require('../src-server/lib/auth');
+      const savedN = process.env.NODE_ENV, savedS = process.env.AGENT_COOKIE_SECURE, savedH = process.env.AGENT_ENABLE_HSTS;
+      const cap = () => { const o = {}; return { setHeader(k, v) { o[k] = v; }, get() { return o['Set-Cookie']; } }; };
+      try {
+        delete process.env.NODE_ENV; delete process.env.AGENT_COOKIE_SECURE; delete process.env.AGENT_ENABLE_HSTS;
+        let r = cap(); setAuthCookie(r, 'tok'); assert.ok(!/; Secure/.test(r.get()), '开发默认不加 Secure（避免本地 HTTP 登录不可用）');
+        process.env.AGENT_COOKIE_SECURE = '1';
+        r = cap(); setAuthCookie(r, 'tok'); assert.ok(/; Secure/.test(r.get()), 'AGENT_COOKIE_SECURE=1 强制 Secure');
+      } finally {
+        if (savedN === undefined) delete process.env.NODE_ENV; else process.env.NODE_ENV = savedN;
+        if (savedS === undefined) delete process.env.AGENT_COOKIE_SECURE; else process.env.AGENT_COOKIE_SECURE = savedS;
+        if (savedH === undefined) delete process.env.AGENT_ENABLE_HSTS; else process.env.AGENT_ENABLE_HSTS = savedH;
+      }
+    });
+    await t('SEC-08：token 黑名单过期清理（保留未过期条目）', () => {
+      const { cleanBlacklist } = require('../src-server/lib/auth');
+      const expiredAt = new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString(); // 30 天前（远超 TTL+1h）
+      db.prepare(`INSERT INTO token_blacklist (jti, username, created_at) VALUES ('sec08-expired','u',?)`).run(expiredAt);
+      db.prepare(`INSERT INTO token_blacklist (jti, username, created_at) VALUES ('sec08-fresh','u',?)`).run(new Date().toISOString());
+      cleanBlacklist();
+      assert.strictEqual(db.prepare(`SELECT COUNT(*) c FROM token_blacklist WHERE jti='sec08-expired'`).get().c, 0, '过期条目应被清理');
+      assert.strictEqual(db.prepare(`SELECT COUNT(*) c FROM token_blacklist WHERE jti='sec08-fresh'`).get().c, 1, '未过期条目应保留');
+      db.prepare(`DELETE FROM token_blacklist WHERE jti='sec08-fresh'`).run();
+    });
   }
 
   console.log('【N+1】P5.31 对话内定时任务：cron 增强 + create_task 工具');
@@ -5287,6 +5405,7 @@ function t(name, fn) {
     await t('单元：P2-2 rerankAndSlice 重排生效——mock 逆序返回覆盖 RRF 序 + rerank_score 附加 + channels/hit_terms 保留 + topN 截断', async () => {
       const { rerankAndSlice, __expireCircuitBreakers } = require('../src-server/lib/retriever');
       __expireCircuitBreakers(); // 跨用例熔断状态重置（模块级 30s 记忆会短路本用例的 mock 供应商）
+      const savedAllowPrivate = process.env.AGENT_FETCH_ALLOW_PRIVATE; process.env.AGENT_FETCH_ALLOW_PRIVATE = '1'; // SEC-05：本用例 mock 网关在 127.0.0.1，需显式放行私网
       db.prepare(`INSERT INTO providers (name,base_url,api_key,models,configured,is_default) VALUES ('P2补测rerank供应商','http://127.0.0.1:1','sk-p2test','["bge-reranker-v2-m3"]',1,0)`).run();
       const pid = db.prepare(`SELECT id FROM providers WHERE name='P2补测rerank供应商'`).get().id;
       const origFetch = globalThis.fetch;
@@ -5303,12 +5422,14 @@ function t(name, fn) {
         assert.strictEqual(out2[0].id, 4, '截断后仍保持重排序');
       } finally {
         globalThis.fetch = origFetch;
+        if (savedAllowPrivate === undefined) delete process.env.AGENT_FETCH_ALLOW_PRIVATE; else process.env.AGENT_FETCH_ALLOW_PRIVATE = savedAllowPrivate;
         db.prepare('DELETE FROM providers WHERE id=?').run(pid);
       }
     });
     await t('单元：P2-2 bgeRerank——results 降序解析 / data[] 备选格式 / HTTP 500 → null + 30s 熔断窗口内不再发请求', async () => {
       const { bgeRerank, __expireCircuitBreakers } = require('../src-server/lib/retriever');
       __expireCircuitBreakers(); // 前序用例可能触发熔断（如 bgeEmbed 失败路径），重置后本用例熔断断言才真实可控
+      const savedAllowPrivate = process.env.AGENT_FETCH_ALLOW_PRIVATE; process.env.AGENT_FETCH_ALLOW_PRIVATE = '1'; // SEC-05：mock 网关在 127.0.0.1，需显式放行私网
       db.prepare(`INSERT INTO providers (name,base_url,api_key,models,configured,is_default) VALUES ('P2补测rerank供应商2','http://127.0.0.1:1','sk-p2test2','["bge-reranker-v2-m3"]',1,0)`).run();
       const pid = db.prepare(`SELECT id FROM providers WHERE name='P2补测rerank供应商2'`).get().id;
       const origFetch = globalThis.fetch;
@@ -5331,12 +5452,14 @@ function t(name, fn) {
         assert.strictEqual(calls, before, '熔断窗口内不应再发请求（rerankDownUntil 30s 记忆）');
       } finally {
         globalThis.fetch = origFetch;
+        if (savedAllowPrivate === undefined) delete process.env.AGENT_FETCH_ALLOW_PRIVATE; else process.env.AGENT_FETCH_ALLOW_PRIVATE = savedAllowPrivate;
         db.prepare('DELETE FROM providers WHERE id=?').run(pid);
       }
     });
     await t('单元：P2-1 bgeEmbed——成功 1024 维列表 / 维度不符降级 / 条数不符降级（结构校验三态，mock fetch finally 恢复）', async () => {
       const { bgeEmbed, __expireCircuitBreakers } = require('../src-server/lib/retriever');
       __expireCircuitBreakers(); // HTTP 区无供应商调用已设 30s 熔断（无 provider 也落熔断行的实现语义），不重置会短路成功路径
+      const savedAllowPrivate = process.env.AGENT_FETCH_ALLOW_PRIVATE; process.env.AGENT_FETCH_ALLOW_PRIVATE = '1'; // SEC-05：mock 网关在 127.0.0.1，需显式放行私网
       db.prepare(`INSERT INTO providers (name,base_url,api_key,models,configured,is_default) VALUES ('P2补测embed供应商','http://127.0.0.1:1','sk-p2test3','["bge-m3"]',1,0)`).run();
       const pid = db.prepare(`SELECT id FROM providers WHERE name='P2补测embed供应商'`).get().id;
       const origFetch = globalThis.fetch;
@@ -5352,6 +5475,7 @@ function t(name, fn) {
         assert.strictEqual(badCount, null, '条数不符（1≠2）同样返回 null（本次经 30s 熔断短路——bgeDownUntil 与 rerankDownUntil 同构，熔断语义已在 bgeRerank 用例独立覆盖）');
       } finally {
         globalThis.fetch = origFetch;
+        if (savedAllowPrivate === undefined) delete process.env.AGENT_FETCH_ALLOW_PRIVATE; else process.env.AGENT_FETCH_ALLOW_PRIVATE = savedAllowPrivate;
         db.prepare('DELETE FROM providers WHERE id=?').run(pid);
       }
     });

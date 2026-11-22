@@ -841,14 +841,17 @@ router.delete('/:id', (req, res) => {
   res.json({ code: 0, msg: '已删除' });
 });
 
-// ---------- API 发布（OpenAI 兼容端点密钥；P3：归属级权限） ----------
+// ---------- API 发布（OpenAI 兼容端点密钥；P3：归属级权限；SEC-02a：哈希存储 + 掩码回显） ----------
 const crypto = require('crypto');
+const { hashKey, maskPrefix } = require('../lib/apikey');
 
 router.get('/:id/api-keys', (req, res) => {
   const agent = db.prepare('SELECT * FROM agents WHERE id=?').get(req.params.id);
   if (!agent) return res.json({ code: 404, msg: '智能体不存在' });
   if (!isOwnerLevel(agent, req.user)) return res.json({ code: 403, msg: '无权限（API 密钥仅创建者与管理员可管理）' });
-  const rows = db.prepare('SELECT id,agent_id,key,name,status,created_at,last_used_at FROM agent_api_keys WHERE agent_id=? ORDER BY id DESC').all(req.params.id);
+  // SEC-02a：库中 key 列为 HMAC 哈希，不回传；仅回前缀掩码（key 字段沿用掩码，兼容前端展示）
+  const rows = db.prepare('SELECT id,agent_id,key_prefix,name,status,created_at,last_used_at FROM agent_api_keys WHERE agent_id=? ORDER BY id DESC').all(req.params.id)
+    .map(r => ({ ...r, key: r.key_prefix || '' }));
   res.json({ code: 0, data: rows });
 });
 
@@ -858,8 +861,9 @@ router.post('/:id/api-keys', (req, res) => {
   if (!isOwnerLevel(agent, req.user)) return res.json({ code: 403, msg: '无权限（API 密钥仅创建者与管理员可管理）' });
   const key = 'sk-ap-' + crypto.randomBytes(20).toString('hex');
   const name = (req.body || {}).name || '默认密钥';
-  const info = db.prepare('INSERT INTO agent_api_keys (agent_id,key,name,status,created_at) VALUES (?,?,?,1,datetime(\'now\',\'localtime\'))')
-    .run(agent.id, key, name);
+  // SEC-02a：仅存哈希 + 前缀掩码；完整 Key 仅本次一次性返回
+  const info = db.prepare('INSERT INTO agent_api_keys (agent_id,key,key_prefix,name,status,created_at) VALUES (?,?,?,?,1,datetime(\'now\',\'localtime\'))')
+    .run(agent.id, hashKey(key), maskPrefix(key), name);
   db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)').run(req.user.username, '创建智能体API密钥', `${agent.name}（${name}）`, req.ip, now());
   res.json({ code: 0, data: { id: info.lastInsertRowid, key } });
 });

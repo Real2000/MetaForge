@@ -2861,4 +2861,23 @@ R5 远期生态首项。**先做 3D 资产生成与导出（新增资产类型 +
 - 浏览器 E2E（临时 3983 端口 + 隔离库）：趋势图 2 条置信带 polygon；逐版本 Wilson 区间（如 v1.0 90% [82.6~94.5]）与显著性徽标（首次/显著回退/显著提升/变化不显著）正确；**时间轴切换**——横轴坐标由均匀 [203,203,203] 变为按真实时间 [32,32,544]，证明按时间映射；**runner 端到端**——弹窗未配置提示正确，填入 mock 命令执行 3 实例 → 成功率 66.7% / 步数 3 / 干预率 0% / 落基线 #13；控制台 0 错误。
 - 已知边界：runner 为**可配置外部命令适配器**，平台不捆绑 harness（本机未安装 `swebench`，以 mock runner 验证协议端到端）；置信带为 Wilson 得分区间；时间轴按字符串 `created_at` 解析；Fisher 仅用于 2×2 两尾。
 
+## M0 商用安全止血闸门（2026-11-22）
+
+**目标**：落实《开发计划表 v1.1》M0 八项 P0 上线硬门槛（对外多租户商用的安全底座），每项「写→验→报」，全量回归保持全绿。
+
+**实现（零新依赖）**
+- **SEC-01 限流 IP 可信化**：`lib/rate-limit.js` 重写 `clientIp`——引入 `AGENT_TRUST_PROXY`（默认空=直连，忽略 `X-Forwarded-For`；正整数 N=信任最靠近服务 N 跳取真实客户端，链路不足回落 TCP 源地址）；`server.js` 同步 `app.set('trust proxy', trustProxySetting())`。堵住伪造 XFF 绕过登录/分享/开放 API 的按 IP 限流与爆破锁定。
+- **SEC-02a 对外密钥哈希存储**：新增 `lib/apikey.js`（HMAC-SHA256(pepper,key) + 前缀掩码 + 哈希形态判定；pepper = `AGENT_APIKEY_PEPPER` > secrets `ENCRYPTION_KEY` > `data/secrets.json`）。`agent_api_keys`/`mcp_tokens` 改存哈希 + `key_prefix`/`token_prefix` 掩码（`db.js` 幂等迁移把存量明文就地转哈希）；`routes/agents.js`、`openapi.js`、`mcp-server.js` 全部改哈希比对、列表仅回掩码、创建一次性回显；**取消全域 Key/令牌**（未绑定智能体一律拒绝，仅 agent 级）。前端 `admin/agents.js`/`admin/mcp.js` 适配掩码展示与「绑定智能体（必选）」。
+- **SEC-03 加密 fail-closed**：`lib/crypto-util.js` 的 `encrypt()` 在 `ENCRYPTION_KEY` 缺失时不再静默返回明文，改显式抛错；`db.js` 启动期致命告警；新增 `scripts/scan-plaintext-secrets.js` 存量明文巡检。
+- **SEC-04 空间可见性 fail-closed**：`lib/space-utils.js` 的 `spaceVisibleTo` 空间不存在时由「宽容放行」改为拒绝，与 `spaceFilterSql` 的 SQL 语义严格对齐（合法 owner 访问由调用方 OR 补齐）；新增 `scripts/scan-dangling-spaces.js`。
+- **SEC-05 SSRF 统一防护**：新增 `lib/ssrf-guard.js`（`ipIsPrivate`/`assertPublicHttpUrl`/`fetchWithRedirectGuard`，逐跳重定向校验）；`tools-extra.js` 内联实现收敛为转发，并接入 `usermodels.js`/`providers.js`/`sso.js`/`mcp.js`/`retriever.js`（`bgeEmbed`/`bgeRerank`）。默认拒绝私网/环回/云元数据（169.254.169.254），内网场景由 `AGENT_FETCH_ALLOW_PRIVATE=1` 显式放行。`SECURITY.md` 声明与实现对齐。
+- **SEC-06 全局安全响应头**：`server.js` 统一注入 `X-Content-Type-Options`/`Referrer-Policy`/`Permissions-Policy`；非 `/share/*` 加 `X-Frame-Options: SAMEORIGIN` + `Content-Security-Policy-Report-Only`（先观察后收紧，不破坏 SPA 内联）；生产（`NODE_ENV=production` 或 `AGENT_ENABLE_HSTS=1`）加 HSTS。
+- **SEC-07 会话安全**：`lib/auth.js` Cookie 生产强制 `Secure`；新增 `users.token_version` 列与 `bumpTokenVersion`——token 内嵌 `tv`、`verify()` 比对，改密/重置/停用/注册递增即吊销该用户全部旧端（本人换新、他人全踢）。签发点 `auth.js`/`routes/auth.js`/`routes/sso.js` 同步带 tv。
+- **SEC-08 黑名单清理**：`lib/auth.js` 的 `cleanBlacklist` 启动即跑 + 每小时清理超 TTL 的 `token_blacklist` 条目，防膨胀。
+
+**验证**
+- `npm test` 冒烟 **595/0 全绿**：新增 `【SEC-M0】` 单元组 8 项 + SEC-06 HTTP 用例 1 项；并同步更新 2 条既有断言（`clientIp` 改「默认忽略 XFF / 受信代理按跳数采信」、`spaceVisibleTo` 改「空间不存在 fail-closed」）与 3 条 retriever 用例（本地 mock 网关按设计设 `AGENT_FETCH_ALLOW_PRIVATE=1`）。
+- 浏览器 E2E（隔离实例，端口 3901 + 独立 `AGENT_DATA_DIR`）：登录→强制改密→首页全量渲染（CSP Report-Only 未破坏 SPA，0 控制台错误）；安全头齐备；**SEC-02a 端到端**——创建密钥一次性回显 `sk-ap-…`、列表掩码 `sk-ap-90****f44c`、库内 `agent_api_keys.key` 存 64 位哈希、明文密钥调 `/openapi/v1/models` 返回 200 且仅列出绑定智能体；MCP 令牌弹窗强制「绑定智能体（必选）、全域令牌已停用」。**修复既有前端 bug**：`admin/agents.js` 的 `loadKeys` 误置于 `.then()` 回调作用域、却在回调外调用，导致 API 弹窗一直 ReferenceError 打不开——已将声明上提至 `openApiKeys` 作用域。`public/sw.js` bump → `m0-v2`。
+- 注意事项：本地嵌入/重排网关（如本机 bge 服务）在默认安全策略下会被视为私网拒绝，需设 `AGENT_FETCH_ALLOW_PRIVATE=1`；生产部署务必设 `NODE_ENV=production`（或 `AGENT_ENABLE_HSTS=1`）以启用 Cookie `Secure` 与 HSTS。
+
 > AI生成

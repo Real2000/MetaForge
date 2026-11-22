@@ -7,6 +7,7 @@ const express = require('express');
 const { db, now } = require('../db');
 const { auth } = require('../lib/auth');
 const { encrypt, decrypt } = require('../lib/crypto-util');
+const { assertPublicHttpUrl } = require('../lib/ssrf-guard'); // SEC-05：用户自填 URL 的服务端请求统一过 SSRF 校验
 
 const router = express.Router();
 router.use(auth);
@@ -34,6 +35,8 @@ router.post('/', (req, res) => {
   const { name, base_url, api_key, models } = req.body || {};
   if (!name?.trim()) return res.json({ code: 400, msg: '名称不能为空' });
   if (!base_url?.trim()) return res.json({ code: 400, msg: '服务地址不能为空（OpenAI 兼容，如 https://api.xxx.com/v1）' });
+  // SEC-05：SSRF 校验（拒绝私网/环回/云元数据地址，除非管理员 AGENT_FETCH_ALLOW_PRIVATE=1）
+  try { assertPublicHttpUrl(base_url.trim()); } catch (e) { return res.json({ code: 400, msg: e.message }); }
   const cnt = db.prepare('SELECT COUNT(*) c FROM user_providers WHERE username=?').get(req.user.username).c;
   if (cnt >= 10) return res.json({ code: 400, msg: '每人最多接入 10 个模型源' });
   const ms = parseModels(models, '[]');
@@ -49,6 +52,8 @@ router.put('/:id', (req, res) => {
   const old = db.prepare('SELECT * FROM user_providers WHERE id=? AND username=?').get(req.params.id, req.user.username);
   if (!old) return res.json({ code: 404, msg: '模型源不存在' });
   const { name, base_url, api_key, models, status } = req.body || {};
+  // SEC-05：改地址同样过 SSRF 校验
+  if (base_url && base_url.trim()) { try { assertPublicHttpUrl(base_url.trim()); } catch (e) { return res.json({ code: 400, msg: e.message }); } }
   const ms = parseModels(models, old.models);
   // Key 编辑保护：未传/传空/传掩码（****）都保留旧值；只有传新明文才覆盖
   const keepKey = (api_key == null || api_key === '' || String(api_key).includes('****')) ? old.api_key : encrypt(api_key);
@@ -68,6 +73,8 @@ router.post('/:id/test', async (req, res) => {
   const old = db.prepare('SELECT * FROM user_providers WHERE id=? AND username=?').get(req.params.id, req.user.username);
   if (!old) return res.json({ code: 404, msg: '模型源不存在' });
   if (!old.base_url) return res.json({ code: 0, data: { ok: false, msg: '❌ 未配置服务地址' } });
+  // SEC-05：连通测试是真实出站请求——先过 SSRF 校验（防把本机/内网地址作为探测目标）
+  try { await assertPublicHttpUrl(old.base_url); } catch (e) { return res.json({ code: 0, data: { ok: false, msg: '❌ ' + e.message } }); }
   try {
     const url = old.base_url.replace(/\/+$/, '') + '/models';
     const plainKey = decrypt(old.api_key);

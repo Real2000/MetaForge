@@ -509,6 +509,12 @@ CREATE TABLE IF NOT EXISTS evaluations (
     db.exec('ALTER TABLE users ADD COLUMN dept_id INTEGER DEFAULT NULL');
     console.log('[db] users 表已迁移：新增 dept_id 字段');
   }
+  // SEC-07/SEC-08（2026-11-22）：token 版本号——用户级令牌吊销维度。
+  // 改密/管理员重置密码/停用账号时 +1，verify() 比对 token 内嵌 tv，使该用户全部旧令牌立即失效。
+  if (!userCols3.includes('token_version')) {
+    db.exec('ALTER TABLE users ADD COLUMN token_version INTEGER DEFAULT 0');
+    console.log('[db] users 表已迁移：新增 token_version 字段（用户级令牌吊销）');
+  }
 }
 // 企业定制线索表（2026-10-20 商业化）：对外价格页「联系销售」表单收集，免登录提交
 db.exec(`CREATE TABLE IF NOT EXISTS enterprise_leads (
@@ -593,6 +599,14 @@ db.exec(`CREATE TABLE IF NOT EXISTS agent_api_keys (
   created_at TEXT,
   last_used_at TEXT
 );`);
+// SEC-02a（2026-11-22）：API Key 改哈希存储——新增 key_prefix（列表展示掩码；key 列自本版起存 HMAC 哈希而非明文）
+{
+  const akCols = db.prepare('PRAGMA table_info(agent_api_keys)').all().map(c => c.name);
+  if (!akCols.includes('key_prefix')) {
+    db.exec("ALTER TABLE agent_api_keys ADD COLUMN key_prefix TEXT DEFAULT ''");
+    console.log('[db] agent_api_keys 表已迁移：新增 key_prefix 字段（SEC-02a 哈希存储）');
+  }
+}
 // 分享会话表（免登录访问，与内部 sessions 隔离）
 db.exec(`CREATE TABLE IF NOT EXISTS share_sessions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1429,6 +1443,11 @@ db.exec(`CREATE TABLE IF NOT EXISTS mcp_tokens (
     db.exec('ALTER TABLE mcp_tokens ADD COLUMN agent_id INTEGER DEFAULT NULL');
     console.log('[db] mcp_tokens 表已迁移：新增 agent_id 字段（P2-2 令牌作用域）');
   }
+  // SEC-02a（2026-11-22）：MCP 令牌改哈希存储——新增 token_prefix（token 列自本版起存 HMAC 哈希而非明文）
+  if (!mcpCols.includes('token_prefix')) {
+    db.exec("ALTER TABLE mcp_tokens ADD COLUMN token_prefix TEXT DEFAULT ''");
+    console.log('[db] mcp_tokens 表已迁移：新增 token_prefix 字段（SEC-02a 哈希存储）');
+  }
 }
 
 // ---------------- P4 扩展迁移（2026-10-22）----------------
@@ -1805,6 +1824,16 @@ module.exports = { db, dbRead, hashPwd, hashPwdAsync, verifyPwd, now, daysAgo, t
     // secrets 表不存在时跳过（保守兜底，release 构建一定有该表）
     console.warn('[db] ENCRYPTION_KEY 自动初始化跳过（secrets 表不可用）:', e.message);
   }
+  // SEC-03（2026-11-22 安全止血）：启动期断言——密钥缺失即告警。
+  // 配合 crypto-util.encrypt 的 fail-closed（缺钥抛错拒绝明文落盘），此处给出显式、可检索的启动告警。
+  try {
+    const chk = db.prepare("SELECT value FROM secrets WHERE name='ENCRYPTION_KEY'").pluck().get();
+    if (!chk || chk.length !== 64) {
+      console.error('[db][SEC-03] 致命：ENCRYPTION_KEY 缺失或长度非法——加密写入将 fail-closed 拒绝（API Key/密钥无法保存）。请确认 secrets 表可用。');
+    }
+  } catch (e) {
+    console.error('[db][SEC-03] 致命：无法校验 ENCRYPTION_KEY（secrets 表不可用）——加密写入将 fail-closed 拒绝。', e.message);
+  }
 }
 
 // ---------- V2.4 #4 收尾：providers/usermodels api_key 加密迁移（幂等） ----------
@@ -1829,6 +1858,33 @@ module.exports = { db, dbRead, hashPwd, hashPwdAsync, verifyPwd, now, daysAgo, t
     }
   } catch (e) { console.error('[db] api_key 加密迁移异常（兜底：不加密）:', e.message); }
   if (n + m) console.log(`[db] 存量 api_key 加密迁移：providers ${n} 行、用户级表 ${m} 行（AES-256-GCM）`);
+}
+
+// ---------- SEC-02a（2026-11-22）：存量对外密钥明文 → HMAC 哈希迁移（幂等，启动期执行） ----------
+// agent_api_keys.key / mcp_tokens.token 本版起存 HMAC-SHA256 哈希；此处把存量明文 Key 就地转为哈希，
+// 并补写展示用前缀掩码。已哈希的行（64 位 hex）跳过。须位于 module.exports 与 ENCRYPTION_KEY 初始化之后
+// （apikey.pepper 依赖 ENCRYPTION_KEY）。
+{
+  try {
+    const { hashKey, maskPrefix, looksHashed } = require('./lib/apikey');
+    const tasks = [
+      { table: 'agent_api_keys', col: 'key', pfx: 'key_prefix' },
+      { table: 'mcp_tokens', col: 'token', pfx: 'token_prefix' },
+    ];
+    let cnt = 0;
+    for (const { table, col, pfx } of tasks) {
+      if (!db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?").get(table)) continue;
+      const rows = db.prepare(`SELECT id, ${col} AS v FROM ${table} WHERE ${col} IS NOT NULL AND ${col} != ''`).all();
+      for (const r of rows) {
+        if (looksHashed(r.v)) continue; // 已是哈希
+        db.prepare(`UPDATE ${table} SET ${col}=?, ${pfx}=? WHERE id=?`).run(hashKey(r.v), maskPrefix(r.v), r.id);
+        cnt++;
+      }
+    }
+    if (cnt) console.log(`[db] SEC-02a 存量对外密钥哈希迁移：${cnt} 行（agent_api_keys/mcp_tokens）`);
+  } catch (e) {
+    console.error('[db] SEC-02a 密钥哈希迁移异常：', e.message);
+  }
 }
 
 // ---------------- P5.27 本地桥设备与任务队列（2026-10-27）----------------

@@ -257,14 +257,14 @@ export async function render(el) {
   }
 
   el.querySelector('#newToken').onclick = () => {
-    // P2-2：可选绑定智能体（作用域令牌）——下拉源用服务端信息卡的已发布智能体清单
+    // SEC-02a：令牌必须绑定智能体（全域令牌已停用）——下拉源用服务端信息卡的已发布智能体清单
     const agentOptions = (srvInfo?.tools || []).map(ta => `<option value="${ta.name.replace(/^agent_(\d+)-?.*$/, '$1')}">${esc(ta.agent)}（${esc(ta.name)}）</option>`).join('');
     const body = `
       <div class="form-item"><label>${t('令牌备注名')}</label><input class="input" id="t_name" placeholder="${t('如：Claude Code 接入 / 部门网关')}"></div>
-      <div class="form-item"><label>${t('绑定智能体（作用域）')}</label><select class="input" id="t_agent">
-        <option value="">${t('全域令牌（可调用全部已发布智能体）')}</option>${agentOptions}
+      <div class="form-item"><label>${t('绑定智能体（必选，作用域）')}</label><select class="input" id="t_agent">
+        <option value="">${t('请选择要绑定的智能体')}</option>${agentOptions}
       </select>
-      <div class="hint">${t('推荐绑定单个智能体（最小授权）：令牌仅可调用绑定的智能体，泄露时影响面最小')}</div></div>`;
+      <div class="hint">${t('令牌仅可调用绑定的智能体（最小授权），泄露时影响面最小；全域令牌已停用')}</div></div>`;
     modal({
       title: t('生成 MCP 访问令牌'), body,
       foot: `<button class="btn" data-cancel>${t('取消')}</button><button class="btn primary" data-save>${t('生成')}</button>`,

@@ -30,7 +30,12 @@ const IV_LENGTH = 16; // GCM 推荐 IV 长度
  */
 function encrypt(plaintext) {
   const key = loadEncryptionKey();
-  if (!key) return plaintext; // 未配置加密密钥时兜底明文（不推荐）
+  // SEC-03（2026-11-22 安全止血）：密钥缺失时不再静默返回明文（fail-closed）——
+  // 原「兜底明文存储」会让 API Key 等敏感值在未配置 ENCRYPTION_KEY 时明文落库。
+  // 现改为显式抛错拒绝写入，调用方需 500 暴露问题而非造成静默泄露。
+  if (!key) {
+    throw new Error('加密密钥 ENCRYPTION_KEY 未配置：拒绝明文落盘（请在启动期确保 secrets 表存在并可初始化密钥）');
+  }
   const iv = crypto.randomBytes(IV_LENGTH);
   const cipher = crypto.createCipheriv(ALGORITHM, key, iv);
   let encrypted = cipher.update(plaintext, 'utf8', 'hex');

@@ -459,6 +459,7 @@ export async function render(el) {
   function openApiKeys(id) {
     const a = agents.find(x => x.id === id);
     const modelId = `agent-${a.id}-${a.name}`;
+    async function loadKeys() { const j = await api(`/agents/${id}/api-keys`); return j.data; }
     loadKeys().then(keys => {
       // U1-8：SDK 下载与三行代码示例（api-docs /sdk 端点；失败静默不影响密钥管理主流程）
       api('/api-docs/sdk').then(j => {
@@ -489,7 +490,7 @@ export async function render(el) {
           <tbody id="akBody">${keys.map(k => `
             <tr>
               <td>${esc(k.name)}</td>
-              <td class="mono" style="font-size:12px">${esc(k.key.slice(0, 14))}…<button class="btn link" data-copy="${esc(k.key)}">${t('复制')}</button></td>
+              <td class="mono" style="font-size:12px">${esc(k.key || '')}</td>
               <td>${k.status ? `<span class="tag green">${t('启用')}</span>` : `<span class="tag gray">${t('停用')}</span>`}</td>
               <td style="font-size:12px;color:var(--text-3)">${esc(k.last_used_at || '-')}</td>
               <td>
@@ -508,7 +509,6 @@ export async function render(el) {
           close(); openApiKeys(id);
         };
       } });
-      async function loadKeys() { const j = await api(`/agents/${id}/api-keys`); return j.data; }
       function bindRows(mask) {
         mask.querySelectorAll('[data-copy]').forEach(b => b.onclick = () => copyText(b.dataset.copy));
         mask.querySelectorAll('[data-tg]').forEach(b => b.onclick = async () => {

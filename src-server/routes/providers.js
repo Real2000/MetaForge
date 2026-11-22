@@ -5,6 +5,7 @@ const { auth, adminOnly } = require('../lib/auth');
 const circuit = require('../lib/circuit');
 const { classifyModel } = require('../lib/model-types');
 const { encrypt, decrypt } = require('../lib/crypto-util');
+const { assertPublicHttpUrl } = require('../lib/ssrf-guard'); // SEC-05：供应商 URL 的 SSRF 校验
 
 const router = express.Router();
 router.use(auth, adminOnly);
@@ -59,6 +60,8 @@ router.get('/health', (req, res) => {
 router.post('/', (req, res) => {
   const { name, base_url, api_key, models, remark, model_price } = req.body || {};
   if (!name?.trim()) return res.json({ code: 400, msg: '供应商名称不能为空' });
+  // SEC-05：SSRF 校验（拒绝私网/环回/云元数据地址，除非管理员 AGENT_FETCH_ALLOW_PRIVATE=1）
+  if (base_url && String(base_url).trim()) { try { assertPublicHttpUrl(String(base_url).trim()); } catch (e) { return res.json({ code: 400, msg: e.message }); } }
   const ms = typeof models === 'string' ? models.split(/[,，\s]+/).filter(Boolean) : (models || []);
   const configured = 1;
   const priceJson = parsePriceBody(model_price);
@@ -74,6 +77,8 @@ router.put('/:id', (req, res) => {
   const old = db.prepare('SELECT * FROM providers WHERE id=?').get(req.params.id);
   if (!old) return res.json({ code: 404, msg: '供应商不存在' });
   const { name, base_url, api_key, models, remark, auth_type, auth_config, status, status_msg, model_price } = req.body || {};
+  // SEC-05：SSRF 校验（改地址同样拦截）
+  if (base_url && String(base_url).trim()) { try { assertPublicHttpUrl(String(base_url).trim()); } catch (e) { return res.json({ code: 400, msg: e.message }); } }
   let ms;
   if (Array.isArray(models)) ms = models;
   else if (typeof models === 'string' && models) ms = models.split(/[,，\s]+/).filter(Boolean);

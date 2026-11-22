@@ -56,6 +56,39 @@ const { editionBanner, checkExpiryNotice } = require('./src-server/lib/edition')
 const fs = require('fs');
 
 const app = express();
+
+// SEC-01 限流 IP 可信化（2026-11-22）：受信代理配置统一出口，影响 req.ip 与 clientIp 取值。
+// 默认（未设 AGENT_TRUST_PROXY）为直连，Express 不采信 X-Forwarded-For，堵住伪造 XFF 绕过按 IP 限流/爆破锁定。
+const { trustProxySetting } = require('./src-server/lib/rate-limit');
+app.set('trust proxy', trustProxySetting());
+
+// SEC-06 全局安全响应头（2026-11-22）：任意响应统一注入，防 MIME 嗅探/点击劫持/信息外泄。
+// HSTS 仅生产（或 AGENT_ENABLE_HSTS=1）启用，避免本地 HTTP 开发被浏览器强制 HTTPS。
+// CSP 先以 Report-Only 下发（不破坏 SPA 内联脚本/样式），观察无大规模违规后再切强制。
+// 分享页 /share/* 需要被白名单域名 iframe 嵌入：跳过此处 X-Frame-Options，交由该路由动态下发 frame-ancestors。
+const isProd = process.env.NODE_ENV === 'production' || process.env.AGENT_ENABLE_HSTS === '1';
+const APP_CSP_REPORT_ONLY = [
+  "default-src 'self'",
+  "img-src 'self' data: blob: https:",
+  "style-src 'self' 'unsafe-inline'",
+  "script-src 'self' 'unsafe-inline'",
+  "connect-src 'self'",
+  "font-src 'self' data:",
+  "base-uri 'self'",
+  "frame-ancestors 'self'",
+].join('; ');
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(self), camera=(), payment=()');
+  if (isProd) res.setHeader('Strict-Transport-Security', 'max-age=15552000; includeSubDomains');
+  if (!String(req.path).startsWith('/share/')) {
+    res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+    res.setHeader('Content-Security-Policy-Report-Only', APP_CSP_REPORT_ONLY);
+  }
+  next();
+});
+
 // U0-6 A2A Agent Card 公开发现端点（必须在任何鉴权中间件之前注册）
 const { publicRouter, authRouter, adminRouter } = require('./src-server/routes/a2a');
 app.use(publicRouter); // /.well-known/agent-card.json 公开访问

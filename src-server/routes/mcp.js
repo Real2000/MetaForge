@@ -7,6 +7,14 @@ const { auth, adminOnly } = require('../lib/auth');
 const mcp = require('../lib/mcp');
 const catalog = require('../lib/mcp-catalog');
 const creds = require('../lib/mcp-credentials');
+const { assertPublicHttpUrl } = require('../lib/ssrf-guard'); // SEC-05：MCP 服务 URL 的 SSRF 校验
+
+/** SEC-05：对 MCP 服务 URL 做 SSRF 校验（跳过含 {{占位符}} 的模板 URL，渲染后再校验由 listTools 承担） */
+async function checkServerUrl(url) {
+  const s = String(url || '').trim();
+  if (!s || s.includes('{{')) return;
+  await assertPublicHttpUrl(s);
+}
 
 const router = express.Router();
 router.use(auth);
@@ -51,9 +59,10 @@ router.get('/', (req, res) => {
 });
 
 // 新建（admin）
-router.post('/', adminOnly, (req, res) => {
+router.post('/', adminOnly, async (req, res) => {
   const { name, url, api_key, transport } = req.body || {};
   if (!name?.trim() || !url?.trim()) return res.json({ code: 400, msg: '请填写服务名称与 URL' });
+  try { await checkServerUrl(url.trim()); } catch (e) { return res.json({ code: 400, msg: e.message }); }
   const info = db.prepare(`INSERT INTO mcp_servers (name,url,api_key,transport,status,created_at) VALUES (?,?,?,?,1,datetime('now','localtime'))`)
     .run(name.trim(), url.trim(), api_key || '', transport === 'sse' ? 'sse' : 'http');
   db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)').run(req.user.username, '注册MCP服务', name.trim(), req.ip, now());
@@ -62,10 +71,11 @@ router.post('/', adminOnly, (req, res) => {
 
 // 编辑（admin）——P5.32：trusted 信任开关（显式标记后才允许该服务的只读工具降为 low 免确认）
 // P5.33 审查修复（R2/F9）：trusted 未传时保留原值——此前停用/启用按钮只传 status 会静默清零信任并写失真审计
-router.put('/:id', adminOnly, (req, res) => {
+router.put('/:id', adminOnly, async (req, res) => {
   const old = db.prepare('SELECT * FROM mcp_servers WHERE id=?').get(req.params.id);
   if (!old) return res.json({ code: 404, msg: 'MCP 服务不存在' });
   const { name, url, api_key, transport, status, trusted } = req.body || {};
+  if (url && String(url).trim() !== old.url) { try { await checkServerUrl(url.trim()); } catch (e) { return res.json({ code: 400, msg: e.message }); } }
   const nextTrusted = trusted !== undefined ? (trusted === 1 || trusted === true ? 1 : 0) : (old.trusted ? 1 : 0);
   if (nextTrusted !== (old.trusted ? 1 : 0)) {
     db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
@@ -162,6 +172,7 @@ router.post('/probe', adminOnly, async (req, res) => {
   const { url, api_key } = req.body || {};
   if (!url?.trim()) return res.json({ code: 400, msg: '请填写 URL' });
   try {
+    await checkServerUrl(url.trim());
     const { tools } = await mcp.listTools({ url: url.trim(), api_key: api_key || '' });
     res.json({ code: 0, data: { count: tools.length, tools: tools.map(t => ({ name: t.originalName, desc: (t.description || '').slice(0, 100) })) } });
   } catch (e) {

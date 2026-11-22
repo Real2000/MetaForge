@@ -8,7 +8,7 @@
  */
 const express = require('express');
 const { db, hashPwd, now } = require('../db');
-const { auth, adminOnly } = require('../lib/auth');
+const { auth, adminOnly, bumpTokenVersion } = require('../lib/auth');
 
 const router = express.Router();
 router.use(auth, adminOnly);
@@ -79,6 +79,8 @@ router.put('/:id', (req, res) => {
   const newDeptId = dept_id === undefined ? (target.dept_id ?? null) : normalizeDeptId(dept_id);
   db.prepare('UPDATE users SET nickname=?,role=?,dept=?,dept_id=?,status=? WHERE id=?')
     .run(String(nickname ?? target.nickname).slice(0, 30), newRole, String(dept ?? target.dept).slice(0, 30), newDeptId, newStatus, target.id);
+  // SEC-07（2026-11-22）：停用账号即吊销其全部令牌（token_version +1），在线会话立即失效
+  if (newStatus === 0 && target.status !== 0) bumpTokenVersion(target.id);
   const changes = [];
   if (newRole !== target.role) changes.push(newRole === 'admin' ? '升为管理员' : '转为普通用户');
   if (newStatus !== target.status) changes.push(newStatus === 0 ? '停用' : '启用');
@@ -96,8 +98,10 @@ router.put('/:id/reset-password', (req, res) => {
   const pwdErr = validPwd((req.body || {}).newPwd);
   if (pwdErr) return res.json({ code: 400, msg: pwdErr });
   db.prepare('UPDATE users SET password=?, must_change_pwd=1 WHERE id=?').run(hashPwd((req.body || {}).newPwd), target.id);
+  // SEC-07（2026-11-22）：管理员重置密码即踢出该用户全部端——token_version +1 使旧令牌全部失效
+  bumpTokenVersion(target.id);
   db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(req.user.username, '重置密码', `${target.username}（该用户下次登录需强制修改密码）`, req.ip, now());
+    .run(req.user.username, '重置密码', `${target.username}（该用户下次登录需强制修改密码，已踢出其它登录端）`, req.ip, now());
   res.json({ code: 0, msg: `已重置 ${target.username} 的密码，其下次登录将要求修改` });
 });
 

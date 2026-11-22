@@ -11,6 +11,7 @@ const { db, now } = require('../db');
 const { auth, adminOnly } = require('../lib/auth');
 const { runAgent } = require('../lib/workflow');
 const { extractApiContract, buildMcpInputSchema } = require('../lib/api-doc'); // P5.16：文档/schema 同源
+const { hashKey, maskPrefix } = require('../lib/apikey'); // SEC-02a：令牌哈希存储/比对
 
 const router = express.Router();
 
@@ -36,7 +37,8 @@ function listPublishedAgents() {
 // ================= MCP 协议端点（POST /mcp，Bearer 令牌） =================
 router.post('/', async (req, res) => {
   const token = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
-  const tk = db.prepare('SELECT * FROM mcp_tokens WHERE token=? AND status=1').get(token);
+  // SEC-02a：库中 token 列为 HMAC 哈希——按哈希比对
+  const tk = db.prepare('SELECT * FROM mcp_tokens WHERE token=? AND status=1').get(hashKey(token));
   if (!tk) {
     return res.status(401).json({ jsonrpc: '2.0', id: (req.body || {}).id ?? null, error: { code: -32001, message: 'Unauthorized: invalid or disabled MCP token' } });
   }
@@ -62,8 +64,8 @@ router.post('/', async (req, res) => {
         return ok({});
       case 'tools/list': {
         const agents = listPublishedAgents();
-        // P2-2：令牌作用域——绑定了 agent_id 的令牌仅暴露绑定的智能体（全域令牌 tk.agent_id 为 NULL 不受限）
-        const scoped = tk.agent_id ? agents.filter(a => a.id === tk.agent_id) : agents;
+        // SEC-02a：取消全域令牌——仅暴露令牌绑定的智能体（未绑定的令牌不返回任何工具）
+        const scoped = agents.filter(a => a.id === tk.agent_id);
         return ok({
           tools: scoped.map(a => {
             const c = extractApiContract(a);
@@ -79,8 +81,11 @@ router.post('/', async (req, res) => {
         const name = (params || {}).name || '';
         const m = /^agent_(\d+)$/.exec(name);
         if (!m) return err(-32602, `Invalid tool name: ${name}（工具名形如 agent_{id}，请先 tools/list 查看清单）`);
-        // P2-2：令牌作用域校验——绑定智能体的令牌仅可调用绑定目标（与 openapi.js agent_api_keys 同防线）
-        if (tk.agent_id && tk.agent_id !== +m[1]) {
+        // SEC-02a：取消全域令牌——必须绑定具体智能体才可调用
+        if (!tk.agent_id) {
+          return ok({ content: [{ type: 'text', text: '令牌未绑定智能体（全域令牌已停用，请重新生成绑定到具体智能体的令牌）' }], isError: true });
+        }
+        if (tk.agent_id !== +m[1]) {
           return ok({ content: [{ type: 'text', text: `令牌无权访问该智能体（令牌已绑定作用域，仅可调用 agent_${tk.agent_id}）` }], isError: true });
         }
         const agent = db.prepare(`SELECT * FROM agents WHERE id=? AND status='published'`).get(+m[1]);
@@ -122,33 +127,32 @@ router.get('/info', auth, adminOnly, (req, res) => {
       auth: 'Authorization: Bearer <令牌>',
       commands: { initialize: 'initialize', tools_list: 'tools/list', tools_call: 'tools/call' },
       tools: agents.map(a => ({ name: `agent_${a.id}`, agent: a.name, description: (a.description || '').slice(0, 100), params: extractApiContract(a).input.map(p => `${p.name}${p.required ? '*' : ''}:${p.type}`.replace(/(file|array\[file\])/, '📄$1')).join(' · ') })),
-      hint: '在 MCP 客户端（Claude Code / Cursor / Cherry Studio 等）添加自定义 MCP 服务器：URL 填上方端点，鉴权头填 Authorization: Bearer <令牌>，即可调用平台已发布智能体。生成令牌时可绑定单个智能体（作用域令牌仅能调用绑定的智能体，推荐最小授权）；留空为全域令牌。',
+      hint: '在 MCP 客户端（Claude Code / Cursor / Cherry Studio 等）添加自定义 MCP 服务器：URL 填上方端点，鉴权头填 Authorization: Bearer <令牌>，即可调用平台已发布智能体。生成令牌时必须绑定单个智能体（作用域令牌仅能调用绑定的智能体，最小授权；全域令牌已停用）。',
     },
   });
 });
 
-// 令牌列表（脱敏展示：仅首尾片段；P2-2：附带 agent_id/agent_name 作用域信息）
+// 令牌列表（脱敏展示：仅前缀掩码，不回传哈希；P2-2：附带 agent_id/agent_name 作用域信息）
 router.get('/tokens', auth, adminOnly, (req, res) => {
-  const rows = db.prepare(`SELECT t.*, a.name AS agent_name FROM mcp_tokens t LEFT JOIN agents a ON a.id = t.agent_id ORDER BY t.id DESC`).all()
-    .map(t => ({ ...t, token: t.token.length > 14 ? t.token.slice(0, 10) + '…' + t.token.slice(-4) : t.token }));
+  const rows = db.prepare(`SELECT t.id, t.name, t.agent_id, t.status, t.calls, t.last_used_at, t.created_at, t.token_prefix, a.name AS agent_name
+    FROM mcp_tokens t LEFT JOIN agents a ON a.id = t.agent_id ORDER BY t.id DESC`).all()
+    .map(t => ({ ...t, token: t.token_prefix || '' }));
   res.json({ code: 0, data: rows });
 });
 
 // 生成令牌（创建时完整返回一次，之后列表脱敏）
-// P2-2 修复 2026-11-09：可选 agent_id 绑定单个智能体（空 = 全域令牌，向后兼容存量调用方）
+// SEC-02a：仅存哈希 + 前缀掩码；取消全域令牌——必须绑定具体已发布智能体（D-3：仅 agent 级 + space/租户级）
 router.post('/tokens', auth, adminOnly, (req, res) => {
   const name = String((req.body || {}).name || '').slice(0, 30) || 'MCP 令牌';
-  let agentId = null;
   const raw = (req.body || {}).agent_id;
-  if (raw !== undefined && raw !== null && raw !== '') {
-    agentId = Number(raw);
-    if (!Number.isInteger(agentId) || agentId <= 0) return res.json({ code: 400, msg: 'agent_id 参数非法（正整数或留空）' });
-    const agent = db.prepare("SELECT id, name FROM agents WHERE id=? AND status='published'").get(agentId);
-    if (!agent) return res.json({ code: 400, msg: '绑定的智能体不存在或未发布' });
-  }
+  if (raw === undefined || raw === null || raw === '') return res.json({ code: 400, msg: '必须绑定一个已发布智能体（全域令牌已停用）' });
+  const agentId = Number(raw);
+  if (!Number.isInteger(agentId) || agentId <= 0) return res.json({ code: 400, msg: 'agent_id 参数非法（正整数）' });
+  const agent = db.prepare("SELECT id, name FROM agents WHERE id=? AND status='published'").get(agentId);
+  if (!agent) return res.json({ code: 400, msg: '绑定的智能体不存在或未发布' });
   const token = 'mcp_' + crypto.randomBytes(24).toString('hex');
-  db.prepare('INSERT INTO mcp_tokens (token,name,agent_id,status,created_at) VALUES (?,?,?,1,?)').run(token, name, agentId, now());
-  res.json({ code: 0, data: { token, name, agent_id: agentId }, msg: agentId ? '令牌已生成（已绑定智能体作用域，仅本次完整展示，请立即保存）' : '令牌已生成（全域令牌，仅本次完整展示，请立即保存）' });
+  db.prepare('INSERT INTO mcp_tokens (token,token_prefix,name,agent_id,status,created_at) VALUES (?,?,?,?,1,?)').run(hashKey(token), maskPrefix(token), name, agentId, now());
+  res.json({ code: 0, data: { token, name, agent_id: agentId }, msg: '令牌已生成（已绑定智能体作用域，仅本次完整展示，请立即保存）' });
 });
 
 // 停用 / 启用

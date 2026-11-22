@@ -75,15 +75,19 @@ function readToken(req) {
   return '';
 }
 
-/** 登录/换码成功后写 HttpOnly Cookie（与 token TTL 同寿；SameSite=Lax 兼容 SSE/顶层导航且防跨站 POST） */
+/** 登录/换码成功后写 HttpOnly Cookie（与 token TTL 同寿；SameSite=Lax 兼容 SSE/顶层导航且防跨站 POST）
+ *  SEC-07（2026-11-22）：生产环境强制 Secure 属性——仅经 HTTPS 回传，防明文信道窃取。
+ *  触发条件：NODE_ENV=production 或 AGENT_ENABLE_HSTS=1 或 AGENT_COOKIE_SECURE=1（本地 HTTP 开发默认不加，避免登录不可用）。 */
 function setAuthCookie(res, token) {
   const maxAge = Math.floor(TOKEN_TTL_MS / 1000);
-  res.setHeader('Set-Cookie', `${AUTH_COOKIE_NAME}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}`);
+  const secure = (process.env.NODE_ENV === 'production' || process.env.AGENT_ENABLE_HSTS === '1' || process.env.AGENT_COOKIE_SECURE === '1') ? '; Secure' : '';
+  res.setHeader('Set-Cookie', `${AUTH_COOKIE_NAME}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${secure}`);
 }
 
-/** 登出时清除认证 Cookie（Max-Age=0 即删） */
+/** 登出时清除认证 Cookie（Max-Age=0 即删；SEC-07：生产同步带 Secure，确保能覆盖已 Secure 的旧 Cookie） */
 function clearAuthCookie(res) {
-  res.setHeader('Set-Cookie', `${AUTH_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`);
+  const secure = (process.env.NODE_ENV === 'production' || process.env.AGENT_ENABLE_HSTS === '1' || process.env.AGENT_COOKIE_SECURE === '1') ? '; Secure' : '';
+  res.setHeader('Set-Cookie', `${AUTH_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secure}`);
 }
 
 function verify(token) {
@@ -94,6 +98,13 @@ function verify(token) {
   try {
     const payload = JSON.parse(Buffer.from(body, 'base64url').toString());
     if (payload.exp && Date.now() > payload.exp) return null;
+    // SEC-07（2026-11-22）：用户级令牌吊销——比对 token 内嵌版本号 tv 与用户当前 token_version。
+    // 改密/重置密码/停用账号时将该用户 token_version +1，本检查使该用户全部已签发旧令牌立即失效
+    // （无需逐条黑名单；旧令牌无 tv 字段时跳过，保持向后兼容）。
+    if (payload.tv != null) {
+      const u = db.prepare('SELECT token_version FROM users WHERE id=?').get(payload.uid);
+      if (!u || (u.token_version || 0) !== payload.tv) return null;
+    }
     // P0-4 token 吊销检查：查询 blacklist 表，命中则视为无效
     if (payload.jti) {
       const blacklisted = db.prepare('SELECT 1 FROM token_blacklist WHERE jti=?').get(payload.jti);
@@ -134,4 +145,24 @@ function revokeToken(req) {
   } catch { }
 }
 
-module.exports = { sign, verify, auth, adminOnly, revokeToken, TOKEN_TTL_MS, readToken, setAuthCookie, clearAuthCookie };
+/** SEC-07（2026-11-22）：用户级令牌吊销——将指定用户 token_version +1。
+ *  改密/管理员重置密码/停用账号时调用，配合 verify() 的 tv 比对，使该用户全部旧令牌立即失效。
+ *  返回新的 token_version（调用方可在吊销后签发携带新版本号的令牌，实现「本人换新、他人全踢」）。 */
+function bumpTokenVersion(userId) {
+  db.prepare('UPDATE users SET token_version = COALESCE(token_version, 0) + 1 WHERE id=?').run(userId);
+  const r = db.prepare('SELECT token_version FROM users WHERE id=?').get(userId);
+  return r ? (r.token_version || 0) : 0;
+}
+
+// SEC-08（2026-11-22）：token_blacklist 定期清理防膨胀——超过 TTL 的条目其令牌已自然过期，
+// 黑名单记录可安全删除。启动时执行一次 + 每小时一次（unref 不阻进程退出）。
+function cleanBlacklist() {
+  try {
+    const cutoff = new Date(Date.now() - TOKEN_TTL_MS - 3600000).toISOString(); // TTL + 1h 冗余
+    db.prepare('DELETE FROM token_blacklist WHERE created_at < ?').run(cutoff);
+  } catch { /* 表不可用等异常忽略 */ }
+}
+cleanBlacklist();
+setInterval(cleanBlacklist, 60 * 60 * 1000).unref();
+
+module.exports = { sign, verify, auth, adminOnly, revokeToken, bumpTokenVersion, cleanBlacklist, TOKEN_TTL_MS, readToken, setAuthCookie, clearAuthCookie };

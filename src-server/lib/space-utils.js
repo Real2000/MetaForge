@@ -34,7 +34,11 @@ function getOwnedSpaceIds(db, username) {
 function spaceVisibleTo(db, spaceId, username) {
   if (!spaceId) return true; // 无归属（0/NULL/''）→ 全员可见
   const sp = db.prepare('SELECT type, owner FROM spaces WHERE id=?').get(spaceId);
-  if (!sp) return true; // 空间不存在（脏数据/已删空间）→ 宽容放行，不因空间字段拒绝（与无归属等效）
+  // SEC-04（2026-11-22 安全止血）：空间不存在（脏数据/已删空间）→ fail-closed 不可见。
+  // 原实现 `return true`（宽容放行）与 spaceFilterSql 的 SQL 语义不一致：SQL 侧空间不存在即 EXISTS 为假、
+  // 资源被排除；JS 侧却放行，造成内存过滤链路越权泄露。现改为与 SQL 对齐：无法确认空间归属即拒绝；
+  // 资源 owner 命中的放行由调用方（filterBySpace）以 OR 方式补充。
+  if (!sp) return false;
   if (sp.type === 'enterprise') return true; // 企业空间 → 企业共享，全员可见
   return sp.owner === username; // 个人/部门空间 → 空间 owner 可见（过渡逻辑，部门成员名单待 members 表）
 }

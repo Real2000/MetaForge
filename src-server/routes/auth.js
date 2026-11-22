@@ -2,7 +2,7 @@
 const express = require('express');
 const crypto = require('crypto');
 const { db, hashPwd, verifyPwd, hashPwdAsync, now } = require('../db');
-const { sign, auth, adminOnly, revokeToken, TOKEN_TTL_MS, setAuthCookie, clearAuthCookie } = require('../lib/auth');
+const { sign, auth, adminOnly, revokeToken, bumpTokenVersion, TOKEN_TTL_MS, setAuthCookie, clearAuthCookie } = require('../lib/auth');
 const { createLimiter, clientIp } = require('../lib/rate-limit');
 const { loadSecrets } = require('../lib/secrets'); // 钉钉 OAuth 凭证（DINGTALK_APP_KEY/APP_SECRET）
 const { mint: mintExchange, consume: consumeExchange } = require('../lib/exchange-code'); // #14：一次性交换码换 JWT
@@ -85,7 +85,7 @@ router.post('/login', loginLimiter, async (req, res) => {
   clearLoginAttempts(username);
   // 旧 SALT 密码平滑迁移：登录成功即重写为新 SALT 哈希（一次性，用户无感）
   if (v.legacy) db.prepare('UPDATE users SET password=? WHERE id=?').run(await hashPwdAsync(password), user.id);
-  const token = sign({ uid: user.id, exp: Date.now() + TOKEN_TTL_MS });
+  const token = sign({ uid: user.id, exp: Date.now() + TOKEN_TTL_MS, tv: user.token_version || 0 });
   db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
     .run(user.username, '登录系统', '密码登录成功', ip, now());
   setAuthCookie(res, token); // P2-3：HttpOnly Cookie 签发（token 不再依赖前端 storage 持久化）
@@ -120,8 +120,11 @@ router.post('/login/change-password', auth, async (req, res) => {
   // 改密后吊销当前 token（旧 token 立即失效）——P2-3 连带修复（2026-11-09）：吊销后必须重新签发，
   // 否则改密成功即死会话（旧 Cookie 已吊销 / 前端无可用凭据，进入平台即被 401 踢回登录页）；
   // 该缺陷属存量问题，此前因 must_change_pwd 标记失效（P1-3）+ 前端路径 404 双重死链从未暴露
+  // SEC-07（2026-11-22）：改密后吊销该用户「全部端」旧令牌——token_version +1 使所有旧 tv 令牌立即失效，
+  // 再为本机重新签发携带新版本号的令牌（本人无缝续用，其它端被踢）。
   revokeToken(req);
-  const freshToken = sign({ uid: user.id, exp: Date.now() + TOKEN_TTL_MS });
+  const newTv = bumpTokenVersion(user.id);
+  const freshToken = sign({ uid: user.id, exp: Date.now() + TOKEN_TTL_MS, tv: newTv });
   setAuthCookie(res, freshToken); // 旧 Cookie 同名覆盖，浏览器立即换新
   db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
     .run(user.username, '修改密码', '密码已更新' + (user.must_change_pwd ? '（弱口令强制改密完成）' : ''), req.ip, now());
@@ -236,7 +239,7 @@ router.get('/dingtalk/callback', async (req, res) => {
     return fail('用户映射失败：' + e.message, 500, '钉钉登录用户创建失败');
   }
   // ⑤ 签发与密码登录完全同构的 token（sign 自动加 jti，TOKEN_TTL_MS 同 TTL，/api/auth/me 可直接校验）
-  const token = sign({ uid: user.id, exp: Date.now() + TOKEN_TTL_MS });
+  const token = sign({ uid: user.id, exp: Date.now() + TOKEN_TTL_MS, tv: user.token_version || 0 });
   db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
     .run(user.username, '钉钉扫码登录', '成功（' + (user.created ? '新建用户' : '匹配已有用户') + '）', ip, now());
   // ⑥ 302 重定向回前端（token 走 URL hash 不随请求发服务器；前端适配不在本轮）
@@ -310,8 +313,8 @@ router.post('/register', async (req, res) => {
   db.prepare('INSERT INTO invite_registrations (username, invite_code, ip, created_at) VALUES (?,?,?,?)')
     .run(username, invite_code, req.ip, now());
   // 签发 Token 自动登录
-  const user = db.prepare('SELECT id, username, nickname, role, dept, onboarded FROM users WHERE username=?').get(username);
-  const token = sign({ uid: user.id });
+  const user = db.prepare('SELECT id, username, nickname, role, dept, onboarded, token_version FROM users WHERE username=?').get(username);
+  const token = sign({ uid: user.id, tv: user.token_version || 0 });
   setAuthCookie(res, token);
   res.json({ code: 0, msg: '注册成功', data: { token, user } });
 });

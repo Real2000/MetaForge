@@ -9,6 +9,7 @@ const { db, now } = require('../db');
 const { createLimiter, clientIp } = require('../lib/rate-limit');
 const { getEnabledProviders, generateState, consumeState, exchangeCode, bindOrCreateUser } = require('../lib/sso');
 const { encrypt, decrypt } = require('../lib/crypto-util');
+const { assertPublicHttpUrl } = require('../lib/ssrf-guard'); // SEC-05：SSO 端点 URL 的 SSRF 校验
 const { sign, setAuthCookie, auth } = require('../lib/auth');
 
 const router = express.Router();
@@ -37,7 +38,7 @@ router.post('/callback', callbackLimiter, async (req, res) => {
     // 执行 OAuth2 授权码交换
     const identity = await exchangeCode(code, provider_id);
     const user = await bindOrCreateUser(identity, provider_id);
-    const token = sign({ uid: user.id, exp: Date.now() + 7 * 86400000 });
+    const token = sign({ uid: user.id, exp: Date.now() + 7 * 86400000, tv: user.token_version || 0 });
     setAuthCookie(res, token);
     res.json({ code: 0, data: { token, user } });
   } catch (e) {
@@ -63,6 +64,10 @@ router.post('/', (req, res) => {
   const b = req.body || {};
   const name = String(b.name || '').trim();
   if (!name) return res.json({ code: 400, msg: '提供方名称不能为空' });
+  // SEC-05：SSO 端点 URL 出站前需为公网地址（issuer/authorization_url/token_url/userinfo_url）
+  for (const k of ['issuer', 'authorization_url', 'token_url', 'userinfo_url']) {
+    if (b[k] && String(b[k]).trim()) { try { assertPublicHttpUrl(String(b[k]).trim()); } catch (e) { return res.json({ code: 400, msg: `字段 ${k} 非法：${e.message}` }); } }
+  }
   const secret = String(b.client_secret || '');
   const encrypted = secret ? encrypt(secret) : '';
   db.prepare(`INSERT INTO sso_providers (name, display_name, issuer, client_id, client_secret,
@@ -80,6 +85,10 @@ router.put('/:id', (req, res) => {
   const old = db.prepare('SELECT * FROM sso_providers WHERE id=?').get(req.params.id);
   if (!old) return res.json({ code: 404, msg: 'SSO 提供方不存在' });
   const b = req.body || {};
+  // SEC-05：SSO 端点 URL 出站前需为公网地址
+  for (const k of ['issuer', 'authorization_url', 'token_url', 'userinfo_url']) {
+    if (b[k] && String(b[k]).trim()) { try { assertPublicHttpUrl(String(b[k]).trim()); } catch (e) { return res.json({ code: 400, msg: `字段 ${k} 非法：${e.message}` }); } }
+  }
   const secret = String(b.client_secret || '');
   // 仅当提供了新密钥且与掩码不同时才更新
   const updatedSecret = (secret && secret !== '••••••••') ? encrypt(secret) : old.client_secret;

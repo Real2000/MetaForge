@@ -13,6 +13,7 @@
  * 返回 [{content, file, kb, kb_id, score(融合), bm25, vec, engine, channels, hit_terms, rerank_score}]
  */
 const { db } = require('../db');
+const { assertPublicHttpUrl } = require('./ssrf-guard'); // SEC-05：向量/重排网关出站前的 SSRF 校验
 
 const DIM = 256;              // 本地哈希向量维度
 const BGE_DIM = 1024;         // bge-m3 向量维度
@@ -44,7 +45,9 @@ async function bgeEmbed(texts) {
   const ps = bgeProviders();
   for (const p of ps) {
     try {
-      const r = await fetch(p.base_url.replace(/\/+$/, '') + '/embeddings', {
+      const url = p.base_url.replace(/\/+$/, '') + '/embeddings';
+      await assertPublicHttpUrl(url); // SEC-05：拒绝私网/环回目标（网关在内网时由 AGENT_FETCH_ALLOW_PRIVATE=1 放行）
+      const r = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + p.api_key },
         body: JSON.stringify({ model: BGE_MODEL, input: texts.map(t => String(t || '').slice(0, 4000)) }),
@@ -83,6 +86,7 @@ async function bgeRerank(query, candidates, model) {
   for (const p of ps) {
     try {
       const url = p.base_url.replace(/\/+$/, '') + '/rerank';
+      await assertPublicHttpUrl(url); // SEC-05：拒绝私网/环回目标
       const r = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + p.api_key },

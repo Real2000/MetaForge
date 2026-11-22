@@ -12,6 +12,7 @@ const { resolveKbFilter } = require('../lib/kb-metadata'); // V1.2 审查加固 
 const { check, countHits, mask } = require('../lib/security');
 const dify = require('../lib/dify');
 const { createLimiter } = require('../lib/rate-limit');
+const { hashKey } = require('../lib/apikey'); // SEC-02a：按哈希比对 API Key
 const { addUsage } = require('../lib/quota');
 const { recordModelUsage } = require('../lib/billing'); // U1-6：开放 API 调用成本归因（归智能体发布者）
 
@@ -51,15 +52,18 @@ function authKey(req) {
   const h = req.headers.authorization || '';
   const key = h.startsWith('Bearer ') ? h.slice(7).trim() : '';
   if (!key) return null;
-  const k = db.prepare('SELECT * FROM agent_api_keys WHERE key=? AND status=1').get(key);
+  // SEC-02a：库中 key 列为 HMAC 哈希——按哈希比对（不再明文比对）
+  const k = db.prepare('SELECT * FROM agent_api_keys WHERE key=? AND status=1').get(hashKey(key));
   if (!k) return null;
   db.prepare('UPDATE agent_api_keys SET last_used_at=? WHERE id=?').run(now(), k.id);
   return { k };
 }
 
-/** P2-2 修复：校验 key 是否允许访问指定 agent——key 无 agent_id 限制或 agent_id 匹配则通过，否则返回错误消息 */
+/** SEC-02a：取消「全域 Key」——无绑定 agent_id 的 Key 一律拒绝（D-3：仅 agent 级 + space/租户级）。
+ *  存量全域行为死代码（agent_id NOT NULL，生产库 0 行），移除后无迁移包袱。
+ *  返回错误消息字符串表示拒绝，null 表示通过。 */
 function authKeyForAgent(k, agentId) {
-  if (!k.agent_id) return null; // 无 agent_id 限制（全域 Key）
+  if (!k.agent_id) return 'API Key 未绑定智能体（全域 Key 已停用，请创建绑定到具体智能体的 Key）';
   if (k.agent_id === agentId) return null; // 匹配
   return 'API Key 无权访问该智能体（Key 绑定到特定智能体，请创建对应 Key）';
 }
@@ -73,8 +77,8 @@ router.get('/v1/models', keyModelsLimit, (req, res) => {
   const h = authKey(req);
   if (!h) return unauthorized(res);
   const agents = db.prepare("SELECT id,name,description FROM agents WHERE status='published' AND (source='self' OR source='dify')").all();
-  // P2-2 修复：全域 Key（agent_id 为 null/0）能看到所有已发布智能体；绑定了 agent_id 的 Key 只看到绑定的智能体
-  const visible = !h.k.agent_id ? agents : agents.filter(a => a.id === h.k.agent_id);
+  // SEC-02a：全域 Key 停用后，仅可见 Key 绑定的智能体（无绑定不返回任何智能体）
+  const visible = agents.filter(a => a.id === h.k.agent_id);
   res.json({
     object: 'list',
     data: visible.map(a => ({
@@ -98,7 +102,7 @@ router.post('/v1/chat/completions', keyChatLimit, async (req, res) => {
   const agentId = m ? +m[1] : 0;
   // P2-2 修复：校验 Key 的作用域——绑定了 agent_id 的 Key 仅可调用绑定智能体
   const scopeCheck = authKeyForAgent(h.k, agentId);
-  if (scopeCheck) return res.status(403).json({ error: { message: scopeCheck.msg, type: 'key_scope_denied' } });
+  if (scopeCheck) return res.status(403).json({ error: { message: scopeCheck, type: 'key_scope_denied' } });
   const agent = m ? db.prepare('SELECT * FROM agents WHERE id=? AND status=?').get(agentId, 'published') : null;
   if (!agent) {
     return res.status(404).json({ error: { message: `模型不存在：${model}。请先 GET /openapi/v1/models 获取可用智能体列表`, type: 'model_not_found' } });
