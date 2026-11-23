@@ -16,6 +16,7 @@
  */
 const express = require('express');
 const { db } = require('../db');
+const dal = require('../lib/dal'); // BE-C1：新增强制统一出口（方言翻译 + 租户边界注入）
 const { auth, adminOnly } = require('../lib/auth');
 const evalSuite = require('../lib/eval-suite');
 const swebenchRunner = require('../lib/swebench-runner');
@@ -36,8 +37,10 @@ router.get('/config', (req, res) => {
 router.get('/suites', (req, res) => {
   const suites = evalSuite.SUITE_TEMPLATES.map(t => ({ ...t, builtin: true }));
   // AI-03（2026-11-23）：附带 score/created_at/metrics——RAG 基线历史可直接展示四指标聚合
-  const evals = db.prepare(`SELECT e.id, e.name, e.type, e.kb_id, e.agent_id, e.score, e.created_at, e.metrics, a.name AS agent_name
-    FROM evaluations e LEFT JOIN agents a ON a.id=e.agent_id ORDER BY e.id DESC LIMIT 200`).all();
+  // BE-C1（2026-11-23）：走 dal 统一出口，evaluations/agents 为租户域表，统一注入租户边界（单租户零回归）
+  const tw = dal.tenantWhere('e', dal.tenantScope(req));
+  const evals = dal.q(`SELECT e.id, e.name, e.type, e.kb_id, e.agent_id, e.score, e.created_at, e.metrics, a.name AS agent_name
+    FROM evaluations e LEFT JOIN agents a ON a.id=e.agent_id WHERE 1=1${tw.sqlStr} ORDER BY e.id DESC LIMIT 200`, tw.args);
   for (const ev of evals) {
     let metrics = null;
     try { metrics = JSON.parse(ev.metrics || 'null'); } catch { metrics = null; }
@@ -182,7 +185,9 @@ router.post('/rag-baseline', adminOnly, async (req, res) => {
   let cases = Array.isArray(b.cases) && b.cases.length ? b.cases : null;
   let evRef = null;
   if (!cases && b.evaluation_id != null) {
-    evRef = db.prepare(`SELECT * FROM evaluations WHERE id=? AND type='kb' AND kb_id=?`).get(Number(b.evaluation_id), kbId);
+    // BE-C1：走 dal 统一出口 + 租户边界——引用的评测集必须属于当前租户，防止跨租户借用 dataset
+    const tw = dal.tenantWhere('', dal.tenantScope(req));
+    evRef = dal.getq(`SELECT * FROM evaluations WHERE id=? AND type='kb' AND kb_id=?${tw.sqlStr}`, [Number(b.evaluation_id), kbId, ...tw.args]);
     if (!evRef) return res.json({ code: 404, msg: 'evaluation_id 对应的知识库评测集不存在（须为该库的 type=kb 评测集）' });
     try { cases = JSON.parse(evRef.dataset || '[]'); } catch { cases = null; }
     if (!Array.isArray(cases) || !cases.length) return res.json({ code: 400, msg: '该评测集 dataset 为空或损坏' });
@@ -196,8 +201,8 @@ router.post('/rag-baseline', adminOnly, async (req, res) => {
   if (!out.ok) return res.json({ code: 400, msg: out.msg });
   const m = out.metrics;
   const fmt = v => (v == null ? '—' : (+v).toFixed(2));
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(req.user.username, 'RAG 质量基线采集', `${out.name}：${out.cases} 用例（可评答案 ${m.evaluated_answers}）——上下文精确率 ${fmt(m.context_precision)} / 召回率 ${fmt(m.context_recall)} / 答案相关性 ${fmt(m.answer_relevancy)} / 忠实度 ${fmt(m.faithfulness)}`, req.ip, require('../db').now());
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)',
+    [req.user.username, 'RAG 质量基线采集', `${out.name}：${out.cases} 用例（可评答案 ${m.evaluated_answers}）——上下文精确率 ${fmt(m.context_precision)} / 召回率 ${fmt(m.context_recall)} / 答案相关性 ${fmt(m.answer_relevancy)} / 忠实度 ${fmt(m.faithfulness)}`, req.ip, require('../db').now()]);
   res.json({ code: 0, data: { id: out.id, name: out.name, cases: out.cases, metrics: out.metrics, score: out.score, detail: out.detail } });
 });
 

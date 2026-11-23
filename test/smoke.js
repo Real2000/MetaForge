@@ -11210,6 +11210,114 @@ print('PY_OK')
     }
   });
 
+  // ==================== BE-E1 迁移框架单一化（2026-11-23） ====================
+  console.log('【BE-E1】迁移框架单一化（M4 列迁出 / down 回滚 / schema 锚点与漂移 / 内联门禁 / CLI）');
+  {
+    const { db } = require('../src-server/db');
+    const mig = require('../src-server/lib/migrate');
+
+    await t('BE-E1：M4 列迁移 #124~#131 已入册——全新库单次 boot 后全部就位（时序 Bug 根治）', () => {
+      // 本 smoke 进程 require db.js 即为全新库单次 boot（此前 M4 内联块写在建表语句之前，
+      // 单次 boot 会丢 retrieval_trace，靠 P2 子进程二次 boot 才补救——此测试守住该回归）
+      const traceCols = db.prepare('PRAGMA table_info(chat_traces)').all().map(c => c.name);
+      assert.ok(traceCols.includes('retrieval_trace'), 'chat_traces 应有 retrieval_trace（#128）');
+      const kbCols = db.prepare('PRAGMA table_info(kbs)').all().map(c => c.name);
+      for (const c of ['rerank_enabled', 'rerank_model', 'rerank_top_n', 'rerank_threshold']) {
+        assert.ok(kbCols.includes(c), `kbs 应有 ${c}（#124~#127）`);
+      }
+      const evCols = db.prepare('PRAGMA table_info(evaluations)').all().map(c => c.name);
+      assert.ok(evCols.includes('metrics'), 'evaluations 应有 metrics（#129）');
+      const amCols = db.prepare('PRAGMA table_info(agent_memories)').all().map(c => c.name);
+      assert.ok(amCols.includes('embedding') && amCols.includes('last_used_at'), 'agent_memories 应有 embedding+last_used_at（#130/#131）');
+      const ids = mig.getAppliedIds();
+      for (const id of [124, 125, 126, 127, 128, 129, 130, 131]) {
+        assert.ok(ids.has(id), `迁移 #${id} 应已记录台账`);
+      }
+      // db.js 不再含 M4 内联迁移（DDL 特征级检查，迁出干净）
+      const src = fs.readFileSync(path.join(__dirname, '../src-server/db.js'), 'utf8');
+      assert.ok(!src.includes('ADD COLUMN retrieval_trace'), 'db.js 不应再含 retrieval_trace 内联加列');
+      assert.ok(!src.includes('ADD COLUMN rerank_'), 'db.js 不应再含 kbs.rerank_* 内联加列');
+      assert.ok(!src.includes('ADD COLUMN metrics'), 'db.js 不应再含 evaluations.metrics 内联加列');
+      assert.ok(!src.includes('ADD COLUMN embedding BLOB') && !src.includes("ADD COLUMN last_used_at"), 'db.js 不应再含 agent_memories M4 两列内联加列');
+    });
+
+    await t('BE-E1：down/up 回滚闭环——逆序回滚 #131 删列、台账出册、up 恢复', () => {
+      const appliedBefore = mig.getAppliedIds();
+      assert.ok(appliedBefore.has(131), '前置：#131 应在台账');
+      try {
+        const results = mig.revertMigrations(mig.ALL_MIGRATIONS, { to: 130 });
+        assert.strictEqual(results.length, 1, '应恰好回滚一步（#131）');
+        assert.ok(results[0].ok && results[0].id === 131, '回滚 #131 应成功：' + JSON.stringify(results[0]));
+        const cols = db.prepare('PRAGMA table_info(agent_memories)').all().map(c => c.name);
+        assert.ok(!cols.includes('last_used_at'), '回滚后 last_used_at 列应消失（DROP COLUMN）');
+        assert.ok(!mig.getAppliedIds().has(131), '台账应移除 #131');
+      } finally {
+        // 防御式：断言失败也保证 up 恢复，不把删列状态泄漏给后续测试
+        const r = mig.runMigrations(mig.ALL_MIGRATIONS, { onlyIds: [131] });
+        assert.strictEqual(r.applied, 1, 'up 应重新应用 #131');
+      }
+      const colsAfter = db.prepare('PRAGMA table_info(agent_memories)').all().map(c => c.name);
+      assert.ok(colsAfter.includes('last_used_at'), 'up 后 last_used_at 列应恢复');
+      assert.ok(mig.getAppliedIds().has(131), '台账应重新记录 #131');
+    });
+
+    await t('BE-E1：schema 锚点与漂移检测——指纹一致 ok、绕过框架改结构报 drift 并定位对象', () => {
+      const fp = mig.computeSchemaFingerprint();
+      assert.ok(/^[0-9a-f]{64}$/.test(fp.hash), '全库指纹应为 sha256 hex');
+      assert.ok(fp.objectCount > 100, `应覆盖全库对象（实际 ${fp.objectCount}）`);
+      mig.anchorSchema();
+      assert.strictEqual(mig.checkSchemaDrift().status, 'ok', '锚定后应一致');
+      // 模拟「绕过迁移框架直改结构」：漂移检测应捕获并定位对象
+      db.exec("ALTER TABLE sessions ADD COLUMN __drift_probe TEXT DEFAULT ''");
+      const drift = mig.checkSchemaDrift();
+      assert.strictEqual(drift.status, 'drift', '直改结构应报 drift');
+      assert.ok(drift.drifted.some(k => k.startsWith('table:sessions')), 'drift 应定位到 sessions：' + drift.drifted.join(','));
+      try {
+        db.exec('ALTER TABLE sessions DROP COLUMN __drift_probe');
+      } catch (e) { throw new Error('清理探针列失败：' + e.message); }
+      assert.strictEqual(mig.checkSchemaDrift().status, 'ok', '恢复后应重新一致');
+      // 锚点与发布绑定：app_version 记录 package.json 版本
+      const ver = db.prepare("SELECT value FROM schema_anchor WHERE key='app_version'").get();
+      assert.ok(ver && /^\d+\.\d+\.\d+/.test(ver.value), '锚点应记录应用版本（与发布绑定）');
+    });
+
+    await t('BE-E1：lint-inline-schema 门禁——冻结基线，新增内联建表/加列被拦截', () => {
+      const lint = require('../scripts/lint-inline-schema.js');
+      // 函数级：扫描器解析 CREATE TABLE / ALTER ADD COLUMN
+      const scanned = lint.scanInlineSchema('db.exec("CREATE TABLE IF NOT EXISTS foo (id INTEGER)");\ndb.exec("ALTER TABLE foo ADD COLUMN bar TEXT");');
+      assert.ok(scanned.tables.includes('foo'), '应扫出内联建表 foo');
+      assert.ok(scanned.alters.some(([k]) => k === 'foo.bar'), '应扫出加列对 foo.bar');
+      const baseline = JSON.parse(fs.readFileSync(lint.BASELINE, 'utf8'));
+      // 门禁级：当前真实 db.js 通过（基线内）
+      const realSrc = fs.readFileSync(lint.DB_JS, 'utf8');
+      const ok = lint.checkInlineSchema(realSrc, baseline);
+      assert.ok(ok.ok, '当前 db.js 应通过门禁：' + JSON.stringify(ok.violations || []));
+      // 门禁级：基线外新增被拦截（建表 + 加列各一）
+      const badSrc = realSrc + '\ndb.exec("CREATE TABLE IF NOT EXISTS __lint_probe (id INTEGER)");\ndb.exec("ALTER TABLE sessions ADD COLUMN __probe_col TEXT");';
+      const bad = lint.checkInlineSchema(badSrc, baseline);
+      assert.strictEqual(bad.ok, false, '新增内联 DDL 应被拦截');
+      assert.ok(bad.violations.some(v => v.includes('__lint_probe')), '应报告新增建表违规');
+      assert.ok(bad.violations.some(v => v.includes('__probe_col')), '应报告新增加列违规');
+    });
+
+    await t('BE-E1：CLI scripts/migrate.js——status 子进程跑通（台账 + 锚点 + 漂移状态）', async () => {
+      const { spawn } = require('child_process');
+      const child = spawn(process.execPath, [path.join(__dirname, '../scripts/migrate.js'), 'status'], {
+        cwd: path.join(__dirname, '..'), env: { ...process.env }, stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let out = '', err = '';
+      child.stdout.on('data', d => { out += d; });
+      child.stderr.on('data', d => { err += d; });
+      const timer = setTimeout(() => child.kill('SIGKILL'), 60000);
+      const code = await new Promise((resolve) => { child.on('close', resolve); });
+      clearTimeout(timer);
+      assert.strictEqual(code, 0, 'CLI status 应正常退出（stderr：' + err.slice(0, 200) + '）');
+      assert.ok(out.includes('台账：'), '应输出台账统计');
+      assert.ok(/已应用/.test(out), '应报告已应用步数');
+      assert.ok(out.includes('锚点'), '应输出锚点状态');
+    });
+  }
+
   try { db.close(); } catch { }
   fs.rmSync(process.env.AGENT_DATA_DIR, { recursive: true, force: true });
   console.log('\n———————————————');

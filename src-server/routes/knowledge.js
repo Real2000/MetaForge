@@ -15,6 +15,7 @@
  */
 const express = require('express');
 const { db, now } = require('../db');
+const dal = require('../lib/dal'); // BE-C1：新增强制统一出口（方言翻译 + 租户边界注入）
 const { auth } = require('../lib/auth');
 const { retrieve, rerankModels } = require('../lib/retriever');
 const { generateForFile } = require('../lib/keywordgen');
@@ -544,7 +545,9 @@ router.get('/:id/meta-options', (req, res) => {
   const kb = db.prepare('SELECT * FROM kbs WHERE id=?').get(req.params.id);
   const deny = denyIfNotAllowed(kb, req.user);
   if (deny) return res.json(deny);
-  const rows = db.prepare("SELECT c.metadata FROM kb_chunks c WHERE c.kb_id=? AND c.metadata IS NOT NULL AND c.metadata != ''").all(kb.id);
+  // BE-C1：走 dal 统一出口 + 租户边界（kb 归属已由 denyIfNotAllowed 校验，chunk 随库走，双保险）
+  const tw = dal.tenantWhere('c', dal.tenantScope(req));
+  const rows = dal.q(`SELECT c.metadata FROM kb_chunks c WHERE c.kb_id=? AND c.metadata IS NOT NULL AND c.metadata != ''${tw.sqlStr}`, [kb.id, ...tw.args]);
   const byKey = new Map(); // 键 → Set(去重值集）
   for (const r of rows) {
     let meta = null;

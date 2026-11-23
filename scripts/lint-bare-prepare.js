@@ -21,8 +21,16 @@ const path = require('path');
 const ROOT = path.join(__dirname, '..');
 const SCAN_DIRS = ['src-server'];
 const BASELINE = path.join(__dirname, 'dal-baseline.json');
-// 允许「出口/框架」层直接持有裸查（db.js/dal.js 等为方言与租户出口自身；audit.js 为审计写入/校验底层，须对任意 db 实例工作）
-const ALLOWLIST = new Set(['src-server/db.js', 'src-server/lib/dal.js', 'src-server/lib/migrate.js', 'src-server/lib/sql-dialect.js', 'src-server/lib/db-driver.js', 'src-server/lib/audit.js']);
+// 允许「出口/框架」层直接持有裸查（db.js/dal.js 等为方言与租户出口自身；audit.js 为审计写入/校验底层，须对任意 db 实例工作）。
+// RAG/向量引擎底层（2026-11-23 补录，M4 质量战役产物）：vec0 虚表 DDL/KNN、FTS5 MATCH、BLOB 向量读写、
+// GraphRAG 实体图、记忆语义召回、RAGAS 指标采集、摄取管道——均为平台原生 SQLite 特性语法，
+// 方言翻译（q/getq/runq）与业务 CRUD 租户收敛不适用（D-2：SQLite 为默认库，PG 方言仅 SaaS 档远期）。
+const ALLOWLIST = new Set([
+  'src-server/db.js', 'src-server/lib/dal.js', 'src-server/lib/migrate.js',
+  'src-server/lib/sql-dialect.js', 'src-server/lib/db-driver.js', 'src-server/lib/audit.js',
+  'src-server/lib/vector-index.js', 'src-server/lib/retriever.js', 'src-server/lib/graphrag.js',
+  'src-server/lib/memory-recall.js', 'src-server/lib/rag-metrics.js', 'src-server/lib/ingestion-pipeline.js',
+]);
 
 function walk(dir, out = []) {
   for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {

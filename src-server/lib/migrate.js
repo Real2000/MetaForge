@@ -1,15 +1,24 @@
 /**
- * P1-17 版本化迁移框架（2026-11-13）
+ * P1-17 版本化迁移框架（2026-11-13）｜BE-E1 迁移单一化升级（2026-11-23）
  *
- * 目标：替代 db.js 内所有的内联 ALTER TABLE 迁移块，用序号/名称/上移/下移的迁移文件管理。
- * 每步迁移定义 { id, name, up, down }，按 id 顺序依次执行 up（降级用 down，暂不实现）。
+ * 目标：db.js 内联建表/加列的历史包袱冻结基线，此后 schema 演进只发生在这里。
+ * 每步迁移定义 { id, name, up?, down? }，按 id 顺序依次执行 up；down 用于回滚。
  *
  * 设计要点：
  *   1) 幂等：每步迁移执行前检查目标列/表是否存在，存在则跳过；
- *   2) 审计：迁移执行流程写入 op_logs（第一次执行记录 action=migrate）；
- *   3) 兼容：提供 addColumn、ensureTable 等快捷工具，与 db.js 内联迁移等价；
- *   4) 静默：新表创建后不给 console.log（db.js 原有那些日志由各模块自主决定是否输出）；
- *   5) 替代而非删除：内联迁移仍保留在 db.js（兼容旧库、降级分支），迁移框架从 id=1 开始记录。
+ *   2) 审计：_migrations 台账记录已应用 id（首次执行时间）；
+ *   3) 工具：addColumn/ensureTable/dropColumn 快捷函数；
+ *   4) down（BE-E1）：列迁移默认回滚=DROP COLUMN（SQLite ≥ 3.35），表迁移=DROP TABLE，
+ *      自定义 up 未提供 down 则标记不可回滚；revertMigrations 按逆序回滚、遇错即停；
+ *   5) 锚点（BE-E1）：anchorSchema 记录全库结构指纹 + 应用版本；checkSchemaDrift 检测
+ *      「绕过框架的结构漂移」——迁移台账未变但表结构变了（boot 时 warn，不阻塞）；
+ *   6) 开关：AGENT_NO_AUTO_MIGRATE=1 时 db.js 跳过 boot 自动迁移与锚定（CLI down 专用，
+ *      防止 require db 后自动 up 把刚回滚的步又加回来）。
+ *
+ * 背景（为什么 M4 列迁移要迁出 db.js）：M4 期间 AI-09 的 chat_traces.retrieval_trace 内联块
+ * 写在建表语句之前，全新库单次启动时 ALTER 报 no such table 被吞，导致首次对话落库即抛
+ * no such column、done 事件发不出（smoke 之所以没拦住，是 P2 HTTP 测试 spawn 子进程二次
+ * boot 同一目录把列补上了）。迁移执行器在 db.js 全部建表之后运行，时序天然正确。
  */
 
 const { db } = require('../db');
@@ -64,6 +73,20 @@ function addColumn(table, column, def) {
   }
 }
 
+/** 快捷删列（BE-E1 down 用，幂等）：列存在则 ALTER TABLE DROP COLUMN（需 SQLite ≥ 3.35），返回 true 表示已执行 */
+function dropColumn(table, column) {
+  if (!hasColumn(table, column)) return false;
+  const ver = String(db.prepare('select sqlite_version()').pluck().get());
+  const [major, minor] = ver.split('.').map(Number);
+  if (major < 3 || (major === 3 && minor < 35)) {
+    throw new Error(`当前 SQLite ${ver} 不支持 DROP COLUMN（需 ≥ 3.35），无法回滚 ${table}.${column}`);
+  }
+  db.exec(`ALTER TABLE ${table} DROP COLUMN ${column}`);
+  columnCache.set(`${table}.${column}`, false);
+  console.log(`[migrate] ${table} 表已回滚：删除 ${column} 字段`);
+  return true;
+}
+
 /** 快捷创建表（幂等） */
 function ensureTable(name, createSql) {
   if (tableExists(name)) return false;
@@ -111,6 +134,12 @@ function markApplied(id, name) {
   db.prepare(`INSERT OR IGNORE INTO ${MIGRATIONS_TABLE} (id, name, applied_at) VALUES (?, ?, datetime('now','localtime'))`).run(id, name);
 }
 
+/** 从台账移除某迁移记录（BE-E1 down 回滚时用） */
+function unmarkApplied(id) {
+  ensureMigrationsTable();
+  db.prepare(`DELETE FROM ${MIGRATIONS_TABLE} WHERE id=?`).run(id);
+}
+
 /**
  * 执行全部未应用的迁移
  * @param {MigrationStep[]} steps - 迁移步骤数组（按 id 升序排列）
@@ -156,6 +185,113 @@ function runMigrations(steps, opts = {}) {
   resetColumnCache();
   console.log(`[migrate] 完成 ${applied}/${filtered.length} 项迁移${errors.length ? `（${errors.length} 项错误）` : ''}`);
   return { applied, total: filtered.length, errors };
+}
+
+/* ---------- BE-E1 down 回滚执行器 ---------- */
+
+/**
+ * 按逆序回滚已应用迁移（遇错即停，保持结构一致：后续步可能依赖本步）
+ * @param {MigrationStep[]} steps - 迁移步骤数组
+ * @param {object} [opts]
+ * @param {number}  [opts.to] - 回滚到该 id（保留该 id 及更早；默认仅回滚最新已应用的一步）
+ * @returns {{ id:number, name:string, ok:boolean, error?:string }[]}
+ */
+function revertMigrations(steps, opts = {}) {
+  const appliedIds = getAppliedIds();
+  if (!appliedIds.size) return [];
+  const desc = [...steps].sort((a, b) => b.id - a.id);
+  const maxApplied = Math.max(...appliedIds);
+  const to = Number.isFinite(opts.to) ? opts.to : maxApplied - 1;
+  const results = [];
+  for (const s of desc) {
+    if (s.id <= to) break;
+    if (!appliedIds.has(s.id)) continue;
+    try {
+      if (typeof s.down === 'function') {
+        s.down({ db, dropColumn, addColumn, hasColumn, tableExists });
+      } else if (s.table && s.column) {
+        dropColumn(s.table, s.column);
+      } else if (s.table && s.createSql) {
+        db.exec(`DROP TABLE IF EXISTS ${s.table}`);
+        console.log(`[migrate] 已回滚：删除 ${s.table} 表`);
+      } else {
+        throw new Error('自定义 up 迁移未定义 down，不可回滚（请补 down 或指定更早的 --to）');
+      }
+      unmarkApplied(s.id);
+      results.push({ id: s.id, name: s.name, ok: true });
+    } catch (e) {
+      console.error(`[migrate] 回滚 #${s.id}「${s.name}」失败：${e.message}`);
+      results.push({ id: s.id, name: s.name, ok: false, error: e.message });
+      break;
+    }
+  }
+  resetColumnCache();
+  return results;
+}
+
+/* ---------- BE-E1 schema 锚点与漂移检测 ---------- */
+
+const crypto = require('crypto');
+
+/** DDL 归一化：压平空白，避免纯格式差异产生假漂移 */
+function normalizeDdl(sql) { return String(sql).replace(/\s+/g, ' ').trim(); }
+
+function sha256(s) { return crypto.createHash('sha256').update(s).digest('hex'); }
+
+/**
+ * 全库结构指纹：sqlite_master 中全部 user 对象（表/索引/视图/触发器）的 DDL 归一化哈希。
+ * 排除 _migrations（台账）与 schema_anchor（锚点自身），避免自指。任一对象 DDL 变化 → hash 变化。
+ */
+function computeSchemaFingerprint() {
+  const rows = db.prepare("SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' AND sql IS NOT NULL AND name NOT IN ('_migrations','schema_anchor')").all();
+  const perObject = {};
+  for (const r of rows) perObject[`${r.type}:${r.name}`] = sha256(normalizeDdl(r.sql));
+  const hash = sha256(Object.keys(perObject).sort().map(k => k + '=' + perObject[k]).join('\n'));
+  return { hash, perObject, objectCount: rows.length };
+}
+
+let anchorTableChecked = false;
+function ensureAnchorTable() {
+  if (anchorTableChecked) return;
+  db.exec(`CREATE TABLE IF NOT EXISTS schema_anchor (key TEXT PRIMARY KEY, value TEXT)`);
+  anchorTableChecked = true;
+}
+
+/** 应用版本（锚点与发布绑定：BE-E1 验收「schema 版本号与发布绑定」） */
+function appVersion() {
+  try { return require('../../package.json').version || 'unknown'; } catch { return 'unknown'; }
+}
+
+/** 锚定当前结构（boot 迁移完成后调用）：写 schema_hash / per_object / app_version / anchored_at */
+function anchorSchema() {
+  ensureAnchorTable();
+  const fp = computeSchemaFingerprint();
+  const up = db.prepare('INSERT INTO schema_anchor (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value');
+  up.run('schema_hash', fp.hash);
+  up.run('per_object', JSON.stringify(fp.perObject));
+  up.run('app_version', appVersion());
+  up.run('anchored_at', new Date().toISOString());
+  return fp;
+}
+
+/**
+ * 漂移检测：实际结构 vs 上次锚点。
+ *   ok         —— 台账与实际结构一致（无绕过框架的改动）
+ *   drift      —— 结构变了但台账没变（有人绕过框架 ALTER/建表），drifted 列出具体对象
+ *   unanchored —— 首次启动（未锚定），boot 时应直接锚定不告警
+ */
+function checkSchemaDrift() {
+  ensureAnchorTable();
+  const get = k => { const r = db.prepare('SELECT value FROM schema_anchor WHERE key=?').get(k); return r ? r.value : null; };
+  const anchoredHash = get('schema_hash');
+  if (!anchoredHash) return { status: 'unanchored' };
+  const fp = computeSchemaFingerprint();
+  if (fp.hash === anchoredHash) return { status: 'ok', hash: fp.hash, appVersion: get('app_version'), anchoredAt: get('anchored_at') };
+  let anchoredPer = {};
+  try { anchoredPer = JSON.parse(get('per_object') || '{}'); } catch { }
+  const drifted = [...new Set([...Object.keys(anchoredPer), ...Object.keys(fp.perObject)])]
+    .filter(k => anchoredPer[k] !== fp.perObject[k]);
+  return { status: 'drift', drifted, hash: fp.hash, anchoredHash };
 }
 
 /* ---------- 迁移步骤定义 ---------- */
@@ -603,16 +739,35 @@ const ALL_MIGRATIONS = [
   );` },
   { id: 122, name: 'agent_api_keys 日/月配额（BE-B3）', table: 'agent_api_keys', column: 'quota_daily', def: 'INTEGER DEFAULT 0' },
   { id: 123, name: 'agent_api_keys.quota_monthly（BE-B3）', table: 'agent_api_keys', column: 'quota_monthly', def: 'INTEGER DEFAULT 0' },
+  // === M4 检索质量战役（2026-11-23）—— BE-E1 迁出 db.js 内联块，schema 演进单一化 ===
+  // 这批列原以内联块写在 db.js（AI-09/AI-03/AI-05），其中 chat_traces.retrieval_trace 的内联块
+  // 位置早于建表语句导致全新库单次启动时丢失（详见文件头注释）。迁出后由本注册表唯一维护。
+  { id: 124, name: 'kbs.rerank_enabled - 库级重排开关（M4 AI-09）', table: 'kbs', column: 'rerank_enabled', def: 'INTEGER DEFAULT NULL' },
+  { id: 125, name: 'kbs.rerank_model - 库级重排模型（M4 AI-09）', table: 'kbs', column: 'rerank_model', def: "TEXT DEFAULT ''" },
+  { id: 126, name: 'kbs.rerank_top_n - 库级精排输出条数（M4 AI-09）', table: 'kbs', column: 'rerank_top_n', def: 'INTEGER DEFAULT NULL' },
+  { id: 127, name: 'kbs.rerank_threshold - 库级重排分数阈值（M4 AI-09）', table: 'kbs', column: 'rerank_threshold', def: 'REAL DEFAULT NULL' },
+  { id: 128, name: 'chat_traces.retrieval_trace - 检索全链路诊断 JSON（M4 AI-09/AI-13）', table: 'chat_traces', column: 'retrieval_trace', def: "TEXT DEFAULT '[]'" },
+  { id: 129, name: 'evaluations.metrics - 评测多指标聚合 JSON（M4 AI-03）', table: 'evaluations', column: 'metrics', def: 'TEXT DEFAULT NULL' },
+  { id: 130, name: 'agent_memories.embedding - 记忆语义向量缓存 BLOB（M4 AI-05）', table: 'agent_memories', column: 'embedding', def: 'BLOB DEFAULT NULL' },
+  { id: 131, name: 'agent_memories.last_used_at - 召回时间衰减基点（M4 AI-05）', table: 'agent_memories', column: 'last_used_at', def: 'TEXT DEFAULT NULL' },
 ];
 
 module.exports = {
   addColumn,
   ensureTable,
+  dropColumn,
   hasColumn,
   tableExists,
   resetColumnCache,
   runMigrations,
+  revertMigrations,
   getAppliedIds,
+  markApplied,
+  unmarkApplied,
+  computeSchemaFingerprint,
+  anchorSchema,
+  checkSchemaDrift,
+  appVersion,
   ALL_MIGRATIONS,
   TENANT_TABLES,
 };

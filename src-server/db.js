@@ -421,8 +421,10 @@ CREATE TABLE IF NOT EXISTS evaluations (
     db.prepare('UPDATE providers SET is_default=0 WHERE is_default=1 AND id != ?').run(keep);
     console.log(`[db] 供应商默认归一化：保留 #${keep}，清除其余 ${dupDefaults.length - 1} 个默认标志`);
   }
-  // 部分唯一索引：is_default=1 的行全局最多一个（归一化之后才能建成功）
-  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_providers_single_default ON providers(is_default) WHERE is_default=1`);
+  // （BE-E1 2026-11-23）原此处内联建 idx_providers_single_default（全局单默认唯一索引），
+  // 与迁移 #115（MT-12 供应商租户覆盖层）的 DROP INDEX 语义冲突：#115 应用后每次 boot 在此
+  // 又把死索引复活，触发 schema 锚点漂移告警。唯一性保证已由 #115 的按租户唯一索引
+  // idx_providers_tenant_default 承担，本行删除（归一化逻辑保留——存量脏数据仍需收敛）。
 }
 
 // ---------------- 存量库迁移（幂等） ----------------
@@ -965,36 +967,11 @@ if (!kbCols4.includes('pipeline')) {
     }
   } catch (e) { console.error('[db] U1-9 图片理解迁移失败（不阻塞启动）：', e.message); }
 }
-// ================== M4 AI-09 重排阈值门控 + 库级配置（2026-11-23）==================
-// kbs.rerank_enabled  INTEGER —— 该库是否启用重排（NULL=沿用全局默认 true；0=强制关；1=强制开）
-// kbs.rerank_model    TEXT    —— 该库指定重排模型（''=用全局默认 bge-reranker-v2-m3）
-// kbs.rerank_top_n    INTEGER —— 该库精排输出条数（NULL=用全局默认 5）
-// kbs.rerank_threshold REAL   —— 该库重排分数阈值（NULL=不过滤，保持历史基线行为；数值时低于阈值的片段不进 context）
-// chat_traces.retrieval_trace TEXT —— 单次检索全链路诊断（AI-09 落 trace；AI-13 面板数据源）：
-//   JSON { rewrite, candidates, rerank:{requested,applied,degraded,model,threshold,candidates,passed}, engine, top }
-{
-  try {
-    const kbRerankCols = db.prepare('PRAGMA table_info(kbs)').all().map(c => c.name);
-    const addKb = (col, ddl) => { if (!kbRerankCols.includes(col)) { db.exec(`ALTER TABLE kbs ADD COLUMN ${ddl}`); console.log(`[db] kbs 表已迁移：新增 ${col} 字段（AI-09 重排库级配置）`); } };
-    addKb('rerank_enabled', 'rerank_enabled INTEGER DEFAULT NULL');
-    addKb('rerank_model', "rerank_model TEXT DEFAULT ''");
-    addKb('rerank_top_n', 'rerank_top_n INTEGER DEFAULT NULL');
-    addKb('rerank_threshold', 'rerank_threshold REAL DEFAULT NULL');
-    const traceCols = db.prepare('PRAGMA table_info(chat_traces)').all().map(c => c.name);
-    if (!traceCols.includes('retrieval_trace')) {
-      db.exec(`ALTER TABLE chat_traces ADD COLUMN retrieval_trace TEXT DEFAULT '[]'`);
-      console.log('[db] chat_traces 表已迁移：新增 retrieval_trace 字段（AI-09 检索诊断）');
-    }
-  } catch (e) { console.error('[db] M4 AI-09 重排库级配置迁移失败（不阻塞启动）：', e.message); }
-}
-// agents.kb_metadata_filter：挂知识库时声明的检索过滤（JSON 对象，AND 语义；值支持 "$user.dept" 占位符，
-// chat 时解析为请求用户部门文本名；NULL=不过滤）。例：{"level":"公开","dept":"$user.dept"}
-const agentCols2 = db.prepare('PRAGMA table_info(agents)').all().map(c => c.name);
-if (!agentCols2.includes('kb_metadata_filter')) {
-  db.exec(`ALTER TABLE agents ADD COLUMN kb_metadata_filter TEXT DEFAULT NULL`);
-  console.log('[db] agents 表已迁移：新增 kb_metadata_filter 字段（知识库检索过滤声明）');
-}
-// users.dept_id 存量回填（V1.1 审查 F4 收尾 2026-10-30）：按 dept 文本名精确匹配部门，仅无歧义时回填。
+// （BE-E1 2026-11-23）M4 AI-09 重排库级配置（kbs.rerank_*4 列）与 chat_traces.retrieval_trace
+// 已迁出至 lib/migrate.js 迁移 #124~#128（内联块曾位于建表语句之前，全新库单次启动会丢失 retrieval_trace
+// 导致首次对话落库即抛 no such column；迁移执行器在全部建表之后运行，时序天然正确）。
+// db.js 自此不再新增内联建表/加列，门禁：npm run lint:schema（scripts/lint-inline-schema.js）。
+// ---------------- V1.3（2026-10-30）：#6 评测集 + #4 钉钉 mock ----------------
 // 幂等（WHERE dept_id IS NULL 可重跑）；行级迁移三件套：try-catch + 幂等 + 迁移日志
 try {
   const backfill = db.prepare(`
@@ -1030,13 +1007,8 @@ if (!evalCols.includes('type')) {
   db.exec(`UPDATE evaluations SET type='agent' WHERE type IS NULL OR type=''`);
   console.log('[db] evaluations 表已迁移：新增 type 字段（agent|kb 双型评测，存量归一 agent）');
 }
-// M4 AI-03（2026-11-23）：召回评测多指标聚合列——type='kb' 行存 { top1, hit_at_k, recall_at_k, mrr, ndcg }（JSON），
-// 与 score（Top-1 均分，向后兼容字段）并存；type='rag' 行存 RAGAS 四指标聚合 { context_precision, context_recall,
-// answer_relevancy, faithfulness, ... }。NULL = 未评测/旧数据（读取侧归一）。
-if (!evalCols.includes('metrics')) {
-  db.exec(`ALTER TABLE evaluations ADD COLUMN metrics TEXT DEFAULT NULL`);
-  console.log('[db] evaluations 表已迁移：新增 metrics 列（召回多指标/RAG 四指标聚合 JSON）');
-}
+// （BE-E1 2026-11-23）evaluations.metrics（M4 AI-03 召回多指标/RAGAS 四指标聚合 JSON）
+// 已迁出至 lib/migrate.js 迁移 #129。
 // 钉钉回调事件幂等去重表（V1.3 #4）：钉钉失败会重试（最长 24h），重复投递必须 ACK 不重放
 // event_id 为钉钉回调体 EventId；INSERT 冲突 = 已处理过 → 直接返回成功
 db.exec(`CREATE TABLE IF NOT EXISTS dingtalk_events (
@@ -2166,17 +2138,7 @@ db.exec('CREATE INDEX IF NOT EXISTS idx_bc_device ON bridge_crashes(device_id);'
   if (!cols.includes('source')) db.exec("ALTER TABLE agent_memories ADD COLUMN source TEXT DEFAULT 'chat'");
   if (!cols.includes('summary')) db.exec("ALTER TABLE agent_memories ADD COLUMN summary TEXT DEFAULT ''");
   if (!cols.includes('summary_source')) db.exec("ALTER TABLE agent_memories ADD COLUMN summary_source TEXT DEFAULT ''");
-  // M4 AI-05（2026-11-23）记忆语义召回：embedding（float32 BLOB，与 kb_chunks 同格式：engine tag + 小端浮点，
-  // 由 lib/memory-recall.js 读写）+ last_used_at（衰减基点：长期未用记忆降权；召回命中后回写）。
-  // 两列均允许 NULL：存量记忆无向量时懒计算补齐（召回侧批量嵌入并回写，与 kb_chunks.embedding 同模式）。
-  if (!cols.includes('embedding')) {
-    db.exec('ALTER TABLE agent_memories ADD COLUMN embedding BLOB DEFAULT NULL');
-    console.log('[db] agent_memories 表已迁移：新增 embedding 列（记忆语义向量缓存，懒计算）');
-  }
-  if (!cols.includes('last_used_at')) {
-    db.exec("ALTER TABLE agent_memories ADD COLUMN last_used_at TEXT DEFAULT NULL");
-    console.log('[db] agent_memories 表已迁移：新增 last_used_at 列（时间衰减基点）');
-  }
+  // （BE-E1 2026-11-23）M4 AI-05 的 embedding/last_used_at 两列已迁出至 lib/migrate.js 迁移 #130/#131。
 }
 
 
@@ -3051,11 +3013,20 @@ db.exec(`CREATE TABLE IF NOT EXISTS agent_experience (
 db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_exp_pair ON agent_experience(agent_id, task_type);');
 db.exec('CREATE INDEX IF NOT EXISTS idx_agent_exp_type ON agent_experience(task_type);');
 
-// P1-17 版本化迁移框架（2026-11-13）：执行 _migrations 注册表中尚未登记的列迁移
-// 新迁移直接在该框架中追加，逐步替代 db.js 内联 ALTER TABLE 块
+// P1-17 版本化迁移框架（2026-11-13）+ BE-E1 迁移单一化（2026-11-23）：
+//   执行 _migrations 注册表中尚未应用的迁移（列/表/up 函数），随后做结构锚点与漂移检测。
+//   AGENT_NO_AUTO_MIGRATE=1 时跳过本块（CLI down 专用：防止 require db 后自动 up 把刚回滚的步加回来）。
+//   漂移语义：迁移台账未变但结构变了 = 有人绕过框架直改 schema，warn 不阻塞（新结构随后被重新锚定）。
 try {
-  const { runMigrations, ALL_MIGRATIONS } = require('./lib/migrate');
-  runMigrations(ALL_MIGRATIONS);
+  const { runMigrations, ALL_MIGRATIONS, checkSchemaDrift, anchorSchema } = require('./lib/migrate');
+  if (process.env.AGENT_NO_AUTO_MIGRATE !== '1') {
+    runMigrations(ALL_MIGRATIONS);
+    const drift = checkSchemaDrift();
+    if (drift.status === 'drift') {
+      console.warn(`[migrate] 结构漂移告警：实际 schema 与上次锚点不一致（未走迁移框架的改动？）—— ${drift.drifted.join(', ')}`);
+    }
+    anchorSchema();
+  }
 } catch (e) {
   console.error('[migrate] 迁移框架初始化失败（非致命）：', e.message);
 }
