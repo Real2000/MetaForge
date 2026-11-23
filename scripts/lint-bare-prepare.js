@@ -27,12 +27,14 @@ const BASELINE = path.join(__dirname, 'dal-baseline.json');
 // 方言翻译（q/getq/runq）与业务 CRUD 租户收敛不适用（D-2：SQLite 为默认库，PG 方言仅 SaaS 档远期）。
 // workflow.js（2026-11-23 AI-08 补录）：画布执行引擎层——运行落库/子智能体调度/检查点/节点防线查询
 // 均为引擎内部机制 SQL，须对任意 db 实例工作（与 audit.js 同性质），不属业务路由 CRUD 收敛范围。
+// access-log.js（2026-11-23 BE-F1 补录）：请求日志中间件——finish 回调对构造注入的 db 实例落
+// access_logs 骨架行，同属框架层（不持有业务查询语义）。
 const ALLOWLIST = new Set([
   'src-server/db.js', 'src-server/lib/dal.js', 'src-server/lib/migrate.js',
   'src-server/lib/sql-dialect.js', 'src-server/lib/db-driver.js', 'src-server/lib/audit.js',
   'src-server/lib/vector-index.js', 'src-server/lib/retriever.js', 'src-server/lib/graphrag.js',
   'src-server/lib/memory-recall.js', 'src-server/lib/rag-metrics.js', 'src-server/lib/ingestion-pipeline.js',
-  'src-server/lib/workflow.js',
+  'src-server/lib/workflow.js', 'src-server/lib/access-log.js',
 ]);
 
 function walk(dir, out = []) {

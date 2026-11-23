@@ -750,6 +750,79 @@ const ALL_MIGRATIONS = [
   { id: 129, name: 'evaluations.metrics - 评测多指标聚合 JSON（M4 AI-03）', table: 'evaluations', column: 'metrics', def: 'TEXT DEFAULT NULL' },
   { id: 130, name: 'agent_memories.embedding - 记忆语义向量缓存 BLOB（M4 AI-05）', table: 'agent_memories', column: 'embedding', def: 'BLOB DEFAULT NULL' },
   { id: 131, name: 'agent_memories.last_used_at - 召回时间衰减基点（M4 AI-05）', table: 'agent_memories', column: 'last_used_at', def: 'TEXT DEFAULT NULL' },
+  // === D-3（2026-11-23 拍板：需要全域模式）agent_api_keys 支持 agent_id=NULL（全域 Key）===
+  // 背景：M0/SEC-02a 时代「无绑定 Key」曾被判死代码移除（当时 D-3 未拍板、生产库 0 行）；拍板后恢复全域语义
+  // 并补齐归属防线：全域 Key（agent_id NULL）可访问同租户全部已发布智能体（openapi.js authKeyForAgent 校验）。
+  // SQLite 无法 ALTER 列移除 NOT NULL → 重建表法；存量绑定行归属回填（继承其 agent 的 owner/租户）。
+  { id: 132, name: 'agent_api_keys 全域 Key：agent_id 可空 + owner_username/tenant_id 归属（D-3 拍板）',
+    up: ({ db }) => {
+      db.exec(`CREATE TABLE IF NOT EXISTS agent_api_keys__d3 (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_id INTEGER DEFAULT NULL,
+        key TEXT UNIQUE NOT NULL,
+        key_prefix TEXT DEFAULT '',
+        name TEXT DEFAULT '',
+        status INTEGER DEFAULT 1,
+        quota_daily INTEGER DEFAULT 0,
+        quota_monthly INTEGER DEFAULT 0,
+        owner_username TEXT DEFAULT '',
+        tenant_id INTEGER DEFAULT 1,
+        created_at TEXT,
+        last_used_at TEXT
+      )`);
+      db.exec(`INSERT INTO agent_api_keys__d3 (id, agent_id, key, key_prefix, name, status, quota_daily, quota_monthly, owner_username, tenant_id, created_at, last_used_at)
+        SELECT k.id, k.agent_id, k.key, k.key_prefix, k.name, k.status, IFNULL(k.quota_daily,0), IFNULL(k.quota_monthly,0),
+               IFNULL(a.owner, ''), IFNULL(a.tenant_id, 1), k.created_at, k.last_used_at
+        FROM agent_api_keys k LEFT JOIN agents a ON a.id = k.agent_id`);
+      db.exec('DROP TABLE agent_api_keys');
+      db.exec('ALTER TABLE agent_api_keys__d3 RENAME TO agent_api_keys');
+      console.log('[migrate] agent_api_keys 已重建：agent_id 可空（D-3 全域 Key）+ owner_username/tenant_id 归属列');
+    },
+    down: ({ db }) => {
+      // 回滚：全域行不可降级保留（旧 schema 无归属语义，fail-closed 清理），绑定行原样迁回
+      db.exec(`CREATE TABLE IF NOT EXISTS agent_api_keys__old (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_id INTEGER NOT NULL,
+        key TEXT UNIQUE NOT NULL,
+        key_prefix TEXT DEFAULT '',
+        name TEXT DEFAULT '',
+        status INTEGER DEFAULT 1,
+        quota_daily INTEGER DEFAULT 0,
+        quota_monthly INTEGER DEFAULT 0,
+        created_at TEXT,
+        last_used_at TEXT
+      )`);
+      db.exec(`INSERT INTO agent_api_keys__old (id, agent_id, key, key_prefix, name, status, quota_daily, quota_monthly, created_at, last_used_at)
+        SELECT id, agent_id, key, key_prefix, name, status, quota_daily, quota_monthly, created_at, last_used_at
+        FROM agent_api_keys WHERE agent_id IS NOT NULL`);
+      db.exec('DROP TABLE agent_api_keys');
+      db.exec('ALTER TABLE agent_api_keys__old RENAME TO agent_api_keys');
+      console.log('[migrate] agent_api_keys 已回滚：恢复 agent_id NOT NULL（全域行已清理）');
+    } },
+  // === BE-F1（2026-11-23）请求日志 + 结构化可观测：requestId 贯穿日志链 ===
+  // access_logs 为每请求骨架行；op_logs/err_logs/security_events 加 request_id 关联列
+  // （audit.js 拦截器自动补值；request_id 不参与 SEC-11 哈希链——写入端/校验端同步排除，旧行校验不受影响）。
+  { id: 133, name: 'access_logs 请求日志表（BE-F1）', table: 'access_logs', createSql: `CREATE TABLE IF NOT EXISTS access_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id TEXT DEFAULT '',
+    method TEXT DEFAULT '',
+    path TEXT DEFAULT '',
+    status INTEGER DEFAULT 0,
+    duration_ms INTEGER DEFAULT 0,
+    username TEXT DEFAULT '',
+    tenant_id INTEGER DEFAULT 1,
+    ip TEXT DEFAULT '',
+    created_at TEXT
+  )` },
+  { id: 134, name: 'op_logs.request_id - 审计关联请求（BE-F1，不参与哈希链）', table: 'op_logs', column: 'request_id', def: "TEXT DEFAULT ''" },
+  { id: 135, name: 'err_logs.request_id - 错误关联请求（BE-F1）', table: 'err_logs', column: 'request_id', def: "TEXT DEFAULT ''" },
+  { id: 136, name: 'security_events.request_id - 安全事件关联请求（BE-F1，不参与哈希链）', table: 'security_events', column: 'request_id', def: "TEXT DEFAULT ''" },
+  // === AI-10（2026-11-23）多路查询 + HyDE：库级开关（默认关，控成本） ===
+  // 0=关闭（默认，行为与历史一致）；1=多路查询（3~5 子查询各路检索跨路 RRF 融合）；2=多路 + HyDE 假设答案向量路。
+  { id: 137, name: 'kbs.multi_query - 库级多路查询/HyDE 开关（AI-10，默认关）', table: 'kbs', column: 'multi_query', def: 'INTEGER DEFAULT 0' },
+  // === AI-14（2026-11-23）查询感知元数据过滤：库级开关（默认关） ===
+  // 开启后 LLM 从查询推断过滤条件（值域约束 fail-closed：域外键值丢弃；与静态声明交集、静态优先）。
+  { id: 138, name: 'kbs.infer_metadata_filter - 库级查询感知过滤开关（AI-14，默认关）', table: 'kbs', column: 'infer_metadata_filter', def: 'INTEGER DEFAULT 0' },
 ];
 
 module.exports = {

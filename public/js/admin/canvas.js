@@ -1413,6 +1413,26 @@ export function createCanvas(root, opts = {}) {
           <div style="flex:1"><label>${t('重排模型（可选）')}</label>
             <input class="input" data-k="rerank_model" value="${esc(c.rerank_model || '')}" placeholder="bge-reranker-v2-m3"></div>
         </div>
+        <div class="fd" style="display:flex;gap:10px">
+          <div style="flex:1"><label>🧩 ${t('多路查询')}</label>
+            <select class="input" data-k="multi_query">
+              <option value="" ${(c.multi_query ?? '') === '' ? 'selected' : ''}>${t('沿用库级默认')}</option>
+              <option value="on" ${c.multi_query === 'on' ? 'selected' : ''}>${t('开启（子查询扩写融合）')}</option>
+              <option value="off" ${c.multi_query === 'off' ? 'selected' : ''}>${t('强制关闭')}</option>
+            </select></div>
+          <div style="flex:1"><label>💡 HyDE</label>
+            <select class="input" data-k="hyde">
+              <option value="" ${(c.hyde ?? '') === '' ? 'selected' : ''}>${t('不启用')}</option>
+              <option value="on" ${c.hyde === 'on' ? 'selected' : ''}>${t('假设答案检索路（需配模型）')}</option>
+            </select></div>
+        </div>
+        <div class="fd"><label>🧠 ${t('查询感知过滤（AI-14）')}</label>
+          <select class="input" data-k="infer_filter">
+            <option value="" ${(c.infer_filter ?? '') === '' ? 'selected' : ''}>${t('沿用库级默认')}</option>
+            <option value="on" ${c.infer_filter === 'on' ? 'selected' : ''}>${t('开启（由查询推断元数据过滤）')}</option>
+            <option value="off" ${c.infer_filter === 'off' ? 'selected' : ''}>${t('强制关闭')}</option>
+          </select>
+          <div class="hint">🛡️ ${t('值域约束 fail-closed：推断条件必须来自库内实际元数据值域，域外一律忽略——误过滤率 0；静态声明的过滤优先于 AI 推断')}</div></div>
         <div class="fd"><label>🛡️ ${t('元数据过滤（JSON，可选）')}</label>
           <textarea class="input" data-k="metadata_filter" style="min-height:52px" placeholder='${t('例：{"level":"公开"}——仅命中满足条件的分块（同智能体挂库过滤语义）')}'>${esc(c.metadata_filter || '')}</textarea></div>
         <div class="fd"><label style="display:flex;gap:6px;align-items:center;font-size:12px"><input type="checkbox" data-k="kb_rewrite" ${(c.rewrite ?? true) !== false ? 'checked' : ''}> ${t('多轮改写（携带对话历史消解指代；Chatflow 多轮场景建议开启）')}</label></div>

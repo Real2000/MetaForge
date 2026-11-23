@@ -135,6 +135,12 @@ app.use(expressStatic(path.join(__dirname, 'public'), staticOptions));
 const { tenantContext } = require('./src-server/lib/auth');
 app.use(tenantContext);
 
+// BE-F1（2026-11-23）：requestId 贯穿日志链——每请求生成 requestId（AsyncLocalStorage 传播），
+// audit.js 拦截器为全部 op_logs/security_events 自动补 request_id；res finish 落 access_logs 骨架行；
+// 响应头回传 X-Request-Id（用户报障可引用）。挂在 tenantContext 后：API 路由全覆盖、静态资源天然豁免。
+const { db: _dbF1, now: _nowF1 } = require('./src-server/db');
+app.use(require('./src-server/lib/access-log').accessLogMiddleware(_dbF1, _nowF1));
+
 // API 路由（BE-B5：统一经 mountApi 双挂载 /api/v1/* 与 /api/*）
 apiVersion.mountApi(app, 'auth', require('./src-server/routes/auth'));
 apiVersion.mountApi(app, 'auth/sso', require('./src-server/routes/sso'));
@@ -259,7 +265,8 @@ app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.ht
 const { db, now } = require('./src-server/db');
 app.use((err, req, res, next) => {
   console.error('[server]', err.message);
-  try { db.prepare('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)').run('http', `${req.method} ${req.url}: ${err.message}`, now()); } catch { }
+  // BE-F1：err_logs 带 requestId（验收「err_logs 含 requestId」主通道）
+  try { db.prepare('INSERT INTO err_logs (source,message,request_id,created_at) VALUES (?,?,?,?)').run('http', `${req.method} ${req.url}: ${err.message}`, req.requestId || '', now()); } catch { }
   res.status(500).json({ code: 500, msg: '服务内部错误：' + err.message });
 });
 

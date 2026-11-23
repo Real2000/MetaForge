@@ -125,9 +125,21 @@ function parseInsert(sql) {
 }
 
 /**
- * 受控落库：脱敏 → UTC → 写入 → 回读实际行计算哈希链并回填。
+ * 受控落库：脱敏 → UTC → requestId 注入（BE-F1）→ 写入 → 回读实际行计算哈希链并回填。
  * @param {Function} prepareRaw db 的**原始** prepare（installGuard 闭包传入，避免自递归）
  */
+const { currentRequestId } = require('./request-context');
+// BE-F1：request_id 为日志链关联键而非审计内容，不参与哈希链（写入端/校验端同步排除，
+// 避免迁移加列后旧行 canonical 变化导致 verifyChain 误报篡改）
+const NON_HASH_COLS = ['id', 'prev_hash', 'record_hash', 'request_id'];
+/** 目标表是否有 request_id 列（每次探测不做长缓存：BE-E1 down/up 窗口后仍新鲜；
+ *  旧 schema 表（如独立内存库/未迁移库）返回 false → 降级不注入，审计写入永不因关联键缺失而失败） */
+function hasRidColumn(prepareRaw, table) {
+  try {
+    const cols = prepareRaw(`PRAGMA table_info(${table})`).all();
+    return cols.some((c) => c.name === 'request_id');
+  } catch { return false; }
+}
 function auditInsert(prepareRaw, table, cols, argIndex, args) {
   const row = {};
   cols.forEach((c, i) => { row[c] = argIndex[i] < 0 ? null : args[argIndex[i]]; });
@@ -135,19 +147,23 @@ function auditInsert(prepareRaw, table, cols, argIndex, args) {
   for (const k of Object.keys(row)) row[k] = sanitizeValue(row[k]);
   // ② UTC 时间（created_at 一律覆盖）
   if (cols.includes('created_at')) row.created_at = utcNow();
+  // ②' BE-F1：请求上下文内自动补 request_id（列已就位才注入——旧 schema 表降级不注入，兼容独立测试库/未迁移库）
+  const ridCol = (table === 'op_logs' || table === 'security_events') && hasRidColumn(prepareRaw, table);
+  const rid = currentRequestId();
+  if (ridCol && rid && !cols.includes('request_id')) row.request_id = rid;
   // prev_hash：链上一条（写入前查询，不含本行）
   const prevRow = prepareRaw(`SELECT record_hash FROM ${table} ORDER BY id DESC LIMIT 1`).get();
   const prevHash = (prevRow && prevRow.record_hash) || GENESIS;
   // 插入（record_hash 依赖实际存储值，先留默认空串，回读后再回填）
-  const insCols = [...cols, 'prev_hash'];
+  const insCols = ridCol ? [...cols, 'request_id', 'prev_hash'] : [...cols, 'prev_hash'];
   row.prev_hash = prevHash;
   const vals = insCols.map((c) => (row[c] === undefined ? null : row[c]));
   const info = prepareRaw(`INSERT INTO ${table} (${insCols.join(',')}) VALUES (${insCols.map(() => '?').join(',')})`).run(...vals);
   const id = info.lastInsertRowid;
-  // ③ 回读实际存储行 → 计算 record_hash → 回填
+  // ③ 回读实际存储行 → 计算 record_hash → 回填（request_id 不参与哈希）
   const stored = prepareRaw(`SELECT * FROM ${table} WHERE id=?`).get(id);
   if (stored) {
-    const ccols = Object.keys(stored).filter((c) => c !== 'id' && c !== 'prev_hash' && c !== 'record_hash');
+    const ccols = Object.keys(stored).filter((c) => !NON_HASH_COLS.includes(c));
     const rec = sha256(prevHash + '|' + canonical(stored, ccols));
     prepareRaw(`UPDATE ${table} SET record_hash=? WHERE id=?`).run(rec, id);
   }
@@ -184,7 +200,8 @@ function verifyChain(db, table) {
   const rows = db.prepare(`SELECT * FROM ${table} WHERE record_hash IS NOT NULL AND record_hash != '' ORDER BY id ASC`).all();
   let prev = GENESIS, brokenAt = null;
   for (const r of rows) {
-    const cols = Object.keys(r).filter((c) => c !== 'id' && c !== 'prev_hash' && c !== 'record_hash');
+    // BE-F1：request_id 不参与哈希（与 auditInsert 写入端一致；否则迁移后旧行全部误报篡改）
+    const cols = Object.keys(r).filter((c) => !NON_HASH_COLS.includes(c));
     const rec = sha256(prev + '|' + canonical(r, cols));
     if (r.prev_hash !== prev || r.record_hash !== rec) { brokenAt = r.id; break; }
     prev = r.record_hash;

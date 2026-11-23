@@ -5,7 +5,7 @@
  *  - POST /api/agents/:id/prompt-versions/:vid/rollback 回滚写回 + 再记一条新版本（note='回滚到 vN'，完整审计链） */
 const express = require('express');
 const { db, now } = require('../db');
-const { auth } = require('../lib/auth');
+const { auth, adminOnly } = require('../lib/auth');
 const { chatOnce } = require('../lib/llm');
 const { canView, canEdit, isOwnerLevel, parseJsonArr } = require('../lib/agent-access');
 const { sanitizeMetadata } = require('../lib/kb-metadata'); // V1.2 #2 2026-10-30：kb_metadata_filter 入参清洗
@@ -839,6 +839,74 @@ router.delete('/:id', (req, res) => {
   if (!isOwnerLevel(old, req.user)) return res.json({ code: 403, msg: '无删除权限（仅创建者与管理员，协作者不可删除）' });
   db.prepare('DELETE FROM agents WHERE id=?').run(old.id);
   db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)').run(req.user.username, '删除智能体', old.name, req.ip, now());
+  res.json({ code: 0, msg: '已删除' });
+});
+
+// ---------- D-3 全域 API Key（2026-11-23 拍板：需要全域模式）----------
+// 全域 Key（agent_id=NULL）可访问本租户全部「已发布」智能体——面向「外部系统一 Key 集成多智能体」场景。
+// 管理权限从严：adminOnly（租户管理员/平台超管）——作用域大，与单智能体 Key 的 owner 级权限分开；
+// 多租户下按 Key.tenant_id 隔离（租户管理员仅见/仅管本租户；平台超管 bypass 全见，旁路审计由中间件负责）。
+// 新端点一律走 dal 统一出口（BE-C1 棘轮：不增裸查门禁计数）。
+router.get('/global-keys', adminOnly, (req, res) => {
+  const dal = require('../lib/dal');
+  const tw = dal.tenantWhere('', dal.tenantScope(req));
+  const rows = dal.q(`SELECT id, key_prefix, name, status, quota_daily, quota_monthly, owner_username, tenant_id, created_at, last_used_at
+    FROM agent_api_keys WHERE agent_id IS NULL${tw.sqlStr} ORDER BY id DESC`, tw.args)
+    .map(r => ({ ...r, key: r.key_prefix || '' }));
+  res.json({ code: 0, data: rows });
+});
+
+router.post('/global-keys', adminOnly, (req, res) => {
+  const dal = require('../lib/dal');
+  const body = req.body || {};
+  const key = 'sk-gk-' + crypto.randomBytes(20).toString('hex'); // gk 前缀标识全域（与 agent 级 sk-ap- 区分，泄漏排查可辨识）
+  const name = String(body.name || '').slice(0, 60) || '全域密钥';
+  const qDaily = Math.max(0, parseInt(body.quota_daily, 10) || 0);
+  const qMonthly = Math.max(0, parseInt(body.quota_monthly, 10) || 0);
+  // 归属：创建者 + 其当前租户（多租户下 req.tenant.id；单租户默认 1）——openapi 侧按此做作用域防线
+  const tenantId = (req.tenant && Number.isFinite(Number(req.tenant.id))) ? Number(req.tenant.id) : 1;
+  const info = dal.runq(`INSERT INTO agent_api_keys (agent_id,key,key_prefix,name,status,quota_daily,quota_monthly,owner_username,tenant_id,created_at)
+    VALUES (NULL,?,?,?,1,?,?,?,?,datetime('now','localtime'))`,
+    [hashKey(key), maskPrefix(key), name, qDaily, qMonthly, req.user.username, tenantId]);
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)',
+    [req.user.username, '创建全域API密钥', `${name}（租户 ${tenantId}，可访问本租户全部已发布智能体）`, req.ip, now()]);
+  res.json({ code: 0, data: { id: info.lastInsertRowid, key }, msg: '全域密钥已创建（完整密钥仅本次返回，请立即保存）' });
+});
+
+// 全域 Key 定位（404 语义）+ 租户归属防线：非本租户的 Key 视同不存在（不泄露存在性）
+function globalKeyRow(req, kid) {
+  const dal = require('../lib/dal');
+  const tw = dal.tenantWhere('', dal.tenantScope(req));
+  return dal.getq(`SELECT * FROM agent_api_keys WHERE id=? AND agent_id IS NULL${tw.sqlStr}`, [kid, ...tw.args]);
+}
+
+router.put('/global-keys/:kid/quota', adminOnly, (req, res) => {
+  const dal = require('../lib/dal');
+  const k = globalKeyRow(req, req.params.kid);
+  if (!k) return res.json({ code: 404, msg: '全域密钥不存在' });
+  const qDaily = Math.max(0, parseInt((req.body || {}).quota_daily, 10) || 0);
+  const qMonthly = Math.max(0, parseInt((req.body || {}).quota_monthly, 10) || 0);
+  dal.runq('UPDATE agent_api_keys SET quota_daily=?, quota_monthly=? WHERE id=?', [qDaily, qMonthly, k.id]);
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)',
+    [req.user.username, '设置全域API密钥配额', `${k.name}（日 ${qDaily || '不限'} / 月 ${qMonthly || '不限'}）`, req.ip, now()]);
+  res.json({ code: 0, msg: '配额已更新', data: { quota_daily: qDaily, quota_monthly: qMonthly } });
+});
+
+router.post('/global-keys/:kid/toggle', adminOnly, (req, res) => {
+  const dal = require('../lib/dal');
+  const k = globalKeyRow(req, req.params.kid);
+  if (!k) return res.json({ code: 404, msg: '全域密钥不存在' });
+  dal.runq('UPDATE agent_api_keys SET status=? WHERE id=?', [k.status ? 0 : 1, k.id]);
+  res.json({ code: 0, msg: k.status ? '已停用' : '已启用' });
+});
+
+router.delete('/global-keys/:kid', adminOnly, (req, res) => {
+  const dal = require('../lib/dal');
+  const k = globalKeyRow(req, req.params.kid);
+  if (!k) return res.json({ code: 404, msg: '全域密钥不存在' });
+  dal.runq('DELETE FROM agent_api_keys WHERE id=?', [k.id]);
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)',
+    [req.user.username, '删除全域API密钥', `${k.name}（#${k.id}）`, req.ip, now()]);
   res.json({ code: 0, msg: '已删除' });
 });
 

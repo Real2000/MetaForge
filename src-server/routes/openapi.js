@@ -90,11 +90,18 @@ function authKey(req) {
   return { k };
 }
 
-/** SEC-02a：取消「全域 Key」——无绑定 agent_id 的 Key 一律拒绝（D-3：仅 agent 级 + space/租户级）。
- *  存量全域行为死代码（agent_id NOT NULL，生产库 0 行），移除后无迁移包袱。
- *  返回错误消息字符串表示拒绝，null 表示通过。 */
+/** 密钥作用域校验（返回错误消息字符串表示拒绝，null 表示通过）
+ *  D-3（2026-11-23 拍板：需要全域模式）：
+ *  - 绑定 Key（agent_id 非空）→ 仅可调用绑定智能体（原语义不变）；
+ *  - 全域 Key（agent_id NULL）→ 可访问与 Key 同租户的全部已发布智能体（企业对外一 Key 集成多智能体）；
+ *    防线 fail-closed：目标 agent 不存在/未发布拒绝；多租户下跨租户拒绝（单租户 tenant_id 恒等零回归）。 */
 function authKeyForAgent(k, agentId) {
-  if (!k.agent_id) return 'API Key 未绑定智能体（全域 Key 已停用，请创建绑定到具体智能体的 Key）';
+  if (k.agent_id == null) {
+    const agent = getq('SELECT id, status, tenant_id FROM agents WHERE id=?', [agentId]); // BE-C1：新增查询走统一出口
+    if (!agent || agent.status !== 'published') return '目标智能体不存在或未发布（全域 Key 仅可访问已发布智能体）';
+    if (Number(agent.tenant_id ?? 1) !== Number(k.tenant_id ?? 1)) return 'API Key 无权访问其他租户的智能体';
+    return null;
+  }
   if (k.agent_id === agentId) return null; // 匹配
   return 'API Key 无权访问该智能体（Key 绑定到特定智能体，请创建对应 Key）';
 }
@@ -107,9 +114,11 @@ function unauthorized(res) {
 router.get('/v1/models', keyModelsLimit, keyQuota, (req, res) => {
   const h = authKey(req);
   if (!h) return unauthorized(res);
-  const agents = db.prepare("SELECT id,name,description FROM agents WHERE status='published' AND (source='self' OR source='dify')").all();
-  // SEC-02a：全域 Key 停用后，仅可见 Key 绑定的智能体（无绑定不返回任何智能体）
-  const visible = agents.filter(a => a.id === h.k.agent_id);
+  const agents = db.prepare("SELECT id,name,description,tenant_id FROM agents WHERE status='published' AND (source='self' OR source='dify')").all();
+  // D-3：全域 Key（agent_id NULL）可见同租户全部已发布智能体；绑定 Key 仅可见绑定智能体（SEC-02a 语义不变）
+  const visible = h.k.agent_id == null
+    ? agents.filter(a => Number(a.tenant_id ?? 1) === Number(h.k.tenant_id ?? 1))
+    : agents.filter(a => a.id === h.k.agent_id);
   res.json({
     object: 'list',
     data: visible.map(a => ({
@@ -248,3 +257,5 @@ function finish(res, stream, model, created, content, tokens) {
 }
 
 module.exports = router;
+// D-3 测试口：作用域矩阵单测用（smoke 直接验证 authKeyForAgent 的全域/绑定语义矩阵）
+module.exports.__authKeyForAgent = authKeyForAgent;

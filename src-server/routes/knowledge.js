@@ -417,7 +417,7 @@ router.get('/rerank-models', (req, res) => {
 
 // 召回测试（混合检索：BM25 + 向量加权 RRF 融合 + 可选 Rerank；P2 升级 async 双引擎，2026-10-29 支持权重/重排可视化参数）
 router.post('/recall-test', async (req, res) => {
-  const { kb_id, file_id, query, top_n, threshold, vector_weight, rerank_model, rerank_enabled, metadataFilter } = req.body || {};
+  const { kb_id, file_id, query, top_n, threshold, vector_weight, rerank_model, rerank_enabled, metadataFilter, multi_query, hyde, infer_filter } = req.body || {};
   if (!query?.trim()) return res.json({ code: 400, msg: '请输入测试问题' });
   let kbId = kb_id || null;
   if (file_id) {
@@ -443,6 +443,9 @@ router.post('/recall-test', async (req, res) => {
     vecWeight,                              // 0=纯BM25  / 1=纯向量 / 默认0.5均衡
     rerankModel: rerank_model || null,      // 重排模型（下拉选择，null=默认）
     rerankEnabled: rerank_enabled !== false, // 重排开关（对比效果用）
+    ...(multi_query === 'off' ? { multiQuery: false } : multi_query === 'on' ? { multiQuery: true } : {}), // AI-10：三态覆盖（''=库级默认）
+    ...(hyde === true ? { hyde: true } : {}),  // AI-10：HyDE 假设答案路（需与多路同开）
+    ...(infer_filter === 'off' ? { inferFilter: false } : infer_filter === 'on' ? { inferFilter: true } : {}), // AI-14：查询感知过滤三态（''=库级默认）
     ...(Object.keys(mFilter).length ? { metadataFilter: mFilter } : {}),
   });
   // 检查最终结果中是否有 rerank_score 来判断重排是否实际生效

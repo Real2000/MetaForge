@@ -460,6 +460,9 @@ export async function render(el) {
     const a = agents.find(x => x.id === id);
     const modelId = `agent-${a.id}-${a.name}`;
     async function loadKeys() { const j = await api(`/agents/${id}/api-keys`); return j.data; }
+    // D-3（2026-11-23）：全域密钥（可访问本租户全部已发布智能体）；非管理员 403 时静默不显示区块
+    const gj = await api('/agents/global-keys').catch(() => null);
+    const gkeys = (gj && gj.code === 0 && Array.isArray(gj.data)) ? gj.data : null;
     loadKeys().then(keys => {
       // U1-8：SDK 下载与三行代码示例（api-docs /sdk 端点；失败静默不影响密钥管理主流程）
       api('/api-docs/sdk').then(j => {
@@ -482,6 +485,27 @@ export async function render(el) {
           ${t('模型名：')}<span class="mono">${esc(modelId)}</span>${t('（先 GET /openapi/v1/models 可列出全部可用智能体）')}
         </div>
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+          <b>🌐 ${t('全域密钥（{n}）').replace('{n}', gkeys ? gkeys.length : 0)}</b>
+          <button class="btn primary" id="gkNew" style="padding:4px 12px;font-size:12px">＋ ${t('创建全域密钥')}</button>
+        </div>
+        <div class="hint" style="margin-bottom:8px">🌐 ${t('全域密钥不绑定单个智能体，可访问本租户全部已发布智能体（外部系统一个 Key 集成多智能体）')}</div>
+        ${gkeys === null ? '' : `<div class="table-wrap"><table class="tbl">
+          <thead><tr><th>${t('名称')}</th><th>${t('密钥')}</th><th>${t('归属')}</th><th>${t('状态')}</th><th>${t('最近调用')}</th><th>${t('操作')}</th></tr></thead>
+          <tbody id="gkBody">${gkeys.map(k => `
+            <tr>
+              <td>${esc(k.name)}</td>
+              <td class="mono" style="font-size:12px">${esc(k.key || '')}</td>
+              <td style="font-size:12px">${esc(k.owner_username || '-')} · ${t('租户')} ${k.tenant_id ?? 1}</td>
+              <td>${k.status ? `<span class="tag green">${t('启用')}</span>` : `<span class="tag gray">${t('停用')}</span>`}</td>
+              <td style="font-size:12px;color:var(--text-3)">${esc(k.last_used_at || '-')}</td>
+              <td>
+                <button class="btn link" data-gtg="${k.id}">${k.status ? t('停用') : t('启用')}</button>
+                <button class="btn link" style="color:var(--danger)" data-gdk="${k.id}">${t('删除')}</button>
+              </td>
+            </tr>`).join('') || `<tr><td colspan="6" class="empty">${t('暂无全域密钥')}</td></tr>`}
+          </tbody>
+        </table></div>`}
+        <div style="display:flex;justify-content:space-between;align-items:center;margin:14px 0 8px;border-top:1px solid var(--border,#eef0f3);padding-top:14px">
           <b>${t('API 密钥（{n}）').replace('{n}', keys.length)}</b>
           <button class="btn primary" id="akNew" style="padding:4px 12px;font-size:12px">＋ ${t('创建密钥')}</button>
         </div>
@@ -502,6 +526,23 @@ export async function render(el) {
         </table></div>`;
       modal({ title: t('API 发布 - {n}').replace('{n}', a.name), body, wide: true, onMount(mask, close) {
         bindRows(mask);
+        // D-3：全域密钥创建（仅管理员可见；非管理员区块已隐藏，此处防御判空）
+        mask.querySelector('#gkNew')?.addEventListener('click', async () => {
+          const j = await api('/agents/global-keys', { method: 'POST', body: {} });
+          if (j.code !== 0) { toast(j.msg || '创建失败'); return; }
+          copyText(j.data.key);
+          modal({ title: t('全域密钥已创建（已复制）'), body: `<div class="form-item"><label>${t('请立即保存，仅此一次完整展示；该密钥可访问本租户全部已发布智能体')}</label><textarea class="input mono" readonly style="min-height:70px">${esc(j.data.key)}</textarea></div>` });
+          close(); openApiKeys(id);
+        });
+        mask.querySelectorAll('[data-gtg]').forEach(b => b.onclick = async () => {
+          const j = await api(`/agents/global-keys/${b.dataset.gtg}/toggle`, { method: 'POST' });
+          toast(j.msg); close(); openApiKeys(id);
+        });
+        mask.querySelectorAll('[data-gdk]').forEach(b => b.onclick = async () => {
+          if (!(await confirmBox(t('删除该全域密钥？使用中的调用将立即失效（影响本租户全部已发布智能体）。')))) return;
+          const j = await api(`/agents/global-keys/${b.dataset.gdk}`, { method: 'DELETE' });
+          toast(j.msg || t('已删除')); close(); openApiKeys(id);
+        });
         mask.querySelector('#akNew').onclick = async () => {
           const j = await api(`/agents/${id}/api-keys`, { method: 'POST', body: {} });
           copyText(j.data.key);

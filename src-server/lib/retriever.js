@@ -327,6 +327,54 @@ function bm25ScoresMemory(rows, qTerms) {
  *   - metadataFilter（V1.2 #2 2026-10-30）：元数据过滤对象（AND 语义，键值须全满足；空对象=不过滤）
  * 调用方全部 await retrieve(...)（原同步调用点已同步改造）。
  */
+/** 从分块行提取元数据键值域（AI-14 推断的合法性边界；键≤12、每键值≤10，防爆 prompt） */
+function _metaVocabFromRows(rows) {
+  const vocab = {};
+  for (const r of rows) {
+    let m = null;
+    try { if (r.metadata && r.metadata !== '{}') m = JSON.parse(r.metadata); } catch { m = null; }
+    if (!m || typeof m !== 'object' || Array.isArray(m)) continue;
+    for (const [k, v] of Object.entries(m)) {
+      if (!vocab[k]) vocab[k] = new Set();
+      const set = vocab[k];
+      (Array.isArray(v) ? v : [v]).forEach(x => { if (set.size < 10 && x != null && x !== '') set.add(String(x)); });
+    }
+    if (Object.keys(vocab).length >= 12) break;
+  }
+  return Object.fromEntries(Object.entries(vocab).map(([k, s]) => [k, [...s]]));
+}
+
+/** AI-14 开关判定：opts.inferFilter 显式优先，否则库级 kbs.infer_metadata_filter（默认关） */
+function _kbInferFlag(kbId, opts) {
+  if (opts.inferFilter != null) return opts.inferFilter === true;
+  if (kbId == null) return false;
+  try {
+    const r = db.prepare('SELECT infer_metadata_filter FROM kbs WHERE id=?').get(kbId);
+    return !!(r && Number(r.infer_metadata_filter) === 1);
+  } catch { return false; }
+}
+
+/** AI-14：推断过滤条件并与静态声明交集合并（静态优先；返回 {merged, ai}——ai 供 trace） */
+async function _resolveAiFilter(query, rows, kbId, opts, _trace) {
+  if (!_kbInferFlag(kbId, opts)) return { merged: opts.metadataFilter, ai: null };
+  const vocabObj = _metaVocabFromRows(rows);
+  if (!Object.keys(vocabObj).length) return { merged: opts.metadataFilter, ai: null };
+  let ai = null;
+  try {
+    const { inferMetadataFilter } = require('./metadata-infer');
+    ai = await inferMetadataFilter(query, vocabObj, {
+      model: opts.rewriteModel, username: opts.username, tenantId: opts.tenantId,
+    });
+  } catch { ai = null; }
+  if (_trace) _trace.inferFilter = {
+    applied: !!(ai && Object.keys(ai).length), filter: ai || null,
+    vocabulary: Object.keys(vocabObj),
+  };
+  if (!ai || !Object.keys(ai).length) return { merged: opts.metadataFilter, ai: null };
+  const stat = (opts.metadataFilter && typeof opts.metadataFilter === 'object' && !Array.isArray(opts.metadataFilter)) ? opts.metadataFilter : null;
+  return { merged: { ...ai, ...(stat || {}) }, ai }; // 同键静态优先——AI 只能缩小，不能推翻
+}
+
 async function retrieve(query, kbId = null, topN = 5, threshold = 0.01, opts = {}) {
   // AI-09/AI-13：检索诊断载体（调用方传 opts.trace 对象时回填；用于 chat_traces.retrieval_trace 落库）
   const _trace = (opts.trace && typeof opts.trace === 'object') ? opts.trace : null;
@@ -342,6 +390,22 @@ async function retrieve(query, kbId = null, topN = 5, threshold = 0.01, opts = {
       if (rq) query = rq;
     } catch { /* 改写失败不影响检索 */ }
     if (_trace) _trace.rewrite = { original: _origQ, rewritten: query, applied: query !== _origQ };
+  }
+  // AI-10（2026-11-23）：多路查询 + HyDE 分发——opts.multiQuery 显式传值优先；未传时读库级 kbs.multi_query
+  //（1=多路 / 2=多路+HyDE）；显式 false 时跳过库级读取（子路调用防递归的关键）。
+  let _mq = opts.multiQuery;
+  if (_mq == null && kbId != null) {
+    try {
+      const kbMq = db.prepare('SELECT multi_query FROM kbs WHERE id=?').get(kbId);
+      const mv = Number(kbMq && kbMq.multi_query) || 0;
+      if (mv === 1 || mv === 2) {
+        _mq = true;
+        if (mv === 2) opts = { ...opts, hyde: opts.hyde ?? true };
+      }
+    } catch { /* 库级读取失败 → 视为未开启（0 阻断） */ }
+  }
+  if (_mq === true) {
+    return retrieveMultiQuery(query, kbId, topN, threshold, { ...opts, multiQuery: true });
   }
   // P2 里程碑补测修复（2026-11-05）：vector_weight 非法值鲁棒性——原实现 Number('abc')=NaN 后
   // Math.min/max 对 NaN 透传 → wV/wB 全 NaN → RRF 全 NaN → score>=threshold 恒 false → 静默 0 命中；
@@ -378,8 +442,11 @@ async function retrieve(query, kbId = null, topN = 5, threshold = 0.01, opts = {
   };
   // V1.2 #2 2026-10-30：元数据过滤（AND 语义）——rows 取回后、任何打分/通道计算前逐行判定，覆盖全部分支
   // （annRows 从 rows 派生，先在此过滤即可）。fail-closed：无元数据/缺键/值不匹配的行直接滤除（防误授权）。
+  // AI-14（2026-11-23）查询感知元数据过滤：LLM 从查询推断过滤条件（值域约束 fail-closed——域外键值丢弃），
+  // 与静态 metadataFilter 交集合并（同键静态优先）。0 阻断（无模型/超时 → 不过滤）。
+  const _ai = await _resolveAiFilter(query, rows, kbId, opts, _trace);
   // 无 metadataFilter 或空过滤对象时全部通过——与无过滤行为完全一致（黄金基线护栏红线，勿动语义）。
-  const fObj = (opts.metadataFilter && typeof opts.metadataFilter === 'object' && !Array.isArray(opts.metadataFilter)) ? opts.metadataFilter : null;
+  const fObj = (_ai.merged && typeof _ai.merged === 'object' && !Array.isArray(_ai.merged)) ? _ai.merged : null;
   const fKeys = fObj ? Object.keys(fObj).filter(k => k && fObj[k] !== undefined && fObj[k] !== null && fObj[k] !== '') : [];
   if (fKeys.length) {
     const kept = rows.filter(r => {
@@ -535,6 +602,79 @@ async function retrieve(query, kbId = null, topN = 5, threshold = 0.01, opts = {
   if (_trace) _trace.engine = engine;
   const vecScores = vecs.map(v => cosine(qVec, v));
   return rerankAndSlice(query, finish(rows, bm25, vecScores, engine, RERANK_CANDIDATES, threshold, vecWeight, qTerms, graphRank), topN, rerankOpts, kbId);
+}
+
+/**
+ * AI-10（2026-11-23）多路查询 + HyDE：扩写 → 各路并行检索（不重排）→ 跨路 RRF 融合 → 统一重排切片。
+ * 触发：opts.multiQuery===true（显式）或库级 kbs.multi_query（1=多路 / 2=多路+HyDE，retrieve 内分发）。
+ * 0 阻断：扩写失败/超时/无模型 → expandQueries 返回 [原查询] → 单路语义与关闭时完全一致。
+ * HyDE：假设答案作为额外一路参与检索（答案与文档同为陈述句，嵌入空间更接近，向量通道受益最大）。
+ * 性能：各路 Promise.all 并行；每路独立载库扫描（大库下为 N 倍读放大——默认关的考量之一）；
+ *       融合后统一重排复用单路终点语义（阈值门控/降级/trace 全一致）。
+ */
+async function retrieveMultiQuery(query, kbId, topN, threshold, opts = {}) {
+  const _trace = (opts.trace && typeof opts.trace === 'object') ? opts.trace : null;
+  const { expandQueries } = require('./multi-query');
+  const wantHyde = opts.hyde === true;
+  let expand;
+  try {
+    expand = await expandQueries(query, {
+      hyde: wantHyde,
+      model: opts.rewriteModel || opts.multiQueryModel,
+      username: opts.username, tenantId: opts.tenantId,
+    });
+  } catch { expand = { queries: [query] }; }
+  const queries = Array.isArray(expand.queries) ? expand.queries.filter(Boolean) : [];
+  if (wantHyde && expand.hyde) queries.push(expand.hyde);
+  if (queries.length <= 1) {
+    if (_trace) _trace.multiQuery = { applied: false, reason: 'expansion_fallback', queries: [query] };
+    return retrieve(query, kbId, topN, threshold, { ...opts, multiQuery: false, hyde: false });
+  }
+  if (_trace) _trace.multiQuery = { applied: true, hyde: !!(wantHyde && expand.hyde), queries };
+  // AI-14：多路模式下推断一次（原查询），合并进各路 metadataFilter——各路 inferFilter:false 防重复 LLM 调用
+  let mqOpts = opts;
+  if (_kbInferFlag(kbId, opts)) {
+    let vocabRows = [];
+    try { vocabRows = db.prepare("SELECT metadata FROM kb_chunks WHERE kb_id=? AND metadata IS NOT NULL AND metadata != '' LIMIT 500").all(kbId); } catch { }
+    if (vocabRows.length) {
+      const { merged } = await _resolveAiFilter(query, vocabRows, kbId, { ...opts, inferFilter: true }, _trace);
+      if (merged && typeof merged === 'object' && Object.keys(merged).length) mqOpts = { ...opts, metadataFilter: merged };
+    }
+  }
+  mqOpts = { ...mqOpts, inferFilter: false };
+  // 各路并行：不重排（融合后统一重排）、各路 trace 不回填主 trace、每路取 RERANK_CANDIDATES 条候选
+  const perRoute = await Promise.all(queries.map(q => retrieve(q, kbId, RERANK_CANDIDATES, threshold, {
+    ...mqOpts, multiQuery: false, hyde: false, rerankEnabled: false, trace: null,
+  })));
+  // 跨路 RRF：chunk_id → Σ 1/(60+rank)（任一路命中即有分；多路命中叠加增强）
+  const fused = new Map();
+  perRoute.forEach(hits => {
+    (hits || []).forEach((h, rank) => {
+      const cur = fused.get(h.id);
+      const add = 1 / (60 + rank + 1);
+      if (cur) cur.rrf += add;
+      else fused.set(h.id, { rrf: add, item: h });
+    });
+  });
+  const merged = [...fused.values()].sort((a, b) => b.rrf - a.rrf)
+    .map(x => ({ ...x.item, multi_rrf: +x.rrf.toFixed(6) }));
+  // 统一重排：合并库级重排配置（与单路 retrieve 内部同款语义），trace 回填主 trace 的 rerank 段
+  let rerankOpts = opts;
+  if (kbId != null) {
+    const kbRow = db.prepare('SELECT rerank_enabled, rerank_model, rerank_top_n, rerank_threshold FROM kbs WHERE id=?').get(kbId);
+    const kbc = kbRow ? normalizeKbRerankConfig({
+      rerank_enabled: kbRow.rerank_enabled, rerank_model: kbRow.rerank_model,
+      rerank_top_n: kbRow.rerank_top_n, rerank_threshold: kbRow.rerank_threshold,
+    }) : null;
+    rerankOpts = {
+      ...opts,
+      rerankEnabled: (kbc && kbc.enabled != null) ? kbc.enabled : opts.rerankEnabled,
+      rerankModel: (kbc && kbc.model) ? kbc.model : opts.rerankModel,
+      rerankTopN: (kbc && kbc.topN != null) ? kbc.topN : opts.rerankTopN,
+      rerankThreshold: (kbc && kbc.threshold != null) ? kbc.threshold : opts.rerankThreshold,
+    };
+  }
+  return rerankAndSlice(query, merged.slice(0, RERANK_CANDIDATES), topN, { ...rerankOpts, trace: _trace }, kbId);
 }
 
 /* ---------------- AI-02 收尾（D-4：SQLite-vec）辅助：BLOB 按需加载 / 回填 ---------------- */

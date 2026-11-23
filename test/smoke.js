@@ -2825,6 +2825,149 @@ function t(name, fn) {
           // 测试自清理：configured=1 供应商残留会泄漏到后续块（如 keywordgen 的 no_provider 判断）
           db.prepare(`DELETE FROM providers WHERE name='脱敏测试供应商'`).run();
         });
+        // ===== D-3 全域 API Key（2026-11-23 拍板：需要全域模式）端到端 =====
+        await t('HTTP：D-3 全域 Key——adminOnly 创建 / 非管理员 403 / 掩码列表 / models 全域可见 + 跨租户不可见 / 停用即失效', async () => {
+          const { hashKey } = require('../src-server/lib/apikey');
+          // admin token（httpadmin 已由上一用例建立；防御性补建）
+          if (!db.prepare(`SELECT id FROM users WHERE username='httpadmin'`).get()) {
+            db.prepare(`INSERT INTO users (username,password,nickname,role,status,must_change_pwd,created_at) VALUES ('httpadmin',?,'测试管理员','admin',1,0,datetime('now','localtime'))`).run(hashPwd('http-pass-123'));
+          }
+          const tokA = sign({ uid: db.prepare(`SELECT id FROM users WHERE username='httpadmin'`).get().id, exp: Date.now() + 3600000 });
+          // 测试智能体：同租户两个已发布 + 一个他租户已发布（跨租户防线断言）
+          db.prepare(`INSERT INTO spaces (name,type,owner,members,created_at,tenant_id) VALUES ('D3测试空间','enterprise','httpadmin','[]',datetime('now','localtime'),1)`).run();
+          const spid = db.prepare(`SELECT id FROM spaces WHERE name='D3测试空间'`).get().id;
+          db.prepare(`INSERT INTO agents (name,type,space_id,owner,status,visibility,tenant_id,created_at) VALUES ('D3发布甲','other',?,'httpadmin','published','public',1,datetime('now','localtime'))`).run(spid);
+          db.prepare(`INSERT INTO agents (name,type,space_id,owner,status,visibility,tenant_id,created_at) VALUES ('D3发布乙','other',?,'httpadmin','published','public',1,datetime('now','localtime'))`).run(spid);
+          db.prepare(`INSERT INTO agents (name,type,space_id,owner,status,visibility,tenant_id,created_at) VALUES ('D3他租户','other',?,'httpadmin','published','public',2,datetime('now','localtime'))`).run(spid);
+          try {
+            // ① 非管理员创建 → 403（adminOnly 从严）
+            const deny = await jfetch('/api/agents/global-keys', { method: 'POST', body: JSON.stringify({ name: '越权全域Key' }) }, tok1);
+            assert.strictEqual(deny.j.code, 403, '普通用户创建全域 Key 应被拒（adminOnly）：' + JSON.stringify(deny.j).slice(0, 80));
+            // ② admin 创建 → 前缀 sk-gk-
+            const mk = await jfetch('/api/agents/global-keys', { method: 'POST', body: JSON.stringify({ name: 'HTTP全域Key' }) }, tokA);
+            assert.ok(mk.j && mk.j.code === 0, 'admin 创建全域 Key 应成功：' + JSON.stringify(mk.j).slice(0, 80));
+            const gkey = mk.j.data.key;
+            assert.ok(gkey.startsWith('sk-gk-'), '全域 Key 前缀应为 sk-gk-（与智能体级 sk-ap- 区分）');
+            const kid = mk.j.data.id;
+            // ③ 列表掩码回显（SEC-02a 语义延续：不回传哈希）
+            const lst = await jfetch('/api/agents/global-keys', {}, tokA);
+            const row = (lst.j.data || []).find(x => x.id === kid);
+            assert.ok(row, '新建全域 Key 应在列表');
+            assert.ok(row.key.startsWith('sk-gk-') && !/^[0-9a-f]{64}$/.test(row.key.replace('sk-', '')), '列表 key 应为掩码而非哈希形态');
+            assert.strictEqual(row.owner_username, 'httpadmin', '应记录创建者归属');
+            // ④ openapi /v1/models：全域可见同租户两个、跨租户不可见
+            const models = await jfetch('/openapi/v1/models', {}, gkey);
+            assert.ok(models.j && Array.isArray(models.j.data), 'models 应返回数组');
+            const names = models.j.data.map(m => m.id).join('|');
+            assert.ok(names.includes('D3发布甲') && names.includes('D3发布乙'), '全域 Key 应可见同租户全部已发布智能体');
+            assert.ok(!names.includes('D3他租户'), '全域 Key 不得可见他租户智能体（租户防线）');
+            // ⑤ 停用即失效（status=0 → authKey 拒绝 401）
+            const tg = await jfetch(`/api/agents/global-keys/${kid}/toggle`, { method: 'POST' }, tokA);
+            assert.ok(tg.j && tg.j.code === 0, '停用应成功');
+            const after = await jfetch('/openapi/v1/models', {}, gkey);
+            assert.strictEqual(after.status, 401, '停用后的全域 Key 调用应 401');
+            // ⑥ 库内 key 列为哈希（SEC-02a 延续）
+            const krow = db.prepare('SELECT key FROM agent_api_keys WHERE id=?').get(kid);
+            assert.ok(krow && krow.key !== gkey && krow.key === hashKey(gkey), '库内应为 HMAC 哈希（明文不落库）');
+          } finally {
+            db.prepare(`DELETE FROM agent_api_keys WHERE name='HTTP全域Key' OR name='越权全域Key'`).run();
+            db.prepare(`DELETE FROM agents WHERE name IN ('D3发布甲','D3发布乙','D3他租户')`).run();
+            db.prepare(`DELETE FROM spaces WHERE id=?`).run(spid);
+          }
+        });
+        // ===== AI-13 RAG 检索可观测（2026-11-23）：rag-traces 端点数据源 =====
+        await t('HTTP：AI-13 检索可观测——全链路 trace 结构化回传 + query 联表 + 0 命中可归因 + 过滤与噪声剔除', async () => {
+          // admin token（httpadmin 已存在）
+          const tokA2 = sign({ uid: db.prepare(`SELECT id FROM users WHERE username='httpadmin'`).get().id, exp: Date.now() + 3600000 });
+          // 造数：session + user message + agent + chat_traces（含全字段 trace 的 0 命中样本 + 一条噪声行 trace='[]'）
+          db.prepare(`INSERT INTO sessions (title,username,created_at) VALUES ('AI13测试会话','httpu1',datetime('now','localtime'))`).run();
+          const sid2 = db.prepare(`SELECT id FROM sessions WHERE title='AI13测试会话'`).get().id;
+          db.prepare(`INSERT INTO messages (session_id,role,content,created_at) VALUES (?, 'user','年假怎么申请',datetime('now','localtime'))`).run(sid2);
+          const mid2 = db.prepare('SELECT id FROM messages WHERE session_id=? ORDER BY id DESC').get(sid2).id;
+          db.prepare(`INSERT INTO spaces (name,type,owner,members,created_at,tenant_id) VALUES ('AI13空间','enterprise','httpadmin','[]',datetime('now','localtime'),1)`).run();
+          const sp13 = db.prepare(`SELECT id FROM spaces WHERE name='AI13空间'`).get().id;
+          db.prepare(`INSERT INTO agents (name,type,space_id,owner,status,visibility,tenant_id,created_at) VALUES ('AI13挂库智能体','other',?,'httpadmin','published','public',1,datetime('now','localtime'))`).run(sp13);
+          const ag13 = db.prepare(`SELECT id FROM agents WHERE name='AI13挂库智能体'`).get().id;
+          const trJson = JSON.stringify({
+            rewrite: { original: '年假怎么申请', rewritten: '年假 申请 流程 规定', applied: true },
+            engine: 'H',
+            ann: { engine: 'sqlite-vec', hits: 0, coverage: '12/12' },
+            rerank: { requested: true, applied: true, degraded: false, model: 'bge-reranker-v2-m3', threshold: 0.35, candidates: 6, passed: 0 },
+          });
+          db.prepare(`INSERT INTO chat_traces (session_id,message_id,agent_id,model,mode,latency_ms,tokens,prompt_chars,kb_hits,tool_calls,blocked,retrieval_trace,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,datetime('now','localtime'))`)
+            .run(sid2, mid2, ag13, 'mock-model', 'chat', 820, 0, 40, '[]', '[]', '', trJson);
+          const traceId = db.prepare('SELECT id FROM chat_traces WHERE session_id=? ORDER BY id DESC').get(sid2).id;
+          // 噪声行：retrieval_trace='[]'（无诊断的普通对话）不应出现在面板数据源
+          db.prepare(`INSERT INTO chat_traces (session_id,message_id,agent_id,model,mode,latency_ms,tokens,prompt_chars,kb_hits,tool_calls,blocked,retrieval_trace,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,datetime('now','localtime'))`)
+            .run(sid2, null, ag13, 'mock-model', 'chat', 100, 0, 20, '[]', '[]', '', '[]');
+          try {
+            const r = await jfetch('/api/monitor/rag-traces', {}, tokA2);
+            assert.ok(r.j && r.j.code === 0, '端点应成功：' + JSON.stringify(r.j || {}).slice(0, 80));
+            const row = (r.j.data.list || []).find(x => x.id === traceId);
+            assert.ok(row, '含全链路 trace 的行应出现在面板数据源');
+            assert.strictEqual(row.query, '年假怎么申请', '用户 query 应经 messages 联表回传（0 命中归因的输入）');
+            assert.strictEqual(row.username, 'httpu1', '会话用户应联表回传');
+            assert.strictEqual(row.agent_name, 'AI13挂库智能体', '智能体名应联表回传');
+            assert.strictEqual(row.hit_count, 0, '0 命中样本 hit_count 应为 0');
+            // 结构化 trace：归因所需字段齐备（rewrite/rerank 阈值门控/ANN 覆盖度）
+            assert.ok(row.trace.rewrite && row.trace.rewrite.applied === true, 'trace.rewrite 应结构化回传');
+            assert.strictEqual(row.trace.rerank.passed, 0, '重排门控 passed=0 应保留（「阈值全滤光」归因依据）');
+            assert.strictEqual(row.trace.rerank.candidates, 6, '候选数应保留');
+            assert.ok(String(row.trace.ann.coverage) === '12/12', 'ANN 覆盖度应保留');
+            assert.ok(!(r.j.data.list || []).some(x => x.retrieval_trace === '[]'), "trace='[]' 的噪声行不应出现（只看含诊断的对话）");
+            // agent_id 过滤生效
+            const r2 = await jfetch('/api/monitor/rag-traces?agent_id=' + ag13, {}, tokA2);
+            assert.ok((r2.j.data.list || []).every(x => x.agent_id === ag13), 'agent_id 过滤应生效');
+            const r3 = await jfetch('/api/monitor/rag-traces?agent_id=99999', {}, tokA2);
+            assert.strictEqual((r3.j.data.list || []).length, 0, '不存在的智能体过滤应返回空');
+          } finally {
+            db.prepare(`DELETE FROM chat_traces WHERE session_id=?`).run(sid2);
+            db.prepare(`DELETE FROM messages WHERE session_id=?`).run(sid2);
+            db.prepare(`DELETE FROM sessions WHERE id=?`).run(sid2);
+            db.prepare(`DELETE FROM agents WHERE id=?`).run(ag13);
+            db.prepare(`DELETE FROM spaces WHERE id=?`).run(sp13);
+          }
+        });
+        // ===== BE-F1 requestId 贯穿日志链（2026-11-23）端到端 =====
+        await t('HTTP：BE-F1——X-Request-Id 响应头 + access_logs 骨架行 + op_logs 自动注入 + request-chain 聚合', async () => {
+          const tokA3 = sign({ uid: db.prepare(`SELECT id FROM users WHERE username='httpadmin'`).get().id, exp: Date.now() + 3600000 });
+          // ① 普通请求：响应头带 X-Request-Id，access_logs 落骨架行
+          const r1 = await fetch(base + '/api/monitor/op-logs?size=1', { headers: { Authorization: 'Bearer ' + tokA3 } });
+          const rid1 = r1.headers.get('x-request-id');
+          assert.ok(/^[0-9a-f]{12}$/.test(rid1 || ''), '响应头应携带 12 位 hex X-Request-Id：' + rid1);
+          const a1 = db.prepare('SELECT * FROM access_logs WHERE request_id=?').get(rid1);
+          assert.ok(a1, 'access_logs 应落骨架行');
+          assert.strictEqual(a1.method, 'GET', 'access_logs 应记录方法');
+          assert.strictEqual(a1.status, 200, 'access_logs 应记录状态码');
+          assert.ok(a1.duration_ms >= 0, 'access_logs 应记录耗时');
+          assert.strictEqual(a1.username, 'httpadmin', 'access_logs 应记录用户（finish 时 req.user 已填充）');
+          // ② 触发 op_logs 审计写入的请求（创建全域 Key 走 audit 拦截器）→ op_logs 自动带同 requestId
+          const mk2 = await fetch(base + '/api/agents/global-keys', {
+            method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + tokA3 },
+            body: JSON.stringify({ name: 'BE-F1链路Key' }),
+          });
+          const rid2 = mk2.headers.get('x-request-id');
+          let mk2j = null; try { mk2j = await mk2.json(); } catch { }
+          assert.ok(mk2j && mk2j.code === 0, '创建全域 Key 应成功：' + JSON.stringify(mk2j || {}).slice(0, 80));
+          const op1 = db.prepare(`SELECT * FROM op_logs WHERE request_id=? AND action='创建全域API密钥'`).get(rid2);
+          assert.ok(op1, 'audit 拦截器应为 op_logs 自动注入 request_id（AsyncLocalStorage 全链路）');
+          assert.strictEqual(op1.username, 'httpadmin', '审计行用户正确');
+          // 哈希链仍完整（request_id 不参与哈希——写入端/校验端同步排除）
+          const { verifyChain } = require('../src-server/lib/audit');
+          const vc = verifyChain(db, 'op_logs');
+          assert.ok(vc.ok, 'op_logs 哈希链应完整（request_id 排除在哈希外）：' + JSON.stringify(vc).slice(0, 80));
+          // ③ request-chain 端点：按 requestId 聚合三者
+          const chain = await jfetch(`/api/monitor/request-chain?request_id=${rid2}`, {}, tokA3);
+          assert.ok(chain.j && chain.j.code === 0, 'request-chain 应成功');
+          assert.ok(chain.j.data.access && chain.j.data.access.request_id === rid2, '链中应含 access_logs 骨架行');
+          assert.ok((chain.j.data.ops || []).some(o => o.action === '创建全域API密钥'), '链中应含 op_logs 审计行');
+          // ④ 健康检查减噪：/api/health 不落 access_logs
+          await fetch(base + '/api/health').catch(() => { });
+          await new Promise(r2 => setTimeout(r2, 150)); // finish 异步落库
+          const hc = db.prepare(`SELECT COUNT(*) c FROM access_logs WHERE path LIKE '%/health%'`).get().c;
+          assert.strictEqual(hc, 0, '健康检查不应落 access_logs（探针减噪）');
+          db.prepare(`DELETE FROM agent_api_keys WHERE name='BE-F1链路Key'`).run();
+        });
         // ===== P1-3 分页参数容错（2026-11-04）：lib 统一解析 + 三接口回归（notify 原必 500 实锤点） =====
         await t('P1-3：parsePagination 六态容错（缺省/正常/abc/负数/超大/小数）', () => {
           const { parsePagination } = require('../src-server/lib/pagination');
@@ -11241,20 +11384,22 @@ print('PY_OK')
       assert.ok(!src.includes('ADD COLUMN embedding BLOB') && !src.includes("ADD COLUMN last_used_at"), 'db.js 不应再含 agent_memories M4 两列内联加列');
     });
 
-    await t('BE-E1：down/up 回滚闭环——逆序回滚 #131 删列、台账出册、up 恢复', () => {
+    await t('BE-E1：down/up 回滚闭环——逆序回滚删列、台账出册、up 恢复', () => {
       const appliedBefore = mig.getAppliedIds();
       assert.ok(appliedBefore.has(131), '前置：#131 应在台账');
       try {
+        // 注：迁移注册表后续新增更高 id（如 D-3 #132）时此处同步维护——回滚窗口 [to+1, max]，断言聚焦 #131 的列级 down 语义
         const results = mig.revertMigrations(mig.ALL_MIGRATIONS, { to: 130 });
-        assert.strictEqual(results.length, 1, '应恰好回滚一步（#131）');
-        assert.ok(results[0].ok && results[0].id === 131, '回滚 #131 应成功：' + JSON.stringify(results[0]));
+        assert.ok(results.length >= 1 && results.every(r => r.ok), '窗口内全部步应回滚成功：' + JSON.stringify(results));
+        assert.ok(results.some(r => r.id === 131), '应包含 #131');
         const cols = db.prepare('PRAGMA table_info(agent_memories)').all().map(c => c.name);
         assert.ok(!cols.includes('last_used_at'), '回滚后 last_used_at 列应消失（DROP COLUMN）');
         assert.ok(!mig.getAppliedIds().has(131), '台账应移除 #131');
       } finally {
         // 防御式：断言失败也保证 up 恢复，不把删列状态泄漏给后续测试
-        const r = mig.runMigrations(mig.ALL_MIGRATIONS, { onlyIds: [131] });
-        assert.strictEqual(r.applied, 1, 'up 应重新应用 #131');
+        const missing = mig.ALL_MIGRATIONS.filter(s => s.id > 130 && !mig.getAppliedIds().has(s.id)).map(s => s.id);
+        const up = mig.runMigrations(mig.ALL_MIGRATIONS, { onlyIds: missing });
+        assert.ok(up.applied >= 1, 'up 应重新应用被回滚的步：' + JSON.stringify(missing));
       }
       const colsAfter = db.prepare('PRAGMA table_info(agent_memories)').all().map(c => c.name);
       assert.ok(colsAfter.includes('last_used_at'), 'up 后 last_used_at 列应恢复');
@@ -11396,6 +11541,258 @@ print('PY_OK')
       db.prepare('DELETE FROM kb_files WHERE kb_id=?').run(kbId);
       db.prepare('DELETE FROM kbs WHERE id=?').run(kbId);
     }
+  }
+
+  // ==================== D-3 全域 API Key（2026-11-23 拍板：需要全域模式） ====================
+  console.log('【D-3】全域 API Key（迁移 #132 重建 / 作用域矩阵 / down 回滚）');
+  {
+    const { db } = require('../src-server/db');
+    const mig = require('../src-server/lib/migrate');
+
+    await t('D-3：迁移 #132 重建 agent_api_keys——agent_id 可空 + 归属列 + down/up 回滚闭环', () => {
+      const cols = db.prepare('PRAGMA table_info(agent_api_keys)').all();
+      const agentIdCol = cols.find(c => c.name === 'agent_id');
+      assert.strictEqual(agentIdCol.notnull, 0, 'agent_id 应可空（NULL=全域 Key）');
+      for (const c of ['owner_username', 'tenant_id']) assert.ok(cols.some(x => x.name === c), `应有归属列 ${c}`);
+      assert.ok(mig.getAppliedIds().has(132), '迁移 #132 应在台账');
+      try {
+        // 注：注册表后续新增更高 id 时窗口自动扩大（BE-F1 #133~136 等）——断言聚焦 #132 的重建语义
+        const r = mig.revertMigrations(mig.ALL_MIGRATIONS, { to: 131 });
+        assert.ok(r.length >= 1 && r.every(x => x.ok), '窗口内全部步应回滚成功：' + JSON.stringify(r).slice(0, 120));
+        assert.ok(r.some(x => x.id === 132), '应包含 #132');
+        let c2 = db.prepare('PRAGMA table_info(agent_api_keys)').all().find(c => c.name === 'agent_id');
+        assert.strictEqual(c2.notnull, 1, '回滚后 agent_id 应恢复 NOT NULL（旧 schema）');
+      } finally {
+        // 防御式：断言失败也保证 up 恢复，不把旧结构泄漏给后续测试
+        const missing = mig.ALL_MIGRATIONS.filter(s => s.id > 131 && !mig.getAppliedIds().has(s.id)).map(s => s.id);
+        const up = mig.runMigrations(mig.ALL_MIGRATIONS, { onlyIds: missing });
+        assert.ok(up.applied >= 1, 'up 应重新应用被回滚的步：' + JSON.stringify(missing));
+      }
+      const c3 = db.prepare('PRAGMA table_info(agent_api_keys)').all().find(c => c.name === 'agent_id');
+      assert.strictEqual(c3.notnull, 0, 'up 后 agent_id 应再次可空');
+    });
+
+    await t('D-3：作用域矩阵——全域 Key 同租户已发布放行 / 未发布拒绝 / 跨租户拒绝 / 不存在拒绝；绑定 Key 语义回归', () => {
+      const { __authKeyForAgent } = require('../src-server/routes/openapi');
+      // 造数：同租户已发布/未发布 + 他租户已发布（矩阵四象限）
+      db.prepare(`INSERT INTO spaces (name,type,owner,members,created_at,tenant_id) VALUES ('D3矩阵空间','enterprise','admin','[]',datetime('now','localtime'),1)`).run();
+      const spid = db.prepare(`SELECT id FROM spaces WHERE name='D3矩阵空间'`).get().id;
+      db.prepare(`INSERT INTO agents (name,type,space_id,owner,status,visibility,tenant_id,created_at) VALUES ('D3矩阵已发布','other',?,'admin','published','public',1,datetime('now','localtime'))`).run(spid);
+      db.prepare(`INSERT INTO agents (name,type,space_id,owner,status,visibility,tenant_id,created_at) VALUES ('D3矩阵草稿','other',?,'admin','draft','public',1,datetime('now','localtime'))`).run(spid);
+      db.prepare(`INSERT INTO agents (name,type,space_id,owner,status,visibility,tenant_id,created_at) VALUES ('D3矩阵他租户','other',?,'admin','published','public',2,datetime('now','localtime'))`).run(spid);
+      const pubId = db.prepare(`SELECT id FROM agents WHERE name='D3矩阵已发布'`).get().id;
+      const draftId = db.prepare(`SELECT id FROM agents WHERE name='D3矩阵草稿'`).get().id;
+      const othId = db.prepare(`SELECT id FROM agents WHERE name='D3矩阵他租户'`).get().id;
+      try {
+        const gk = { agent_id: null, tenant_id: 1 }; // 全域 Key（租户 1）
+        assert.strictEqual(__authKeyForAgent(gk, pubId), null, '全域 Key → 同租户已发布应放行');
+        assert.match(String(__authKeyForAgent(gk, draftId)), /未发布/, '全域 Key → 未发布应拒绝（fail-closed）');
+        assert.match(String(__authKeyForAgent(gk, othId)), /其他租户/, '全域 Key → 他租户应拒绝');
+        assert.match(String(__authKeyForAgent(gk, 99999999)), /不存在或未发布/, '全域 Key → 不存在应拒绝');
+        const bound = { agent_id: pubId, tenant_id: 1 }; // 绑定 Key（回归：SEC-02a 语义不变）
+        assert.strictEqual(__authKeyForAgent(bound, pubId), null, '绑定 Key → 匹配应放行（回归）');
+        assert.match(String(__authKeyForAgent(bound, othId)), /无权访问/, '绑定 Key → 不匹配应拒绝（回归）');
+        const legacyNoBind = { tenant_id: 1 }; // 极端防御：agent_id undefined（历史脏行）按全域矩阵处理（查库校验兜底）
+        assert.match(String(__authKeyForAgent(legacyNoBind, pubId)), /.*/, '不得抛异常');
+      } finally {
+        db.prepare(`DELETE FROM agents WHERE name IN ('D3矩阵已发布','D3矩阵草稿','D3矩阵他租户')`).run();
+        db.prepare(`DELETE FROM spaces WHERE id=?`).run(spid);
+      }
+    });
+  }
+
+  // ==================== AI-10 多路查询 + HyDE（2026-11-23） ====================
+  console.log('【AI-10】多路查询 + HyDE（扩写回退 0 阻断 / 跨路 RRF 融合 / 库级开关 / trace 可观测）');
+  {
+    const { db } = require('../src-server/db');
+    const mq = require('../src-server/lib/multi-query');
+    const r = require('../src-server/lib/retriever');
+
+    await t('AI-10：expandQueries——正常扩写/缓存/异常回落/垃圾输出回落/行式容错/原查询兜底/hyde', async () => {
+      mq.__clearCache();
+      let calls = 0;
+      mq.__setImpl(async () => { calls++; return '{"queries": ["原查询", "子查询甲", "子查询乙"]}'; });
+      let out = await mq.expandQueries('原查询', {});
+      assert.deepStrictEqual(out.queries, ['原查询', '子查询甲', '子查询乙'], '应解析出 3 路');
+      await mq.expandQueries('原查询', {});
+      assert.strictEqual(calls, 1, '同查询二次应命中缓存（省一次模型调用）');
+      mq.__clearCache();
+      mq.__setImpl(async () => '{"queries": ["原查询", "子甲"], "hyde": "这是一段假设答案。"}');
+      out = await mq.expandQueries('原查询', { hyde: true });
+      assert.strictEqual(out.hyde, '这是一段假设答案。', 'hyde 字段应解析（假设答案路）');
+      mq.__clearCache();
+      mq.__setImpl(async () => { throw new Error('boom'); });
+      out = await mq.expandQueries('原查询', {});
+      assert.deepStrictEqual(out.queries, ['原查询'], '扩写异常应回落单路（0 阻断）');
+      mq.__clearCache();
+      mq.__setImpl(async () => 'garbage !!!');
+      out = await mq.expandQueries('原查询', {});
+      assert.deepStrictEqual(out.queries, ['原查询'], '垃圾输出应回落单路');
+      mq.__clearCache();
+      mq.__setImpl(async () => '查询一\n查询二\nhyde: 假设答案文本');
+      out = await mq.expandQueries('原查询', { hyde: true });
+      assert.ok(out.queries.includes('查询一') && out.queries.includes('查询二'), '非 JSON 行式解析应容错工作');
+      assert.strictEqual(out.hyde, '假设答案文本', '行式 hyde: 前缀应解析');
+      mq.__clearCache();
+      mq.__setImpl(async () => '{"queries": ["只有子查询"]}');
+      out = await mq.expandQueries('原查询', {});
+      assert.strictEqual(out.queries[0], '原查询', '模型漏带原查询时应补为首路（兜底召回）');
+      mq.__setImpl(null); mq.__clearCache();
+    });
+
+    await t('AI-10：retrieve 多路融合——跨路 RRF 命中增强 + trace.multiQuery 可观测 + 扩写失败回落零回归', async () => {
+      db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('AI-10 多路测试库','',1,'httpu1',datetime('now','localtime'))`).run();
+      const kbId = db.prepare(`SELECT id FROM kbs WHERE name='AI-10 多路测试库'`).get().id;
+      db.prepare(`INSERT INTO kb_files (kb_id,name,size,status,chunk_count,created_at) VALUES (?,'多路文档.txt',50,'success',3,datetime('now','localtime'))`).run(kbId);
+      const fid = db.prepare('SELECT id FROM kb_files WHERE kb_id=? ORDER BY id DESC').get(kbId).id;
+      db.prepare('INSERT INTO kb_chunks (file_id,kb_id,content) VALUES (?,?,?)').run(fid, kbId, '公司年假制度规定：入职满一年的员工可申请带薪年假五天。');
+      db.prepare('INSERT INTO kb_chunks (file_id,kb_id,content) VALUES (?,?,?)').run(fid, kbId, '休假申请流程：年假需在系统提前三个工作日提交审批。');
+      db.prepare('INSERT INTO kb_chunks (file_id,kb_id,content) VALUES (?,?,?)').run(fid, kbId, '公司考勤处罚规定：迟到三次以上通报批评。');
+      try {
+        // 桩：扩写两路子查询 + 一路原查询——分别命中「天数」与「流程」块（单路关键词易漏召的表述）
+        mq.__clearCache();
+        mq.__setImpl(async () => '{"queries": ["年假有多少天", "休假怎么申请"]}');
+        const trace = {};
+        const hits = await r.retrieve('年假怎么申请', kbId, 5, 0.01, { multiQuery: true, rerankEnabled: false, trace });
+        assert.ok(hits.length >= 2, '多路融合应命中多个主题块：' + hits.length);
+        assert.ok(hits.some(h => h.content.includes('五天')), '应命中天数块（子查询「年假有多少天」路）');
+        assert.ok(hits.some(h => h.content.includes('提前三个工作日')), '应命中流程块（子查询「休假怎么申请」路——单路问法易漏召的表述）');
+        assert.ok(trace.multiQuery && trace.multiQuery.applied === true, 'trace.multiQuery 应回填（AI-13 可观测）');
+        assert.ok(Array.isArray(trace.multiQuery.queries) && trace.multiQuery.queries.length >= 2, '子查询清单应在 trace（可回答「用了哪几路」）');
+        assert.ok(hits.every(h => h.multi_rrf != null), '跨路融合分 multi_rrf 应随命中回传');
+        // 关闭零回归：不传 multiQuery → 单路（无多路 trace）
+        const trace2 = {};
+        await r.retrieve('年假怎么申请', kbId, 5, 0.01, { rerankEnabled: false, trace: trace2 });
+        assert.strictEqual(trace2.multiQuery, undefined, '关闭时不应有多路 trace（行为与历史一致）');
+        // 扩写失败回落单路（0 阻断）
+        mq.__clearCache();
+        mq.__setImpl(async () => { throw new Error('LLM 不可用'); });
+        const hits3 = await r.retrieve('年假怎么申请', kbId, 5, 0.01, { multiQuery: true, rerankEnabled: false });
+        assert.ok(hits3.length >= 1, '扩写失败回落单路仍应正常检索');
+      } finally {
+        mq.__setImpl(null); mq.__clearCache();
+        db.prepare('DELETE FROM kb_chunks WHERE kb_id=?').run(kbId);
+        db.prepare('DELETE FROM kb_files WHERE kb_id=?').run(kbId);
+        db.prepare('DELETE FROM kbs WHERE id=?').run(kbId);
+      }
+    });
+
+    await t('AI-10：库级开关 kbs.multi_query=1 自动多路 + 显式 off 覆盖（节点级三态语义）', async () => {
+      db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('AI-10 库级开关库','',1,'httpu1',datetime('now','localtime'))`).run();
+      const kbId = db.prepare(`SELECT id FROM kbs WHERE name='AI-10 库级开关库'`).get().id;
+      db.prepare(`INSERT INTO kb_files (kb_id,name,size,status,chunk_count,created_at) VALUES (?,'开关文档.txt',30,'success',1,datetime('now','localtime'))`).run(kbId);
+      const fid = db.prepare('SELECT id FROM kb_files WHERE kb_id=? ORDER BY id DESC').get(kbId).id;
+      db.prepare('INSERT INTO kb_chunks (file_id,kb_id,content) VALUES (?,?,?)').run(fid, kbId, '差旅报销标准：高铁二等座按票面全额报销。');
+      try {
+        db.prepare('UPDATE kbs SET multi_query=1 WHERE id=?').run(kbId);
+        mq.__clearCache();
+        mq.__setImpl(async () => '{"queries": ["差旅报销", "报销标准是什么"]}');
+        const trace = {};
+        const hits = await r.retrieve('报销标准', kbId, 5, 0.01, { rerankEnabled: false, trace }); // 不传 multiQuery → 库级生效
+        assert.ok(trace.multiQuery && trace.multiQuery.applied, '库级 multi_query=1 应自动多路（无 opts 也生效）');
+        assert.ok(hits.length >= 1, '应命中报销块');
+        const trace2 = {};
+        await r.retrieve('报销标准', kbId, 5, 0.01, { multiQuery: false, rerankEnabled: false, trace: trace2 });
+        assert.strictEqual(trace2.multiQuery, undefined, '显式 off 应覆盖库级（AI-08 节点级三态的基础）');
+      } finally {
+        mq.__setImpl(null); mq.__clearCache();
+        db.prepare('DELETE FROM kb_chunks WHERE kb_id=?').run(kbId);
+        db.prepare('DELETE FROM kb_files WHERE kb_id=?').run(kbId);
+        db.prepare('DELETE FROM kbs WHERE id=?').run(kbId);
+      }
+    });
+  }
+
+  // ==================== AI-14 查询感知元数据过滤（2026-11-23） ====================
+  console.log('【AI-14】查询感知元数据过滤（值域约束 fail-closed / 静态优先 / 误过滤率 0）');
+  {
+    const { db } = require('../src-server/db');
+    const mi = require('../src-server/lib/metadata-infer');
+    const r = require('../src-server/lib/retriever');
+
+    await t('AI-14：inferMetadataFilter——正常推断/值域外丢弃（幻觉防误过滤）/异常回落/缓存/空意图', async () => {
+      const vocab = { 部门: ['人事部', '财务部'], 文档类型: ['制度', '通知'] };
+      mi.__clearCache();
+      let calls = 0;
+      mi.__setImpl(async () => { calls++; return '{"filter": {"部门": "人事部"}}'; });
+      let out = await mi.inferMetadataFilter('人事部的年假制度', vocab, {});
+      assert.deepStrictEqual(out, { 部门: '人事部' }, '应推断出部门过滤');
+      await mi.inferMetadataFilter('人事部的年假制度', vocab, {});
+      assert.strictEqual(calls, 1, '同查询+同值域应命中缓存');
+      // 值域外丢弃（误过滤率 0 的核心防线：模型幻觉值不得造成过滤）
+      mi.__clearCache();
+      mi.__setImpl(async () => '{"filter": {"部门": "不存在的部门", "文档类型": "制度"}}');
+      out = await mi.inferMetadataFilter('随便问问', vocab, {});
+      assert.deepStrictEqual(out, { 文档类型: '制度' }, '值域外的键值应丢弃，域内条件保留');
+      // 键也域外
+      mi.__clearCache();
+      mi.__setImpl(async () => '{"filter": {" invented_key ": "x"}}');
+      out = await mi.inferMetadataFilter('随便问问', vocab, {});
+      assert.strictEqual(out, null, '全域外推断应返回 null（不过滤）');
+      // 空意图
+      mi.__clearCache();
+      mi.__setImpl(async () => '{"filter": {}}');
+      out = await mi.inferMetadataFilter('今天天气如何', vocab, {});
+      assert.strictEqual(out, null, '无过滤意图应返回 null（宁缺勿错）');
+      // 异常/垃圾回落
+      mi.__clearCache();
+      mi.__setImpl(async () => { throw new Error('boom'); });
+      out = await mi.inferMetadataFilter('人事的', vocab, {});
+      assert.strictEqual(out, null, '异常应回落不过滤（0 阻断）');
+      mi.__setImpl(null); mi.__clearCache();
+    });
+
+    await t('AI-14：retrieve 端到端——推断过滤命中目标分块 + 静态声明优先 + 关闭零回归', async () => {
+      db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('AI-14 过滤测试库','',1,'httpu1',datetime('now','localtime'))`).run();
+      const kbId = db.prepare(`SELECT id FROM kbs WHERE name='AI-14 过滤测试库'`).get().id;
+      db.prepare(`INSERT INTO kb_files (kb_id,name,size,status,chunk_count,created_at) VALUES (?,'部门制度.txt',60,'success',3,datetime('now','localtime'))`).run(kbId);
+      const fid = db.prepare('SELECT id FROM kb_files WHERE kb_id=? ORDER BY id DESC').get(kbId).id;
+      const mkChunk = (content, meta) => db.prepare('INSERT INTO kb_chunks (file_id,kb_id,content,metadata) VALUES (?,?,?,?)').run(fid, kbId, content, JSON.stringify(meta));
+      mkChunk('人事部年假制度：入职满一年带薪年假五天。', { 部门: '人事部' });
+      mkChunk('财务部报销制度：发票需在三十天内提交。', { 部门: '财务部' });
+      mkChunk('通用考勤要求：迟到三次通报批评。', { 部门: '人事部', 文档类型: '制度' });
+      try {
+        // 推断开启 + 桩推断人事部 → 仅命中人事部分块
+        mi.__clearCache();
+        mi.__setImpl(async () => '{"filter": {"部门": "人事部"}}');
+        const trace = {};
+        const hits = await r.retrieve('年假制度', kbId, 5, 0.01, { inferFilter: true, rerankEnabled: false, trace });
+        assert.ok(hits.length >= 1 && hits.every(h => h.content.includes('人事部') || h.content.includes('考勤')), '推断过滤后应仅命中人事部分块');
+        assert.ok(!hits.some(h => h.content.includes('财务部')), '财务部块应被过滤（查询感知生效）');
+        assert.ok(trace.inferFilter && trace.inferFilter.applied === true, 'trace.inferFilter 应回填（AI-13 可观测）');
+        assert.deepStrictEqual(trace.inferFilter.filter, { 部门: '人事部' }, '推断条件应在 trace（可回答「过滤了什么」）');
+        // 静态优先：静态声明财务部 + 推断人事部 → 同键取静态（AI 不得推翻显式声明）
+        mi.__clearCache();
+        const hits2 = await r.retrieve('年假制度', kbId, 5, 0.01, {
+          inferFilter: true, rerankEnabled: false,
+          metadataFilter: { 部门: '财务部' },
+        });
+        assert.ok(hits2.length >= 1 && hits2.every(h => h.content.includes('财务部')), '静态声明应优先于 AI 推断（同键取静态）');
+        // 误过滤率 0：空意图（桩返回空 filter）→ 命中集与「未开启推断」完全一致（不得因开启而丢任何一条）
+        mi.__clearCache();
+        mi.__setImpl(async () => '{"filter": {}}');
+        const q3 = '公司制度全览';
+        const withEmptyIntent = await r.retrieve(q3, kbId, 5, 0.01, { inferFilter: true, rerankEnabled: false });
+        const withoutInfer = await r.retrieve(q3, kbId, 5, 0.01, { rerankEnabled: false });
+        assert.strictEqual(withEmptyIntent.length, withoutInfer.length, '空过滤意图不得改变命中集（误过滤率 0——与关闭时逐条一致）');
+        assert.deepStrictEqual(withEmptyIntent.map(h => h.id).sort(), withoutInfer.map(h => h.id).sort(), '命中集应完全一致（id 级）');
+        // 关闭零回归：显式 off 与未开启行为一致
+        const offHits = await r.retrieve(q3, kbId, 5, 0.01, { inferFilter: false, rerankEnabled: false });
+        assert.strictEqual(offHits.length, withoutInfer.length, '显式关闭应与未开启行为一致（零回归）');
+        // 库级开关：kbs.infer_metadata_filter=1 自动生效
+        db.prepare('UPDATE kbs SET infer_metadata_filter=1 WHERE id=?').run(kbId);
+        mi.__clearCache();
+        mi.__setImpl(async () => '{"filter": {"文档类型": "制度"}}');
+        const trace2 = {};
+        await r.retrieve('考勤要求', kbId, 5, 0.01, { rerankEnabled: false, trace: trace2 });
+        assert.ok(trace2.inferFilter && trace2.inferFilter.applied, '库级 infer_metadata_filter=1 应自动推断');
+      } finally {
+        mi.__setImpl(null); mi.__clearCache();
+        db.prepare('DELETE FROM kb_chunks WHERE kb_id=?').run(kbId);
+        db.prepare('DELETE FROM kb_files WHERE kb_id=?').run(kbId);
+        db.prepare('DELETE FROM kbs WHERE id=?').run(kbId);
+      }
+    });
   }
 
   try { db.close(); } catch { }

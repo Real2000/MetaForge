@@ -25,6 +25,7 @@ export async function render(el) {
     <span class="fb-chip" data-v="llm">💰 ${t('Token 成本')}</span>
     <span class="fb-chip" data-v="kb">📚 ${t('检索命中率')}</span>
     <span class="fb-chip" data-v="eval">🧪 ${t('评测得分')}</span>
+    <span class="fb-chip" data-v="trace">🔍 ${t('检索可观测')}</span>
     <span style="font-size:12px;color:var(--text-3);margin-left:auto" id="qzHint">💡 ${t('点击行查看完整问答上下文')}</span>
   </div>
   <div id="vFb">
@@ -43,7 +44,8 @@ export async function render(el) {
   </div>
   <div id="vLlm" style="display:none"></div>
   <div id="vKb" style="display:none"></div>
-  <div id="vEval" style="display:none"></div>`;
+  <div id="vEval" style="display:none"></div>
+  <div id="vTrace" style="display:none"></div>`;
 
   const tbody = el.querySelector('#tbody');
 
@@ -203,12 +205,112 @@ export async function render(el) {
       </div>`;
   }
 
-  // ---------- 视图切换（四视图数据一次拉取，切换纯前端渲染不再发请求） ----------
+  // ---------- 视图五：检索可观测（AI-13，2026-11-23）——单次检索全链路诊断 + 0 命中归因 ----------
+  // 数据源 GET /api/monitor/rag-traces（chat_traces.retrieval_trace 结构化后回传）；懒加载：切到本视图才拉取。
+  let traceData = null;
+  async function loadTraces(force) {
+    if (traceData && !force) return traceData;
+    const j = await api('/monitor/rag-traces?size=50');
+    traceData = (j && j.code === 0 && j.data) ? j.data : { list: [], total: 0 };
+    return traceData;
+  }
+  /** 0 命中自动归因：从 trace 结构化字段拼「为什么没召回」——验收核心能力 */
+  function diagnoseMiss(row) {
+    const tr = row.trace || {};
+    const reasons = [];
+    if (tr.rewrite && tr.rewrite.applied) reasons.push(`AI-01 查询改写已生效：“${tr.rewrite.original}” → “${tr.rewrite.rewritten}”（改写后仍无候选）`);
+    if (tr.ann && tr.ann.degraded) reasons.push(`向量索引降级（${tr.ann.reason || '原因未知'}）——本次为全表扫描口径，覆盖度 ${tr.ann.coverage || '—'}`);
+    if (tr.rerank) {
+      if (tr.rerank.reason === 'disabled') reasons.push('重排已关闭（库级/全局配置），排名为 RRF 融合直接结果');
+      else if (tr.rerank.degraded) reasons.push(`重排不可用已降级（${tr.rerank.reason || 'unavailable'}），模型 ${tr.rerank.model || '—'}`);
+      else if (tr.rerank.threshold != null && tr.rerank.candidates > 0 && tr.rerank.passed === 0) {
+        reasons.push(`重排阈值门控：${tr.rerank.candidates} 个候选全部低于阈值 ${tr.rerank.threshold}（零命中主因——可下调阈值或补充知识库内容）`);
+      } else if (!tr.rerank.applied) reasons.push('重排未生效');
+    }
+    if (tr.engine) reasons.push(`检索引擎通道：${String(tr.engine)}（H=混合/B3=纯 BM25 缓存/向量通道见 ANN 覆盖度）`);
+    if (!reasons.length) reasons.push('检索无候选返回——最常见原因：知识库内容未覆盖该查询、分块粒度不匹配、或相似度阈值过高');
+    return reasons;
+  }
+  function openTraceDetail(row) {
+    const tr = row.trace || {};
+    const seg = (icon, title, body, color) => `
+      <div class="fd"><label>${icon} ${t(title)}</label>
+        <div style="font-size:12.5px;line-height:1.8;padding:10px 14px;background:${color || '#f8faff'};border-radius:10px;white-space:pre-wrap">${body}</div></div>`;
+    const rr = tr.rerank || {};
+    const rw = tr.rewrite || {};
+    const an = tr.ann || {};
+    modal({
+      title: `🔍 ${t('检索全链路')} #${row.id}`, wide: true,
+      body: `
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;font-size:12px">
+          <span class="tag blue">👤 ${esc(row.username || '—')}</span>
+          <span class="tag gray">🤖 ${esc(row.agent_name || '—')}</span>
+          <span class="tag ${row.hit_count ? 'green' : 'red'}">${row.hit_count ? `✅ ${t('命中')} ${row.hit_count}` : '❌ ' + t('0 命中')}</span>
+          ${tr.engine ? `<span class="tag gray">⚙️ ${esc(String(tr.engine))}</span>` : ''}
+          <span class="tag gray">⏱️ ${row.latency_ms ?? '—'}ms</span>
+          <span class="tag gray">${esc((row.created_at || '').slice(0, 16))}</span>
+        </div>
+        ${seg('👤', '用户查询', esc(row.query || '（无对应提问记录）'), '#f0f9ff')}
+        ${rw.applied ? seg('✏️', 'AI-01 查询改写', `${t('原始')}：“${esc(rw.original || '')}”\n${t('改写后')}：“${esc(rw.rewritten || '')}”`, '#fefce8') : ''}
+        ${tr.engine ? seg('⚙️', '引擎与通道', `engine=${esc(String(tr.engine))}${an.coverage ? `\nANN 覆盖度：${esc(String(an.coverage))}` : ''}${an.degraded ? `\nANN 降级：${esc(String(an.reason || ''))}` : ''}${an.hits != null ? `\nANN 命中：${an.hits}` : ''}`, '#f0fdf4') : ''}
+        ${tr.rerank ? seg('⚡', 'AI-09 重排诊断', `requested=${rr.requested} · applied=${rr.applied} · degraded=${rr.degraded}${rr.reason ? ` · reason=${esc(String(rr.reason))}` : ''}\nmodel=${esc(rr.model || '—')}${rr.threshold != null ? `\n阈值门控：${rr.candidates} 候选 → ${rr.passed} 通过（阈值 ${rr.threshold}）` : ''}`, rr.applied ? '#f0fdf4' : '#fef2f2') : ''}
+        ${tr.graph ? seg('🕸️', 'AI-04 图谱通道', `实体 ${tr.graph.entities} · 关系 ${tr.graph.relations} · 助推分块 ${tr.graph.chunks}`, '#f5f3ff') : ''}
+        ${tr.context ? seg('📦', 'AI-06 上下文压缩', esc(JSON.stringify(tr.context, null, 2).slice(0, 600)), '#f8faff') : ''}
+        ${tr.faithfulness ? seg('🛡️', 'AI-07 忠实度校验', esc(typeof tr.faithfulness === 'object' ? JSON.stringify(tr.faithfulness, null, 2) : String(tr.faithfulness)), '#f0fdf4') : ''}
+        ${row.hit_count ? seg('📄', `命中片段（${row.hit_count}）`, (row.kb_hits || []).slice(0, 8).map((h, i) => `#${i + 1} 「${esc(h.file || h.kb || '')}」score=${(+h.score || 0).toFixed(3)}${h.rerank_score != null ? ` rerank=${(+h.rerank_score).toFixed(3)}` : ''}\n${esc(String(h.content || '').slice(0, 160))}…`).join('\n\n'), '#ffffff') : `
+        <div style="border:1px solid #fecaca;background:#fef2f2;border-radius:10px;padding:12px 14px;margin-bottom:12px">
+          <b style="color:#dc2626">❌ ${t('为什么没召回？（自动归因）')}</b>
+          ${diagnoseMiss(row).map(x => `<div style="font-size:12.5px;line-height:1.9;color:var(--text-2)">· ${esc(x)}</div>`).join('')}
+        </div>`}`,
+      foot: `<button class="btn" data-close>${t('关闭')}</button>`,
+      onMount(mask, close) { mask.querySelector('[data-close]').onclick = close; },
+    });
+  }
+  async function renderTrace() {
+    const box = el.querySelector('#vTrace');
+    box.innerHTML = `<div class="empty" style="padding:40px">⏳ ${t('加载中…')}</div>`;
+    const D = await loadTraces();
+    const list = D.list || [];
+    if (!list.length) {
+      box.innerHTML = `<div class="card" style="padding:40px;text-align:center">
+        <div style="font-size:28px;margin-bottom:8px">🔍</div>
+        <div style="color:var(--text-3);font-size:13px">${t('暂无检索诊断数据——挂知识库的智能体产生对话后，每次检索的全链路 trace 将在此展示（改写/引擎/重排/图谱/忠实度）')}</div>
+      </div>`;
+      return;
+    }
+    box.innerHTML = `
+      <div class="card" style="padding:14px 18px;margin-bottom:14px;display:flex;align-items:baseline;gap:10px">
+        <b style="font-size:14px">🔍 ${t('最近检索全链路（最新 50 条）')}</b>
+        <span style="font-size:12px;color:var(--text-3)">${t('合计')} ${fmtNum(D.total || 0)} ${t('条含检索诊断的对话')} · ${t('点击行查看归因详情（0 命中自动回答“为什么没召回”）')}</span>
+        <button class="btn sm" id="traceRefresh" style="margin-left:auto">🔄 ${t('刷新')}</button>
+      </div>
+      <div class="card"><div class="table-wrap"><table class="tbl">
+        <thead><tr><th style="width:130px">${t('时间')}</th><th style="width:100px">${t('用户')}</th><th style="width:120px">${t('智能体')}</th><th>${t('查询')}</th><th style="width:70px">${t('命中')}</th><th style="width:80px">${t('重排')}</th><th style="width:70px">${t('耗时')}</th></tr></thead>
+        <tbody>${list.map(r => `
+          <tr data-trid="${r.id}" style="cursor:pointer">
+            <td style="font-size:12px;color:var(--text-3)">${esc((r.created_at || '').slice(0, 16))}</td>
+            <td style="font-size:12px">${esc(r.username || '—')}</td>
+            <td style="font-size:12px">🤖 ${esc(r.agent_name || '—')}</td>
+            <td style="font-size:12px">${esc((r.query || '—').slice(0, 50))}</td>
+            <td>${r.hit_count ? `<span class="tag green">${r.hit_count}</span>` : '<span class="tag red">0</span>'}</td>
+            <td style="font-size:11px">${r.trace?.rerank?.applied ? `✅ ${r.trace.rerank.passed ?? ''}` : r.trace?.rerank?.degraded ? '⚠️ ' + t('降级') : '—'}</td>
+            <td style="font-size:12px">${r.latency_ms ?? '—'}ms</td>
+          </tr>`).join('')}
+        </tbody></table></div></div>`;
+    box.querySelector('#traceRefresh').onclick = async () => { traceData = null; renderTrace(); };
+    box.querySelectorAll('[data-trid]').forEach(tr2 => tr2.onclick = () => {
+      const row = list.find(x => x.id === +tr2.dataset.trid);
+      if (row) openTraceDetail(row);
+    });
+  }
+
+  // ---------- 视图切换（四视图数据一次拉取，切换纯前端渲染不再发请求；trace 视图懒加载） ----------
   const HINTS = {
     fb: () => `💡 ${t('点击行查看完整问答上下文')}`,
     llm: () => `💡 ${t('悬停柱体查看当日明细；TOP10 按累计 tokens 排序')}`,
     kb: () => `💡 ${t('分母为当前仍挂知识库的智能体对话（近似口径，详见卡片说明）')}`,
     eval: () => `💡 ${t('数据来自 V1.3 #6 评测集（仅统计已完成的评测运行）')}`,
+    trace: () => `💡 ${t('AI-13 检索可观测：单次检索全链路（改写/引擎/重排/图谱/压缩/忠实度），0 命中自动归因')}`,
   };
   function renderView() {
     el.querySelectorAll('[data-v]').forEach(c => {
@@ -220,9 +322,11 @@ export async function render(el) {
     el.querySelector('#vLlm').style.display = view === 'llm' ? '' : 'none';
     el.querySelector('#vKb').style.display = view === 'kb' ? '' : 'none';
     el.querySelector('#vEval').style.display = view === 'eval' ? '' : 'none';
+    el.querySelector('#vTrace').style.display = view === 'trace' ? '' : 'none';
     if (view === 'llm') renderLlm();
     if (view === 'kb') renderKb();
     if (view === 'eval') renderEval();
+    if (view === 'trace') renderTrace();
   }
 
   async function load() {

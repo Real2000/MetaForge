@@ -606,6 +606,13 @@ const NODE_EXECUTORS = {
     if (d.rerank_enabled === 'on' || d.rerank_enabled === true) opts.rerankEnabled = true;
     else if (d.rerank_enabled === 'off' || d.rerank_enabled === false) opts.rerankEnabled = false;
     if (d.rerank_model) opts.rerankModel = String(d.rerank_model);
+    // AI-10（2026-11-23）：节点级多路查询三态覆盖（''=库级 kbs.multi_query 默认；on/off 强制）+ HyDE
+    if (d.multi_query === 'on' || d.multi_query === true) opts.multiQuery = true;
+    else if (d.multi_query === 'off' || d.multi_query === false) opts.multiQuery = false;
+    if (d.hyde === true || d.hyde === 'on') opts.hyde = true;
+    // AI-14（2026-11-23）：节点级查询感知过滤三态（''=库级 kbs.infer_metadata_filter 默认；on/off 强制）
+    if (d.infer_filter === 'on' || d.infer_filter === true) opts.inferFilter = true;
+    else if (d.infer_filter === 'off' || d.infer_filter === false) opts.inferFilter = false;
     if (d.metadata_filter) {
       try {
         const f = JSON.parse(d.metadata_filter);
