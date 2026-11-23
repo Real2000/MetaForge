@@ -200,11 +200,12 @@ function runq(sql, params) {
 
 /**
  * 从请求解析租户范围：单租户模式返回 null（不启用边界）；多租户返回整数 tenant_id。
+ * 平台超管（tenantContext 挂 bypass=true）跨租户运维 → 返回 null（无边界，旁路强制审计由中间件负责）。
  * @param {object} req Express 请求（须已过 tenantContext 中间件，挂 req.tenant）
  * @returns {number|null}
  */
 function tenantScope(req) {
-  if (!req || !req.tenant || req.tenant.single) return null;
+  if (!req || !req.tenant || req.tenant.single || req.tenant.bypass) return null;
   const id = req.tenant.id;
   return (id != null && Number.isFinite(Number(id))) ? Number(id) : null;
 }

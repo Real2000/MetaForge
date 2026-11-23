@@ -1034,6 +1034,7 @@ export async function render(el, params) {
       initial: S.workflow,
       models: allModels,
       agents: childCandidates.map(a => ({ id: a.id, name: a.name, icon: a.icon })),
+      kbs: (kbs || []).map(k => ({ id: k.id, name: k.name, doc_count: k.doc_count || 0 })), // AI-08：知识检索节点下拉数据源（当前用户可见库清单，归属校验服务端做）
       markDirty: () => { if (pubInfo.has && !pubInfo.draftDirty) { pubInfo.draftDirty = true; renderPubVerBadge(); } scheduleSave(); scheduleCollabSubmit(); }, // P5.9：画布真实交互才标「未发布改动」；U1-7：同步触发协作防抖提交（服务端 diff=0 时仅 ack 不广播，无回环）
       onMoveEnd: moves => collabSendMove(moves), // U1-7：拖拽结束上报位置（轻指令，不占版本号）
     });

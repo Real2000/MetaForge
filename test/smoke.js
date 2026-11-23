@@ -11318,6 +11318,86 @@ print('PY_OK')
     });
   }
 
+  // ==================== AI-08 工作流知识库检索节点（2026-11-23） ====================
+  console.log('【AI-08】工作流知识库检索节点（一等 RAG 节点 / 租户防线 / 节点级召回测试）');
+  {
+    const { db } = require('../src-server/db');
+    const { NODE_EXECUTORS, runWorkflow } = require('../src-server/lib/workflow');
+    const schema = require('../src-server/lib/workflow-schema');
+
+    // 建测试库 + 分块（BM25 关键词命中，无需嵌入向量）
+    db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('AI-08 检索节点测试库','',1,'httpu1',datetime('now','localtime'))`).run();
+    const kbId = db.prepare(`SELECT id FROM kbs WHERE name='AI-08 检索节点测试库'`).get().id;
+    db.prepare(`INSERT INTO kb_files (kb_id,name,size,status,chunk_count,created_at) VALUES (?,'考勤制度.txt',50,'success',2,datetime('now','localtime'))`).run(kbId);
+    const fileId = db.prepare('SELECT id FROM kb_files WHERE kb_id=? ORDER BY id DESC').get(kbId).id;
+    db.prepare('INSERT INTO kb_chunks (file_id,kb_id,content) VALUES (?,?,?)').run(fileId, kbId, '员工迟到早退的，按公司考勤制度处理，三次以上通报批评。');
+    db.prepare('INSERT INTO kb_chunks (file_id,kb_id,content) VALUES (?,?,?)').run(fileId, kbId, '年假申请需提前三个工作日在系统提交。');
+    const ctx = { agent: { tenant_id: 1 }, username: 'httpu1' };
+    try {
+      await t('AI-08：知识检索节点执行器——chunks/text/count 输出契约 + BM25 命中', async () => {
+        const node = { id: 'n1', type: 'knowledge', data: { kb_id: kbId, top_n: 3, threshold: '', rerank_enabled: 'off', metadata_filter: '' } };
+        const out = await NODE_EXECUTORS.knowledge(node, { query: '迟到早退怎么处理' }, ctx);
+        assert.ok(out.count >= 1, '应至少命中 1 条（BM25 关键词）');
+        assert.ok(Array.isArray(out.chunks) && out.chunks.length === out.count, 'chunks 数组长度应与 count 一致');
+        assert.ok(String(out.chunks[0].content).includes('迟到'), '命中片段应含特征词');
+        assert.ok(out.text.includes('考勤制度'), '拼接上下文应含命中内容（下游 LLM 直接可用）');
+        for (const k of ['file', 'kb', 'score', 'bm25', 'vec', 'rerank_score', 'content']) assert.ok(k in out.chunks[0], `chunks 元素应含溯源字段 ${k}`);
+        assert.ok(out.retrieval_trace && typeof out.retrieval_trace === 'object', '应带检索诊断 trace（AI-13 可观测）');
+      });
+      await t('AI-08：防线——kb_id 未配置 / 库不存在 / 库停用 fail-closed 拒绝执行', async () => {
+        await assert.rejects(() => NODE_EXECUTORS.knowledge({ data: {} }, { query: 'x' }, ctx), /未配置知识库/);
+        await assert.rejects(() => NODE_EXECUTORS.knowledge({ data: { kb_id: 99999999 } }, { query: 'x' }, ctx), /不存在/);
+        db.prepare('UPDATE kbs SET enabled=0 WHERE id=?').run(kbId);
+        await assert.rejects(() => NODE_EXECUTORS.knowledge({ data: { kb_id: kbId } }, { query: 'x' }, ctx), /已停用/);
+        db.prepare('UPDATE kbs SET enabled=1 WHERE id=?').run(kbId);
+      });
+      await t('AI-08：防线——跨租户库拒绝 / query 空拒绝 / metadata_filter 非法 JSON 拒绝', async () => {
+        db.prepare('UPDATE kbs SET tenant_id=999 WHERE id=?').run(kbId);
+        await assert.rejects(() => NODE_EXECUTORS.knowledge({ data: { kb_id: kbId } }, { query: 'x' }, ctx), /其他租户/);
+        db.prepare('UPDATE kbs SET tenant_id=1 WHERE id=?').run(kbId);
+        await assert.rejects(() => NODE_EXECUTORS.knowledge({ data: { kb_id: kbId } }, { query: '' }, ctx), /查询为空/);
+        await assert.rejects(() => NODE_EXECUTORS.knowledge({ data: { kb_id: kbId, metadata_filter: '{bad json' } }, { query: 'x' }, ctx), /metadata_filter/);
+      });
+      await t('AI-08：schema——knowledge 入白名单可保存 + 输出变量注册 + checkRefs 校验 query 模板引用', () => {
+        const wf = schema.validateWorkflowV2({
+          nodes: [
+            { id: 'start', type: 'start', position: { x: 0, y: 0 }, data: {} },
+            { id: 'n1', type: 'knowledge', position: { x: 1, y: 1 }, data: { kb_id: kbId, query: '{{#start.input#}}', top_n: 5 } },
+            { id: 'n2', type: 'end', position: { x: 2, y: 2 }, data: { outputs: [{ variable: 'result', value: '{{#n1.text#}}' }] } },
+          ],
+          edges: [{ id: 'e1', source: 'start', target: 'n1' }, { id: 'e2', source: 'n1', target: 'n2' }],
+        });
+        assert.ok(wf && !wf.error, '含 knowledge 节点的图应通过保存校验：' + (wf?.error || ''));
+        const outs = schema.getNodeOutputs({ id: 'n1', type: 'knowledge', data: {} }).map(o => o.name);
+        for (const k of ['chunks', 'text', 'count']) assert.ok(outs.includes(k), `应注册输出变量 ${k}`);
+        assert.strictEqual(schema.checkRefs(wf).length, 0, '合法引用（start.input / n1.text）应零问题');
+        const wfBad = schema.validateWorkflowV2({ nodes: wf.nodes.map(n => n.id === 'n1' ? { ...n, data: { ...n.data, query: '{{#ghost.var#}}' } } : n), edges: wf.edges });
+        const bad = schema.checkRefs(wfBad);
+        assert.ok(bad.some(p => p.ref === 'ghost.var'), 'knowledge.query 引用不存在变量应被 checkRefs 捕获');
+      });
+      await t('AI-08：端到端——start → knowledge → end 图 runWorkflow 全链路（resolveInputs 模板渲染）', async () => {
+        const agent = {
+          id: 0, name: 'AI-08 测试画布', edit_mode: 'canvas', kb_id: null, model: '', mcp_servers: '[]', tenant_id: 1,
+          workflow: JSON.stringify({
+            nodes: [
+              { id: 'start', type: 'start', position: { x: 0, y: 0 }, data: {} },
+              { id: 'n1', type: 'knowledge', position: { x: 1, y: 1 }, data: { title: '查考勤', kb_id: kbId, query: '{{#start.input#}}', top_n: 3, threshold: '', rerank_enabled: 'off' } },
+              { id: 'n2', type: 'end', position: { x: 2, y: 2 }, data: { outputs: [{ variable: 'result', value: '{{#n1.text#}}' }] } },
+            ],
+            edges: [{ id: 'e1', source: 'start', target: 'n1' }, { id: 'e2', source: 'n1', target: 'n2' }],
+          }),
+        };
+        const r = await runWorkflow(agent, { input: '迟到早退怎么处理' }, { username: 'httpu1' });
+        assert.ok(String(r.output || '').includes('考勤制度'), 'end 输出（引用 {{#n1.text#}}）应含检索命中内容：' + String(r.output).slice(0, 80));
+        assert.ok(r.results?.n1?.count >= 1, 'n1 节点输出应含 count（resolveInputs → 执行器 → 变量表全链路）');
+      });
+    } finally {
+      db.prepare('DELETE FROM kb_chunks WHERE kb_id=?').run(kbId);
+      db.prepare('DELETE FROM kb_files WHERE kb_id=?').run(kbId);
+      db.prepare('DELETE FROM kbs WHERE id=?').run(kbId);
+    }
+  }
+
   try { db.close(); } catch { }
   fs.rmSync(process.env.AGENT_DATA_DIR, { recursive: true, force: true });
   console.log('\n———————————————');

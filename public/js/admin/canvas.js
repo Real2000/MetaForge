@@ -27,6 +27,7 @@ export const NODE_TYPES = {
   answer:  { icon: '💬', color: '#2563eb', label: t('直接回复'), def: { title: t('直接回复'), text: '{{#start.input#}}' } },
   classifier: { icon: '🎯', color: '#c026d3', label: t('问题分类器'), def: { title: t('问题分类器'), categories: [{ name: t('闲聊') }, { name: t('业务咨询') }], instruction: '', model: '' } },
   aggregator: { icon: '🔀', color: '#0d9488', label: t('变量聚合器'), def: { title: t('变量聚合器'), sources: [{ variable: '' }], mode: 'first' } },
+  knowledge: { icon: '📚', color: '#059669', label: t('知识库检索'), def: { title: t('知识库检索'), kb_id: '', query: '{{#start.input#}}', top_n: 5, threshold: '', rerank_enabled: '', rerank_model: '', metadata_filter: '', rewrite: true } },
   end:     { icon: '🟥', color: '#dc2626', label: t('输出（结束）'), def: { title: t('输出（结束）'), outputs: [{ variable: 'result', value: '{{#start.input#}}' }] } },
 };
 
@@ -43,6 +44,7 @@ export const NODE_OUTPUTS = {
   answer: [{ name: 'text', label: t('直接回复内容') }],
   classifier: [{ name: 'class_name', label: t('命中类别名') }, { name: 'branch', label: t('命中分支名') }],
   aggregator: [{ name: 'output', label: t('聚合值（首个非空）') }, { name: 'array', label: t('数组拼接结果') }],
+  knowledge: [{ name: 'chunks', label: t('命中片段数组') }, { name: 'text', label: t('拼接上下文（可直接嵌入 LLM 提示词）') }, { name: 'count', label: t('命中条数') }],
   end: [],
 };
 
@@ -76,6 +78,7 @@ export function createCanvas(root, opts = {}) {
       (others.length ? `<optgroup label="${t('其他类型模型（本节点不可用）')}">${others.map(m => `<option disabled>⛔ ${esc(m.name)} · ${TYPE_TAG[m.type] || m.type}${TYPE_GUIDE[m.type] ? '——' + t(TYPE_GUIDE[m.type]) : ''}</option>`).join('')}</optgroup>` : '');
   }
   let agents = opts.agents || [];
+  let kbs = opts.kbs || []; // AI-08：知识检索节点下拉数据源（studio 传入当前用户可见库清单）
   let wf = opts.initial && Array.isArray(opts.initial.nodes) ? JSON.parse(JSON.stringify(opts.initial)) : { nodes: [], edges: [], viewport: { x: 60, y: 40, zoom: 1 } };
   // 容错兜底：外部造数/导入的 JSON 可能缺 viewport（正常保存链路经 validateWorkflowV2 会补），缺失会使 applyViewport 崩掉整页
   if (!wf.viewport || typeof wf.viewport !== 'object') wf.viewport = { x: 60, y: 40, zoom: 1 };
@@ -315,6 +318,7 @@ export function createCanvas(root, opts = {}) {
       ${libCard('assign', NODE_TYPES.assign, t('set / append / clear'))}
       ${libCard('if-else', NODE_TYPES['if-else'], t('多条件 IF/ELIF/ELSE'))}
       ${libCard('aggregator', NODE_TYPES.aggregator, t('并行分支汇合取值'))}
+      ${libCard('knowledge', NODE_TYPES.knowledge, t('检索知识库片段供下游引用（RAG）'))}
       ${libCard('end', NODE_TYPES.end, t('最终回复模板'))}
       <div class="grp">💬 ${t('对话（Chatflow）')}</div>
       ${libCard('answer', NODE_TYPES.answer, t('流式即时回复，流程继续'))}
@@ -404,6 +408,7 @@ export function createCanvas(root, opts = {}) {
     if (n.type === 'answer') return `💬 ${esc(String(d.text || '').replace(/\s+/g, ' ').slice(0, 34) || t('待配置'))}`;
     if (n.type === 'classifier') return (d.categories || []).map(c => `⇢ ${esc(c.name || '?')}`).join(' · ') + ' · ⇢ default';
     if (n.type === 'aggregator') return `🔀 ${d.mode === 'array' ? t('数组拼接') : t('首个非空')} × ${(d.sources || []).length}`;
+    if (n.type === 'knowledge') { const k = kbs.find(x => String(x.id) === String(d.kb_id)); return k ? `📚 ${esc(k.name)} · Top${d.top_n || 5}` : `⚠️ ${t('未选择知识库')}`; }
     if (n.type === 'end') return `📤 ${esc(String(d.outputs?.[0]?.value || '').replace(/\s+/g, ' ').slice(0, 34) || '待配置')}`;
     return '';
   }
@@ -1376,8 +1381,46 @@ export function createCanvas(root, opts = {}) {
           <select class="input" data-k="aggr.mode">
             <option value="first" ${(c.mode || 'first') === 'first' ? 'selected' : ''}>${t('first · 首个非空')}</option>
             <option value="array" ${c.mode === 'array' ? 'selected' : ''}>${t('array · 拼成数组')}</option>
-          </select></div>
-        <div class="hint">📤 ${t('输出变量')}：<span class="code">{{#${n.id}.output#}}</span>${c.mode === 'array' ? ` · <span class="code">{{#${n.id}.array#}}</span>（${t('数组')}）` : ''}</div>`;
+           </select></div>
+         <div class="hint">📤 ${t('输出变量')}：<span class="code">{{#${n.id}.output#}}</span>${c.mode === 'array' ? ` · <span class="code">{{#${n.id}.array#}}</span>（${t('数组')}）` : ''}</div>`;
+    } else if (n.type === 'knowledge') {
+      // AI-08（2026-11-23）知识库检索节点：一等 RAG 节点——检索指定库，输出 chunks/text/count 供下游引用
+      body = `
+        <div class="fd"><label>📚 ${t('知识库')}</label>
+          <select class="input" data-k="kb_id">
+            <option value="">${t('请选择…')}</option>
+            ${kbs.map(k => `<option value="${k.id}" ${String(c.kb_id) === String(k.id) ? 'selected' : ''}>📚 ${esc(k.name)}（${k.doc_count || 0} ${t('文档')}）</option>`).join('')}
+          </select>
+          ${kbs.length ? '' : `<div class="hint">⚠️ ${t('暂无可选知识库——请先在「知识库」页创建并上传文档')}</div>`}</div>
+        <div class="fd"><label>${t('检索查询（模板）')}</label>
+          <textarea class="input" data-k="query" id="cvKbQueryTa">${esc(c.query || '{{#start.input#}}')}</textarea>
+          ${varPicker('cvKbQueryTa')}
+          <div class="hint">💡 ${t('默认检索用户消息；可引用上游变量构造精准查询（如分类器命中类 → 按类检索；前置 LLM 抽取关键词 → 关键词检索）')}</div></div>
+        <div class="fd" style="display:flex;gap:10px">
+          <div style="flex:1"><label>${t('返回条数 TopN')}</label>
+            <input class="input" type="number" min="1" max="50" data-k="top_n" value="${c.top_n ?? 5}"></div>
+          <div style="flex:1"><label>${t('相似度阈值')}</label>
+            <input class="input" type="number" step="0.01" min="0" max="1" data-k="threshold" value="${c.threshold ?? ''}" placeholder="0.01">
+            <div class="hint">${t('留空 = 0.01 不过滤')}</div></div>
+        </div>
+        <div class="fd" style="display:flex;gap:10px">
+          <div style="flex:1"><label>⚡ ${t('重排')}</label>
+            <select class="input" data-k="rerank_enabled">
+              <option value="" ${(c.rerank_enabled ?? '') === '' ? 'selected' : ''}>${t('沿用库级默认')}</option>
+              <option value="on" ${c.rerank_enabled === 'on' ? 'selected' : ''}>${t('强制开启')}</option>
+              <option value="off" ${c.rerank_enabled === 'off' ? 'selected' : ''}>${t('强制关闭')}</option>
+            </select></div>
+          <div style="flex:1"><label>${t('重排模型（可选）')}</label>
+            <input class="input" data-k="rerank_model" value="${esc(c.rerank_model || '')}" placeholder="bge-reranker-v2-m3"></div>
+        </div>
+        <div class="fd"><label>🛡️ ${t('元数据过滤（JSON，可选）')}</label>
+          <textarea class="input" data-k="metadata_filter" style="min-height:52px" placeholder='${t('例：{"level":"公开"}——仅命中满足条件的分块（同智能体挂库过滤语义）')}'>${esc(c.metadata_filter || '')}</textarea></div>
+        <div class="fd"><label style="display:flex;gap:6px;align-items:center;font-size:12px"><input type="checkbox" data-k="kb_rewrite" ${(c.rewrite ?? true) !== false ? 'checked' : ''}> ${t('多轮改写（携带对话历史消解指代；Chatflow 多轮场景建议开启）')}</label></div>
+        <div class="fd"><button class="btn" id="cvKbTest" style="width:100%">🧪 ${t('节点级召回测试（按当前配置跑一次）')}</button>
+          <div class="hint" style="margin-top:4px">${t('用当前配置真实检索一次验证命中质量——查询中的变量模板先按默认值代入；与「运行测试」独立，不产生节点输出')}</div></div>
+        <div id="cvKbTestOut"></div>
+        ${prodOptions(n, c)}
+        <div class="hint">📚 ${t('输出变量')}：<span class="code">{{#${n.id}.text#}}</span>（${t('拼接上下文')}） · <span class="code">{{#${n.id}.count#}}</span> · <span class="code">{{#${n.id}.chunks#}}</span><br>💡 ${t('下游 LLM 提示词嵌')} <span class="code">{{#${n.id}.text#}}</span> ${t('即为经典 RAG 编排；可一图多库多次检索')}</div>`;
     } else if (n.type === 'end') {
       body = `
         <div class="fd"><label>${t('最终回复模板')}</label>
@@ -1410,6 +1453,11 @@ export function createCanvas(root, opts = {}) {
         if (key === 'temperature') v = Math.max(0, Math.min(1, Number(v) || 0.7));
         if (key === 'timeout') v = Number(v) || (n.type === 'code' ? 3000 : 60000);
         if (key === 'retry') v = Math.max(0, Math.min(3, Number(v) || 0));
+        // AI-08 知识检索节点：数值字段规范化 + checkbox 语义
+        if (key === 'top_n') v = Math.max(1, Math.min(Number(v) || 5, 50));
+        if (key === 'threshold') v = (v === '' ? '' : Math.max(0, Math.min(Number(v) || 0, 1)));
+        if (key === 'kb_id') v = Number(v) || 0;
+        if (key === 'kb_rewrite') v = inp.checked;
         if (key === 'onError') { c.onError = v; renderProp(); renderNodes(); markDirty(); pushHistoryDebounced(); return; }
         if (key === 'ctx_history') { v = inp.checked; }
         if (key === 'cases.logical') { c.cases[i].logical = v; markDirty(); return; }
@@ -1429,6 +1477,7 @@ export function createCanvas(root, opts = {}) {
         else if (key === 'cd.value') c.cases[i].conditions[j].value = v;
         else if (key === 'ctx_history') { c.context = { ...(c.context || {}), use_history: v }; renderProp(); }
         else if (key === 'ctx_rounds') { c.context = { ...(c.context || {}), rounds: Number(v) || 3 }; }
+        else if (key === 'kb_rewrite') { c.rewrite = v; }
         else if (key === 'variables.name') { c.variables[i].name = v; renderProp(); renderNodes(); }
         else if (key === 'variables.default') c.variables[i].default = v;
         else if (key === 'variables.type') { c.variables[i].type = v; if (v === 'file' || v === 'array[file]') c.variables[i].default = ''; renderProp(); renderNodes(); } // P5.14 文件类型（切类型清默认值）
@@ -1526,6 +1575,46 @@ export function createCanvas(root, opts = {}) {
                 const ref = `{{#${n.id}.${b.dataset.copyfield}#}}`;
                 copyText(ref).then(ok => toast(ok ? t('已复制：') + ref : ref));
               });
+            } catch (e) { out.innerHTML = `<div style="color:#dc2626">❌ ${esc(e.message)}</div>`; }
+          };
+        },
+      });
+    });
+    // AI-08 知识检索节点级召回测试：复用库级 /knowledge/recall-test（归属校验服务端做），弹窗输入典型问题验证命中质量
+    prop.querySelector('#cvKbTest')?.addEventListener('click', () => {
+      const kbId = Number(c.kb_id);
+      const kbName = kbs.find(x => String(x.id) === String(c.kb_id))?.name || '?';
+      if (!kbId) { toast(t('请先选择知识库')); return; }
+      const modal2 = modal({
+        title: '🧪 ' + t('节点级召回测试：') + esc(kbName),
+        body: `<div class="fd" style="margin:0"><label>${t('测试问题')}</label>
+          <textarea class="input" id="cvKbTestQ" style="min-height:64px" placeholder="${t('输入一个典型问题，验证当前 TopN/阈值/重排配置下的命中质量')}"></textarea>
+          <div class="hint">${t('查询模板')}: <span class="code">${esc(String(c.query || '{{#start.input#}}'))}</span>——${t('模板变量在运行测试时才渲染；本测试用你输入的问题直接检索')}</div></div>
+          <div id="cvKbTestOut" style="margin-top:8px"></div>`,
+        foot: `<button class="btn primary" id="cvKbTestGo">▶ ${t('检索')}</button>`,
+        onMount(mask, close) {
+          mask.querySelector('#cvKbTestGo').onclick = async () => {
+            const out = mask.querySelector('#cvKbTestOut');
+            const q = mask.querySelector('#cvKbTestQ').value.trim();
+            if (!q) { out.innerHTML = `<div class="hint" style="color:#dc2626">${t('请输入测试问题')}</div>`; return; }
+            out.innerHTML = `<div class="hint">⏳ ${t('检索中…')}</div>`;
+            try {
+              let mFilter = null;
+              try { mFilter = c.metadata_filter ? JSON.parse(c.metadata_filter) : null; } catch { throw new Error(t('元数据过滤不是合法 JSON——请先修正节点配置')); }
+              const j = await api('/knowledge/recall-test', { method: 'POST', body: {
+                kb_id: kbId, query: q,
+                top_n: Number(c.top_n) || 5,
+                threshold: (c.threshold === '' || c.threshold == null) ? undefined : Number(c.threshold),
+                ...(c.rerank_enabled === 'on' ? { rerank_enabled: true } : c.rerank_enabled === 'off' ? { rerank_enabled: false } : {}),
+                ...(c.rerank_model ? { rerank_model: String(c.rerank_model) } : {}),
+                ...(mFilter && typeof mFilter === 'object' && Object.keys(mFilter).length ? { metadataFilter: mFilter } : {}),
+              } });
+              if (j.code !== 0) throw new Error(j.msg || t('检索失败'));
+              const hits = j.data.hits || [];
+              out.innerHTML = `<div class="fd"><label>📤 ${t('命中')} ${j.data.count} ${t('条')} · ${j.data.mode} · ${j.data.rerankApplied ? '⚡ ' + t('重排已生效') : t('重排未生效')}</label>` +
+                (hits.map((h, i2) => `<div style="border-top:1px solid var(--border,#eef0f3);padding:6px 0;font-size:12px">
+                  <div style="color:var(--text-3)">#${i2 + 1} ${esc(h.file || h.kb || '')} · score ${(+h.score).toFixed(3)}${h.rerank_score != null ? ` · ${t('重排')} ${(+h.rerank_score).toFixed(3)}` : ''}</div>
+                  <div>${esc(String(h.content || '').slice(0, 140))}…</div></div>`).join('') || `<div class="hint" style="color:#d97706">⚠️ ${t('0 命中——检查分块内容/阈值设置')}</div>`) + '</div>';
             } catch (e) { out.innerHTML = `<div style="color:#dc2626">❌ ${esc(e.message)}</div>`; }
           };
         },

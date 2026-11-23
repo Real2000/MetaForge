@@ -26,6 +26,14 @@
  *           → 输出：branch（命中分支名）；操作符：equals/not_equals/contains/not_contains/starts_with/gt/gte/lt/lte/is_empty/not_empty/regex
  * - end:     { title, outputs:[{variable,value}] }                                    → 输出：首个 variable 为对话回复
  *
+ * AI-08（2026-11-23）工作流知识库检索节点：
+ * - knowledge: { title, kb_id, query(模板，默认 {{#start.input#}}), top_n(1~50，默认 5),
+ *               threshold(相似度阈值，空=0.01), rerank_enabled(''=沿用库级|'on'|'off'),
+ *               rerank_model(''=默认), metadata_filter(JSON，AND 语义，同 agents.kb_metadata_filter),
+ *               rewrite(true=多轮改写，默认 true) }
+ *           → 输出：chunks（命中片段数组：file/kb/score/bm25/vec/rerank_score/content）
+ *                   + text（拼接上下文，可直接嵌入下游 LLM prompt）+ count（命中条数）
+ *
  * P5.6 新增（体验进阶）：
  * - answer:    { title, text(模板) }                        → 输出：text（Chatflow 直接回复：执行时即时回传，流程继续）
  * - classifier: { title, categories:[{name}], instruction, model } → 输出：class_name + branch（LLM 分类，出边 sourceHandle=类别名/default，分支机制同 if-else）
@@ -46,6 +54,7 @@ const NODE_OUTPUT_SCHEMA = {
   answer:  [{ name: 'text', type: 'string', label: '直接回复内容' }],
   classifier: [{ name: 'class_name', type: 'string', label: '命中类别名' }, { name: 'branch', type: 'string', label: '命中分支名' }],
   aggregator: [{ name: 'output', type: 'string', label: '聚合值（首个非空）' }, { name: 'array', type: 'array', label: '数组模式拼接结果' }],
+  knowledge: [{ name: 'chunks', type: 'array', label: '命中片段数组（file/kb/score/rerank_score/content）' }, { name: 'text', type: 'string', label: '拼接上下文（可直接嵌入 LLM prompt）' }, { name: 'count', type: 'number', label: '命中条数' }],
   end:     [],
 };
 
@@ -121,6 +130,7 @@ const TYPE_MAP = { start: 'start', llm: 'llm', tool: 'tool', agent: 'agent', bra
 const EXT_EXECUTOR_TYPES = [
   'http_request', 'code_sandbox', 'condition_loop', 'variable_assign',
   'notification', 'database_query', 'delay', 'logger', 'transform',
+  'knowledge', // AI-08（2026-11-23）：工作流知识库检索节点（画布一等节点）
 ];
 const ALLOWED_NODE_TYPES = new Set([...Object.keys(NODE_OUTPUT_SCHEMA), 'tool', ...EXT_EXECUTOR_TYPES]);
 
@@ -286,6 +296,7 @@ function checkRefs(wf) {
     if (n.type === 'assign') texts.push(...(n.data?.assignments || []).map(a => a.value));
     if (n.type === 'answer') texts.push(n.data?.text);
     if (n.type === 'aggregator') texts.push(...(n.data?.sources || []).map(s => s.variable));
+    if (n.type === 'knowledge') texts.push(n.data?.query); // AI-08：检索查询模板可引用上游变量
     if (n.type === 'end') texts.push(...(n.data?.outputs || []).map(o => o.value));
     // 迭代子流程内的引用也校验（item/index 特殊变量放行）
     if (n.type === 'iteration' && n.data?.subflow?.nodes) {

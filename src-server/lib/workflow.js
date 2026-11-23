@@ -313,6 +313,7 @@ function resolveInputs(node, results, inputVars) {
     case 'answer': return { text: r(d.text || '') }; // P5.6 直接回复（Chatflow）
     case 'classifier': return { question: r(d.question || '{{#start.input#}}'), instruction: String(d.instruction || '') }; // P5.6 问题分类器
     case 'aggregator': return { sources: (d.sources || []).map(s => r(String(s?.variable ?? ''))) }; // P5.6 变量聚合器
+    case 'knowledge': return { query: r(d.query || '{{#start.input#}}') }; // AI-08 知识检索：查询模板可引用上游变量（默认用户消息）
     // P3-2（2026-11-09）：此处原有 answer/classifier/aggregator 三个 case 的整块重复粘贴（第二份为不可达死代码），已删除
     case 'if-else': {
       const vars = {};
@@ -571,6 +572,56 @@ const NODE_EXECUTORS = {
     const out = {};
     for (const o of inputs.outputs || []) out[o.variable] = o.value;
     return { ...out, reply: inputs.outputs?.[0]?.value ?? '' };
+  },
+
+  /** AI-08 工作流知识库检索节点（2026-11-23）：画布一等 RAG 节点——检索指定库并输出
+   *  chunks/text/count 供下游引用（LLM prompt 嵌 {{#node.text#}} 即经典 RAG 编排）。
+   *  与「智能体挂库自动注入」（runWorkflow 内置注入）互补：挂库注入面向简单链路零配置；
+   *  本节点面向精细编排——一图可多库多次检索、查询可改写自上游变量、重排/阈值/过滤节点级可调。
+   *  防线（fail-closed）：①kb_id 引用的库不存在/已停用 → 拒绝；②多租户下画布归属智能体与
+   *  被检索库不同租户 → 拒绝（跨租户借用；单租户模式 tenant_id 恒等天然通过）；③query 渲染后
+   *  为空 → 拒绝；④metadata_filter 非法 JSON → 拒绝（配置错误显式暴露，不静默吞）。 */
+  knowledge: async (node, inputs, ctx) => {
+    const d = node.data || {};
+    const kbId = Number(d.kb_id);
+    if (!Number.isInteger(kbId) || kbId <= 0) throw new Error('知识库检索节点未配置知识库（kb_id）');
+    const kb = db.prepare('SELECT id, name, tenant_id, enabled FROM kbs WHERE id=?').get(kbId);
+    if (!kb) throw new Error(`知识库检索节点引用的知识库不存在（id=${kbId}，可能已被删除）`);
+    if (!kb.enabled) throw new Error(`知识库「${kb.name}」已停用（enabled=0），节点拒绝执行`);
+    // 租户防线：多租户下画布（agent.tenant_id）与被检索库必须同租户——跨租户借用 dataset 即拒绝
+    const agentTenant = Number(ctx?.agent?.tenant_id ?? 0);
+    if (agentTenant && Number(kb.tenant_id ?? 0) !== agentTenant) {
+      throw new Error('知识库检索节点引用了其他租户的知识库（已拒绝执行）');
+    }
+    const query = String(inputs.query ?? '').trim();
+    if (!query) throw new Error('知识库检索节点查询为空（query 模板渲染结果为空字符串）');
+    const topN = Math.max(1, Math.min(Number(d.top_n) || 5, 50));
+    const threshold = (d.threshold === '' || d.threshold == null) ? 0.01 : Math.max(0, Math.min(Number(d.threshold) || 0, 1));
+    const opts = {
+      username: ctx?.username,        // 查询改写按最终用户路由自有模型
+      tenantId: agentTenant || undefined,
+      trace: {},                     // AI-13 可观测：重排/引擎/改写诊断随节点输出可调试
+    };
+    // 节点级重排三态覆盖：''/null=沿用库级/全局默认（不传，retriever 走 kbs.rerank_* 配置）；on/off 强制
+    if (d.rerank_enabled === 'on' || d.rerank_enabled === true) opts.rerankEnabled = true;
+    else if (d.rerank_enabled === 'off' || d.rerank_enabled === false) opts.rerankEnabled = false;
+    if (d.rerank_model) opts.rerankModel = String(d.rerank_model);
+    if (d.metadata_filter) {
+      try {
+        const f = JSON.parse(d.metadata_filter);
+        if (f && typeof f === 'object' && !Array.isArray(f) && Object.keys(f).length) opts.metadataFilter = f;
+      } catch { throw new Error('知识库检索节点的 metadata_filter 不是合法 JSON 对象'); }
+    }
+    // 多轮改写（AI-01）：chat 触发时默认携带会话历史做指代消解；节点可显式关闭（单次检索场景）
+    if (d.rewrite !== false && Array.isArray(ctx?.history) && ctx.history.length) opts.history = ctx.history;
+    const { retrieve } = require('./retriever'); // 延迟 require（与 runWorkflow 内置注入同因：retriever 不回指 workflow，防加载环）
+    const hits = await retrieve(query, kbId, topN, threshold, opts);
+    return {
+      count: hits.length,
+      text: hits.map(h => `【${h.file || h.kb || '知识库'}】\n${h.content}`).join('\n\n'),
+      chunks: hits.map(h => ({ file: h.file, kb: h.kb, score: h.score, bm25: h.bm25, vec: h.vec, rerank_score: h.rerank_score, content: h.content })),
+      ...(opts.trace && Object.keys(opts.trace).length ? { retrieval_trace: opts.trace } : {}),
+    };
   },
 
   /** P5.20 HTTP 请求节点（P1-1 修复 2026-11-09：接入 SSRF 防护——复用 tools-extra.js 的
