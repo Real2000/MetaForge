@@ -16,6 +16,7 @@
  * 解析产物绝不透传为工具调用——未知 op、绝对路径、路径穿越一律拒绝。
  */
 const { db, now } = require('../db');
+const dal = require('./dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const { OPS_WHITELIST, opAllowedForTier, normalizeTier, opMinTier } = require('../routes/localbridge');
 
 // 高危 op：默认关闭，需设备级 allow_high_risk 显式开启（与桥端档位构成双层）
@@ -186,12 +187,11 @@ function isOnline(dev) {
 }
 function resolveDevice(username, wantName) {
   if (wantName) {
-    const byName = db.prepare('SELECT * FROM localbridge_devices WHERE username=? AND device_name LIKE ? ORDER BY is_default DESC, last_seen DESC LIMIT 1')
-      .get(username, `%${wantName}%`);
+    const byName = dal.getq('SELECT * FROM localbridge_devices WHERE username=? AND device_name LIKE ? ORDER BY is_default DESC, last_seen DESC LIMIT 1', [username, `%${wantName}%`]);
     if (byName) return byName;
   }
-  return db.prepare('SELECT * FROM localbridge_devices WHERE username=? AND is_default=1').get(username)
-    || db.prepare('SELECT * FROM localbridge_devices WHERE username=? ORDER BY last_seen DESC LIMIT 1').get(username);
+  return dal.getq('SELECT * FROM localbridge_devices WHERE username=? AND is_default=1', [username])
+    || dal.getq('SELECT * FROM localbridge_devices WHERE username=? ORDER BY last_seen DESC LIMIT 1', [username]);
 }
 
 // ---------------- 出站回执（可读化，best-effort） ----------------
@@ -258,7 +258,7 @@ async function handleInbound({ msg, text, auditId, channelId, bind } = {}) {
   // ② 身份反查：渠道 sender_id → 平台 username
   const cid = Number(channelId) || (bind && Number(bind.channel_id)) || 0;
   const ub = cid
-    ? db.prepare('SELECT username FROM user_channel_bindings WHERE channel_id=? AND channel_user_id=?').get(cid, senderId)
+    ? dal.getq('SELECT username FROM user_channel_bindings WHERE channel_id=? AND channel_user_id=?', [cid, senderId])
     : null;
   if (!ub || !ub.username) {
     const rr = '请先在平台「接入管理 → 用户绑定」中绑定你的渠道身份，之后才能远程操控你的电脑。';
@@ -296,13 +296,11 @@ async function handleInbound({ msg, text, auditId, channelId, bind } = {}) {
   }
 
   // ⑤ 入队（★携带 channel_msg_id，使桥 /result 回传分支生效）
-  const info = db.prepare('INSERT INTO localbridge_tasks (device_id,username,op,params,status,channel_msg_id,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)')
-    .run(dev.id, username, parsed.op, JSON.stringify(parsed.params), 'pending', auditId || null, now(), now());
+  const info = dal.runq('INSERT INTO localbridge_tasks (device_id,username,op,params,status,channel_msg_id,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)', [dev.id, username, parsed.op, JSON.stringify(parsed.params), 'pending', auditId || null, now(), now()]);
 
   // 审计留痕
   try {
-    db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at,duration_ms) VALUES (?,?,?,?,?,?)')
-      .run(username, `渠道远控:${parsed.op}`, `设备${dev.device_name}；渠道${channel}#${auditId || ''}`, '', now(), null);
+    dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at,duration_ms) VALUES (?,?,?,?,?,?)', [username, `渠道远控:${parsed.op}`, `设备${dev.device_name}；渠道${channel}#${auditId || ''}`, '', now(), null]);
   } catch { /* 审计失败不阻断 */ }
 
   // 可选回执（公众号已有被动占位回复，跳过避免重复）

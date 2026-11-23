@@ -16,6 +16,7 @@
  *   3) 判定与取字节分离：本模块只做判定，读取由调用方完成（wf 走 DB、目录类走磁盘）。
  */
 const path = require('path');
+const dal = require('./dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const fs = require('fs');
 
 const { db } = require('../db');
@@ -110,7 +111,7 @@ function resolvePreview(user, q = {}) {
   const src = String(q.src || '').toLowerCase();
 
   if (src === 'wf') {
-    const row = db.prepare('SELECT id,name,ext,size,content_b64,created_by,source,created_at FROM wf_files WHERE id=?').get(+q.id);
+    const row = dal.getq('SELECT id,name,ext,size,content_b64,created_by,source,created_at FROM wf_files WHERE id=?', [+q.id]);
     const deny = canViewWfFile(user, row);
     if (!deny.ok) return deny;
     if (!row.content_b64) return { ok: false, code: 404, msg: '原文未保留（仅解析文本可用）' };
@@ -120,13 +121,13 @@ function resolvePreview(user, q = {}) {
   }
 
   if (src === 'kb') {
-    const f = db.prepare('SELECT id,kb_id,name,size,status FROM kb_files WHERE id=?').get(+q.id);
+    const f = dal.getq('SELECT id,kb_id,name,size,status FROM kb_files WHERE id=?', [+q.id]);
     if (!f) return { ok: false, code: 404, msg: '文件不存在' };
-    const kb = db.prepare('SELECT id,owner,name FROM kbs WHERE id=?').get(f.kb_id);
+    const kb = dal.getq('SELECT id,owner,name FROM kbs WHERE id=?', [f.kb_id]);
     const deny = canViewKb(user, kb);
     if (!deny.ok) return deny;
     // kb_files 只保留解析文本与分块，原文不入库：由调用方改用 /api/knowledge/files/:id/chunks 预览
-    const chunks = db.prepare('SELECT content FROM kb_chunks WHERE file_id=? ORDER BY id ASC').all(f.id);
+    const chunks = dal.q('SELECT content FROM kb_chunks WHERE file_id=? ORDER BY id ASC', [f.id]);
     return { ok: true, kind: 'kb', name: f.name, ext: extOf(f.name), size: f.size || 0, text: chunks.map(c => c.content || '').join('\n\n'), chunks };
   }
 

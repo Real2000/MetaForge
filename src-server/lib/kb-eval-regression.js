@@ -15,6 +15,7 @@
  *     异步执行，不阻塞触发请求的响应。
  */
 const { db, now } = require('../db');
+const dal = require('./dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const { retrieve } = require('./retriever');
 
 const EVAL_K = 10; // 多指标评估口径 K（Top-K 检索深度）
@@ -123,8 +124,7 @@ async function rerunEvalSet(ev) {
     const delta = +((score - prev).toFixed(2));
     diff = Math.abs(delta) <= 0.02 ? '持平' : (delta > 0 ? '+' + delta.toFixed(2) : delta.toFixed(2));
   }
-  db.prepare(`UPDATE evaluations SET score=?, result=?, metrics=?, status='done' WHERE id=?`)
-    .run(score, JSON.stringify(detail), JSON.stringify(metrics), ev.id);
+  dal.runq(`UPDATE evaluations SET score=?, result=?, metrics=?, status='done' WHERE id=?`, [score, JSON.stringify(detail), JSON.stringify(metrics), ev.id]);
   return { score, prev_score: prev, diff, metrics, detail };
 }
 
@@ -136,9 +136,9 @@ async function rerunEvalSet(ev) {
  * actor={username, ip} 可选（触发者信息，写 op_logs 用，缺省归到库 owner）。
  */
 async function runKbRegression(kbId, actor) {
-  const kb = db.prepare('SELECT * FROM kbs WHERE id=?').get(kbId);
+  const kb = dal.getq('SELECT * FROM kbs WHERE id=?', [kbId]);
   if (!kb) return { ran: 0 };
-  const evals = db.prepare(`SELECT * FROM evaluations WHERE kb_id=? AND type='kb' ORDER BY id`).all(kb.id);
+  const evals = dal.q(`SELECT * FROM evaluations WHERE kb_id=? AND type='kb' ORDER BY id`, [kb.id]);
   if (!evals.length) return { ran: 0 };
   const username = actor?.username || kb.owner;
   const ip = actor?.ip || '';
@@ -146,11 +146,9 @@ async function runKbRegression(kbId, actor) {
   for (const ev of evals) {
     const r = await rerunEvalSet(ev);
     lines.push(`${ev.name}：${trendText(r)}（hit@${r.metrics.hit_at_k} / 召回@${r.metrics.recall_at_k} / MRR ${r.metrics.mrr} / NDCG ${r.metrics.ndcg}）`);
-    db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-      .run(username, '知识库评测回归', `${kb.name} / ${ev.name}：${r.prev_score == null ? '首次' : r.prev_score} → ${r.score}（${r.diff}）；hit@${r.metrics.hit_at_k} / 召回@${r.metrics.recall_at_k} / MRR ${r.metrics.mrr} / NDCG ${r.metrics.ndcg}`, ip, now());
+    dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [username, '知识库评测回归', `${kb.name} / ${ev.name}：${r.prev_score == null ? '首次' : r.prev_score} → ${r.score}（${r.diff}）；hit@${r.metrics.hit_at_k} / 召回@${r.metrics.recall_at_k} / MRR ${r.metrics.mrr} / NDCG ${r.metrics.ndcg}`, ip, now()]);
   }
-  db.prepare('INSERT INTO notifications (username,title,content,type,link,is_read,created_at) VALUES (?,?,?,?,?,0,?)')
-    .run(kb.owner, `知识库「${kb.name}」召回评测回归`, lines.join('；'), 'system', '#/knowledge', now());
+  dal.runq('INSERT INTO notifications (username,title,content,type,link,is_read,created_at) VALUES (?,?,?,?,?,0,?)', [kb.owner, `知识库「${kb.name}」召回评测回归`, lines.join('；'), 'system', '#/knowledge', now()]);
   return { ran: evals.length };
 }
 

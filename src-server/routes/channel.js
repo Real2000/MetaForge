@@ -5,6 +5,7 @@
  *  GET  /api/channel/status         渠道配置状态（哪些渠道已配凭证，adminOnly）
  */
 const express = require('express');
+const dal = require('../lib/dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const { db, now } = require('../db');
 const { auth, adminOnly } = require('../lib/auth');
 const { normalizeInbound, send, CHANNEL_TYPES, upsertChannel, listChannels, getChannelConfig, updateCallbackStatus, toggleChannel, deleteChannel, upsertUserBinding, listUserBindings, deleteUserBinding, resolveCardCallback, sendCardResult, auditInbound } = require('../lib/channel');
@@ -29,7 +30,7 @@ const xmlParser = express.text({ type: ['text/xml', 'application/xml'], limit: '
 /** POST /api/channel/event/:id —— 飞书/企微/公众号 事件订阅共用的回调端点 */
 router.get('/event/:id', async (req, res) => {
   // URL 验证握手（企微/公众号 GET + query params）
-  const ch = db.prepare('SELECT id, type, enabled FROM channels WHERE id=?').get(Number(req.params.id));
+  const ch = dal.getq('SELECT id, type, enabled FROM channels WHERE id=?', [Number(req.params.id)]);
   if (!ch) return res.status(404).json({ code: 404, msg: '渠道不存在' });
   const adapter = getAdapter(ch.type);
   if (!adapter || adapter.status === 'reserved') return res.status(200).send(req.query.echostr || '');
@@ -41,7 +42,7 @@ router.get('/event/:id', async (req, res) => {
 });
 
 router.post('/event/:id', xmlParser, async (req, res) => {
-  const ch = db.prepare('SELECT id, type, enabled FROM channels WHERE id=?').get(Number(req.params.id));
+  const ch = dal.getq('SELECT id, type, enabled FROM channels WHERE id=?', [Number(req.params.id)]);
   if (!ch) return res.status(404).json({ code: 404, msg: '渠道不存在' });
   const isXmlChannel = ch.type === 'wechat-mp' || ch.type === 'wecom';
   if (!ch.enabled) return isXmlChannel ? res.type('text/xml').send('success') : res.status(200).json({ code: 0, msg: '渠道已停用' });
@@ -127,7 +128,7 @@ async function handleCardCallback(req, res) {
     let chRow = null;
     if (channelIdRaw) chRow = getChannelConfig(Number(channelIdRaw));
     else if (channelType) {
-      const r0 = db.prepare('SELECT id FROM channels WHERE type=? AND enabled=1 ORDER BY id LIMIT 1').get(channelType);
+      const r0 = dal.getq('SELECT id FROM channels WHERE type=? AND enabled=1 ORDER BY id LIMIT 1', [channelType]);
       if (r0) chRow = getChannelConfig(r0.id);
     }
 
@@ -192,7 +193,7 @@ router.get('/messages', adminOnly, (req, res) => {
   if (q) { wh.push('(text LIKE ? OR sender_id LIKE ?)'); args.push(`%${q}%`, `%${q}%`); }
   const sql = `SELECT id, event_id, channel, sender_id, chat_id, chat_type, text, attachments, dispatched_to, dispatch_result, created_at
     FROM channel_messages${wh.length ? ' WHERE ' + wh.join(' AND ') : ''} ORDER BY id DESC LIMIT 200`;
-  res.json({ code: 0, data: db.prepare(sql).all(...args) });
+  res.json({ code: 0, data: dal.q(sql, [...args]) });
 });
 
 /** 出站统一发送（adminOnly）：测试/运营用统一出口 */
@@ -255,8 +256,7 @@ router.post('/:id/toggle', adminOnly, (req, res) => {
 router.delete('/:id', adminOnly, (req, res) => {
   try {
     deleteChannel(Number(req.params.id));
-    db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-      .run(req.user.username, '删除渠道', `#${req.params.id}`, req.ip, now());
+    dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '删除渠道', `#${req.params.id}`, req.ip, now()]);
     res.json({ code: 0, msg: '已删除' });
   } catch (e) { res.json({ code: 404, msg: e.message }); }
 });
@@ -272,14 +272,13 @@ router.post('/:id/callback-status', adminOnly, (req, res) => {
 
 /** connector_oauth_states：发起 OAuth 连接（生成 state，10 分钟有效） */
 router.post('/:id/oauth/start', adminOnly, (req, res) => {
-  const ch = db.prepare('SELECT id, type FROM channels WHERE id=?').get(Number(req.params.id));
+  const ch = dal.getq('SELECT id, type FROM channels WHERE id=?', [Number(req.params.id)]);
   if (!ch) return res.json({ code: 404, msg: '渠道不存在' });
   const crypto = require('crypto');
   const state = crypto.randomBytes(16).toString('hex');
   const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
-  db.prepare(`INSERT INTO connector_oauth_states (state, channel_id, redirect_uri, username, expires_at, created_at)
-    VALUES (?,?,?,?,?,?)`)
-    .run(state, ch.id, String(req.body?.redirect_uri || ''), req.user.username, expiresAt, now());
+  dal.runq(`INSERT INTO connector_oauth_states (state, channel_id, redirect_uri, username, expires_at, created_at)
+    VALUES (?,?,?,?,?,?)`, [state, ch.id, String(req.body?.redirect_uri || ''), req.user.username, expiresAt, now()]);
   res.json({ code: 0, data: { state, expires_in: 600 } });
 });
 
@@ -287,12 +286,12 @@ router.post('/:id/oauth/start', adminOnly, (req, res) => {
 router.post('/oauth/consume', adminOnly, (req, res) => {
   const { state } = req.body || {};
   if (!state) return res.json({ code: 400, msg: 'state 不能为空' });
-  const row = db.prepare('SELECT * FROM connector_oauth_states WHERE state=?').get(String(state));
+  const row = dal.getq('SELECT * FROM connector_oauth_states WHERE state=?', [String(state)]);
   if (!row) return res.json({ code: 404, msg: 'state 不存在' });
   if (row.consumed) return res.json({ code: 400, msg: 'state 已使用（防重放）' });
   const expired = row.expires_at && new Date(row.expires_at) < new Date();
   if (expired) return res.json({ code: 400, msg: 'state 已过期，请重新发起连接' });
-  db.prepare('UPDATE connector_oauth_states SET consumed=1 WHERE id=?').run(row.id);
+  dal.runq('UPDATE connector_oauth_states SET consumed=1 WHERE id=?', [row.id]);
   res.json({ code: 0, data: { channel_id: row.channel_id, username: row.username } });
 });
 
@@ -305,7 +304,7 @@ router.get('/adapters', adminOnly, (req, res) => {
 
 /** 渠道出站发送（复用 P1-7 统一 send，飞书走 im-feishu 适配器） */
 router.post('/:id/send-im', adminOnly, async (req, res) => {
-  const ch = db.prepare('SELECT id, type, enabled FROM channels WHERE id=?').get(Number(req.params.id));
+  const ch = dal.getq('SELECT id, type, enabled FROM channels WHERE id=?', [Number(req.params.id)]);
   if (!ch) return res.json({ code: 404, msg: '渠道不存在' });
   const b = req.body || {};
   if (!b.receiver || !b.content) return res.json({ code: 400, msg: 'receiver 与 content 必填' });
@@ -346,8 +345,7 @@ router.post('/binds/upsert', adminOnly, (req, res) => {
 /** 解绑（级联删白名单） */
 router.delete('/binds/:id', adminOnly, (req, res) => {
   deleteBind(Number(req.params.id));
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(req.user.username, '解绑群聊', `#${req.params.id}`, req.ip, now());
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '解绑群聊', `#${req.params.id}`, req.ip, now()]);
   res.json({ code: 0, msg: '已解绑' });
 });
 
@@ -413,8 +411,7 @@ router.post('/user-bindings/upsert', adminOnly, (req, res) => {
 /** DELETE /api/channel/user-bindings/:id —— 解绑 */
 router.delete('/user-bindings/:id', adminOnly, (req, res) => {
   deleteUserBinding(Number(req.params.id));
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(req.user.username, '解绑用户渠道', `#${req.params.id}`, req.ip, now());
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '解绑用户渠道', `#${req.params.id}`, req.ip, now()]);
   res.json({ code: 0, msg: '已解绑' });
 });
 

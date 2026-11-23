@@ -10,6 +10,7 @@
  *  - 删除/密钥等高危操作仅 管理员 ∪ 创建者（agents.js 内单独校验）
  */
 const { db } = require('../db'); // V2.4 #9：引入 db 用于 agent_acls 表查询
+const dal = require('./dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 
 function parseJsonArr(s) {
   if (Array.isArray(s)) return s; // 前端 fetch body 直接传数组（E2E 实测发现：JSON.parse(数组) 会静默失败成 []）
@@ -23,12 +24,10 @@ function parseJsonArr(s) {
 function hasAclAccess(a, user) {
   if (!a || !user) return false;
   // 拒绝规则优先：有明确 deny（allow=0）则拒绝访问
-  const denies = db.prepare(`SELECT 1 FROM agent_acls WHERE agent_id=? AND allow=0 AND (grant_to='user' AND grant_to_value=? OR grant_to='dept' AND grant_to_value=? OR grant_to='role' AND grant_to_value=?) LIMIT 1`)
-    .all(a.id, user.username, user.dept, user.role);
+  const denies = dal.q(`SELECT 1 FROM agent_acls WHERE agent_id=? AND allow=0 AND (grant_to='user' AND grant_to_value=? OR grant_to='dept' AND grant_to_value=? OR grant_to='role' AND grant_to_value=?) LIMIT 1`, [a.id, user.username, user.dept, user.role]);
   if (denies.length) return false;
   // 查用户、部门、角色三路ACL，任一匹配即放行
-  const rows = db.prepare(`SELECT allow FROM agent_acls WHERE agent_id=? AND allow=1 AND (grant_to='user' AND grant_to_value=? OR grant_to='dept' AND grant_to_value=? OR grant_to='role' AND grant_to_value=?) LIMIT 1`)
-    .all(a.id, user.username, user.dept, user.role);
+  const rows = dal.q(`SELECT allow FROM agent_acls WHERE agent_id=? AND allow=1 AND (grant_to='user' AND grant_to_value=? OR grant_to='dept' AND grant_to_value=? OR grant_to='role' AND grant_to_value=?) LIMIT 1`, [a.id, user.username, user.dept, user.role]);
   if (rows.length && rows[0].allow === 1) return true;
   return null; // 未配置任何 ACL → 不置可否，由下游规则决定
 }

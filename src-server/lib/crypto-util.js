@@ -39,11 +39,14 @@ function keyFromFile() {
   } catch { return null; }
 }
 
-/** 从 secrets 表读取（旧版来源，兼容）；惰性 require 打破加载期循环依赖 */
+/** 从 secrets 表读取（旧版来源，兼容）；惰性 require 打破加载期循环依赖
+ *  BE-C1（2026-11-23）：dal 同样须惰性 require——顶层引入会把 dal 拉进「db.js 加载期→keyInfo→dal→db」
+ *  循环链，循环未完成时 exports 部分初始化（pluck undefined 被 catch 吞掉，密钥来源静默回退），
+ *  首轮 codemod 顶层注入实测触发 Node circular dependency Warning，此处回归惰性原设计 */
 function keyFromDb() {
   try {
     const { db } = require('../db');
-    const row = db.prepare("SELECT value FROM secrets WHERE name='ENCRYPTION_KEY'").pluck().get();
+    const row = require('./dal').pluck("SELECT value FROM secrets WHERE name='ENCRYPTION_KEY'");
     return keyFromHex(row);
   } catch { return null; }
 }

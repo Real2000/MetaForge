@@ -5,6 +5,7 @@
  * 管理端 CRUD 也挂在同一个 router（adminOnly 保护），避免新增路由文件
  */
 const express = require('express');
+const dal = require('../lib/dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const { db, now } = require('../db');
 const { createLimiter, clientIp } = require('../lib/rate-limit');
 const { getEnabledProviders, generateState, consumeState, exchangeCode, bindOrCreateUser } = require('../lib/sso');
@@ -52,7 +53,7 @@ router.use(auth);
 // 获取 SSO 提供方列表（含配置字段，仅管理员可见）
 router.get('/', (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ code: 403, msg: '需要管理员权限' });
-  const rows = db.prepare('SELECT * FROM sso_providers ORDER BY id').all();
+  const rows = dal.q('SELECT * FROM sso_providers ORDER BY id');
   // 密钥脱敏
   const safe = rows.map(r => ({ ...r, client_secret: r.client_secret ? '••••••••' : '' }));
   res.json({ code: 0, data: safe });
@@ -70,19 +71,19 @@ router.post('/', async (req, res) => {
   }
   const secret = String(b.client_secret || '');
   const encrypted = secret ? encrypt(secret) : '';
-  db.prepare(`INSERT INTO sso_providers (name, display_name, issuer, client_id, client_secret,
+  dal.runq(`INSERT INTO sso_providers (name, display_name, issuer, client_id, client_secret,
     authorization_url, token_url, userinfo_url, scopes, type, jwt_bind_mode, allow_local_login, enabled, created_at, updated_at)
-    VALUES (?,?,?,?,?,?,?,?,?,?,1,1,0,datetime('now','localtime'),datetime('now','localtime'))`).run(
+    VALUES (?,?,?,?,?,?,?,?,?,?,1,1,0,datetime('now','localtime'),datetime('now','localtime'))`, [
     name, String(b.display_name || ''), String(b.issuer || ''), String(b.client_id || ''), encrypted,
     String(b.authorization_url || ''), String(b.token_url || ''), String(b.userinfo_url || ''),
-    String(b.scopes || ''), String(b.type || 'oidc'));
+    String(b.scopes || ''), String(b.type || 'oidc')]);
   res.json({ code: 0, msg: '已创建' });
 });
 
 // 更新 SSO 提供方
 router.put('/:id', async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ code: 403, msg: '需要管理员权限' });
-  const old = db.prepare('SELECT * FROM sso_providers WHERE id=?').get(req.params.id);
+  const old = dal.getq('SELECT * FROM sso_providers WHERE id=?', [req.params.id]);
   if (!old) return res.json({ code: 404, msg: 'SSO 提供方不存在' });
   const b = req.body || {};
   // SEC-05：SSO 端点 URL 出站前需为公网地址
@@ -92,28 +93,27 @@ router.put('/:id', async (req, res) => {
   const secret = String(b.client_secret || '');
   // 仅当提供了新密钥且与掩码不同时才更新
   const updatedSecret = (secret && secret !== '••••••••') ? encrypt(secret) : old.client_secret;
-  db.prepare(`UPDATE sso_providers SET name=?,display_name=?,issuer=?,client_id=?,client_secret=?,
-    authorization_url=?,token_url=?,userinfo_url=?,scopes=?,type=?,updated_at=datetime('now','localtime') WHERE id=?`)
-    .run(String(b.name || ''), String(b.display_name || ''), String(b.issuer || ''), String(b.client_id || ''),
+  dal.runq(`UPDATE sso_providers SET name=?,display_name=?,issuer=?,client_id=?,client_secret=?,
+    authorization_url=?,token_url=?,userinfo_url=?,scopes=?,type=?,updated_at=datetime('now','localtime') WHERE id=?`, [String(b.name || ''), String(b.display_name || ''), String(b.issuer || ''), String(b.client_id || ''),
       updatedSecret, String(b.authorization_url || ''), String(b.token_url || ''), String(b.userinfo_url || ''),
-      String(b.scopes || ''), String(b.type || 'oidc'), req.params.id);
+      String(b.scopes || ''), String(b.type || 'oidc'), req.params.id]);
   res.json({ code: 0, msg: '已保存' });
 });
 
 // 启用/停用切换
 router.post('/:id/toggle', (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ code: 403, msg: '需要管理员权限' });
-  const old = db.prepare('SELECT id, enabled FROM sso_providers WHERE id=?').get(req.params.id);
+  const old = dal.getq('SELECT id, enabled FROM sso_providers WHERE id=?', [req.params.id]);
   if (!old) return res.json({ code: 404, msg: 'SSO 提供方不存在' });
   const next = old.enabled ? 0 : 1;
-  db.prepare('UPDATE sso_providers SET enabled=?,updated_at=datetime(\'now\',\'localtime\') WHERE id=?').run(next, old.id);
+  dal.runq('UPDATE sso_providers SET enabled=?,updated_at=datetime(\'now\',\'localtime\') WHERE id=?', [next, old.id]);
   res.json({ code: 0, data: { enabled: !!next } });
 });
 
 // 删除 SSO 提供方（先停用后删除）
 router.delete('/:id', (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ code: 403, msg: '需要管理员权限' });
-  db.prepare('DELETE FROM sso_providers WHERE id=?').run(req.params.id);
+  dal.runq('DELETE FROM sso_providers WHERE id=?', [req.params.id]);
   res.json({ code: 0, msg: '已删除' });
 });
 

@@ -5,6 +5,7 @@
  * 鉴权：agent_api_keys 表中的密钥（后台「智能体管理 → API」创建）
  */
 const express = require('express');
+const dal = require('../lib/dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const { db, now } = require('../db');
 const { chat } = require('../lib/llm');
 const { retrieve } = require('../lib/retriever');
@@ -84,9 +85,9 @@ function authKey(req) {
   const key = h.startsWith('Bearer ') ? h.slice(7).trim() : '';
   if (!key) return null;
   // SEC-02a：库中 key 列为 HMAC 哈希——按哈希比对（不再明文比对）
-  const k = db.prepare('SELECT * FROM agent_api_keys WHERE key=? AND status=1').get(hashKey(key));
+  const k = dal.getq('SELECT * FROM agent_api_keys WHERE key=? AND status=1', [hashKey(key)]);
   if (!k) return null;
-  db.prepare('UPDATE agent_api_keys SET last_used_at=? WHERE id=?').run(now(), k.id);
+  dal.runq('UPDATE agent_api_keys SET last_used_at=? WHERE id=?', [now(), k.id]);
   return { k };
 }
 
@@ -114,7 +115,7 @@ function unauthorized(res) {
 router.get('/v1/models', keyModelsLimit, keyQuota, (req, res) => {
   const h = authKey(req);
   if (!h) return unauthorized(res);
-  const agents = db.prepare("SELECT id,name,description,tenant_id FROM agents WHERE status='published' AND (source='self' OR source='dify')").all();
+  const agents = dal.q("SELECT id,name,description,tenant_id FROM agents WHERE status='published' AND (source='self' OR source='dify')");
   // D-3：全域 Key（agent_id NULL）可见同租户全部已发布智能体；绑定 Key 仅可见绑定智能体（SEC-02a 语义不变）
   const visible = h.k.agent_id == null
     ? agents.filter(a => Number(a.tenant_id ?? 1) === Number(h.k.tenant_id ?? 1))
@@ -143,7 +144,7 @@ router.post('/v1/chat/completions', keyChatLimit, keyQuota, async (req, res) => 
   // P2-2 修复：校验 Key 的作用域——绑定了 agent_id 的 Key 仅可调用绑定智能体
   const scopeCheck = authKeyForAgent(h.k, agentId);
   if (scopeCheck) return res.status(403).json({ error: { message: scopeCheck, type: 'key_scope_denied' } });
-  const agent = m ? db.prepare('SELECT * FROM agents WHERE id=? AND status=?').get(agentId, 'published') : null;
+  const agent = m ? dal.getq('SELECT * FROM agents WHERE id=? AND status=?', [agentId, 'published']) : null;
   if (!agent) {
     return res.status(404).json({ error: { message: `模型不存在：${model}。请先 GET /openapi/v1/models 获取可用智能体列表`, type: 'model_not_found' } });
   }
@@ -163,7 +164,7 @@ router.post('/v1/chat/completions', keyChatLimit, keyQuota, async (req, res) => 
 
   // ---------- 外部 Dify 智能体 ----------
   if (agent.source === 'dify' && agent.external_api_key && (agent.external_mode === 'chat' || agent.external_mode === 'completion')) {
-    const plat = db.prepare('SELECT * FROM platforms WHERE type=? AND status=1 ORDER BY id DESC').get('dify');
+    const plat = dal.getq('SELECT * FROM platforms WHERE type=? AND status=1 ORDER BY id DESC', ['dify']);
     if (!plat) return res.status(502).json({ error: { message: '未找到启用的 Dify 平台配置', type: 'api_error' } });
     try {
       let full = '', usage = null;
@@ -190,8 +191,7 @@ router.post('/v1/chat/completions', keyChatLimit, keyQuota, async (req, res) => 
           meta: { via: 'openapi', agent: agent.name },
         });
       } catch { /* 成本归因失败不影响 API 响应 */ }
-      db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-        .run('openapi', 'API调用', `智能体「${agent.name}」（${pt} tokens）`, req.ip, now());
+      dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', ['openapi', 'API调用', `智能体「${agent.name}」（${pt} tokens）`, req.ip, now()]);
       finish(res, stream, modelId, created, out, pt);
     } catch (e) {
       res.status(502).json({ error: { message: '外部智能体调用失败：' + e.message, type: 'api_error' } });
@@ -230,8 +230,7 @@ router.post('/v1/chat/completions', keyChatLimit, keyQuota, async (req, res) => 
         meta: { via: 'openapi', agent: agent.name },
       });
     } catch { /* 成本归因失败不影响 API 响应 */ }
-    db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-      .run('openapi', 'API调用', `智能体「${agent.name}」（${pt} tokens）`, req.ip, now());
+    dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', ['openapi', 'API调用', `智能体「${agent.name}」（${pt} tokens）`, req.ip, now()]);
     finish(res, stream, modelId, created, out, pt);
   } catch (e) {
     res.status(500).json({ error: { message: '对话服务异常：' + e.message, type: 'api_error' } });

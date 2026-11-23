@@ -41,6 +41,7 @@
  *   WS     /api/canvas-ws                      — 实时通道（见 lib/canvas-collab.js）
  */
 const express = require('express');
+const dal = require('../lib/dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const crypto = require('crypto');
 const { db, now } = require('../db');
 const { auth } = require('../lib/auth');
@@ -61,7 +62,7 @@ function canManage(room, user) {
 
 /** 检查用户是否为房间成员 */
 function isMember(roomId, username) {
-  const m = db.prepare('SELECT id FROM collab_room_members WHERE room_id=? AND username=? AND status=?').get(roomId, username, 'active');
+  const m = dal.getq('SELECT id FROM collab_room_members WHERE room_id=? AND username=? AND status=?', [roomId, username, 'active']);
   return !!m;
 }
 
@@ -69,43 +70,41 @@ function isMember(roomId, username) {
 
 router.get('/rooms', (req, res) => {
   // 我创建或参与的（活跃）房间
-  const rows = db.prepare(`
+  const rows = dal.q(`
     SELECT DISTINCT r.*
     FROM collab_rooms r
     LEFT JOIN collab_room_members m ON m.room_id=r.id AND m.username=?
     WHERE r.status='active' AND (r.host=? OR m.id IS NOT NULL)
     ORDER BY r.updated_at DESC
-  `).all(req.user.username, req.user.username);
+  `, [req.user.username, req.user.username]);
   res.json({ code: 0, data: rows });
 });
 
 router.post('/rooms', (req, res) => {
   const { name, description, room_type, model, settings } = req.body || {};
   if (!name) return res.json({ code: 400, msg: '房间名称不能为空' });
-  const r = db.prepare(`INSERT INTO collab_rooms (name,description,room_type,host,model,status,settings,created_at,updated_at)
-    VALUES (?,?,?,?,?,'active',?,?,?)`).run(
+  const r = dal.runq(`INSERT INTO collab_rooms (name,description,room_type,host,model,status,settings,created_at,updated_at)
+    VALUES (?,?,?,?,?,'active',?,?,?)`, [
     name.slice(0, 200), (description || '').slice(0, 1000), room_type || 'collab',
     req.user.username, model || '', JSON.stringify(settings || {}), now(), now()
-  );
+  ]);
   const roomId = Number(r.lastInsertRowid);
   // 自动将创建者加入成员表
-  db.prepare(`INSERT INTO collab_room_members (room_id,username,role,nickname,joined_at,status) VALUES (?,?,'host',?,?,?)`)
-    .run(roomId, req.user.username, req.user.nickname || req.user.username, now(), 'active');
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(req.user.username, '创建协作房间', name.slice(0, 100), req.ip, now());
+  dal.runq(`INSERT INTO collab_room_members (room_id,username,role,nickname,joined_at,status) VALUES (?,?,'host',?,?,?)`, [roomId, req.user.username, req.user.nickname || req.user.username, now(), 'active']);
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '创建协作房间', name.slice(0, 100), req.ip, now()]);
   res.json({ code: 0, data: { id: roomId } });
 });
 
 router.get('/rooms/:id', (req, res) => {
-  const r = db.prepare('SELECT * FROM collab_rooms WHERE id=?').get(req.params.id);
+  const r = dal.getq('SELECT * FROM collab_rooms WHERE id=?', [req.params.id]);
   if (!r) return res.json({ code: 404, msg: '房间不存在' });
-  const memberCount = db.prepare("SELECT COUNT(*) AS c FROM collab_room_members WHERE room_id=? AND status='active'").get(r.id).c;
-  const aiCount = db.prepare("SELECT COUNT(*) AS c FROM collab_ai_participants WHERE room_id=? AND status='active'").get(r.id).c;
+  const memberCount = dal.getq("SELECT COUNT(*) AS c FROM collab_room_members WHERE room_id=? AND status='active'", [r.id]).c;
+  const aiCount = dal.getq("SELECT COUNT(*) AS c FROM collab_ai_participants WHERE room_id=? AND status='active'", [r.id]).c;
   res.json({ code: 0, data: { ...r, memberCount, aiCount } });
 });
 
 router.put('/rooms/:id', (req, res) => {
-  const r = db.prepare('SELECT * FROM collab_rooms WHERE id=?').get(req.params.id);
+  const r = dal.getq('SELECT * FROM collab_rooms WHERE id=?', [req.params.id]);
   if (!r) return res.json({ code: 404, msg: '房间不存在' });
   if (!canManage(r, req.user)) return res.json({ code: 403, msg: '仅主持人或管理员可修改房间设置' });
   const { name, description, model, settings } = req.body || {};
@@ -117,17 +116,16 @@ router.put('/rooms/:id', (req, res) => {
   if (settings !== undefined) { fields.push('settings=?'); vals.push(JSON.stringify(settings)); }
   fields.push('updated_at=?'); vals.push(now());
   vals.push(r.id);
-  db.prepare(`UPDATE collab_rooms SET ${fields.join(',')} WHERE id=?`).run(...vals);
+  dal.runq(`UPDATE collab_rooms SET ${fields.join(',')} WHERE id=?`, [...vals]);
   res.json({ code: 0 });
 });
 
 router.post('/rooms/:id/close', (req, res) => {
-  const r = db.prepare('SELECT * FROM collab_rooms WHERE id=?').get(req.params.id);
+  const r = dal.getq('SELECT * FROM collab_rooms WHERE id=?', [req.params.id]);
   if (!r) return res.json({ code: 404, msg: '房间不存在' });
   if (!canManage(r, req.user)) return res.json({ code: 403, msg: '仅主持人或管理员可关闭房间' });
-  db.prepare("UPDATE collab_rooms SET status='closed',closed_at=?,updated_at=? WHERE id=?").run(now(), now(), r.id);
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(req.user.username, '关闭协作房间', r.name.slice(0, 100), req.ip, now());
+  dal.runq("UPDATE collab_rooms SET status='closed',closed_at=?,updated_at=? WHERE id=?", [now(), now(), r.id]);
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '关闭协作房间', r.name.slice(0, 100), req.ip, now()]);
   // U1-7：同步踢出画布协作 WS 会话（成员端立即收 closed 提示并断开）
   try { require('../lib/canvas-collab').notifyRoomClosed(r.id); } catch (e) { console.error('[collab] 通知画布协作关闭失败：', e.message); }
   res.json({ code: 0 });
@@ -137,129 +135,125 @@ router.post('/rooms/:id/close', (req, res) => {
 
 // 为智能体创建画布协作房间（若已有活跃绑定房间 → 直接复用，幂等）
 router.post('/rooms/by-agent/:agentId', (req, res) => {
-  const agent = db.prepare('SELECT id, name FROM agents WHERE id=?').get(req.params.agentId);
+  const agent = dal.getq('SELECT id, name FROM agents WHERE id=?', [req.params.agentId]);
   if (!agent) return res.json({ code: 404, msg: '智能体不存在' });
-  const exist = db.prepare("SELECT * FROM collab_rooms WHERE agent_id=? AND status='active' ORDER BY id DESC LIMIT 1").get(agent.id);
+  const exist = dal.getq("SELECT * FROM collab_rooms WHERE agent_id=? AND status='active' ORDER BY id DESC LIMIT 1", [agent.id]);
   if (exist) {
     const mine = exist.host === req.user.username || req.user.role === 'admin'
-      || db.prepare("SELECT id FROM collab_room_members WHERE room_id=? AND username=? AND status='active'").get(exist.id, req.user.username);
+      || dal.getq("SELECT id FROM collab_room_members WHERE room_id=? AND username=? AND status='active'", [exist.id, req.user.username]);
     if (!mine) return res.json({ code: 403, msg: '该画布已有协作房间，但你不是成员（请联系房主添加）' });
     return res.json({ code: 0, data: { id: exist.id, reused: true, name: exist.name } });
   }
-  const r = db.prepare(`INSERT INTO collab_rooms (name,description,room_type,host,model,status,settings,agent_id,created_at,updated_at)
-    VALUES (?,?,?,?,?,'active',?,?,?,?)`).run(
-    `画布协作 · ${agent.name}`.slice(0, 200), '', 'collab', req.user.username, '', JSON.stringify({ canvas: true }), agent.id, now(), now());
+  const r = dal.runq(`INSERT INTO collab_rooms (name,description,room_type,host,model,status,settings,agent_id,created_at,updated_at)
+    VALUES (?,?,?,?,?,'active',?,?,?,?)`, [
+    `画布协作 · ${agent.name}`.slice(0, 200), '', 'collab', req.user.username, '', JSON.stringify({ canvas: true }), agent.id, now(), now()]);
   const roomId = Number(r.lastInsertRowid);
-  db.prepare(`INSERT INTO collab_room_members (room_id,username,role,nickname,joined_at,status) VALUES (?,?,'host',?,?,?)`)
-    .run(roomId, req.user.username, req.user.nickname || req.user.username, now(), 'active');
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(req.user.username, '创建画布协作房间', `「${agent.name}」#${roomId}`, req.ip, now());
+  dal.runq(`INSERT INTO collab_room_members (room_id,username,role,nickname,joined_at,status) VALUES (?,?,'host',?,?,?)`, [roomId, req.user.username, req.user.nickname || req.user.username, now(), 'active']);
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '创建画布协作房间', `「${agent.name}」#${roomId}`, req.ip, now()]);
   res.json({ code: 0, data: { id: roomId, name: `画布协作 · ${agent.name}` } });
 });
 
 // 查询智能体的活跃画布协作房间（登录即可查；能否入房由 WS 加入校验把守）
 router.get('/rooms/by-agent/:agentId', (req, res) => {
-  const r = db.prepare("SELECT id, name, host, room_type, created_at FROM collab_rooms WHERE agent_id=? AND status='active' ORDER BY id DESC LIMIT 1").get(req.params.agentId);
+  const r = dal.getq("SELECT id, name, host, room_type, created_at FROM collab_rooms WHERE agent_id=? AND status='active' ORDER BY id DESC LIMIT 1", [req.params.agentId]);
   if (!r) return res.json({ code: 0, data: null });
-  const members = db.prepare("SELECT username, role, nickname FROM collab_room_members WHERE room_id=? AND status='active' ORDER BY role DESC, joined_at").all(r.id);
+  const members = dal.q("SELECT username, role, nickname FROM collab_room_members WHERE room_id=? AND status='active' ORDER BY role DESC, joined_at", [r.id]);
   const isMember = req.user.role === 'admin' || r.host === req.user.username || members.some(m => m.username === req.user.username);
   res.json({ code: 0, data: { ...r, members, isMember } });
 });
 
 // 房间绑定/解绑画布（host/admin；换绑会丢弃旧会话态内存版本——服务端以新 agent 画布重新初始化）
 router.put('/rooms/:id/bind-agent', (req, res) => {
-  const r = db.prepare('SELECT * FROM collab_rooms WHERE id=?').get(req.params.id);
+  const r = dal.getq('SELECT * FROM collab_rooms WHERE id=?', [req.params.id]);
   if (!r) return res.json({ code: 404, msg: '房间不存在' });
   if (!canManage(r, req.user)) return res.json({ code: 403, msg: '仅主持人或管理员可绑定画布' });
   const agentId = (req.body || {}).agent_id;
   if (agentId == null || agentId === '') {
-    db.prepare('UPDATE collab_rooms SET agent_id=NULL,updated_at=? WHERE id=?').run(now(), r.id);
+    dal.runq('UPDATE collab_rooms SET agent_id=NULL,updated_at=? WHERE id=?', [now(), r.id]);
     return res.json({ code: 0, msg: '已解绑画布（房间转为普通协作）' });
   }
-  const agent = db.prepare('SELECT id, name FROM agents WHERE id=?').get(Number(agentId));
+  const agent = dal.getq('SELECT id, name FROM agents WHERE id=?', [Number(agentId)]);
   if (!agent) return res.json({ code: 404, msg: '智能体不存在' });
-  db.prepare('UPDATE collab_rooms SET agent_id=?,updated_at=? WHERE id=?').run(agent.id, now(), r.id);
+  dal.runq('UPDATE collab_rooms SET agent_id=?,updated_at=? WHERE id=?', [agent.id, now(), r.id]);
   res.json({ code: 0, msg: `已绑定「${agent.name}」的画布` });
 });
 
 /* ==================== 成员管理 ==================== */
 
 router.get('/rooms/:id/members', (req, res) => {
-  const r = db.prepare('SELECT * FROM collab_rooms WHERE id=?').get(req.params.id);
+  const r = dal.getq('SELECT * FROM collab_rooms WHERE id=?', [req.params.id]);
   if (!r) return res.json({ code: 404, msg: '房间不存在' });
   // 所有成员都可查看成员列表
-  const rows = db.prepare('SELECT * FROM collab_room_members WHERE room_id=? ORDER BY role DESC, joined_at').all(r.id);
+  const rows = dal.q('SELECT * FROM collab_room_members WHERE room_id=? ORDER BY role DESC, joined_at', [r.id]);
   res.json({ code: 0, data: rows });
 });
 
 router.post('/rooms/:id/members', (req, res) => {
-  const r = db.prepare('SELECT * FROM collab_rooms WHERE id=?').get(req.params.id);
+  const r = dal.getq('SELECT * FROM collab_rooms WHERE id=?', [req.params.id]);
   if (!r) return res.json({ code: 404, msg: '房间不存在' });
   if (!canManage(r, req.user)) return res.json({ code: 403, msg: '仅主持人或管理员可添加成员' });
   const { username, role } = req.body || {};
   if (!username) return res.json({ code: 400, msg: '请指定用户名' });
   // 检查是否已在成员中
-  const exists = db.prepare('SELECT id FROM collab_room_members WHERE room_id=? AND username=?').get(r.id, username);
+  const exists = dal.getq('SELECT id FROM collab_room_members WHERE room_id=? AND username=?', [r.id, username]);
   if (exists) {
     // 如果是 left/kicked 状态，重新激活
-    db.prepare("UPDATE collab_room_members SET status='active',joined_at=?,left_at=NULL WHERE id=?").run(now(), exists.id);
+    dal.runq("UPDATE collab_room_members SET status='active',joined_at=?,left_at=NULL WHERE id=?", [now(), exists.id]);
   } else {
-    db.prepare('INSERT INTO collab_room_members (room_id,username,role,joined_at,status) VALUES (?,?,?,?,?)')
-      .run(r.id, username, role || 'member', now(), 'active');
+    dal.runq('INSERT INTO collab_room_members (room_id,username,role,joined_at,status) VALUES (?,?,?,?,?)', [r.id, username, role || 'member', now(), 'active']);
   }
   res.json({ code: 0 });
 });
 
 router.put('/rooms/:id/members/:mid', (req, res) => {
-  const r = db.prepare('SELECT * FROM collab_rooms WHERE id=?').get(req.params.id);
+  const r = dal.getq('SELECT * FROM collab_rooms WHERE id=?', [req.params.id]);
   if (!r) return res.json({ code: 404, msg: '房间不存在' });
   if (!canManage(r, req.user)) return res.json({ code: 403, msg: '仅主持人或管理员可修改成员角色' });
   const { role } = req.body || {};
-  if (role) db.prepare('UPDATE collab_room_members SET role=? WHERE id=? AND room_id=?').run(role, req.params.mid, r.id);
+  if (role) dal.runq('UPDATE collab_room_members SET role=? WHERE id=? AND room_id=?', [role, req.params.mid, r.id]);
   res.json({ code: 0 });
 });
 
 router.delete('/rooms/:id/members/:mid', (req, res) => {
-  const r = db.prepare('SELECT * FROM collab_rooms WHERE id=?').get(req.params.id);
+  const r = dal.getq('SELECT * FROM collab_rooms WHERE id=?', [req.params.id]);
   if (!r) return res.json({ code: 404, msg: '房间不存在' });
   if (!canManage(r, req.user)) return res.json({ code: 403, msg: '仅主持人或管理员可移除成员' });
-  db.prepare("UPDATE collab_room_members SET status='kicked',left_at=? WHERE id=? AND room_id=?").run(now(), req.params.mid, r.id);
+  dal.runq("UPDATE collab_room_members SET status='kicked',left_at=? WHERE id=? AND room_id=?", [now(), req.params.mid, r.id]);
   res.json({ code: 0 });
 });
 
 /* ==================== AI 参与者 ==================== */
 
 router.get('/rooms/:id/ai', (req, res) => {
-  const rows = db.prepare('SELECT c.*, a.name AS agent_name, a.icon AS agent_icon FROM collab_ai_participants c LEFT JOIN agents a ON a.id=c.agent_id WHERE c.room_id=? AND c.status!=\'removed\' ORDER BY c.id').all(req.params.id);
+  const rows = dal.q('SELECT c.*, a.name AS agent_name, a.icon AS agent_icon FROM collab_ai_participants c LEFT JOIN agents a ON a.id=c.agent_id WHERE c.room_id=? AND c.status!=\'removed\' ORDER BY c.id', [req.params.id]);
   res.json({ code: 0, data: rows });
 });
 
 router.post('/rooms/:id/ai', (req, res) => {
-  const r = db.prepare('SELECT * FROM collab_rooms WHERE id=?').get(req.params.id);
+  const r = dal.getq('SELECT * FROM collab_rooms WHERE id=?', [req.params.id]);
   if (!r) return res.json({ code: 404, msg: '房间不存在' });
   if (!canManage(r, req.user)) return res.json({ code: 403, msg: '仅主持人或管理员可添加 AI' });
   const { agent_id, role, instruction } = req.body || {};
   if (!agent_id) return res.json({ code: 400, msg: '请指定智能体 ID' });
-  const a = db.prepare('SELECT id, name FROM agents WHERE id=?').get(agent_id);
+  const a = dal.getq('SELECT id, name FROM agents WHERE id=?', [agent_id]);
   if (!a) return res.json({ code: 404, msg: '智能体不存在' });
-  db.prepare(`INSERT INTO collab_ai_participants (room_id,agent_id,role,instruction,added_by,status,added_at)
-    VALUES (?,?,?,?,?,'active',?)`).run(r.id, agent_id, role || 'collaborator', instruction || '', req.user.username, now());
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(req.user.username, '添加 AI 参与者', `${a.name} → ${r.name}`, req.ip, now());
+  dal.runq(`INSERT INTO collab_ai_participants (room_id,agent_id,role,instruction,added_by,status,added_at)
+    VALUES (?,?,?,?,?,'active',?)`, [r.id, agent_id, role || 'collaborator', instruction || '', req.user.username, now()]);
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '添加 AI 参与者', `${a.name} → ${r.name}`, req.ip, now()]);
   res.json({ code: 0 });
 });
 
 router.put('/rooms/:id/ai/:aid', (req, res) => {
   if (req.user.role !== 'admin') return res.json({ code: 403, msg: '仅管理员可修改 AI 设置' });
   const { role, instruction } = req.body || {};
-  if (role) db.prepare('UPDATE collab_ai_participants SET role=? WHERE id=? AND room_id=?').run(role, req.params.aid, req.params.id);
-  if (instruction !== undefined) db.prepare('UPDATE collab_ai_participants SET instruction=? WHERE id=? AND room_id=?').run(instruction, req.params.aid, req.params.id);
+  if (role) dal.runq('UPDATE collab_ai_participants SET role=? WHERE id=? AND room_id=?', [role, req.params.aid, req.params.id]);
+  if (instruction !== undefined) dal.runq('UPDATE collab_ai_participants SET instruction=? WHERE id=? AND room_id=?', [instruction, req.params.aid, req.params.id]);
   res.json({ code: 0 });
 });
 
 router.delete('/rooms/:id/ai/:aid', (req, res) => {
   if (req.user.role !== 'admin') return res.json({ code: 403, msg: '仅管理员可移除 AI' });
-  db.prepare("UPDATE collab_ai_participants SET status='removed' WHERE id=? AND room_id=?").run(req.params.aid, req.params.id);
+  dal.runq("UPDATE collab_ai_participants SET status='removed' WHERE id=? AND room_id=?", [req.params.aid, req.params.id]);
   res.json({ code: 0 });
 });
 
@@ -272,7 +266,7 @@ router.get('/rooms/:id/messages', (req, res) => {
   if (before) { sql += ' AND id < ?'; args.push(+before); }
   sql += ' ORDER BY id DESC LIMIT ?';
   args.push(Math.min(+limit || 100, 500));
-  let rows = db.prepare(sql).all(...args);
+  let rows = dal.q(sql, [...args]);
   // 过滤 hidden_for 包含当前用户的消息
   rows = rows.filter(m => {
     try { const hidden = JSON.parse(m.hidden_for || '[]'); return !hidden.includes(req.user.username); } catch { return true; }
@@ -281,46 +275,45 @@ router.get('/rooms/:id/messages', (req, res) => {
 });
 
 router.post('/rooms/:id/messages', (req, res) => {
-  const r = db.prepare('SELECT * FROM collab_rooms WHERE id=?').get(req.params.id);
+  const r = dal.getq('SELECT * FROM collab_rooms WHERE id=?', [req.params.id]);
   if (!r) return res.json({ code: 404, msg: '房间不存在' });
   if (r.status !== 'active') return res.json({ code: 400, msg: '房间已关闭，无法发送消息' });
   const { content, parent_id, msg_type, attachments } = req.body || {};
   if (!content) return res.json({ code: 400, msg: '消息内容不能为空' });
-  db.prepare(`INSERT INTO collab_room_messages (room_id,parent_id,sender,role,content,attachments,msg_type,created_at) VALUES (?,?,?,?,?,?,?,?)`)
-    .run(r.id, parent_id || null, req.user.username, 'user', content.slice(0, 50000),
-      JSON.stringify(attachments || []), msg_type || 'text', now());
+  dal.runq(`INSERT INTO collab_room_messages (room_id,parent_id,sender,role,content,attachments,msg_type,created_at) VALUES (?,?,?,?,?,?,?,?)`, [r.id, parent_id || null, req.user.username, 'user', content.slice(0, 50000),
+      JSON.stringify(attachments || []), msg_type || 'text', now()]);
   res.json({ code: 0 });
 });
 
 router.put('/rooms/:id/messages/:mid/recall', (req, res) => {
-  const m = db.prepare('SELECT * FROM collab_room_messages WHERE id=? AND room_id=?').get(req.params.mid, req.params.id);
+  const m = dal.getq('SELECT * FROM collab_room_messages WHERE id=? AND room_id=?', [req.params.mid, req.params.id]);
   if (!m) return res.json({ code: 404, msg: '消息不存在' });
   if (m.sender !== req.user.username && req.user.role !== 'admin')
     return res.json({ code: 403, msg: '仅消息发送者或管理员可撤回' });
-  db.prepare('UPDATE collab_room_messages SET recalled=1 WHERE id=?').run(m.id);
+  dal.runq('UPDATE collab_room_messages SET recalled=1 WHERE id=?', [m.id]);
   res.json({ code: 0 });
 });
 
 router.put('/rooms/:id/messages/:mid/hide', (req, res) => {
-  const m = db.prepare('SELECT * FROM collab_room_messages WHERE id=? AND room_id=?').get(req.params.mid, req.params.id);
+  const m = dal.getq('SELECT * FROM collab_room_messages WHERE id=? AND room_id=?', [req.params.mid, req.params.id]);
   if (!m) return res.json({ code: 404, msg: '消息不存在' });
   if (req.user.role !== 'admin') return res.json({ code: 403, msg: '仅管理员可隐藏消息' });
   try {
     const hidden = JSON.parse(m.hidden_for || '[]');
     if (!hidden.includes(req.user.username)) hidden.push(req.user.username);
-    db.prepare('UPDATE collab_room_messages SET hidden_for=? WHERE id=?').run(JSON.stringify(hidden), m.id);
+    dal.runq('UPDATE collab_room_messages SET hidden_for=? WHERE id=?', [JSON.stringify(hidden), m.id]);
   } catch { return res.json({ code: 500, msg: '隐藏失败' }); }
   res.json({ code: 0 });
 });
 
 router.put('/rooms/:id/messages/:mid/read', (req, res) => {
-  const m = db.prepare('SELECT * FROM collab_room_messages WHERE id=? AND room_id=?').get(req.params.mid, req.params.id);
+  const m = dal.getq('SELECT * FROM collab_room_messages WHERE id=? AND room_id=?', [req.params.mid, req.params.id]);
   if (!m) return res.json({ code: 404, msg: '消息不存在' });
   try {
     const readBy = JSON.parse(m.read_by || '[]');
     if (!readBy.includes(req.user.username)) {
       readBy.push(req.user.username);
-      db.prepare('UPDATE collab_room_messages SET read_by=? WHERE id=?').run(JSON.stringify(readBy), m.id);
+      dal.runq('UPDATE collab_room_messages SET read_by=? WHERE id=?', [JSON.stringify(readBy), m.id]);
     }
   } catch { }
   res.json({ code: 0 });
@@ -330,12 +323,12 @@ router.put('/rooms/:id/messages/:mid/read', (req, res) => {
 
 router.get('/rooms/:id/invites', (req, res) => {
   if (req.user.role !== 'admin') return res.json({ code: 403, msg: '仅管理员可查看邀请' });
-  const rows = db.prepare('SELECT * FROM collab_room_invites WHERE room_id=? ORDER BY id DESC').all(req.params.id);
+  const rows = dal.q('SELECT * FROM collab_room_invites WHERE room_id=? ORDER BY id DESC', [req.params.id]);
   res.json({ code: 0, data: rows });
 });
 
 router.post('/rooms/:id/invites', (req, res) => {
-  const r = db.prepare('SELECT * FROM collab_rooms WHERE id=?').get(req.params.id);
+  const r = dal.getq('SELECT * FROM collab_rooms WHERE id=?', [req.params.id]);
   if (!r) return res.json({ code: 404, msg: '房间不存在' });
   if (!canManage(r, req.user)) return res.json({ code: 403, msg: '仅主持人或管理员可生成邀请' });
   const { target_username, role, max_use, expires_in_hours } = req.body || {};
@@ -345,27 +338,27 @@ router.post('/rooms/:id/invites', (req, res) => {
     const d = new Date(Date.now() + expires_in_hours * 3600000);
     expiresAt = d.toISOString().replace('T', ' ').slice(0, 19);
   }
-  db.prepare(`INSERT INTO collab_room_invites (room_id,invite_code,target_username,role,max_use,expires_at,created_by,created_at)
-    VALUES (?,?,?,?,?,?,?,?)`).run(r.id, code, target_username || '', role || 'member', max_use || 0, expiresAt, req.user.username, now());
+  dal.runq(`INSERT INTO collab_room_invites (room_id,invite_code,target_username,role,max_use,expires_at,created_by,created_at)
+    VALUES (?,?,?,?,?,?,?,?)`, [r.id, code, target_username || '', role || 'member', max_use || 0, expiresAt, req.user.username, now()]);
   res.json({ code: 0, data: { invite_code: code } });
 });
 
 router.put('/rooms/:id/invites/:iid', (req, res) => {
   if (req.user.role !== 'admin') return res.json({ code: 403, msg: '仅管理员可修改邀请' });
   const { enabled, max_use } = req.body || {};
-  if (enabled !== undefined) db.prepare('UPDATE collab_room_invites SET enabled=? WHERE id=? AND room_id=?').run(enabled ? 1 : 0, req.params.iid, req.params.id);
-  if (max_use !== undefined) db.prepare('UPDATE collab_room_invites SET max_use=? WHERE id=? AND room_id=?').run(max_use, req.params.iid, req.params.id);
+  if (enabled !== undefined) dal.runq('UPDATE collab_room_invites SET enabled=? WHERE id=? AND room_id=?', [enabled ? 1 : 0, req.params.iid, req.params.id]);
+  if (max_use !== undefined) dal.runq('UPDATE collab_room_invites SET max_use=? WHERE id=? AND room_id=?', [max_use, req.params.iid, req.params.id]);
   res.json({ code: 0 });
 });
 
 router.delete('/rooms/:id/invites/:iid', (req, res) => {
   if (req.user.role !== 'admin') return res.json({ code: 403, msg: '仅管理员可删除邀请' });
-  db.prepare('DELETE FROM collab_room_invites WHERE id=? AND room_id=?').run(req.params.iid, req.params.id);
+  dal.runq('DELETE FROM collab_room_invites WHERE id=? AND room_id=?', [req.params.iid, req.params.id]);
   res.json({ code: 0 });
 });
 
 router.post('/join/:code', (req, res) => {
-  const inv = db.prepare('SELECT * FROM collab_room_invites WHERE invite_code=? AND enabled=1').get(req.params.code);
+  const inv = dal.getq('SELECT * FROM collab_room_invites WHERE invite_code=? AND enabled=1', [req.params.code]);
   if (!inv) return res.json({ code: 404, msg: '邀请码不存在或已禁用' });
   if (inv.target_username && inv.target_username !== req.user.username)
     return res.json({ code: 403, msg: '此邀请码仅限指定用户' });
@@ -373,41 +366,39 @@ router.post('/join/:code', (req, res) => {
     return res.json({ code: 400, msg: '邀请码已用完' });
   if (inv.expires_at && new Date(inv.expires_at) < new Date())
     return res.json({ code: 400, msg: '邀请码已过期' });
-  const r = db.prepare('SELECT * FROM collab_rooms WHERE id=?').get(inv.room_id);
+  const r = dal.getq('SELECT * FROM collab_rooms WHERE id=?', [inv.room_id]);
   if (!r || r.status !== 'active') return res.json({ code: 404, msg: '房间不存在或已关闭' });
   // 加入成员
-  const exists = db.prepare('SELECT id FROM collab_room_members WHERE room_id=? AND username=?').get(inv.room_id, req.user.username);
+  const exists = dal.getq('SELECT id FROM collab_room_members WHERE room_id=? AND username=?', [inv.room_id, req.user.username]);
   if (exists) {
-    db.prepare("UPDATE collab_room_members SET status='active',joined_at=?,left_at=NULL WHERE id=?").run(now(), exists.id);
+    dal.runq("UPDATE collab_room_members SET status='active',joined_at=?,left_at=NULL WHERE id=?", [now(), exists.id]);
   } else {
-    db.prepare('INSERT INTO collab_room_members (room_id,username,role,joined_at,status) VALUES (?,?,?,?,?)')
-      .run(inv.room_id, req.user.username, inv.role, now(), 'active');
+    dal.runq('INSERT INTO collab_room_members (room_id,username,role,joined_at,status) VALUES (?,?,?,?,?)', [inv.room_id, req.user.username, inv.role, now(), 'active']);
   }
-  db.prepare('UPDATE collab_room_invites SET use_count=use_count+1 WHERE id=?').run(inv.id);
+  dal.runq('UPDATE collab_room_invites SET use_count=use_count+1 WHERE id=?', [inv.id]);
   res.json({ code: 0, data: { room_id: inv.room_id, room_name: r.name } });
 });
 
 /* ---------- P2-2 任务分解 ---------- */
 
 router.post('/rooms/:id/tasks', (req, res) => {
-  const r = db.prepare('SELECT * FROM collab_rooms WHERE id=?').get(req.params.id);
+  const r = dal.getq('SELECT * FROM collab_rooms WHERE id=?', [req.params.id]);
   if (!r) return res.json({ code: 404, msg: '房间不存在' });
   if (!canManage(r, req.user)) return res.json({ code: 403, msg: '仅主持人或管理员可创建任务' });
   const { title, description, parent_id, assignee, assignee_type, deps } = req.body || {};
   if (!title) return res.json({ code: 400, msg: '任务标题不能为空' });
-  const info = db.prepare(`INSERT INTO collab_room_tasks (room_id,parent_id,title,description,assignee,assignee_type,deps,status,created_by,created_at,updated_at)
-    VALUES (?,?,?,?,?,?,?,'pending',?,?,?)`).run(
+  const info = dal.runq(`INSERT INTO collab_room_tasks (room_id,parent_id,title,description,assignee,assignee_type,deps,status,created_by,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,?,'pending',?,?,?)`, [
     r.id, parent_id || null, title.slice(0, 200), (description || '').slice(0, 2000),
     assignee || '', assignee_type || 'human', JSON.stringify(deps || []),
     req.user.username, now(), now()
-  );
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(req.user.username, '创建协作任务', `${title}（${r.name}）`, req.ip, now());
+  ]);
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '创建协作任务', `${title}（${r.name}）`, req.ip, now()]);
   res.json({ code: 0, data: { id: Number(info.lastInsertRowid) } });
 });
 
 router.get('/rooms/:id/tasks', (req, res) => {
-  const rows = db.prepare('SELECT * FROM collab_room_tasks WHERE room_id=? ORDER BY COALESCE(parent_id,0), id').all(req.params.id);
+  const rows = dal.q('SELECT * FROM collab_room_tasks WHERE room_id=? ORDER BY COALESCE(parent_id,0), id', [req.params.id]);
   res.json({ code: 0, data: rows });
 });
 
@@ -422,46 +413,43 @@ router.put('/rooms/:id/tasks/:tid', (req, res) => {
   if (assignee_type !== undefined) { fields.push('assignee_type=?'); vals.push(assignee_type); }
   if (!fields.length) return res.json({ code: 400, msg: '无更新字段' });
   fields.push('updated_at=?'); vals.push(now()); vals.push(req.params.tid, req.params.id);
-  db.prepare(`UPDATE collab_room_tasks SET ${fields.join(',')} WHERE id=? AND room_id=?`).run(...vals);
+  dal.runq(`UPDATE collab_room_tasks SET ${fields.join(',')} WHERE id=? AND room_id=?`, [...vals]);
   res.json({ code: 0 });
 });
 
 router.put('/rooms/:id/tasks/:tid/deps', (req, res) => {
   if (req.user.role !== 'admin') return res.json({ code: 403, msg: '仅管理员可设置依赖' });
   const { deps } = req.body || [];
-  db.prepare('UPDATE collab_room_tasks SET deps=?,updated_at=? WHERE id=? AND room_id=?')
-    .run(JSON.stringify(deps), now(), req.params.tid, req.params.id);
+  dal.runq('UPDATE collab_room_tasks SET deps=?,updated_at=? WHERE id=? AND room_id=?', [JSON.stringify(deps), now(), req.params.tid, req.params.id]);
   res.json({ code: 0 });
 });
 
 /* ---------- P2-3 人机协同 ---------- */
 
 router.post('/rooms/:id/assign', (req, res) => {
-  const r = db.prepare('SELECT * FROM collab_rooms WHERE id=?').get(req.params.id);
+  const r = dal.getq('SELECT * FROM collab_rooms WHERE id=?', [req.params.id]);
   if (!r) return res.json({ code: 404, msg: '房间不存在' });
   if (!canManage(r, req.user)) return res.json({ code: 403, msg: '仅主持人或管理员可指派' });
   const { task_id, assignee, assignee_type } = req.body || {};
   if (!task_id || !assignee) return res.json({ code: 400, msg: '请指定任务和负责人' });
-  const t = db.prepare('SELECT * FROM collab_room_tasks WHERE id=? AND room_id=?').get(task_id, r.id);
+  const t = dal.getq('SELECT * FROM collab_room_tasks WHERE id=? AND room_id=?', [task_id, r.id]);
   if (!t) return res.json({ code: 404, msg: '任务不存在' });
-  db.prepare('UPDATE collab_room_tasks SET assignee=?,assignee_type=?,status=?,updated_at=? WHERE id=?')
-    .run(assignee, assignee_type || 'human', 'assigned', now(), task_id);
+  dal.runq('UPDATE collab_room_tasks SET assignee=?,assignee_type=?,status=?,updated_at=? WHERE id=?', [assignee, assignee_type || 'human', 'assigned', now(), task_id]);
   // 写一条系统消息记录指派
-  db.prepare(`INSERT INTO collab_room_messages (room_id,sender,role,content,msg_type,meta,created_at)
-    VALUES (?,?,?,'system',?,?,'system',?,?)`)
-    .run(r.id, req.user.username, `已指派任务「${t.title}」给 ${assignee}（${assignee_type === 'ai' ? 'AI' : '人'}）`,
-      JSON.stringify({ task_id, assignee, assignee_type }), now());
+  dal.runq(`INSERT INTO collab_room_messages (room_id,sender,role,content,msg_type,meta,created_at)
+    VALUES (?,?,?,'system',?,?,'system',?,?)`, [r.id, req.user.username, `已指派任务「${t.title}」给 ${assignee}（${assignee_type === 'ai' ? 'AI' : '人'}）`,
+      JSON.stringify({ task_id, assignee, assignee_type }), now()]);
   res.json({ code: 0 });
 });
 
 router.post('/rooms/:id/summarize', (req, res) => {
-  const r = db.prepare('SELECT * FROM collab_rooms WHERE id=?').get(req.params.id);
+  const r = dal.getq('SELECT * FROM collab_rooms WHERE id=?', [req.params.id]);
   if (!r) return res.json({ code: 404, msg: '房间不存在' });
   // 查询该房间所有已完成任务，生成一份简明汇总
-  const done = db.prepare("SELECT * FROM collab_room_tasks WHERE room_id=? AND status IN ('done','success','completed') ORDER BY updated_at DESC").all(r.id);
-  const pending = db.prepare("SELECT * FROM collab_room_tasks WHERE room_id=? AND status NOT IN ('done','success','completed','cancelled') ORDER BY id").all(r.id);
-  const messages = db.prepare("SELECT * FROM collab_room_messages WHERE room_id=? AND msg_type!='system' ORDER BY id ASC LIMIT 50").all(r.id);
-  const agents = db.prepare('SELECT c.*, a.name AS agent_name FROM collab_ai_participants c LEFT JOIN agents a ON a.id=c.agent_id WHERE c.room_id=? AND c.status=?').all(r.id, 'active');
+  const done = dal.q("SELECT * FROM collab_room_tasks WHERE room_id=? AND status IN ('done','success','completed') ORDER BY updated_at DESC", [r.id]);
+  const pending = dal.q("SELECT * FROM collab_room_tasks WHERE room_id=? AND status NOT IN ('done','success','completed','cancelled') ORDER BY id", [r.id]);
+  const messages = dal.q("SELECT * FROM collab_room_messages WHERE room_id=? AND msg_type!='system' ORDER BY id ASC LIMIT 50", [r.id]);
+  const agents = dal.q('SELECT c.*, a.name AS agent_name FROM collab_ai_participants c LEFT JOIN agents a ON a.id=c.agent_id WHERE c.room_id=? AND c.status=?', [r.id, 'active']);
   const summary = {
     room: r.name,
     totalTasks: done.length + pending.length,
@@ -470,9 +458,8 @@ router.post('/rooms/:id/summarize', (req, res) => {
     aiParticipants: agents.map(a => ({ name: a.agent_name || `#${a.agent_id}`, role: a.role })),
     lastActivity: messages.length ? messages[messages.length - 1].created_at : null,
   };
-  db.prepare(`INSERT INTO collab_room_messages (room_id,sender,role,content,msg_type,meta,created_at)
-    VALUES (?,?,'system','自动汇总报告',?,'summary',?,?)`)
-    .run(r.id, 'system', JSON.stringify(summary, null, 2), JSON.stringify({ type: 'summary' }), now());
+  dal.runq(`INSERT INTO collab_room_messages (room_id,sender,role,content,msg_type,meta,created_at)
+    VALUES (?,?,'system','自动汇总报告',?,'summary',?,?)`, [r.id, 'system', JSON.stringify(summary, null, 2), JSON.stringify({ type: 'summary' }), now()]);
   res.json({ code: 0, data: summary });
 });
 
@@ -483,13 +470,13 @@ router.post('/rooms/:id/summarize', (req, res) => {
  *  用默认模型分析任务→按业务域匹配 AI 参与者→生成子任务列表写入 collab_room_tasks
  */
 router.post('/rooms/:id/auto-split', async (req, res) => {
-  const r = db.prepare('SELECT * FROM collab_rooms WHERE id=?').get(req.params.id);
+  const r = dal.getq('SELECT * FROM collab_rooms WHERE id=?', [req.params.id]);
   if (!r) return res.json({ code: 404, msg: '房间不存在' });
   if (!canManage(r, req.user)) return res.json({ code: 403, msg: '仅主持人或管理员可自动拆解' });
   const { title, description } = req.body || {};
   if (!title) return res.json({ code: 400, msg: '请提供主任务标题' });
   // 获取房间当前启用的 AI 参与者
-  const aiParts = db.prepare('SELECT c.*, a.name AS agent_name, a.prompt AS agent_prompt FROM collab_ai_participants c LEFT JOIN agents a ON a.id=c.agent_id WHERE c.room_id=? AND c.status=?').all(r.id, 'active');
+  const aiParts = dal.q('SELECT c.*, a.name AS agent_name, a.prompt AS agent_prompt FROM collab_ai_participants c LEFT JOIN agents a ON a.id=c.agent_id WHERE c.room_id=? AND c.status=?', [r.id, 'active']);
   // 用默认模型分析：把主任务分解为子任务
   const taskPrompt = [
     `你是一个任务分解专家。请将以下主任务拆解为若干个可独立执行的子任务。`,
@@ -521,17 +508,16 @@ router.post('/rooms/:id/auto-split', async (req, res) => {
       // 使用已有 dep 信息设置与前一个任务的可选依赖
       const deps = [];
       if (created > 0 && item.depends_on !== undefined) deps.push(created); // 可加依赖
-      db.prepare(`INSERT INTO collab_room_tasks (room_id,title,description,assignee,assignee_type,deps,status,created_by,created_at,updated_at)
-        VALUES (?,?,?,?,?,?,'pending',?,?,?)`).run(
+      dal.runq(`INSERT INTO collab_room_tasks (room_id,title,description,assignee,assignee_type,deps,status,created_by,created_at,updated_at)
+        VALUES (?,?,?,?,?,?,'pending',?,?,?)`, [
         r.id, subTitle, String(item.description || description || '').slice(0, 2000),
         assign ? assign.agent_name || String(assign.agent_id) : '', assign ? 'ai' : 'human',
-        JSON.stringify(deps), req.user.username, now(), now());
+        JSON.stringify(deps), req.user.username, now(), now()]);
       created++;
     }
-    db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-      .run(req.user.username, 'U1-2 自动拆解', `${title} → ${created} 个子任务`, req.ip, now());
+    dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, 'U1-2 自动拆解', `${title} → ${created} 个子任务`, req.ip, now()]);
     // 返回结果
-    const tasks = db.prepare('SELECT * FROM collab_room_tasks WHERE room_id=? ORDER BY id DESC LIMIT ?').all(r.id, created);
+    const tasks = dal.q('SELECT * FROM collab_room_tasks WHERE room_id=? ORDER BY id DESC LIMIT ?', [r.id, created]);
     res.json({ code: 0, data: { tasks, created, raw: text.slice(0, 500) } });
   } catch (e) {
     res.json({ code: 500, msg: '任务拆解失败：' + e.message });
@@ -542,27 +528,27 @@ router.post('/rooms/:id/auto-split', async (req, res) => {
  *  遍历 pending 任务 → 分配给对应的 AI 参与者（通过 assignee 匹配 collab_ai_participants）→ 执行
  */
 router.post('/rooms/:id/run-ai', async (req, res) => {
-  const r = db.prepare('SELECT * FROM collab_rooms WHERE id=?').get(req.params.id);
+  const r = dal.getq('SELECT * FROM collab_rooms WHERE id=?', [req.params.id]);
   if (!r) return res.json({ code: 404, msg: '房间不存在' });
   if (!canManage(r, req.user)) return res.json({ code: 403, msg: '仅主持人或管理员可执行' });
   // 获取 AI 参与者
-  const aiParts = db.prepare('SELECT c.*, a.name AS agent_name, a.prompt FROM collab_ai_participants c LEFT JOIN agents a ON a.id=c.agent_id WHERE c.room_id=? AND c.status=?').all(r.id, 'active');
+  const aiParts = dal.q('SELECT c.*, a.name AS agent_name, a.prompt FROM collab_ai_participants c LEFT JOIN agents a ON a.id=c.agent_id WHERE c.room_id=? AND c.status=?', [r.id, 'active']);
   if (!aiParts.length) return res.json({ code: 400, msg: '房间没有活跃的 AI 参与者' });
   // 获取 pending 任务（不含人工）
-  const tasks = db.prepare("SELECT * FROM collab_room_tasks WHERE room_id=? AND status='pending' AND assignee_type='ai' ORDER BY id").all(r.id);
+  const tasks = dal.q("SELECT * FROM collab_room_tasks WHERE room_id=? AND status='pending' AND assignee_type='ai' ORDER BY id", [r.id]);
   if (!tasks.length) return res.json({ code: 400, msg: '没有待执行的 AI 任务' });
   // 遍历任务并行执行
   const results = [];
   for (const task of tasks) {
     // 找对应的 AI 参与者
     const ai = aiParts.find(a => a.agent_name === task.assignee || String(a.agent_id) === task.assignee);
-    const agent = ai ? db.prepare('SELECT * FROM agents WHERE id=?').get(ai.agent_id) : null;
+    const agent = ai ? dal.getq('SELECT * FROM agents WHERE id=?', [ai.agent_id]) : null;
     if (!agent) {
       results.push({ task: task.title, status: 'skipped', error: `AI 参与者 ${task.assignee} 不存在或未配置` });
       continue;
     }
     // 标记 running
-    db.prepare("UPDATE collab_room_tasks SET status='running',updated_at=? WHERE id=?").run(now(), task.id);
+    dal.runq("UPDATE collab_room_tasks SET status='running',updated_at=? WHERE id=?", [now(), task.id]);
     try {
       const { runWorkflow } = require('../lib/workflow');
       const msg = (task.description ? `${task.description}\n` : '') + `请执行任务：${task.title}`;
@@ -570,12 +556,10 @@ router.post('/rooms/:id/run-ai', async (req, res) => {
       // 暂时使用简单执行，非工作流模式
       const { runAgent } = require('../lib/workflow');
       const agentResult = await runAgent(agent, msg, { triggerType: 'collab', username: req.user.username });
-      db.prepare("UPDATE collab_room_tasks SET status='done',result=?,updated_at=? WHERE id=?")
-        .run(String(agentResult.text || '').slice(0, 2000), now(), task.id);
+      dal.runq("UPDATE collab_room_tasks SET status='done',result=?,updated_at=? WHERE id=?", [String(agentResult.text || '').slice(0, 2000), now(), task.id]);
       results.push({ task: task.title, status: 'done', result: (agentResult.text || '').slice(0, 200) });
     } catch (e) {
-      db.prepare("UPDATE collab_room_tasks SET status='failed',result=?,updated_at=? WHERE id=?")
-        .run(String(e.message || '').slice(0, 500), now(), task.id);
+      dal.runq("UPDATE collab_room_tasks SET status='failed',result=?,updated_at=? WHERE id=?", [String(e.message || '').slice(0, 500), now(), task.id]);
       results.push({ task: task.title, status: 'failed', error: e.message });
     }
   }
@@ -583,9 +567,8 @@ router.post('/rooms/:id/run-ai', async (req, res) => {
   const summaryText = results.map(r => {
     return r.status === 'done' ? `✅ ${r.task}：${r.result}` : `❌ ${r.task}：${r.error || '未知错误'}`;
   }).join('\n');
-  db.prepare(`INSERT INTO collab_room_messages (room_id,sender,role,content,msg_type,meta,created_at)
-    VALUES (?,?,'system',?,'task_summary',?,?)`)
-    .run(r.id, 'system', `多智能体执行汇总：\n${summaryText}`, JSON.stringify({ results, type: 'exec_summary' }), now());
+  dal.runq(`INSERT INTO collab_room_messages (room_id,sender,role,content,msg_type,meta,created_at)
+    VALUES (?,?,'system',?,'task_summary',?,?)`, [r.id, 'system', `多智能体执行汇总：\n${summaryText}`, JSON.stringify({ results, type: 'exec_summary' }), now()]);
   res.json({ code: 0, data: { results, summary: summaryText } });
 });
 

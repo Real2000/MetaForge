@@ -15,6 +15,7 @@
  *   失败自动降级到候选模型 → 降级记录写入 chat_traces
  */
 const { db } = require('../db');
+const dal = require('./dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const circuit = require('./circuit');
 
 /* ---------- 能力标签映射 ---------- */
@@ -46,8 +47,8 @@ function getCandidates(caps, tenantId) {
   // 从已配置供应商中提取
   const base = "SELECT id, name, models, configured, is_default, status AS conn_status FROM providers WHERE configured=1 AND api_key != '' AND base_url != ''";
   const ps = Number.isFinite(Number(tenantId))
-    ? db.prepare(`${base} AND (tenant_id=0 OR tenant_id=?) ORDER BY is_default DESC, id`).all(Number(tenantId))
-    : db.prepare(`${base} ORDER BY is_default DESC, id`).all();
+    ? dal.q(`${base} AND (tenant_id=0 OR tenant_id=?) ORDER BY is_default DESC, id`, [Number(tenantId)])
+    : dal.q(`${base} ORDER BY is_default DESC, id`);
   const candidates = [];
 
   for (const provider of ps) {
@@ -73,7 +74,7 @@ function getCandidates(caps, tenantId) {
 
 /** 从 model_capabilities 表获取某个模型的能力列表（含全局注册） */
 function getModelCapabilities(modelName, providerName) {
-  const rows = db.prepare(`SELECT capability FROM model_capabilities WHERE (model_name=? AND (provider_name=? OR provider_name='')) AND enabled=1`).all(modelName, providerName);
+  const rows = dal.q(`SELECT capability FROM model_capabilities WHERE (model_name=? AND (provider_name=? OR provider_name='')) AND enabled=1`, [modelName, providerName]);
   const caps = rows.map(r => r.capability);
   // 按未命中补全基础能力（所有模型默认有 text 能力）
   if (!caps.includes('text')) caps.push('text');

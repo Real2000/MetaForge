@@ -6,6 +6,7 @@
  * - 两路均失败时服务器拒绝启动，不再使用旧版硬编码兜底密钥。
  */
 const crypto = require('crypto');
+const dal = require('./dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const fs = require('fs');
 const path = require('path');
 const { db } = require('../db');
@@ -102,12 +103,12 @@ function verify(token) {
     // 改密/重置密码/停用账号时将该用户 token_version +1，本检查使该用户全部已签发旧令牌立即失效
     // （无需逐条黑名单；旧令牌无 tv 字段时跳过，保持向后兼容）。
     if (payload.tv != null) {
-      const u = db.prepare('SELECT token_version FROM users WHERE id=?').get(payload.uid);
+      const u = dal.getq('SELECT token_version FROM users WHERE id=?', [payload.uid]);
       if (!u || (u.token_version || 0) !== payload.tv) return null;
     }
     // P0-4 token 吊销检查：查询 blacklist 表，命中则视为无效
     if (payload.jti) {
-      const blacklisted = db.prepare('SELECT 1 FROM token_blacklist WHERE jti=?').get(payload.jti);
+      const blacklisted = dal.getq('SELECT 1 FROM token_blacklist WHERE jti=?', [payload.jti]);
       if (blacklisted) return null;
     }
     return payload;
@@ -120,7 +121,7 @@ function auth(req, res, next) {
   if (!payload) return res.status(401).json({ code: 401, msg: '未登录或登录已过期' });
   // P0-3 收尾 2026-10-30：SELECT 补 dept_id——此前缺该字段导致 req.user.dept_id 恒 undefined，
   // visible_depts 纯数字 ID 模式在 HTTP 链路判定空转（部门树勾选保存正常但部门用户实际看不到智能体）
-  const user = db.prepare('SELECT id, username, nickname, role, dept, dept_id, onboarded, tenant_id, COALESCE(platform_admin,0) AS platform_admin FROM users WHERE id=? AND status=1').get(payload.uid);
+  const user = dal.getq('SELECT id, username, nickname, role, dept, dept_id, onboarded, tenant_id, COALESCE(platform_admin,0) AS platform_admin FROM users WHERE id=? AND status=1', [payload.uid]);
   if (!user) return res.status(401).json({ code: 401, msg: '账号不可用' });
   req.user = user;
   next();
@@ -146,8 +147,7 @@ function revokeToken(req) {
     const [body] = token.split('.');
     const payload = JSON.parse(Buffer.from(body, 'base64url').toString());
     if (payload.jti && payload.uid) {
-      db.prepare('INSERT OR IGNORE INTO token_blacklist (jti, username, created_at) VALUES (?,?,?)')
-        .run(payload.jti, req.user?.username || String(payload.uid), new Date().toISOString());
+      dal.runq('INSERT OR IGNORE INTO token_blacklist (jti, username, created_at) VALUES (?,?,?)', [payload.jti, req.user?.username || String(payload.uid), new Date().toISOString()]);
     }
   } catch { }
 }
@@ -156,8 +156,8 @@ function revokeToken(req) {
  *  改密/管理员重置密码/停用账号时调用，配合 verify() 的 tv 比对，使该用户全部旧令牌立即失效。
  *  返回新的 token_version（调用方可在吊销后签发携带新版本号的令牌，实现「本人换新、他人全踢」）。 */
 function bumpTokenVersion(userId) {
-  db.prepare('UPDATE users SET token_version = COALESCE(token_version, 0) + 1 WHERE id=?').run(userId);
-  const r = db.prepare('SELECT token_version FROM users WHERE id=?').get(userId);
+  dal.runq('UPDATE users SET token_version = COALESCE(token_version, 0) + 1 WHERE id=?', [userId]);
+  const r = dal.getq('SELECT token_version FROM users WHERE id=?', [userId]);
   return r ? (r.token_version || 0) : 0;
 }
 
@@ -166,7 +166,7 @@ function bumpTokenVersion(userId) {
 function cleanBlacklist() {
   try {
     const cutoff = new Date(Date.now() - TOKEN_TTL_MS - 3600000).toISOString(); // TTL + 1h 冗余
-    db.prepare('DELETE FROM token_blacklist WHERE created_at < ?').run(cutoff);
+    dal.runq('DELETE FROM token_blacklist WHERE created_at < ?', [cutoff]);
   } catch { /* 表不可用等异常忽略 */ }
 }
 cleanBlacklist();
@@ -207,7 +207,7 @@ function resolveTenantId(req) {
   const seg = host.split('.')[0];
   if (seg && !/^\d+$/.test(seg) && seg !== 'localhost' && seg !== '127') {
     try {
-      const t = db.prepare('SELECT id FROM tenants WHERE name=? AND status=\'active\' LIMIT 1').get(seg);
+      const t = dal.getq('SELECT id FROM tenants WHERE name=? AND status=\'active\' LIMIT 1', [seg]);
       if (t) return { id: t.id, source: 'subdomain' };
     } catch { /* ignore */ }
   }
@@ -217,8 +217,7 @@ function resolveTenantId(req) {
 /** 平台超管旁路强制审计 */
 function auditTenantBypass(req, user, tenantId) {
   try {
-    db.prepare('INSERT INTO security_events (type, detail, action, source, created_at) VALUES (?,?,?,?,datetime(\'now\',\'localtime\'))')
-      .run('tenant_bypass', `平台超管 ${user.username} 跨租户访问 tenant_id=${tenantId}`, String(req.method) + ' ' + String(req.originalUrl || req.url), 'tenant-context');
+    dal.runq('INSERT INTO security_events (type, detail, action, source, created_at) VALUES (?,?,?,?,datetime(\'now\',\'localtime\'))', ['tenant_bypass', `平台超管 ${user.username} 跨租户访问 tenant_id=${tenantId}`, String(req.method) + ' ' + String(req.originalUrl || req.url), 'tenant-context']);
   } catch { /* 审计失败不阻断 */ }
 }
 
@@ -244,7 +243,7 @@ function tenantContext(req, res, next) {
   const payload = verify(readToken(req));
   let user = null;
   if (payload) {
-    try { user = db.prepare('SELECT id, username, role, tenant_id FROM users WHERE id=? AND status=1').get(payload.uid); } catch { user = null; }
+    try { user = dal.getq('SELECT id, username, role, tenant_id FROM users WHERE id=? AND status=1', [payload.uid]); } catch { user = null; }
   }
   if (user && isPlatformSuperadmin(user)) {
     const r = resolveTenantId(req);

@@ -16,6 +16,7 @@
  *  前端不再硬编码工具清单（旧 TOOL_META 仅 4 项已过时），含 P3-2 新增 11 个工具。
  */
 const express = require('express');
+const dal = require('../lib/dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const { db, now } = require('../db');
 const { auth } = require('../lib/auth');
 const { TOOL_DEFS, AGENT_TOOL_DENY, toolRiskOf } = require('../lib/tools');
@@ -86,14 +87,14 @@ function mcpToolRisk(overrides, tool) {
 /* ---------------- 三区聚合 ---------------- */
 router.get('/', async (req, res) => {
   const me = req.user.username;
-  const favSet = new Set(db.prepare('SELECT item_type, item_id FROM market_favorites WHERE username=?').all(me)
+  const favSet = new Set(dal.q('SELECT item_type, item_id FROM market_favorites WHERE username=?', [me])
     .map(f => `${f.item_type}:${f.item_id}`));
 
   // 零区：内置工具（P3-2 融合 2026-11-06）——从 TOOL_DEFS 动态生成（单一事实来源），
   // 排除 AGENT_TOOL_DENY 违禁工具（create_task/local_exec 不进市场）；keyed=key可配标记 +
   // key_configured=当前用户已配置（user_tool_keys join）；risk 用 toolRiskOf 统一口径；
   // params 拆必填/可选两个数组供卡片展示（技能挂载表单与市场卡片共用本结构）
-  const myKeyed = new Set(db.prepare('SELECT tool_name FROM user_tool_keys WHERE username=? AND status=1').all(me).map(r => r.tool_name));
+  const myKeyed = new Set(dal.q('SELECT tool_name FROM user_tool_keys WHERE username=? AND status=1', [me]).map(r => r.tool_name));
   const builtinTools = Object.values(TOOL_DEFS)
     .filter(t => t?.schema?.function?.name && !AGENT_TOOL_DENY.has(t.schema.function.name))
     .map(t => {
@@ -115,15 +116,14 @@ router.get('/', async (req, res) => {
     .sort((a, b) => a.name.localeCompare(b.name));
 
   // 一区：工作流模版（热度优先 use_count DESC, id DESC）
-  const wfTemplates = db.prepare(`SELECT id,slug,name,icon,category,description,scene,use_count,builtin
-    FROM workflow_templates ORDER BY use_count DESC, id DESC`).all()
+  const wfTemplates = dal.q(`SELECT id,slug,name,icon,category,description,scene,use_count,builtin
+    FROM workflow_templates ORDER BY use_count DESC, id DESC`)
     .map(t => ({ ...t, favorited: favSet.has(`wf_template:${t.id}`) }));
 
   // 二区：技能资产（我的全部 + 他人已发布——与 /api/skillassets 可见性口径一致，私有技能不进市场）
   // P3-2 融合：附 mine 标记 + 全字段（prompt/tools/status）——市场页技能资产 tab 现在承担 CRUD（原独立技能页），
   // 列表需渲染详情/编辑/删除/发布开关；私有技能仅 owner 本人可见（原 /api/skillassets 语义不变，这里多带字段）
-  const skillAssets = db.prepare('SELECT id,name,description,icon,owner,status,prompt,tools,manifest,runtime,version,verified,created_at FROM skill_assets WHERE owner=? OR status=1 ORDER BY id DESC')
-    .all(me)
+  const skillAssets = dal.q('SELECT id,name,description,icon,owner,status,prompt,tools,manifest,runtime,version,verified,created_at FROM skill_assets WHERE owner=? OR status=1 ORDER BY id DESC', [me])
     .map(s => {
       let tools = [];
       try { tools = JSON.parse(s.tools || '[]'); } catch { }
@@ -145,7 +145,7 @@ router.get('/', async (req, res) => {
 
   // 三区：MCP 工具（tools_cache 展开每工具一行；停用服务跳过；item_id = server_id:tool_name 供收藏定位）
   const mcpTools = [];
-  for (const s of db.prepare('SELECT id,name,tools_cache,risk_overrides,trusted,status FROM mcp_servers WHERE status=1 ORDER BY id DESC').all()) {
+  for (const s of dal.q('SELECT id,name,tools_cache,risk_overrides,trusted,status FROM mcp_servers WHERE status=1 ORDER BY id DESC')) {
     let tools = [], overrides = {};
     try { tools = JSON.parse(s.tools_cache || '[]'); } catch { }
     try { overrides = JSON.parse(s.risk_overrides || '{}') || {}; } catch { overrides = {}; }
@@ -190,7 +190,7 @@ router.get('/platforms', async (req, res) => {
   const platforms = [];
   const platformErrors = [];
   let allCached = true;
-  const rows = db.prepare('SELECT * FROM platforms').all();
+  const rows = dal.q('SELECT * FROM platforms');
   // Promise.all 结果顺序与 rows 一一对应（按位映射回原平台行），platforms 拼接顺序与原串行版一致，输出确定性不变
   const results = await Promise.all(rows.map(p => loadPlatformApps(p)));
   results.forEach((r, i) => {
@@ -202,7 +202,7 @@ router.get('/platforms', async (req, res) => {
       // V2.3 审查加固（S2-1）：仅真实发生外呼且失败才记 err_logs（原实现缓存命中也写库，
       // 认证用户高频刷本端点可按 R×N 行/秒持续 10 分钟刷出日志洪泛，90 天保留期内磁盘膨胀）
       if (!r.cached) {
-        try { db.prepare('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)').run('skills-market', `异构应用拉取失败（${p.name}）：${r.error}`, now()); } catch { }
+        try { dal.runq('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)', ['skills-market', `异构应用拉取失败（${p.name}）：${r.error}`, now()]); } catch { }
       }
     }
   });
@@ -221,18 +221,18 @@ router.get('/platforms', async (req, res) => {
 /** 查收藏条目的资产当前详情（join 回详情；不可见/已删除返回 available:false） */
 function favItemDetail(itemType, itemId, username) {
   if (itemType === 'wf_template') {
-    const t = db.prepare('SELECT id,slug,name,icon,category,description,scene,use_count,builtin FROM workflow_templates WHERE id=?').get(+itemId);
+    const t = dal.getq('SELECT id,slug,name,icon,category,description,scene,use_count,builtin FROM workflow_templates WHERE id=?', [+itemId]);
     return t ? { available: true, name: t.name, icon: t.icon || '🎨', description: t.description || '', extra: { category: t.category, use_count: t.use_count, builtin: t.builtin } } : { available: false, name: '', icon: '🎨', description: '', extra: {} };
   }
   if (itemType === 'skill_asset') {
     // 可见性口径同市场列表：本人资产或已发布；他人转私有的收藏条目自然变为不可见
-    const s = db.prepare('SELECT id,name,description,icon,owner,status FROM skill_assets WHERE id=? AND (owner=? OR status=1)').get(+itemId, username);
+    const s = dal.getq('SELECT id,name,description,icon,owner,status FROM skill_assets WHERE id=? AND (owner=? OR status=1)', [+itemId, username]);
     return s ? { available: true, name: s.name, icon: s.icon || '✨', description: s.description || '', extra: { owner: s.owner } } : { available: false, name: '', icon: '✨', description: '', extra: {} };
   }
   if (itemType === 'mcp_tool') {
     const [sid, ...rest] = String(itemId).split(':');
     const toolName = rest.join(':'); // 工具名本身可能含冒号，仅按第一个冒号拆分
-    const s = db.prepare('SELECT id,name,tools_cache,trusted,status FROM mcp_servers WHERE id=? AND status=1').get(+sid);
+    const s = dal.getq('SELECT id,name,tools_cache,trusted,status FROM mcp_servers WHERE id=? AND status=1', [+sid]);
     if (!s || !toolName) return { available: false, name: '', icon: '🔧', description: '', extra: {} };
     let tools = [];
     try { tools = JSON.parse(s.tools_cache || '[]'); } catch { }
@@ -243,7 +243,7 @@ function favItemDetail(itemType, itemId, username) {
 }
 
 router.get('/favorites', (req, res) => {
-  const rows = db.prepare('SELECT item_type,item_id,created_at FROM market_favorites WHERE username=? ORDER BY id DESC').all(req.user.username);
+  const rows = dal.q('SELECT item_type,item_id,created_at FROM market_favorites WHERE username=? ORDER BY id DESC', [req.user.username]);
   res.json({
     code: 0,
     data: rows.map(f => {
@@ -260,8 +260,7 @@ router.post('/favorites', (req, res) => {
   if (!id) return res.json({ code: 400, msg: '缺少收藏对象（item_id）' });
   if (!favItemDetail(item_type, id, req.user.username)?.available) return res.json({ code: 400, msg: '收藏对象不存在或已下架' });
   // UNIQUE(username,item_type,item_id) 幂等：重复收藏 = 已收藏，返回成功
-  db.prepare('INSERT OR IGNORE INTO market_favorites (username,item_type,item_id,created_at) VALUES (?,?,?,?)')
-    .run(req.user.username, item_type, id, now());
+  dal.runq('INSERT OR IGNORE INTO market_favorites (username,item_type,item_id,created_at) VALUES (?,?,?,?)', [req.user.username, item_type, id, now()]);
   res.json({ code: 0, msg: '已收藏' });
 });
 
@@ -271,7 +270,7 @@ router.delete('/favorites', (req, res) => {
   const type = item_type || req.query.item_type;
   const id = String(item_id ?? req.query.item_id ?? '');
   if (!FAV_TYPES.includes(type) || !id) return res.json({ code: 400, msg: '缺少取消收藏参数（item_type / item_id）' });
-  db.prepare('DELETE FROM market_favorites WHERE username=? AND item_type=? AND item_id=?').run(req.user.username, type, id);
+  dal.runq('DELETE FROM market_favorites WHERE username=? AND item_type=? AND item_id=?', [req.user.username, type, id]);
   res.json({ code: 0, msg: '已取消收藏' });
 });
 
@@ -284,7 +283,7 @@ router.delete('/favorites', (req, res) => {
 function uniqueAgentName(base) {
   const b = String(base).slice(0, 43);
   let name = `${b}（副本）`;
-  for (let i = 2; db.prepare('SELECT 1 FROM agents WHERE name=?').get(name); i++) name = `${b}（副本${i}）`;
+  for (let i = 2; dal.getq('SELECT 1 FROM agents WHERE name=?', [name]); i++) name = `${b}（副本${i}）`;
   return name;
 }
 
@@ -304,7 +303,7 @@ router.post('/clone', requireFeature('agents'), (req, res) => {
 
   if (item_type === 'skill_asset') {
     // 可见性口径同市场列表（他人私有资产不可克隆）
-    const s = db.prepare('SELECT * FROM skill_assets WHERE id=? AND (owner=? OR status=1)').get(+id, req.user.username);
+    const s = dal.getq('SELECT * FROM skill_assets WHERE id=? AND (owner=? OR status=1)', [+id, req.user.username]);
     if (!s) return res.json({ code: 404, msg: '技能资产不存在或已下架' });
     // 工具白名单（P5.34b 同 skillassets POST 口径：剔除违禁与未知工具）
     let toolIds = [];
@@ -312,32 +311,28 @@ router.post('/clone', requireFeature('agents'), (req, res) => {
     toolIds = toolIds.filter(t => TOOL_DEFS[t] && !AGENT_TOOL_DENY.has(t));
     const name = uniqueAgentName(s.name);
     // 组装 POST /api/agents 同款 payload 后内部直接 db INSERT（不 HTTP 自调）——列与默认值照抄 routes/agents.js POST /
-    const info = db.prepare(`INSERT INTO agents (name,description,type,space_id,category,prompt,user_prompt,model,temperature,top_p,diversity_mode,icon,context_rounds,max_reply,opening,opening_questions,kb_id,status,source,tools,mcp_servers,long_memory,allow_user_model,suggest_enabled,variables,child_ids,routing_mode,owner,created_at,updated_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))`)
-      .run(name, s.description || '', 'digital', db.prepare('SELECT id FROM spaces WHERE type=? AND owner=? LIMIT 1').get('personal', req.user.username)?.id || 0, '技能', s.prompt, '', '', 0.7, 0.7, 'balanced',
+    const info = dal.runq(`INSERT INTO agents (name,description,type,space_id,category,prompt,user_prompt,model,temperature,top_p,diversity_mode,icon,context_rounds,max_reply,opening,opening_questions,kb_id,status,source,tools,mcp_servers,long_memory,allow_user_model,suggest_enabled,variables,child_ids,routing_mode,owner,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))`, [name, s.description || '', 'digital', dal.getq('SELECT id FROM spaces WHERE type=? AND owner=? LIMIT 1', ['personal', req.user.username])?.id || 0, '技能', s.prompt, '', '', 0.7, 0.7, 'balanced',
         String(s.icon || '✨').slice(0, 8), 10, 1024, `您好，我是从技能市场克隆的「${s.name}」，请问有什么可以帮您？`, '[]',
-        null, 'draft', 'self', JSON.stringify(toolIds), '[]', 0, 1, 1, '[]', '[]', 'function', req.user.username);
-    db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-      .run(req.user.username, '市场克隆技能', `${name}（技能：${s.name}，工具：${toolIds.length ? toolIds.join('/') : '纯提示词'}）`, req.ip, now());
+        null, 'draft', 'self', JSON.stringify(toolIds), '[]', 0, 1, 1, '[]', '[]', 'function', req.user.username]);
+    dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '市场克隆技能', `${name}（技能：${s.name}，工具：${toolIds.length ? toolIds.join('/') : '纯提示词'}）`, req.ip, now()]);
     return res.json({ code: 0, msg: `已克隆为「${name}」草稿——去编排页调整提示词后发布`, data: { agent_id: Number(info.lastInsertRowid), name } });
   }
 
   if (item_type === 'wf_template') {
     // 同构复用 routes/wf-templates.js POST /:id/create 的核心（该逻辑在 router 闭包内不可 import，照抄实现并注明出处）：
     // 读模板 workflow → validateWorkflowV2 二次校验 → 创建画布智能体草稿 → use_count+1
-    const t = db.prepare('SELECT * FROM workflow_templates WHERE id=?').get(+id);
+    const t = dal.getq('SELECT * FROM workflow_templates WHERE id=?', [+id]);
     if (!t) return res.json({ code: 404, msg: '模板不存在' });
     const v = validateWorkflowV2(t.workflow);
     if (!v || v.error) return res.json({ code: 500, msg: '模板 workflow 结构异常：' + (v ? v.error : '解析失败') });
     const name = uniqueAgentName(t.name);
-    const info = db.prepare(`INSERT INTO agents (name,description,type,icon,category,model,prompt,workflow,edit_mode,routing_mode,owner,status,created_at,updated_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))`)
-      .run(name, t.description || '', 'digital', t.icon || '🎨', t.category || '通用', '',
+    const info = dal.runq(`INSERT INTO agents (name,description,type,icon,category,model,prompt,workflow,edit_mode,routing_mode,owner,status,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))`, [name, t.description || '', 'digital', t.icon || '🎨', t.category || '通用', '',
         `【工作流模板：${t.name}】${t.description || ''}\n\n使用说明：${t.scene || '按需调整节点参数'}`,
-        JSON.stringify(v), 'canvas', 'workflow', req.user.username, 'draft');
-    db.prepare('UPDATE workflow_templates SET use_count=use_count+1 WHERE id=?').run(t.id);
-    db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-      .run(req.user.username, '市场克隆模板', `${name}（模板：${t.name}，来源：技能市场）`, req.ip, now());
+        JSON.stringify(v), 'canvas', 'workflow', req.user.username, 'draft']);
+    dal.runq('UPDATE workflow_templates SET use_count=use_count+1 WHERE id=?', [t.id]);
+    dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '市场克隆模板', `${name}（模板：${t.name}，来源：技能市场）`, req.ip, now()]);
     return res.json({ code: 0, msg: `已从模板创建「${name}」草稿——去编排页改提示词/知识库后发布`, data: { agent_id: Number(info.lastInsertRowid), name } });
   }
 

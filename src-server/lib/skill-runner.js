@@ -10,6 +10,7 @@
  *   - 输出经 skill-secrets.scrub 二次脱敏（防技能把凭据回显进 stdout/stderr）。
  */
 const { db, now } = require('../db');
+const dal = require('./dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const { runIsolated } = require('./sandbox');
 const sp = require('./skill-package');
 const secrets = require('./skill-secrets');
@@ -64,8 +65,7 @@ async function runSkill(skill, opts = {}) {
   const timeoutMs = Math.max(1000, Number(opts.timeoutMs) || DEFAULT_TIMEOUT_MS);
 
   // 审计行（running 态先落库，终态回写）
-  const info = db.prepare("INSERT INTO skill_runs (skill_id, owner, status, created_at) VALUES (?,?, 'running', ?)")
-    .run(skill.id, owner, now());
+  const info = dal.runq("INSERT INTO skill_runs (skill_id, owner, status, created_at) VALUES (?,?, 'running', ?)", [skill.id, owner, now()]);
   const runId = Number(info.lastInsertRowid);
 
   let result;
@@ -83,14 +83,13 @@ async function runSkill(skill, opts = {}) {
       sessionId: null,
     });
   } catch (e) {
-    db.prepare('UPDATE skill_runs SET status=?, stderr_excerpt=? WHERE id=?').run('failed', String(e.message).slice(0, 1000), runId);
+    dal.runq('UPDATE skill_runs SET status=?, stderr_excerpt=? WHERE id=?', ['failed', String(e.message).slice(0, 1000), runId]);
     return { status: 'failed', error: '执行异常：' + e.message, stdout: '', stderr: '', runId };
   }
 
   const stdout = secrets.scrub(result.stdout || '', maskValues);
   const stderr = secrets.scrub(result.stderr || '', maskValues);
-  db.prepare('UPDATE skill_runs SET status=?, exit_code=?, duration_ms=?, stdout_excerpt=?, stderr_excerpt=? WHERE id=?')
-    .run(result.status, result.exitCode ?? -1, result.durationMs ?? null, stdout.slice(0, 2000), stderr.slice(0, 1000), runId);
+  dal.runq('UPDATE skill_runs SET status=?, exit_code=?, duration_ms=?, stdout_excerpt=?, stderr_excerpt=? WHERE id=?', [result.status, result.exitCode ?? -1, result.durationMs ?? null, stdout.slice(0, 2000), stderr.slice(0, 1000), runId]);
 
   return {
     status: result.status,
@@ -106,8 +105,7 @@ async function runSkill(skill, opts = {}) {
 
 /** 某技能运行历史（归属校验：仅 owner） */
 function runHistory(skillId, owner, limit = 20) {
-  return db.prepare('SELECT id, status, exit_code, duration_ms, stdout_excerpt, stderr_excerpt, created_at FROM skill_runs WHERE skill_id=? AND owner=? ORDER BY id DESC LIMIT ?')
-    .all(skillId, owner, Math.min(100, Math.max(1, limit)));
+  return dal.q('SELECT id, status, exit_code, duration_ms, stdout_excerpt, stderr_excerpt, created_at FROM skill_runs WHERE skill_id=? AND owner=? ORDER BY id DESC LIMIT ?', [skillId, owner, Math.min(100, Math.max(1, limit))]);
 }
 
 module.exports = { runSkill, runHistory };

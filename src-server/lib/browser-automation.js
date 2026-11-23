@@ -20,6 +20,7 @@
  *   - 白名单域名限制（防止 SSRF）
  */
 const { db, now } = require('../db');
+const dal = require('./dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 
 /* ---------- 配置 ---------- */
 const SESSION_TTL = 120 * 1000; // 会话 2 分钟无操作自动关闭
@@ -56,8 +57,7 @@ async function launchSession() {
   const sessionId = 'br-' + Date.now() + '-' + (++sessionCounter);
   ACTIVE_SESSIONS.set(sessionId, { browser, page, createdAt: Date.now() });
   // 记录
-  db.prepare(`INSERT INTO browser_automations (session_id,action,status,created_by,created_at) VALUES (?,'launch','done',?,?)`)
-    .run(sessionId, 'system', now());
+  dal.runq(`INSERT INTO browser_automations (session_id,action,status,created_by,created_at) VALUES (?,'launch','done',?,?)`, [sessionId, 'system', now()]);
   return { session_id: sessionId };
 }
 
@@ -81,8 +81,7 @@ async function navigate(sessionId, url) {
   const session = getSession(sessionId);
   session.lastUsed = Date.now();
   await session.page.goto(url, { waitUntil: 'networkidle', timeout: NAV_TIMEOUT });
-  db.prepare(`INSERT INTO browser_automations (session_id,url,action,action_input,status,created_by,created_at) VALUES (?,?,?,?,?,?,?)`)
-    .run(sessionId, url.slice(0, 500), 'navigate', url.slice(0, 500), 'done', 'system', now());
+  dal.runq(`INSERT INTO browser_automations (session_id,url,action,action_input,status,created_by,created_at) VALUES (?,?,?,?,?,?,?)`, [sessionId, url.slice(0, 500), 'navigate', url.slice(0, 500), 'done', 'system', now()]);
   return { ok: true, title: await session.page.title() };
 }
 
@@ -92,8 +91,7 @@ async function screenshot(sessionId) {
   session.lastUsed = Date.now();
   const buf = await session.page.screenshot({ type: 'png' });
   const b64 = buf.toString('base64');
-  db.prepare(`INSERT INTO browser_automations (session_id,action,action_result,status,created_by,created_at) VALUES (?,'screenshot',?,'done',?,?)`)
-    .run(sessionId, 'screenshot 完成', 'system', now());
+  dal.runq(`INSERT INTO browser_automations (session_id,action,action_result,status,created_by,created_at) VALUES (?,'screenshot',?,'done',?,?)`, [sessionId, 'screenshot 完成', 'system', now()]);
   return { base64: b64, size: buf.length };
 }
 
@@ -102,8 +100,7 @@ async function click(sessionId, selector) {
   const session = getSession(sessionId);
   session.lastUsed = Date.now();
   await session.page.click(selector);
-  db.prepare(`INSERT INTO browser_automations (session_id,action,action_input,status,created_by,created_at) VALUES (?,'click',?,'done',?,?)`)
-    .run(sessionId, selector, 'system', now());
+  dal.runq(`INSERT INTO browser_automations (session_id,action,action_input,status,created_by,created_at) VALUES (?,'click',?,'done',?,?)`, [sessionId, selector, 'system', now()]);
   return { ok: true };
 }
 
@@ -112,8 +109,7 @@ async function typeText(sessionId, selector, text) {
   const session = getSession(sessionId);
   session.lastUsed = Date.now();
   await session.page.fill(selector, text);
-  db.prepare(`INSERT INTO browser_automations (session_id,action,action_input,status,created_by,created_at) VALUES (?,'type',?,'done',?,?)`)
-    .run(sessionId, JSON.stringify({ selector, text: text.slice(0, 100) }), 'system', now());
+  dal.runq(`INSERT INTO browser_automations (session_id,action,action_input,status,created_by,created_at) VALUES (?,'type',?,'done',?,?)`, [sessionId, JSON.stringify({ selector, text: text.slice(0, 100) }), 'system', now()]);
   return { ok: true };
 }
 
@@ -132,8 +128,7 @@ async function closeSession(sessionId) {
     await session.browser.close();
   } catch { /* 静默 */ }
   ACTIVE_SESSIONS.delete(sessionId);
-  db.prepare(`INSERT INTO browser_automations (session_id,action,status,created_by,created_at) VALUES (?,'close','done',?,?)`)
-    .run(sessionId, 'system', now());
+  dal.runq(`INSERT INTO browser_automations (session_id,action,status,created_by,created_at) VALUES (?,'close','done',?,?)`, [sessionId, 'system', now()]);
   return { ok: true };
 }
 

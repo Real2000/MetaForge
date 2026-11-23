@@ -40,6 +40,7 @@
  *       不依赖任何外部网关，供自动化冒烟测试稳定验证协议与打断语义。
  */
 const { WebSocketServer } = require('ws');
+const dal = require('./dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const path = require('path');
 const fs = require('fs');
 const { db, now } = require('../db');
@@ -70,7 +71,7 @@ function wsUser(req) {
   try {
     const payload = verify(readToken(req));
     if (!payload || !payload.uid) return null;
-    return db.prepare('SELECT id, username, nickname, role FROM users WHERE id=? AND status=1').get(payload.uid) || null;
+    return dal.getq('SELECT id, username, nickname, role FROM users WHERE id=? AND status=1', [payload.uid]) || null;
   } catch { return null; }
 }
 

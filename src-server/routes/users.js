@@ -10,6 +10,7 @@
  *    名下智能体回收给该租户 admin（平台资产不随账号消失）。
  */
 const express = require('express');
+const dal = require('../lib/dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const { db, hashPwd, now } = require('../db');
 const { auth, adminOnly, bumpTokenVersion, isPlatformSuperadmin } = require('../lib/auth');
 
@@ -47,7 +48,7 @@ function canManage(req, target) {
 function normalizeDeptId(v) {
   const n = Number(v);
   if (v == null || v === '' || !Number.isInteger(n) || n < 1) return null;
-  return db.prepare('SELECT 1 FROM departments WHERE id=?').get(n) ? n : null;
+  return dal.getq('SELECT 1 FROM departments WHERE id=?', [n]) ? n : null;
 }
 
 // 除密码外的用户档案（列表/编辑回显）；V1.2 #2 补 dept_id；MT-08 补 tenant_id/platform_admin
@@ -57,9 +58,9 @@ router.get('/', (req, res) => {
   const tid = scopedTenantId(req);
   let rows;
   if (tid == null) {
-    rows = db.prepare(`SELECT ${PROFILE_COLS} FROM users ORDER BY tenant_id, role='admin' DESC, id`).all();
+    rows = dal.q(`SELECT ${PROFILE_COLS} FROM users ORDER BY tenant_id, role='admin' DESC, id`);
   } else {
-    rows = db.prepare(`SELECT ${PROFILE_COLS} FROM users WHERE tenant_id=? ORDER BY role='admin' DESC, id`).all(tid);
+    rows = dal.q(`SELECT ${PROFILE_COLS} FROM users WHERE tenant_id=? ORDER BY role='admin' DESC, id`, [tid]);
   }
   res.json({ code: 0, data: rows });
 });
@@ -69,7 +70,7 @@ router.post('/', (req, res) => {
   const { username, nickname, role, dept, dept_id, password, platform_admin } = req.body || {};
   const uname = String(username || '').trim();
   if (!USERNAME_RE.test(uname)) return res.json({ code: 400, msg: '用户名需 3~20 位字母/数字/下划线' });
-  if (db.prepare('SELECT id FROM users WHERE username=?').get(uname)) return res.json({ code: 400, msg: '用户名已存在' });
+  if (dal.getq('SELECT id FROM users WHERE username=?', [uname])) return res.json({ code: 400, msg: '用户名已存在' });
   const pwdErr = validPwd(password);
   if (pwdErr) return res.json({ code: 400, msg: pwdErr });
   const r = role === 'admin' ? 'admin' : 'user';
@@ -81,20 +82,18 @@ router.post('/', (req, res) => {
     tid = req.user.tenant_id || 1;
   }
   if (!Number.isFinite(tid) || tid < 1) return res.json({ code: 400, msg: '目标租户无效' });
-  if (!db.prepare('SELECT 1 FROM tenants WHERE id=?').get(tid)) return res.json({ code: 400, msg: '目标租户不存在' });
+  if (!dal.getq('SELECT 1 FROM tenants WHERE id=?', [tid])) return res.json({ code: 400, msg: '目标租户不存在' });
   // 平台超管标记仅平台超管可授予
   const pAdmin = (isPlatformSuperadmin(req.user) && platform_admin) ? 1 : 0;
   const deptId = normalizeDeptId(dept_id);
-  const info = db.prepare('INSERT INTO users (username,password,nickname,role,dept,dept_id,status,must_change_pwd,created_at,tenant_id,platform_admin) VALUES (?,?,?,?,?,?,1,1,?,?,?)')
-    .run(uname, hashPwd(password), String(nickname || uname).slice(0, 30), r, String(dept || '').slice(0, 30), deptId, now(), tid, pAdmin);
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(req.user.username, '新增用户', `${uname}（${r === 'admin' ? '管理员' : '普通用户'}${dept ? '·' + dept : ''}，租户#${tid}，首登强制改密）`, req.ip, now());
+  const info = dal.runq('INSERT INTO users (username,password,nickname,role,dept,dept_id,status,must_change_pwd,created_at,tenant_id,platform_admin) VALUES (?,?,?,?,?,?,1,1,?,?,?)', [uname, hashPwd(password), String(nickname || uname).slice(0, 30), r, String(dept || '').slice(0, 30), deptId, now(), tid, pAdmin]);
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '新增用户', `${uname}（${r === 'admin' ? '管理员' : '普通用户'}${dept ? '·' + dept : ''}，租户#${tid}，首登强制改密）`, req.ip, now()]);
   res.json({ code: 0, data: { id: info.lastInsertRowid } });
 });
 
 // 编辑用户：昵称 / 角色 / 部门 / 启停
 router.put('/:id', (req, res) => {
-  const target = db.prepare(`SELECT ${PROFILE_COLS} FROM users WHERE id=?`).get(req.params.id);
+  const target = dal.getq(`SELECT ${PROFILE_COLS} FROM users WHERE id=?`, [req.params.id]);
   if (!target) return res.json({ code: 404, msg: '用户不存在' });
   if (!canManage(req, target)) return res.json({ code: 403, msg: '仅可管理本租户用户' });
   const { nickname, role, dept, dept_id, status, platform_admin } = req.body || {};
@@ -107,7 +106,7 @@ router.put('/:id', (req, res) => {
   if (isSelf && newStatus === 0) return res.json({ code: 400, msg: '不能停用自己的账号' });
   // MT-08：本租户至少保留一名可用管理员
   if (target.role === 'admin' && (newRole !== 'admin' || newStatus === 0)) {
-    const others = db.prepare("SELECT COUNT(*) c FROM users WHERE role='admin' AND status=1 AND id != ? AND tenant_id=?").get(target.id, target.tenant_id || 1).c;
+    const others = dal.getq("SELECT COUNT(*) c FROM users WHERE role='admin' AND status=1 AND id != ? AND tenant_id=?", [target.id, target.tenant_id || 1]).c;
     if (others === 0) return res.json({ code: 400, msg: '该租户至少需要保留一名可用管理员' });
   }
   // MT-08：平台超管标记变更——仅平台超管可操作，且平台至少保留一名平台超管
@@ -115,14 +114,13 @@ router.put('/:id', (req, res) => {
   if (platform_admin != null && isPlatformSuperadmin(req.user)) {
     newPAdmin = platform_admin ? 1 : 0;
     if (target.platform_admin === 1 && newPAdmin === 0) {
-      const others = db.prepare("SELECT COUNT(*) c FROM users WHERE COALESCE(platform_admin,0)=1 AND status=1 AND id != ?").get(target.id).c;
+      const others = dal.getq("SELECT COUNT(*) c FROM users WHERE COALESCE(platform_admin,0)=1 AND status=1 AND id != ?", [target.id]).c;
       if (others === 0) return res.json({ code: 400, msg: '平台至少需要保留一名平台超管' });
     }
   }
   // V1.2 #2：dept_id 绑定——未传保留原值；显式传 null/非法 id 归 NULL；前端部门树下拉会与 dept 文本同时提交
   const newDeptId = dept_id === undefined ? (target.dept_id ?? null) : normalizeDeptId(dept_id);
-  db.prepare('UPDATE users SET nickname=?,role=?,dept=?,dept_id=?,status=?,platform_admin=? WHERE id=?')
-    .run(String(nickname ?? target.nickname).slice(0, 30), newRole, String(dept ?? target.dept).slice(0, 30), newDeptId, newStatus, newPAdmin, target.id);
+  dal.runq('UPDATE users SET nickname=?,role=?,dept=?,dept_id=?,status=?,platform_admin=? WHERE id=?', [String(nickname ?? target.nickname).slice(0, 30), newRole, String(dept ?? target.dept).slice(0, 30), newDeptId, newStatus, newPAdmin, target.id]);
   // SEC-07：停用账号即吊销其全部令牌（token_version +1），在线会话立即失效
   if (newStatus === 0 && target.status !== 0) bumpTokenVersion(target.id);
   const changes = [];
@@ -130,60 +128,57 @@ router.put('/:id', (req, res) => {
   if (newStatus !== target.status) changes.push(newStatus === 0 ? '停用' : '启用');
   if (newPAdmin !== target.platform_admin) changes.push(newPAdmin ? '授予平台超管' : '撤销平台超管');
   if (String(dept ?? target.dept) !== target.dept || newDeptId !== (target.dept_id ?? null)) changes.push('部门调整');
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(req.user.username, '编辑用户', `${target.username}${changes.length ? '：' + changes.join('、') : '（资料更新）'}`, req.ip, now());
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '编辑用户', `${target.username}${changes.length ? '：' + changes.join('、') : '（资料更新）'}`, req.ip, now()]);
   res.json({ code: 0, msg: '已保存' });
 });
 
 // 管理员重置密码：成功后该用户首登强制改密（不记录密码明文）
 router.put('/:id/reset-password', (req, res) => {
-  const target = db.prepare('SELECT id, username, tenant_id FROM users WHERE id=?').get(req.params.id);
+  const target = dal.getq('SELECT id, username, tenant_id FROM users WHERE id=?', [req.params.id]);
   if (!target) return res.json({ code: 404, msg: '用户不存在' });
   if (!canManage(req, target)) return res.json({ code: 403, msg: '仅可管理本租户用户' });
   const pwdErr = validPwd((req.body || {}).newPwd);
   if (pwdErr) return res.json({ code: 400, msg: pwdErr });
-  db.prepare('UPDATE users SET password=?, must_change_pwd=1 WHERE id=?').run(hashPwd((req.body || {}).newPwd), target.id);
+  dal.runq('UPDATE users SET password=?, must_change_pwd=1 WHERE id=?', [hashPwd((req.body || {}).newPwd), target.id]);
   bumpTokenVersion(target.id);
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(req.user.username, '重置密码', `${target.username}（该用户下次登录需强制修改密码，已踢出其它登录端）`, req.ip, now());
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '重置密码', `${target.username}（该用户下次登录需强制修改密码，已踢出其它登录端）`, req.ip, now()]);
   res.json({ code: 0, msg: `已重置 ${target.username} 的密码，其下次登录将要求修改` });
 });
 
 // 删除用户：事务清理名下数据；名下智能体回收给本租户 admin
 router.delete('/:id', (req, res) => {
-  const target = db.prepare('SELECT id, username, role, tenant_id, COALESCE(platform_admin,0) AS platform_admin FROM users WHERE id=?').get(req.params.id);
+  const target = dal.getq('SELECT id, username, role, tenant_id, COALESCE(platform_admin,0) AS platform_admin FROM users WHERE id=?', [req.params.id]);
   if (!target) return res.json({ code: 404, msg: '用户不存在' });
   if (!canManage(req, target)) return res.json({ code: 403, msg: '仅可管理本租户用户' });
   if (target.id === req.user.id) return res.json({ code: 400, msg: '不能删除自己的账号' });
   if (target.role === 'admin') {
-    const others = db.prepare("SELECT COUNT(*) c FROM users WHERE role='admin' AND status=1 AND id != ? AND tenant_id=?").get(target.id, target.tenant_id || 1).c;
+    const others = dal.getq("SELECT COUNT(*) c FROM users WHERE role='admin' AND status=1 AND id != ? AND tenant_id=?", [target.id, target.tenant_id || 1]).c;
     if (others === 0) return res.json({ code: 400, msg: '该租户至少需要保留一名可用管理员' });
   }
   if (target.platform_admin === 1) {
-    const others = db.prepare("SELECT COUNT(*) c FROM users WHERE COALESCE(platform_admin,0)=1 AND status=1 AND id != ?").get(target.id).c;
+    const others = dal.getq("SELECT COUNT(*) c FROM users WHERE COALESCE(platform_admin,0)=1 AND status=1 AND id != ?", [target.id]).c;
     if (others === 0) return res.json({ code: 400, msg: '平台至少需要保留一名平台超管' });
   }
   const tid = target.tenant_id || 1;
   db.transaction((uid, uname) => {
-    const sids = db.prepare('SELECT id FROM sessions WHERE username=?').all(uname).map(r => r.id);
+    const sids = dal.q('SELECT id FROM sessions WHERE username=?', [uname]).map(r => r.id);
     if (sids.length) {
       const inClause = sids.map(() => '?').join(',');
-      db.prepare(`DELETE FROM messages WHERE session_id IN (${inClause})`).run(...sids);
-      db.prepare(`DELETE FROM chat_traces WHERE session_id IN (${inClause})`).run(...sids);
+      dal.runq(`DELETE FROM messages WHERE session_id IN (${inClause})`, [...sids]);
+      dal.runq(`DELETE FROM chat_traces WHERE session_id IN (${inClause})`, [...sids]);
     }
-    db.prepare('DELETE FROM sessions WHERE username=?').run(uname);
-    db.prepare('DELETE FROM favorites WHERE username=?').run(uname);
-    db.prepare('DELETE FROM notification_reads WHERE username=?').run(uname);
-    db.prepare('DELETE FROM agent_memories WHERE username=?').run(uname);
-    db.prepare('DELETE FROM user_providers WHERE username=?').run(uname);
-    db.prepare('DELETE FROM skill_assets WHERE owner=?').run(uname);
+    dal.runq('DELETE FROM sessions WHERE username=?', [uname]);
+    dal.runq('DELETE FROM favorites WHERE username=?', [uname]);
+    dal.runq('DELETE FROM notification_reads WHERE username=?', [uname]);
+    dal.runq('DELETE FROM agent_memories WHERE username=?', [uname]);
+    dal.runq('DELETE FROM user_providers WHERE username=?', [uname]);
+    dal.runq('DELETE FROM skill_assets WHERE owner=?', [uname]);
     // 名下智能体回收给本租户 admin（取该租户首个管理员，缺省回落 admin）
-    const tAdmin = db.prepare("SELECT username FROM users WHERE role='admin' AND tenant_id=? ORDER BY id LIMIT 1").get(tid);
-    db.prepare('UPDATE agents SET owner=? WHERE owner=?').run(tAdmin ? tAdmin.username : 'admin', uname);
-    db.prepare('DELETE FROM users WHERE id=?').run(uid);
+    const tAdmin = dal.getq("SELECT username FROM users WHERE role='admin' AND tenant_id=? ORDER BY id LIMIT 1", [tid]);
+    dal.runq('UPDATE agents SET owner=? WHERE owner=?', [tAdmin ? tAdmin.username : 'admin', uname]);
+    dal.runq('DELETE FROM users WHERE id=?', [uid]);
   })(target.id, target.username);
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(req.user.username, '删除用户', `${target.username}（会话/收藏/记忆/自有模型源/技能已清理，名下智能体回收给租户管理员）`, req.ip, now());
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '删除用户', `${target.username}（会话/收藏/记忆/自有模型源/技能已清理，名下智能体回收给租户管理员）`, req.ip, now()]);
   res.json({ code: 0, msg: '已删除' });
 });
 

@@ -5,6 +5,7 @@
  *  - 工具消费：lib/tools-market.js getUserToolKey 按 ctx.username 读取解密（对话主链路带 username；未配置走免费公共源兜底）
  */
 const express = require('express');
+const dal = require('../lib/dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const { db, now } = require('../db');
 const { auth } = require('../lib/auth');
 const { encrypt, decrypt } = require('../lib/crypto-util');
@@ -23,7 +24,7 @@ function maskKey(k) {
 
 /** 可配工具清单（前端渲染用）：合并已登记状态 */
 router.get('/meta', (req, res) => {
-  const rows = db.prepare('SELECT tool_name FROM user_tool_keys WHERE username=?').all(req.user.username);
+  const rows = dal.q('SELECT tool_name FROM user_tool_keys WHERE username=?', [req.user.username]);
   const registered = new Set(rows.map(r => r.tool_name));
   res.json({
     code: 0,
@@ -37,7 +38,7 @@ router.get('/meta', (req, res) => {
 
 /** 本人 Key 列表（掩码回显，绝不回明文） */
 router.get('/', (req, res) => {
-  const rows = db.prepare('SELECT id, tool_name, api_key, note, status, created_at FROM user_tool_keys WHERE username=? ORDER BY id').all(req.user.username);
+  const rows = dal.q('SELECT id, tool_name, api_key, note, status, created_at FROM user_tool_keys WHERE username=? ORDER BY id', [req.user.username]);
   res.json({
     code: 0,
     data: rows.map(r => ({
@@ -56,35 +57,32 @@ router.post('/', (req, res) => {
     return res.json({ code: 400, msg: `不支持的工具：${tool_name || '(空)'}（可配：${Object.keys(KEYED_TOOLS).join(' / ')}）` });
   }
   if (!api_key || !String(api_key).trim()) return res.json({ code: 400, msg: 'API Key 不能为空' });
-  const dup = db.prepare('SELECT id FROM user_tool_keys WHERE username=? AND tool_name=?').get(req.user.username, tool_name);
+  const dup = dal.getq('SELECT id FROM user_tool_keys WHERE username=? AND tool_name=?', [req.user.username, tool_name]);
   if (dup) return res.json({ code: 400, msg: '该工具已配置过 Key，请直接编辑' });
-  const info = db.prepare('INSERT INTO user_tool_keys (username,tool_name,api_key,note,status,created_at) VALUES (?,?,?,?,1,?)')
-    .run(req.user.username, tool_name, encrypt(String(api_key).trim()), String(note || '').slice(0, 100), now());
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(req.user.username, '配置工具 API Key', `${KEYED_TOOLS[tool_name].label}`, req.ip, now());
+  const info = dal.runq('INSERT INTO user_tool_keys (username,tool_name,api_key,note,status,created_at) VALUES (?,?,?,?,1,?)', [req.user.username, tool_name, encrypt(String(api_key).trim()), String(note || '').slice(0, 100), now()]);
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '配置工具 API Key', `${KEYED_TOOLS[tool_name].label}`, req.ip, now()]);
   res.json({ code: 0, data: { id: info.lastInsertRowid } });
 });
 
 /** 编辑（Key 掩码/空保留旧值——与 usermodels 同一套编辑保护语义） */
 router.put('/:id', (req, res) => {
-  const old = db.prepare('SELECT * FROM user_tool_keys WHERE id=? AND username=?').get(req.params.id, req.user.username);
+  const old = dal.getq('SELECT * FROM user_tool_keys WHERE id=? AND username=?', [req.params.id, req.user.username]);
   if (!old) return res.json({ code: 404, msg: '工具 Key 记录不存在' });
   const { api_key, note, status } = req.body || {};
   const keepKey = (api_key == null || api_key === '' || String(api_key).includes('****')) ? old.api_key : encrypt(String(api_key).trim());
-  db.prepare('UPDATE user_tool_keys SET api_key=?,note=?,status=? WHERE id=?')
-    .run(keepKey, note == null ? old.note : String(note).slice(0, 100), status == null ? old.status : (status ? 1 : 0), old.id);
+  dal.runq('UPDATE user_tool_keys SET api_key=?,note=?,status=? WHERE id=?', [keepKey, note == null ? old.note : String(note).slice(0, 100), status == null ? old.status : (status ? 1 : 0), old.id]);
   res.json({ code: 0, msg: '已保存' });
 });
 
 /** 删除 */
 router.delete('/:id', (req, res) => {
-  db.prepare('DELETE FROM user_tool_keys WHERE id=? AND username=?').run(req.params.id, req.user.username);
+  dal.runq('DELETE FROM user_tool_keys WHERE id=? AND username=?', [req.params.id, req.user.username]);
   res.json({ code: 0, msg: '已删除' });
 });
 
 /** 连通测试：按工具走对应供应商的免费校验端点（只验鉴权不花额度） */
 router.post('/:id/test', async (req, res) => {
-  const old = db.prepare('SELECT * FROM user_tool_keys WHERE id=? AND username=?').get(req.params.id, req.user.username);
+  const old = dal.getq('SELECT * FROM user_tool_keys WHERE id=? AND username=?', [req.params.id, req.user.username]);
   if (!old) return res.json({ code: 404, msg: '工具 Key 记录不存在' });
   const plainKey = decrypt(old.api_key);
   if (!plainKey) return res.json({ code: 0, data: { ok: false, msg: '❌ 未配置 Key' } });

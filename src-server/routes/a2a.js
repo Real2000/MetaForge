@@ -15,6 +15,7 @@
  *   - /api/a2a/* 需要 Bearer Token（与 MCP Server 共享 mcp_tokens 表或独立 a2a_tokens）
  */
 const express = require('express');
+const dal = require('../lib/dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const { db, now } = require('../db');
 const { PLATFORM_VERSION } = require('../lib/version'); // BE-B4：版本单一来源
 const { runAgent } = require('../lib/workflow');
@@ -78,7 +79,7 @@ function buildAgentCard(agent) {
 /* ---------- /.well-known/agent-card.json（公开） ---------- */
 
 publicRouter.get('/.well-known/agent-card.json', (req, res) => {
-  const agents = db.prepare("SELECT id,name,description,icon,tools,workflow,published_workflow,status,updated_at,created_at FROM agents WHERE status='published'").all();
+  const agents = dal.q("SELECT id,name,description,icon,tools,workflow,published_workflow,status,updated_at,created_at FROM agents WHERE status='published'");
   const cards = agents.map(a => buildAgentCard(a));
   res.json({
     schema: 'agent-card-v1',
@@ -148,7 +149,7 @@ function a2aAuth(req, res, next) {
   // ① 平台用户 token（既有通道，最高优先）
   const payload = verify(token);
   if (payload && payload.typ !== a2aOauth.TOKEN_TYP) {
-    const user = db.prepare('SELECT id, username, nickname, role, dept, dept_id, onboarded FROM users WHERE id=? AND status=1').get(payload.uid);
+    const user = dal.getq('SELECT id, username, nickname, role, dept, dept_id, onboarded FROM users WHERE id=? AND status=1', [payload.uid]);
     if (user) { req.user = user; req.authMethod = 'platform'; return next(); }
   }
 
@@ -200,7 +201,7 @@ authRouter.use(a2aAuth);
 
 // 单个智能体的 Agent Card
 authRouter.get('/agents/:id/card', requireScope('a2a:read'), (req, res) => {
-  const agent = db.prepare('SELECT * FROM agents WHERE id=? AND status=?').get(req.params.id, 'published');
+  const agent = dal.getq('SELECT * FROM agents WHERE id=? AND status=?', [req.params.id, 'published']);
   if (!agent) return res.json({ code: 404, msg: '智能体不存在或未发布' });
   res.json({ code: 0, data: buildAgentCard(agent) });
 });
@@ -209,7 +210,7 @@ authRouter.get('/agents/:id/card', requireScope('a2a:read'), (req, res) => {
 authRouter.post('/tasks', requireScope('a2a:call'), async (req, res) => {
   const { agent_id, input, session_id, metadata } = req.body || {};
   if (!agent_id) return res.json({ code: 400, msg: '请指定 agent_id' });
-  const agent = db.prepare('SELECT * FROM agents WHERE id=? AND status=?').get(agent_id, 'published');
+  const agent = dal.getq('SELECT * FROM agents WHERE id=? AND status=?', [agent_id, 'published']);
   if (!agent) return res.json({ code: 404, msg: '智能体不存在或未发布' });
   const taskId = 'a2a-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6);
   // 归属解析：平台用户用其用户名；签名调用方用密钥归属
@@ -219,25 +220,24 @@ authRouter.post('/tasks', requireScope('a2a:call'), async (req, res) => {
     ...(req.a2aCaller ? { caller_kid: req.a2aCaller.kid, caller_org: req.a2aCaller.org } : {}),
   });
   // 记录 A2A 任务 start
-  db.prepare(`INSERT INTO a2a_tasks (task_id, agent_id, agent_name, input, status, meta, created_by, created_at, updated_at)
-    VALUES (?,?,?,?,'submitted',?,?,?,?)`)
-    .run(taskId, agent_id, agent.name, JSON.stringify(input || ''), JSON.stringify(meta), createdBy, now(), now());
+  dal.runq(`INSERT INTO a2a_tasks (task_id, agent_id, agent_name, input, status, meta, created_by, created_at, updated_at)
+    VALUES (?,?,?,?,'submitted',?,?,?,?)`, [taskId, agent_id, agent.name, JSON.stringify(input || ''), JSON.stringify(meta), createdBy, now(), now()]);
   // 返回 task_id，执行异步
   res.json({ code: 0, data: { task_id: taskId, status: 'submitted' } });
   // 异步执行
   try {
-    db.prepare("UPDATE a2a_tasks SET status='working', updated_at=? WHERE task_id=?").run(now(), taskId);
+    dal.runq("UPDATE a2a_tasks SET status='working', updated_at=? WHERE task_id=?", [now(), taskId]);
     const r = await runAgent(agent, String(input?.message || input?.text || input || ''), { triggerType: 'a2a', sessionId: session_id });
     const output = { text: r.text || r };
-    db.prepare("UPDATE a2a_tasks SET status='completed', output=?, updated_at=? WHERE task_id=?").run(JSON.stringify(output), now(), taskId);
+    dal.runq("UPDATE a2a_tasks SET status='completed', output=?, updated_at=? WHERE task_id=?", [JSON.stringify(output), now(), taskId]);
   } catch (e) {
-    db.prepare("UPDATE a2a_tasks SET status='failed', error=?, updated_at=? WHERE task_id=?").run(String(e.message).slice(0, 500), now(), taskId);
+    dal.runq("UPDATE a2a_tasks SET status='failed', error=?, updated_at=? WHERE task_id=?", [String(e.message).slice(0, 500), now(), taskId]);
   }
 });
 
 // 查询任务状态
 authRouter.get('/tasks/:id', (req, res) => {
-  const task = db.prepare('SELECT * FROM a2a_tasks WHERE task_id=?').get(req.params.id);
+  const task = dal.getq('SELECT * FROM a2a_tasks WHERE task_id=?', [req.params.id]);
   if (!task) return res.json({ code: 404, msg: '任务不存在' });
   // 签名调用方仅可查看自身创建的任务
   if (req.a2aCaller && task.created_by !== req.a2aCaller.owner) {
@@ -255,7 +255,7 @@ authRouter.get('/tasks', (req, res) => {
   if (req.a2aCaller) { sql += ' AND created_by=?'; args.push(req.a2aCaller.owner); } // 签名调用方仅见自身任务
   sql += ' ORDER BY id DESC LIMIT ? OFFSET ?';
   args.push(+pageSize, (+page - 1) * +pageSize);
-  const rows = db.prepare(sql).all(...args);
+  const rows = dal.q(sql, [...args]);
   res.json({ code: 0, data: { list: rows, page: +page, pageSize: +pageSize } });
 });
 

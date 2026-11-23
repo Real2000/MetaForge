@@ -7,6 +7,7 @@
  * 逐个已配置供应商尝试（默认优先），避免切换默认供应商后技能断裂。
  */
 const fs = require('fs');
+const dal = require('./dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const path = require('path');
 const { db, now } = require('../db');
 const { chatOnce, getConfiguredProviders, postModel } = require('./llm');
@@ -105,8 +106,7 @@ async function createVideoTask(prompt, seconds = 4, aspectRatio = '16:9', owner 
       if (!res.ok || !j.task_id) throw new Error(j.error || 'HTTP ' + res.status);
       rememberVideoProvider(j.task_id, p); // 记住归属，后续查询/拉内容直连该供应商
       rememberVideoOwner(j.task_id, owner);  // P3-5：记住任务归属用户（owner 为空则不记录，兼容旧调用方）
-      db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-        .run('system', '视频生成任务', `minimax h3 ${secs}s ${ratio} @ ${p.name}（task ${String(j.task_id).slice(0, 20)}）`, '', now());
+      dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', ['system', '视频生成任务', `minimax h3 ${secs}s ${ratio} @ ${p.name}（task ${String(j.task_id).slice(0, 20)}）`, '', now()]);
       return { taskId: j.task_id, model: j.model, seconds: secs, aspectRatio: ratio, status: j.status || 'queued', progress: j.progress || 0, price: j.price };
     } catch (e) { errs.push(`${p.name}：${e.message}`); }
   }

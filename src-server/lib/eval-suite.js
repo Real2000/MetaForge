@@ -19,6 +19,7 @@
  */
 
 const { db, now } = require('../db');
+const dal = require('./dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 
 /* ============================ 常量 / 目标线 ============================ */
 
@@ -335,11 +336,11 @@ function captureFromTelemetry(agentId) {
   const aid = Number(agentId);
   if (!Number.isFinite(aid) || aid <= 0) return { cases: [], metrics: computeMetrics([]) };
   // 任务成功率：该智能体已反馈（solved 非 0）的助手消息；solved=1 通过、solved=2 未解决
-  const solvedRows = db.prepare(`SELECT m.solved AS solved
+  const solvedRows = dal.q(`SELECT m.solved AS solved
     FROM messages m JOIN sessions s ON s.id=m.session_id
-    WHERE s.agent_id=? AND m.role='assistant' AND m.solved IN (1,2)`).all(aid);
+    WHERE s.agent_id=? AND m.role='assistant' AND m.solved IN (1,2)`, [aid]);
   // 步数 / 人工干预：chat_traces 一次对话一行（tool_calls 长度=步数；blocked 非空=被安全阻断=需干预）
-  const traces = db.prepare('SELECT tool_calls, blocked FROM chat_traces WHERE agent_id=? LIMIT 1000').all(aid);
+  const traces = dal.q('SELECT tool_calls, blocked FROM chat_traces WHERE agent_id=? LIMIT 1000', [aid]);
   const cases = [];
   for (const r of solvedRows) {
     cases.push(normalizeCase({ id: 'solved', passed: Number(r.solved) === 1, score: Number(r.solved) === 1 ? 1 : 0 }));
@@ -353,8 +354,7 @@ function captureFromTelemetry(agentId) {
 
 /** 同套件上一条基线（不含本条） */
 function prevBaseline(suite, suiteType, beforeId) {
-  return db.prepare(`SELECT * FROM eval_baselines WHERE suite=? AND suite_type=? AND id < ? ORDER BY id DESC LIMIT 1`)
-    .get(suite, suiteType || 'agent', Number(beforeId) || 1e15) || null;
+  return dal.getq(`SELECT * FROM eval_baselines WHERE suite=? AND suite_type=? AND id < ? ORDER BY id DESC LIMIT 1`, [suite, suiteType || 'agent', Number(beforeId) || 1e15]) || null;
 }
 
 /** 规范化基线行（补指标对象 + 与上一条对比） */
@@ -399,7 +399,7 @@ function createBaseline(opts) {
   const o = opts || {};
   let cases = Array.isArray(o.cases) ? o.cases.map(normalizeCase) : [];
   if (!cases.length && o.evaluation_id != null) {
-    const ev = db.prepare('SELECT * FROM evaluations WHERE id=?').get(Number(o.evaluation_id));
+    const ev = dal.getq('SELECT * FROM evaluations WHERE id=?', [Number(o.evaluation_id)]);
     if (ev) {
       let detail = [];
       try { detail = JSON.parse(ev.result || '[]'); } catch { detail = []; }
@@ -408,16 +408,16 @@ function createBaseline(opts) {
   }
   const metrics = computeMetrics(cases);
   const trimmed = cases.slice(0, MAX_CASES);
-  const info = db.prepare(`INSERT INTO eval_baselines
+  const info = dal.runq(`INSERT INTO eval_baselines
     (suite,suite_type,ref_id,label,agent_version,total,passed,intervened,success_rate,avg_steps,intervention_rate,meets_success,meets_intervention,cases,created_by,created_at)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, [
     String(o.suite || 'unnamed').slice(0, 120), o.suite_type || 'agent',
     o.ref_id != null ? Number(o.ref_id) : null, String(o.label || '').slice(0, 120),
     o.agent_version != null ? Number(o.agent_version) : null,
     metrics.total, metrics.passed, metrics.intervened, metrics.successRate, metrics.avgSteps, metrics.interventionRate,
     metrics.meetsSuccess ? 1 : 0, metrics.meetsIntervention ? 1 : 0,
-    JSON.stringify(trimmed), String(o.created_by || ''), o.created_at || now());
-  const row = db.prepare('SELECT * FROM eval_baselines WHERE id=?').get(info.lastInsertRowid);
+    JSON.stringify(trimmed), String(o.created_by || ''), o.created_at || now()]);
+  const row = dal.getq('SELECT * FROM eval_baselines WHERE id=?', [info.lastInsertRowid]);
   return normalizeBaseline(row, true);
 }
 
@@ -430,7 +430,7 @@ function autoCaptureOnPublish(agent, version, actor) {
   try {
     const aid = Number(agent?.id);
     if (!Number.isFinite(aid) || aid <= 0) return null;
-    const ev = db.prepare(`SELECT * FROM evaluations WHERE agent_id=? AND (type='agent' OR type IS NULL) AND status='done' ORDER BY id DESC LIMIT 1`).get(aid);
+    const ev = dal.getq(`SELECT * FROM evaluations WHERE agent_id=? AND (type='agent' OR type IS NULL) AND status='done' ORDER BY id DESC LIMIT 1`, [aid]);
     let cases = [];
     if (ev) {
       let detail = [];
@@ -453,14 +453,13 @@ function listBaselines({ suite, suite_type, limit = 100 } = {}) {
   const cond = [], args = [];
   if (suite) { cond.push('suite=?'); args.push(String(suite)); }
   if (suite_type) { cond.push('suite_type=?'); args.push(String(suite_type)); }
-  const rows = db.prepare(`SELECT * FROM eval_baselines ${cond.length ? 'WHERE ' + cond.join(' AND ') : ''} ORDER BY id DESC LIMIT ?`)
-    .all(...args, Math.min(Math.max(Number(limit) || 100, 1), 500));
+  const rows = dal.q(`SELECT * FROM eval_baselines ${cond.length ? 'WHERE ' + cond.join(' AND ') : ''} ORDER BY id DESC LIMIT ?`, [...args, Math.min(Math.max(Number(limit) || 100, 1), 500)]);
   return rows.map(r => normalizeBaseline(r, true));
 }
 
 /** 基线详情（含用例明细与对比） */
 function baselineDetail(id) {
-  const row = db.prepare('SELECT * FROM eval_baselines WHERE id=?').get(Number(id));
+  const row = dal.getq('SELECT * FROM eval_baselines WHERE id=?', [Number(id)]);
   if (!row) return null;
   const base = normalizeBaseline(row, true);
   let cases = [];
@@ -471,7 +470,7 @@ function baselineDetail(id) {
 
 /** 指标总览：各套件最新基线 + 达标状态 */
 function overview() {
-  const rows = db.prepare(`SELECT * FROM eval_baselines ORDER BY id DESC`).all();
+  const rows = dal.q(`SELECT * FROM eval_baselines ORDER BY id DESC`);
   const latestBySuite = new Map();
   for (const r of rows) {
     const key = `${r.suite_type}::${r.suite}`;
@@ -487,9 +486,9 @@ function overview() {
 
 /** 删除基线（adminOnly 由路由保证） */
 function deleteBaseline(id) {
-  const row = db.prepare('SELECT id FROM eval_baselines WHERE id=?').get(Number(id));
+  const row = dal.getq('SELECT id FROM eval_baselines WHERE id=?', [Number(id)]);
   if (!row) return false;
-  db.prepare('DELETE FROM eval_baselines WHERE id=?').run(Number(id));
+  dal.runq('DELETE FROM eval_baselines WHERE id=?', [Number(id)]);
   return true;
 }
 
@@ -497,9 +496,9 @@ function deleteBaseline(id) {
 function releaseBaselines(agentId) {
   const aid = Number(agentId);
   if (!Number.isFinite(aid) || aid <= 0) return [];
-  const history = db.prepare(`SELECT version, note, published_by, created_at FROM agent_publish_history WHERE agent_id=? ORDER BY version DESC`).all(aid);
+  const history = dal.q(`SELECT version, note, published_by, created_at FROM agent_publish_history WHERE agent_id=? ORDER BY version DESC`, [aid]);
   return history.map(h => {
-    const b = db.prepare(`SELECT * FROM eval_baselines WHERE suite_type='agent' AND ref_id=? AND agent_version=? ORDER BY id DESC LIMIT 1`).get(aid, h.version);
+    const b = dal.getq(`SELECT * FROM eval_baselines WHERE suite_type='agent' AND ref_id=? AND agent_version=? ORDER BY id DESC LIMIT 1`, [aid, h.version]);
     return { version: h.version, note: h.note || '', published_by: h.published_by || '', created_at: h.created_at || '', baseline: b ? normalizeBaseline(b, true) : null };
   });
 }
@@ -512,8 +511,7 @@ function suiteTrend({ suite, suite_type, limit = 30 } = {}) {
   const name = String(suite || '').trim();
   if (!name) return { suite: '', suite_type: suite_type || null, count: 0, points: [], summary: null };
   const st = suite_type || null;
-  const rows = db.prepare(`SELECT * FROM eval_baselines WHERE suite=? AND (? IS NULL OR suite_type=?) ORDER BY id ASC LIMIT ?`)
-    .all(name, st, st, Math.min(Math.max(Number(limit) || 30, 1), 200));
+  const rows = dal.q(`SELECT * FROM eval_baselines WHERE suite=? AND (? IS NULL OR suite_type=?) ORDER BY id ASC LIMIT ?`, [name, st, st, Math.min(Math.max(Number(limit) || 30, 1), 200)]);
   const points = [];
   let prevMetrics = null;
   for (const r of rows) {

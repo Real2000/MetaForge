@@ -5,10 +5,11 @@
  * 拦截时机：对话开始前（模型调用之前），返回友好提示；不拦截登录/浏览等非消耗操作。
  */
 const { db, now } = require('../db');
+const dal = require('./dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 
 /** 查询用户配额状态。返回 { unlimited, total, used, remaining, percent } */
 function quotaOf(username) {
-  const u = db.prepare('SELECT quota_total, quota_used FROM users WHERE username=?').get(username);
+  const u = dal.getq('SELECT quota_total, quota_used FROM users WHERE username=?', [username]);
   if (!u) return { unlimited: true, total: 0, used: 0, remaining: Infinity, percent: 0 };
   if (!u.quota_total || u.quota_total <= 0) return { unlimited: true, total: 0, used: u.quota_used, remaining: Infinity, percent: 0 };
   return {
@@ -31,7 +32,7 @@ function checkQuota(username) {
 function addUsage(username, tokens) {
   if (!username || !tokens || tokens <= 0) return;
   try {
-    db.prepare('UPDATE users SET quota_used = quota_used + ? WHERE username=?').run(Math.ceil(tokens), username);
+    dal.runq('UPDATE users SET quota_used = quota_used + ? WHERE username=?', [Math.ceil(tokens), username]);
     quotaAlert(username);
   } catch (e) {
     console.error('[quota] 记账失败：', e.message);
@@ -42,7 +43,7 @@ function addUsage(username, tokens) {
  *  记录已提醒档位，升档才发，避免每次记账都轰炸；管理员调整配额后经 resetQuotaAlert 重置重新计） */
 function quotaAlert(username) {
   try {
-    const u = db.prepare('SELECT quota_total, quota_used, quota_alert_level FROM users WHERE username=?').get(username);
+    const u = dal.getq('SELECT quota_total, quota_used, quota_alert_level FROM users WHERE username=?', [username]);
     if (!u || !u.quota_total || u.quota_total <= 0) return; // 不限额用户不预警
     const pct = u.quota_used / u.quota_total;
     const level = pct >= 0.9 ? 2 : (pct >= 0.8 ? 1 : 0);
@@ -51,9 +52,8 @@ function quotaAlert(username) {
       const content = level === 2
         ? `本月用量已达 ${pctTxt}%（${u.quota_used.toLocaleString('zh-CN')} / ${u.quota_total.toLocaleString('zh-CN')}），配额即将耗尽——超出后将无法继续对话。如需继续使用，请联系管理员调整配额。`
         : `本月用量已达 ${pctTxt}%（${u.quota_used.toLocaleString('zh-CN')} / ${u.quota_total.toLocaleString('zh-CN')}）。如近期使用较多，可提前联系管理员调整配额，避免用尽影响工作。`;
-      db.prepare('INSERT INTO notifications (username,title,content,type,link,is_read,created_at) VALUES (?,?,?,?,?,0,?)')
-        .run(username, '📊 Token 配额预警', content, 'quota', '#/help', now());
-      db.prepare('UPDATE users SET quota_alert_level=? WHERE username=?').run(level, username);
+      dal.runq('INSERT INTO notifications (username,title,content,type,link,is_read,created_at) VALUES (?,?,?,?,?,0,?)', [username, '📊 Token 配额预警', content, 'quota', '#/help', now()]);
+      dal.runq('UPDATE users SET quota_alert_level=? WHERE username=?', [level, username]);
       console.log(`[quota] ⚠️ ${username} 用量达 ${pctTxt}%，已发送第 ${level} 档站内信预警`);
     }
   } catch (e) {
@@ -64,7 +64,7 @@ function quotaAlert(username) {
 /** 重置预警档位（管理员调整配额后调用，新配额周期重新预警） */
 function resetQuotaAlert(username) {
   try {
-    db.prepare('UPDATE users SET quota_alert_level=0 WHERE username=?').run(username);
+    dal.runq('UPDATE users SET quota_alert_level=0 WHERE username=?', [username]);
   } catch { }
 }
 
@@ -77,7 +77,7 @@ function tenantQuotaSummary(tenantId = null) {
   const scoped = tenantId != null && tenantId !== '' && Number.isFinite(Number(tenantId));
   const where = scoped ? 'WHERE tenant_id=?' : '';
   const args = scoped ? [Number(tenantId)] : [];
-  const rows = db.prepare(`SELECT username, nickname, quota_total, quota_used, cost_quota FROM users ${where} ORDER BY quota_used DESC`).all(...args);
+  const rows = dal.q(`SELECT username, nickname, quota_total, quota_used, cost_quota FROM users ${where} ORDER BY quota_used DESC`, [...args]);
   const users = rows.map(u => {
     const q = quotaOf(u.username);
     return {

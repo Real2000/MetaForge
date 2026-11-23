@@ -3,6 +3,7 @@
  * 2026-10-20：内置运维任务（每日备份/产物清理/日志归档），不依赖外部 cron
  */
 const { db, now } = require('../db');
+const dal = require('./dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const { runAgent } = require('./workflow');
 const { lastFire } = require('./cron');
 const ops = require('./ops');
@@ -23,7 +24,7 @@ const LOCK_TTL = clusterLock.DEFAULT_TTL_MS;
 // 原先注册在 startScheduler() 内且用 global 守卫；抽到顶层后，worker.js 只需 require 本模块即可消费 'cron-task'，
 // 无需启动 30s 扫描 tick。register 对同名重复注册会抛错，模块缓存保证只执行一次。
 register('cron-task', async (payload) => {
-  const task = db.prepare('SELECT * FROM tasks WHERE id=?').get(payload.taskId);
+  const task = dal.getq('SELECT * FROM tasks WHERE id=?', [payload.taskId]);
   if (!task) throw new Error('任务不存在');
   return await runTask(task);
 });
@@ -31,12 +32,10 @@ register('cron-task', async (payload) => {
 /** P5.34（审查 F8）：自动停用任务并通知归属者（配额耗尽/主体失效等场景共用）
  *  P5.34b（Y3）：outputMsg 只传原因短语（不再自带「任务已自动停用：」前缀），通知模板统一拼装 */
 function disableTask(task, reason, title) {
-  db.prepare('UPDATE tasks SET enabled=0, last_run_at=?, last_result=? WHERE id=?').run(now(), 'fail', task.id);
-  db.prepare('INSERT INTO task_runs (task_id,status,started_at,finished_at,output) VALUES (?,?,?,?,?)')
-    .run(task.id, 'fail', now(), now(), '任务已自动停用：' + reason);
+  dal.runq('UPDATE tasks SET enabled=0, last_run_at=?, last_result=? WHERE id=?', [now(), 'fail', task.id]);
+  dal.runq('INSERT INTO task_runs (task_id,status,started_at,finished_at,output) VALUES (?,?,?,?,?)', [task.id, 'fail', now(), now(), '任务已自动停用：' + reason]);
   try {
-    db.prepare('INSERT INTO notifications (username,title,content,type,link,is_read,created_at) VALUES (?,?,?,?,?,0,?)')
-      .run(task.username, title || '⏸️ 定时任务已自动停用', `任务「${task.name || task.id}」因 ${String(reason).replace(/\n[\s\S]*$/, '')} 已自动停用，可在「任务管理」页查看。`, 'task', '#/tasks', now());
+    dal.runq('INSERT INTO notifications (username,title,content,type,link,is_read,created_at) VALUES (?,?,?,?,?,0,?)', [task.username, title || '⏸️ 定时任务已自动停用', `任务「${task.name || task.id}」因 ${String(reason).replace(/\n[\s\S]*$/, '')} 已自动停用，可在「任务管理」页查看。`, 'task', '#/tasks', now()]);
   } catch { /* 通知失败不影响停用 */ }
 }
 
@@ -52,7 +51,7 @@ async function runTask(task) {
       return { status: 'fail', output: '任务已自动停用：' + String(quotaMsg).split('\n')[0] };
     }
   }
-  const agent = db.prepare('SELECT * FROM agents WHERE id=?').get(task.target_id);
+  const agent = dal.getq('SELECT * FROM agents WHERE id=?', [task.target_id]);
   // P5.34（审查 F8）：执行期复查智能体状态与可见性——权限只在创建时点校验，事后下架/转受限的
   // 智能体不应继续在无人值守周期执行（历史任务 username='' 为管理员创建，仅查发布状态）
   if (!agent || agent.status !== 'published') {
@@ -62,7 +61,7 @@ async function runTask(task) {
     return { status: 'fail', output: '任务已自动停用：' + reason };
   }
   if (task.username) {
-    const owner = db.prepare('SELECT id, username, nickname, role, dept FROM users WHERE username=? AND status=1').get(task.username);
+    const owner = dal.getq('SELECT id, username, nickname, role, dept FROM users WHERE username=? AND status=1', [task.username]);
     if (!owner) {
       disableTask(task, '任务归属者账号已停用/删除');
       return { status: 'fail', output: '任务已自动停用：任务归属者账号已停用/删除' };
@@ -87,12 +86,11 @@ async function runTask(task) {
   } catch (e) {
     status = 'fail';
     output = '执行失败：' + e.message;
-    db.prepare('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)').run('task-scheduler', `任务「${task.name}」执行失败：${e.message}`, now());
+    dal.runq('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)', ['task-scheduler', `任务「${task.name}」执行失败：${e.message}`, now()]);
   }
   const finished = now();
-  db.prepare('INSERT INTO task_runs (task_id,status,started_at,finished_at,output) VALUES (?,?,?,?,?)')
-    .run(task.id, status, started, finished, output);
-  db.prepare('UPDATE tasks SET last_run_at=?, last_result=? WHERE id=?').run(finished, status, task.id);
+  dal.runq('INSERT INTO task_runs (task_id,status,started_at,finished_at,output) VALUES (?,?,?,?,?)', [task.id, status, started, finished, output]);
+  dal.runq('UPDATE tasks SET last_run_at=?, last_result=? WHERE id=?', [finished, status, task.id]);
   // P5.31 配额记账：定时任务的 token 消耗记到任务归属者（此前不记任何人；管理员建的历史任务 username='' 不记）
   try {
     const tokens = usage?.totalTokens || 0;
@@ -115,7 +113,7 @@ function startScheduler() {
       return;
     }
     try {
-      const tasks = db.prepare('SELECT * FROM tasks WHERE enabled=1 AND exec_type=?').all('cron');
+      const tasks = dal.q('SELECT * FROM tasks WHERE enabled=1 AND exec_type=?', ['cron']);
       for (const t of tasks) {
         if (!t.cron) continue;
         const prev = fireMarks.get(t.id) || Date.parse(t.last_run_at || '') || Date.now() - 60000;

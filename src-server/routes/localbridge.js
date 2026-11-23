@@ -14,6 +14,7 @@
  *  - op 白名单在服务端先校验一层（桥端还有第二层）
  */
 const express = require('express');
+const dal = require('../lib/dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const crypto = require('crypto');
 const { db, now } = require('../db');
 const { auth, adminOnly } = require('../lib/auth');
@@ -112,14 +113,12 @@ router.post('/claim', (req, res) => {
   claimIpFail.delete(ip);
 
   // 同 token 复绑（重装/换用户）→ 更新归属；否则新设备
-  const exist = db.prepare('SELECT * FROM localbridge_devices WHERE device_token=?').get(token);
+  const exist = dal.getq('SELECT * FROM localbridge_devices WHERE device_token=?', [token]);
   if (exist) {
-    db.prepare('UPDATE localbridge_devices SET username=?, device_name=?, platform=?, last_seen=?, updated_at=? WHERE id=?')
-      .run(username, String(device_name || exist.device_name).slice(0, 80), String(platform || '').slice(0, 120), now(), now(), exist.id);
+    dal.runq('UPDATE localbridge_devices SET username=?, device_name=?, platform=?, last_seen=?, updated_at=? WHERE id=?', [username, String(device_name || exist.device_name).slice(0, 80), String(platform || '').slice(0, 120), now(), now(), exist.id]);
   } else {
-    const cnt = db.prepare('SELECT COUNT(*) c FROM localbridge_devices WHERE username=?').get(username).c;
-    db.prepare('INSERT INTO localbridge_devices (username,device_token,device_name,platform,is_default,last_seen,created_at) VALUES (?,?,?,?,?,?,?)')
-      .run(username, token, String(device_name || '未命名设备').slice(0, 80), String(platform || '').slice(0, 120), cnt === 0 ? 1 : 0, now(), now());
+    const cnt = dal.getq('SELECT COUNT(*) c FROM localbridge_devices WHERE username=?', [username]).c;
+    dal.runq('INSERT INTO localbridge_devices (username,device_token,device_name,platform,is_default,last_seen,created_at) VALUES (?,?,?,?,?,?,?)', [username, token, String(device_name || '未命名设备').slice(0, 80), String(platform || '').slice(0, 120), cnt === 0 ? 1 : 0, now(), now()]);
   }
   res.json({ code: 0, data: { paired: true, username } });
 });
@@ -127,7 +126,7 @@ router.post('/claim', (req, res) => {
 // ---------- 桥端鉴权中间件 ----------
 function deviceAuth(req, res, next) {
   const token = String(req.headers['x-device-token'] || '');
-  const d = token && db.prepare('SELECT * FROM localbridge_devices WHERE device_token=?').get(token);
+  const d = token && dal.getq('SELECT * FROM localbridge_devices WHERE device_token=?', [token]);
   if (!d) return res.status(401).json({ code: 401, msg: '设备未注册（先完成配对）' });
   req.device = d;
   next();
@@ -136,21 +135,20 @@ function deviceAuth(req, res, next) {
 // 心跳：更新在线状态；未配对设备返回 paired:false（供安装器探测）
 router.post('/heartbeat', (req, res) => {
   const token = String(req.headers['x-device-token'] || '');
-  const d = db.prepare('SELECT * FROM localbridge_devices WHERE device_token=?').get(token);
+  const d = dal.getq('SELECT * FROM localbridge_devices WHERE device_token=?', [token]);
   if (!d) return res.json({ code: 0, data: { paired: false } }); // 不报错：安装探测场景
-  db.prepare('UPDATE localbridge_devices SET last_seen=? WHERE id=?').run(now(), d.id);
+  dal.runq('UPDATE localbridge_devices SET last_seen=? WHERE id=?', [now(), d.id]);
   res.json({ code: 0, data: { paired: true, username: d.username } });
 });
 
 // poll：认领一个 pending 任务（置 running）
 router.post('/poll', deviceAuth, (req, res) => {
-  db.prepare('UPDATE localbridge_devices SET last_seen=? WHERE id=?').run(now(), req.device.id);
+  dal.runq('UPDATE localbridge_devices SET last_seen=? WHERE id=?', [now(), req.device.id]);
   // 超时回收：60s 未回推的 running 任务标 failed（桥重启/断线场景）
-  db.prepare(`UPDATE localbridge_tasks SET status='failed', result='{"ok":false,"error":"执行超时未回推（桥可能离线）"}', updated_at=? WHERE device_id=? AND status='running' AND datetime(updated_at) < datetime('now','localtime','-60 seconds')`)
-    .run(now(), req.device.id);
-  const task = db.prepare(`SELECT * FROM localbridge_tasks WHERE device_id=? AND status='pending' ORDER BY id LIMIT 1`).get(req.device.id);
+  dal.runq(`UPDATE localbridge_tasks SET status='failed', result='{"ok":false,"error":"执行超时未回推（桥可能离线）"}', updated_at=? WHERE device_id=? AND status='running' AND datetime(updated_at) < datetime('now','localtime','-60 seconds')`, [now(), req.device.id]);
+  const task = dal.getq(`SELECT * FROM localbridge_tasks WHERE device_id=? AND status='pending' ORDER BY id LIMIT 1`, [req.device.id]);
   if (task) {
-    db.prepare(`UPDATE localbridge_tasks SET status='running', updated_at=? WHERE id=?`).run(now(), task.id);
+    dal.runq(`UPDATE localbridge_tasks SET status='running', updated_at=? WHERE id=?`, [now(), task.id]);
     let params = {}; try { params = JSON.parse(task.params || '{}'); } catch { }
     res.json({ code: 0, data: { task: { id: task.id, op: task.op, params, tier: normalizeTier(req.device.permission_tier) } } });
   } else {
@@ -161,10 +159,9 @@ router.post('/poll', deviceAuth, (req, res) => {
 // result：回推执行结果
 router.post('/result', deviceAuth, async (req, res) => {
   const { task_id, result } = req.body || {};
-  const t = db.prepare('SELECT * FROM localbridge_tasks WHERE id=?').get(Number(task_id));
+  const t = dal.getq('SELECT * FROM localbridge_tasks WHERE id=?', [Number(task_id)]);
   if (!t || t.device_id !== req.device.id) return res.status(404).json({ code: 404, msg: '任务不存在' });
-  db.prepare(`UPDATE localbridge_tasks SET status=?, result=?, updated_at=? WHERE id=?`)
-    .run(result && result.ok ? 'done' : 'failed', JSON.stringify(result || {}).slice(0, 8000), now(), t.id);
+  dal.runq(`UPDATE localbridge_tasks SET status=?, result=?, updated_at=? WHERE id=?`, [result && result.ok ? 'done' : 'failed', JSON.stringify(result || {}).slice(0, 8000), now(), t.id]);
   // D1-1：写操作回推后落备份台账（供「事后改动清单 / 一键回滚」）
   recordBackupFromResult(req.device, t, result);
   // U2-4 Phase 2 / N6：结果回传渠道。如果该任务关联了 channel_msg_id，通过 channel.js send 回推结果
@@ -172,7 +169,7 @@ router.post('/result', deviceAuth, async (req, res) => {
     try {
       const { send } = require('../lib/channel');
       const { formatResultForChannel } = require('../lib/remote-dispatch'); // 结果可读化（文件类 op 转人类可读）
-      const msgRow = db.prepare('SELECT * FROM channel_messages WHERE id=?').get(t.channel_msg_id);
+      const msgRow = dal.getq('SELECT * FROM channel_messages WHERE id=?', [t.channel_msg_id]);
       if (msgRow && msgRow.channel && msgRow.channel !== 'inbox') {
         const out = formatResultForChannel(t.op, result || {});
         await send({ channel: msgRow.channel, receivers: [msgRow.sender_id] }, { title: out.title, content: out.content });
@@ -186,37 +183,36 @@ router.post('/result', deviceAuth, async (req, res) => {
 
 // ---------- 用户侧：设备管理 ----------
 router.get('/devices', auth, (req, res) => {
-  const rows = db.prepare(`SELECT id, device_name, platform, is_default, permission_tier,
+  const rows = dal.q(`SELECT id, device_name, platform, is_default, permission_tier,
     last_seen, created_at,
     CASE WHEN datetime(last_seen) > datetime('now','localtime','-15 seconds') THEN 1 ELSE 0 END AS online
-    FROM localbridge_devices WHERE username=? ORDER BY is_default DESC, id DESC`).all(req.user.username);
+    FROM localbridge_devices WHERE username=? ORDER BY is_default DESC, id DESC`, [req.user.username]);
   res.json({ code: 0, data: rows });
 });
 
 router.post('/devices/:id/default', auth, (req, res) => {
-  const d = db.prepare('SELECT * FROM localbridge_devices WHERE id=? AND username=?').get(Number(req.params.id), req.user.username);
+  const d = dal.getq('SELECT * FROM localbridge_devices WHERE id=? AND username=?', [Number(req.params.id), req.user.username]);
   if (!d) return res.status(404).json({ code: 404, msg: '设备不存在' });
-  db.prepare('UPDATE localbridge_devices SET is_default=0 WHERE username=?').run(req.user.username);
-  db.prepare('UPDATE localbridge_devices SET is_default=1 WHERE id=?').run(d.id);
+  dal.runq('UPDATE localbridge_devices SET is_default=0 WHERE username=?', [req.user.username]);
+  dal.runq('UPDATE localbridge_devices SET is_default=1 WHERE id=?', [d.id]);
   res.json({ code: 0 });
 });
 
 // N6 / U2-4：高危远控开关（键鼠/clipboard_write/file_write）——设备级总闸，默认关闭
 router.post('/devices/:id/high-risk', auth, (req, res) => {
-  const d = db.prepare('SELECT * FROM localbridge_devices WHERE id=? AND username=?').get(Number(req.params.id), req.user.username);
+  const d = dal.getq('SELECT * FROM localbridge_devices WHERE id=? AND username=?', [Number(req.params.id), req.user.username]);
   if (!d) return res.status(404).json({ code: 404, msg: '设备不存在' });
   const enable = req.body && (req.body.enable === true || req.body.enable === 1 || req.body.enable === '1');
-  db.prepare('UPDATE localbridge_devices SET allow_high_risk=? WHERE id=?').run(enable ? 1 : 0, d.id);
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(req.user.username, enable ? '开启高危远控' : '关闭高危远控', `设备${d.device_name}#${d.id}`, req.ip, now());
+  dal.runq('UPDATE localbridge_devices SET allow_high_risk=? WHERE id=?', [enable ? 1 : 0, d.id]);
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, enable ? '开启高危远控' : '关闭高危远控', `设备${d.device_name}#${d.id}`, req.ip, now()]);
   res.json({ code: 0, data: { id: d.id, allow_high_risk: enable ? 1 : 0 } });
 });
 
 router.delete('/devices/:id', auth, (req, res) => {
-  const d = db.prepare('SELECT * FROM localbridge_devices WHERE id=? AND username=?').get(Number(req.params.id), req.user.username);
+  const d = dal.getq('SELECT * FROM localbridge_devices WHERE id=? AND username=?', [Number(req.params.id), req.user.username]);
   if (!d) return res.status(404).json({ code: 404, msg: '设备不存在' });
-  db.prepare('DELETE FROM localbridge_devices WHERE id=?').run(d.id);
-  db.prepare(`DELETE FROM localbridge_tasks WHERE device_id=? AND status IN ('pending','running')`).run(d.id);
+  dal.runq('DELETE FROM localbridge_devices WHERE id=?', [d.id]);
+  dal.runq(`DELETE FROM localbridge_tasks WHERE device_id=? AND status IN ('pending','running')`, [d.id]);
   res.json({ code: 0 });
 });
 
@@ -228,23 +224,21 @@ function recordBackupFromResult(device, task, result) {
     if (!BACKUP_OPS.includes(task.op)) return;
     const d = result.data || {};
     if (!d.backup_id) return; // 新建文件（无覆盖）不产生备份行
-    db.prepare(`INSERT INTO localbridge_backups
+    dal.runq(`INSERT INTO localbridge_backups
       (device_id,username,task_id,op,path,backup_id,change,before_bytes,after_bytes,status,created_at)
-      VALUES (?,?,?,?,?,?,?,?,?,'active',?)`)
-      .run(device.id, device.username, task.id, task.op, String(d.path || '').slice(0, 500), String(d.backup_id).slice(0, 120),
-        String(d.change || 'modified').slice(0, 20), Number(d.before_bytes) || 0, Number(d.after_bytes) || 0, now());
+      VALUES (?,?,?,?,?,?,?,?,?,'active',?)`, [device.id, device.username, task.id, task.op, String(d.path || '').slice(0, 500), String(d.backup_id).slice(0, 120),
+        String(d.change || 'modified').slice(0, 20), Number(d.before_bytes) || 0, Number(d.after_bytes) || 0, now()]);
   } catch (e) { console.error('[localbridge] 备份台账落库失败：', e.message); }
 }
 
 // ---------- D1-1 设备三档权限设置（readonly/standard/full） ----------
 router.post('/devices/:id/tier', auth, (req, res) => {
-  const d = db.prepare('SELECT * FROM localbridge_devices WHERE id=? AND username=?').get(Number(req.params.id), req.user.username);
+  const d = dal.getq('SELECT * FROM localbridge_devices WHERE id=? AND username=?', [Number(req.params.id), req.user.username]);
   if (!d) return res.status(404).json({ code: 404, msg: '设备不存在' });
   const tier = String((req.body && req.body.tier) || '').trim();
   if (!TIERS.includes(tier)) return res.status(400).json({ code: 400, msg: '无效的权限档位（readonly/standard/full）' });
-  db.prepare('UPDATE localbridge_devices SET permission_tier=? WHERE id=?').run(tier, d.id);
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(req.user.username, '设置端侧权限档位', `设备${d.device_name}#${d.id} → ${tier}`, req.ip, now());
+  dal.runq('UPDATE localbridge_devices SET permission_tier=? WHERE id=?', [tier, d.id]);
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '设置端侧权限档位', `设备${d.device_name}#${d.id} → ${tier}`, req.ip, now()]);
   res.json({ code: 0, data: { id: d.id, permission_tier: tier, ops: [...allowedOpsForTier(tier)] } });
 });
 
@@ -252,24 +246,22 @@ router.post('/devices/:id/tier', auth, (req, res) => {
 router.get('/backups', auth, (req, res) => {
   const devId = Number(req.query.device_id) || 0;
   const rows = devId
-    ? db.prepare('SELECT * FROM localbridge_backups WHERE username=? AND device_id=? ORDER BY id DESC LIMIT 100').all(req.user.username, devId)
-    : db.prepare('SELECT * FROM localbridge_backups WHERE username=? ORDER BY id DESC LIMIT 100').all(req.user.username);
+    ? dal.q('SELECT * FROM localbridge_backups WHERE username=? AND device_id=? ORDER BY id DESC LIMIT 100', [req.user.username, devId])
+    : dal.q('SELECT * FROM localbridge_backups WHERE username=? ORDER BY id DESC LIMIT 100', [req.user.username]);
   res.json({ code: 0, data: rows });
 });
 
 // ---------- D1-1 一键回滚（入队 file_restore 任务，写操作可回滚） ----------
 router.post('/backups/:id/rollback', auth, (req, res) => {
-  const b = db.prepare('SELECT * FROM localbridge_backups WHERE id=? AND username=?').get(Number(req.params.id), req.user.username);
+  const b = dal.getq('SELECT * FROM localbridge_backups WHERE id=? AND username=?', [Number(req.params.id), req.user.username]);
   if (!b) return res.status(404).json({ code: 404, msg: '备份记录不存在' });
   if (b.status !== 'active') return res.status(409).json({ code: 409, msg: '该备份已回滚或不可用' });
-  const dev = db.prepare('SELECT * FROM localbridge_devices WHERE id=? AND username=?').get(b.device_id, req.user.username);
+  const dev = dal.getq('SELECT * FROM localbridge_devices WHERE id=? AND username=?', [b.device_id, req.user.username]);
   if (!dev) return res.status(404).json({ code: 404, msg: '设备不存在' });
   if (!opAllowedForTier('file_restore', dev.permission_tier)) return res.status(403).json({ code: 403, msg: `设备档位（${normalizeTier(dev.permission_tier)}）不允许回滚操作，请先提升档位` });
-  const info = db.prepare('INSERT INTO localbridge_tasks (device_id,username,op,params,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?)')
-    .run(dev.id, req.user.username, 'file_restore', JSON.stringify({ backup_id: b.backup_id, path: b.path }), 'pending', now(), now());
-  db.prepare('UPDATE localbridge_backups SET status=\'restoring\', restored_at=? WHERE id=?').run(now(), b.id);
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(req.user.username, '端侧一键回滚', `设备${dev.device_name}#${dev.id} 备份#${b.id} ${b.path}`, req.ip, now());
+  const info = dal.runq('INSERT INTO localbridge_tasks (device_id,username,op,params,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?)', [dev.id, req.user.username, 'file_restore', JSON.stringify({ backup_id: b.backup_id, path: b.path }), 'pending', now(), now()]);
+  dal.runq('UPDATE localbridge_backups SET status=\'restoring\', restored_at=? WHERE id=?', [now(), b.id]);
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '端侧一键回滚', `设备${dev.device_name}#${dev.id} 备份#${b.id} ${b.path}`, req.ip, now()]);
   res.json({ code: 0, data: { task_id: info.lastInsertRowid, backup_id: b.backup_id, path: b.path } });
 });
 
@@ -302,17 +294,17 @@ function resolveReleaseFile(fileName) {
 function softDevice(req) {
   const token = String(req.headers['x-device-token'] || '');
   if (!token) return null;
-  try { return db.prepare('SELECT * FROM localbridge_devices WHERE device_token=?').get(token) || null; }
+  try { return dal.getq('SELECT * FROM localbridge_devices WHERE device_token=?', [token]) || null; }
   catch { return null; }
 }
 
 // 检查更新（客户端启动 + 定时调用）：公开可查（与安装包下载同域，不含敏感信息）
 router.get('/version', (req, res) => {
   const { current = '0.0.0', platform = '', arch = '', channel = 'stable' } = req.query;
-  const rows = db.prepare("SELECT * FROM bridge_releases WHERE status='active'").all();
+  const rows = dal.q("SELECT * FROM bridge_releases WHERE status='active'");
   const picked = bridgeUpdate.pickRelease(rows, { platform, arch, channel, current });
   const device = softDevice(req);
-  if (device) db.prepare('UPDATE localbridge_devices SET last_seen=? WHERE id=?').run(now(), device.id);
+  if (device) dal.runq('UPDATE localbridge_devices SET last_seen=? WHERE id=?', [now(), device.id]);
   const r = picked.release;
   res.json({
     code: 0, data: {
@@ -331,11 +323,10 @@ router.get('/release/download', (req, res) => {
   const { version, platform = '', arch = '', channel = 'stable' } = req.query;
   let row = null;
   if (version) {
-    row = db.prepare("SELECT * FROM bridge_releases WHERE version=? AND status='active' AND (platform=? OR platform='any' OR platform='') AND (arch=? OR arch='any' OR arch='') ORDER BY id DESC LIMIT 1")
-      .get(bridgeUpdate.normalizeVersion(version), platform, arch);
+    row = dal.getq("SELECT * FROM bridge_releases WHERE version=? AND status='active' AND (platform=? OR platform='any' OR platform='') AND (arch=? OR arch='any' OR arch='') ORDER BY id DESC LIMIT 1", [bridgeUpdate.normalizeVersion(version), platform, arch]);
   }
   if (!row) {
-    const rows = db.prepare("SELECT * FROM bridge_releases WHERE status='active'").all();
+    const rows = dal.q("SELECT * FROM bridge_releases WHERE status='active'");
     row = bridgeUpdate.pickRelease(rows, { platform, arch, channel, current: '0.0.0' }).release;
   }
   if (!row) return res.status(404).json({ code: 404, msg: '未找到匹配的发布包' });
@@ -351,12 +342,11 @@ router.post('/update-report', (req, res) => {
   const device = softDevice(req);
   const b = req.body || {};
   const st = ['success', 'failed', 'rollback'].includes(b.status) ? b.status : 'failed';
-  db.prepare('INSERT INTO bridge_updates (device_id,username,from_version,to_version,channel,status,error,duration_ms,created_at) VALUES (?,?,?,?,?,?,?,?,?)')
-    .run(device ? device.id : null, device ? device.username : '',
+  dal.runq('INSERT INTO bridge_updates (device_id,username,from_version,to_version,channel,status,error,duration_ms,created_at) VALUES (?,?,?,?,?,?,?,?,?)', [device ? device.id : null, device ? device.username : '',
       bridgeUpdate.normalizeVersion(b.from_version), bridgeUpdate.normalizeVersion(b.to_version),
       bridgeUpdate.CHANNELS.includes(b.channel) ? b.channel : 'stable', st,
-      String(b.error || '').slice(0, 500), Number(b.duration_ms) || 0, now());
-  if (device) db.prepare('UPDATE localbridge_devices SET last_seen=? WHERE id=?').run(now(), device.id);
+      String(b.error || '').slice(0, 500), Number(b.duration_ms) || 0, now()]);
+  if (device) dal.runq('UPDATE localbridge_devices SET last_seen=? WHERE id=?', [now(), device.id]);
   res.json({ code: 0 });
 });
 
@@ -365,16 +355,15 @@ router.post('/crash-report', (req, res) => {
   const device = softDevice(req);
   const b = req.body || {};
   const kind = ['startup', 'runtime', 'unhandled'].includes(b.kind) ? b.kind : 'runtime';
-  db.prepare('INSERT INTO bridge_crashes (device_id,username,version,kind,message,stack,created_at) VALUES (?,?,?,?,?,?,?)')
-    .run(device ? device.id : null, device ? device.username : '',
+  dal.runq('INSERT INTO bridge_crashes (device_id,username,version,kind,message,stack,created_at) VALUES (?,?,?,?,?,?,?)', [device ? device.id : null, device ? device.username : '',
       bridgeUpdate.normalizeVersion(b.version) || String(b.version || '').slice(0, 40),
-      kind, String(b.message || '').slice(0, 500), String(b.stack || '').slice(0, 4000), now());
+      kind, String(b.message || '').slice(0, 500), String(b.stack || '').slice(0, 4000), now()]);
   res.json({ code: 0 });
 });
 
 // 发布清单（admin）：附文件是否就位 + 实际哈希
 router.get('/releases', auth, adminOnly, (req, res) => {
-  const rows = db.prepare('SELECT * FROM bridge_releases ORDER BY id DESC').all();
+  const rows = dal.q('SELECT * FROM bridge_releases ORDER BY id DESC');
   res.json({
     code: 0, data: rows.map(r => {
       const f = r.file_name ? resolveReleaseFile(r.file_name) : { exists: false, size: 0, sha256: '' };
@@ -398,39 +387,35 @@ router.post('/releases', auth, adminOnly, (req, res) => {
   const notes = String(b.notes || '').slice(0, 2000);
   const mandatory = b.mandatory ? 1 : 0;
   const min_version = bridgeUpdate.normalizeVersion(b.min_version || '');
-  const dup = db.prepare('SELECT id FROM bridge_releases WHERE version=? AND platform=? AND arch=? AND channel=?').get(version, platform, arch, channel);
+  const dup = dal.getq('SELECT id FROM bridge_releases WHERE version=? AND platform=? AND arch=? AND channel=?', [version, platform, arch, channel]);
   let id;
   if (dup) {
-    db.prepare('UPDATE bridge_releases SET file_name=?,sha256=?,size=?,notes=?,mandatory=?,min_version=?,status=? WHERE id=?')
-      .run(file_name, sha256, size, notes, mandatory, min_version, 'active', dup.id);
+    dal.runq('UPDATE bridge_releases SET file_name=?,sha256=?,size=?,notes=?,mandatory=?,min_version=?,status=? WHERE id=?', [file_name, sha256, size, notes, mandatory, min_version, 'active', dup.id]);
     id = dup.id;
   } else {
-    const info = db.prepare('INSERT INTO bridge_releases (version,platform,arch,channel,file_name,sha256,size,notes,mandatory,min_version,status,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
-      .run(version, platform, arch, channel, file_name, sha256, size, notes, mandatory, min_version, 'active', now());
+    const info = dal.runq('INSERT INTO bridge_releases (version,platform,arch,channel,file_name,sha256,size,notes,mandatory,min_version,status,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)', [version, platform, arch, channel, file_name, sha256, size, notes, mandatory, min_version, 'active', now()]);
     id = Number(info.lastInsertRowid);
   }
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(req.user.username, dup ? '更新发布' : '登记发布', `桥端 ${version} ${platform}/${arch} ${channel}${finfo.exists ? '' : '（文件缺失）'}`, req.ip, now());
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, dup ? '更新发布' : '登记发布', `桥端 ${version} ${platform}/${arch} ${channel}${finfo.exists ? '' : '（文件缺失）'}`, req.ip, now()]);
   res.json({ code: 0, msg: dup ? '发布已更新' : '发布已登记', data: { id, version, file_exists: finfo.exists, sha256 } });
 });
 
 // 下线发布（admin）：默认软下线（status=archived），?hard=1 真删
 router.delete('/releases/:id', auth, adminOnly, (req, res) => {
-  const row = db.prepare('SELECT * FROM bridge_releases WHERE id=?').get(Number(req.params.id));
+  const row = dal.getq('SELECT * FROM bridge_releases WHERE id=?', [Number(req.params.id)]);
   if (!row) return res.status(404).json({ code: 404, msg: '发布不存在' });
-  if (String(req.query.hard) === '1') db.prepare('DELETE FROM bridge_releases WHERE id=?').run(row.id);
-  else db.prepare("UPDATE bridge_releases SET status='archived' WHERE id=?").run(row.id);
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(req.user.username, '下线发布', `桥端 ${row.version} ${row.platform}/${row.arch}`, req.ip, now());
+  if (String(req.query.hard) === '1') dal.runq('DELETE FROM bridge_releases WHERE id=?', [row.id]);
+  else dal.runq("UPDATE bridge_releases SET status='archived' WHERE id=?", [row.id]);
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '下线发布', `桥端 ${row.version} ${row.platform}/${row.arch}`, req.ip, now()]);
   res.json({ code: 0 });
 });
 
 // 更新与崩溃指标（admin）：更新成功率 / 崩溃率 + 最近记录（验收：成功率 ≥ 95%、崩溃率 < 0.5%）
 router.get('/update-stats', auth, adminOnly, (req, res) => {
-  const updates = db.prepare('SELECT * FROM bridge_updates ORDER BY id DESC LIMIT 1000').all();
-  const crashes = db.prepare('SELECT * FROM bridge_crashes ORDER BY id DESC LIMIT 1000').all();
+  const updates = dal.q('SELECT * FROM bridge_updates ORDER BY id DESC LIMIT 1000');
+  const crashes = dal.q('SELECT * FROM bridge_crashes ORDER BY id DESC LIMIT 1000');
   const stats = bridgeUpdate.updateStats(updates, crashes);
-  const releases = db.prepare("SELECT * FROM bridge_releases WHERE status='active' ORDER BY id DESC").all().map(bridgeUpdate.releaseView);
+  const releases = dal.q("SELECT * FROM bridge_releases WHERE status='active' ORDER BY id DESC").map(bridgeUpdate.releaseView);
   res.json({
     code: 0, data: {
       stats,

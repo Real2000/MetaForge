@@ -12,6 +12,7 @@
  * （本项目内部链路自洽；对外接入方使用本仓库的签名示例即可）。
  */
 const crypto = require('crypto');
+const dal = require('./dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const { db, now } = require('../db');
 const { encrypt, decrypt } = require('./crypto-util');
 
@@ -110,9 +111,8 @@ function verifyJws(token, resolveKey, opts = {}) {
 function createKey({ name = '', owner = '', orgName = '', alg = 'RS256', scopes = 'a2a:call', expiresAt = '' } = {}) {
   const { publicKey, privateKey } = generateKeyPair(alg);
   const kid = 'a2ak_' + crypto.randomBytes(12).toString('hex');
-  db.prepare(`INSERT INTO a2a_api_keys (key_id,name,owner,org_name,alg,public_key,private_key,scopes,status,expires_at,created_at)
-    VALUES (?,?,?,?,?,?,?,?,1,?,?)`)
-    .run(kid, name, owner, orgName, alg, publicKey, encrypt(privateKey), scopes, expiresAt, now());
+  dal.runq(`INSERT INTO a2a_api_keys (key_id,name,owner,org_name,alg,public_key,private_key,scopes,status,expires_at,created_at)
+    VALUES (?,?,?,?,?,?,?,?,1,?,?)`, [kid, name, owner, orgName, alg, publicKey, encrypt(privateKey), scopes, expiresAt, now()]);
   return { key_id: kid, alg, public_key: publicKey, private_key: privateKey, scopes };
 }
 
@@ -120,7 +120,7 @@ function createKey({ name = '', owner = '', orgName = '', alg = 'RS256', scopes 
 function resolvePublicKey(kid) {
   if (!kid) return '';
   let row;
-  try { row = db.prepare('SELECT public_key,status,expires_at FROM a2a_api_keys WHERE key_id=?').get(kid); } catch { return ''; }
+  try { row = dal.getq('SELECT public_key,status,expires_at FROM a2a_api_keys WHERE key_id=?', [kid]); } catch { return ''; }
   if (!row || !row.status) return '';
   if (row.expires_at && Date.now() > new Date(row.expires_at).getTime()) return '';
   return row.public_key || '';
@@ -128,7 +128,7 @@ function resolvePublicKey(kid) {
 
 /** 按 kid 取解密后的私钥 PEM（供令牌端点对持有方做断言校验之外的本地使用）；不可用返回空串 */
 function getPrivateKey(kid) {
-  const row = db.prepare('SELECT private_key,status FROM a2a_api_keys WHERE key_id=? AND status=1').get(kid);
+  const row = dal.getq('SELECT private_key,status FROM a2a_api_keys WHERE key_id=? AND status=1', [kid]);
   if (!row) return '';
   return decrypt(row.private_key);
 }
@@ -136,23 +136,23 @@ function getPrivateKey(kid) {
 /** 按 kid 取密钥元信息（不含公私钥）；不存在返回 null */
 function getKeyMeta(kid) {
   if (!kid) return null;
-  try { return db.prepare('SELECT key_id,name,owner,org_name,alg,scopes,status,expires_at FROM a2a_api_keys WHERE key_id=?').get(kid) || null; } catch { return null; }
+  try { return dal.getq('SELECT key_id,name,owner,org_name,alg,scopes,status,expires_at FROM a2a_api_keys WHERE key_id=?', [kid]) || null; } catch { return null; }
 }
 
 /** 列出全部密钥（不含私钥列） */
 function listKeys() {
-  return db.prepare('SELECT id,key_id,name,owner,org_name,alg,scopes,status,expires_at,created_at,last_used_at FROM a2a_api_keys ORDER BY id DESC').all();
+  return dal.q('SELECT id,key_id,name,owner,org_name,alg,scopes,status,expires_at,created_at,last_used_at FROM a2a_api_keys ORDER BY id DESC');
 }
 
 /** 停用密钥（status=0）；返回是否命中 */
 function disableKey(kid) {
-  const r = db.prepare('UPDATE a2a_api_keys SET status=0 WHERE key_id=?').run(kid);
+  const r = dal.runq('UPDATE a2a_api_keys SET status=0 WHERE key_id=?', [kid]);
   return r.changes > 0;
 }
 
 /** 记录最近使用时间（不阻断） */
 function touchKey(kid) {
-  try { db.prepare('UPDATE a2a_api_keys SET last_used_at=? WHERE key_id=?').run(now(), kid); } catch { /* ignore */ }
+  try { dal.runq('UPDATE a2a_api_keys SET last_used_at=? WHERE key_id=?', [now(), kid]); } catch { /* ignore */ }
 }
 
 module.exports = {

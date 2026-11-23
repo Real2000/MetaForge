@@ -10,6 +10,7 @@
  * Phase 1 只完成商品上架架构，不包含购买/支付/分成流程。
  */
 const express = require('express');
+const dal = require('../lib/dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const { db, now } = require('../db');
 const { auth, adminOnly } = require('../lib/auth');
 
@@ -29,13 +30,13 @@ router.get('/', (req, res) => {
   else if (type === 'free') sql += ` AND mp.price_type = 'free'`;
   if (q) { sql += ` AND (mp.name LIKE ? OR mp.agent_name LIKE ?)`; args.push(`%${q}%`, `%${q}%`); }
   sql += ' ORDER BY mp.id DESC';
-  const rows = db.prepare(sql).all(...args);
+  const rows = dal.q(sql, [...args]);
   res.json({ code: 0, data: rows.map(normalizeProduct) });
 });
 
 /* ---------- 商品详情 ---------- */
 router.get('/:id', (req, res) => {
-  const p = db.prepare('SELECT * FROM market_products WHERE id=?').get(req.params.id);
+  const p = dal.getq('SELECT * FROM market_products WHERE id=?', [req.params.id]);
   if (!p) return res.json({ code: 404, msg: '商品不存在' });
   res.json({ code: 0, data: normalizeProduct(p) });
 });
@@ -44,7 +45,7 @@ router.get('/:id', (req, res) => {
 router.post('/', adminOnly, (req, res) => {
   const { agent_id, price_type, price, subscription_period, author_profit_share, description } = req.body || {};
   if (!agent_id) return res.json({ code: 400, msg: '请指定智能体' });
-  const agent = db.prepare('SELECT id, name, owner, status FROM agents WHERE id=?').get(agent_id);
+  const agent = dal.getq('SELECT id, name, owner, status FROM agents WHERE id=?', [agent_id]);
   if (!agent) return res.json({ code: 404, msg: '智能体不存在' });
   if (!req.user.role === 'admin' && agent.owner !== req.user.username) {
     return res.json({ code: 403, msg: '无权限：仅智能体所有者或管理员可发布商品' });
@@ -53,44 +54,37 @@ router.post('/', adminOnly, (req, res) => {
     return res.json({ code: 400, msg: '价格类型非法（可用类型：free / one_time / subscription）' });
   }
   // 幂等：已有该智能体的商品则更新
-  const exist = db.prepare('SELECT * FROM market_products WHERE agent_id=?').get(agent_id);
+  const exist = dal.getq('SELECT * FROM market_products WHERE agent_id=?', [agent_id]);
   if (exist) {
-    db.prepare('UPDATE market_products SET name=?,price_type=?,price=?,subscription_period=?,author_profit_share=?,description=?,updated_at=? WHERE id=?')
-      .run(agent.name, price_type || exist.price_type, price != null ? price : exist.price,
+    dal.runq('UPDATE market_products SET name=?,price_type=?,price=?,subscription_period=?,author_profit_share=?,description=?,updated_at=? WHERE id=?', [agent.name, price_type || exist.price_type, price != null ? price : exist.price,
         subscription_period || exist.subscription_period, author_profit_share != null ? author_profit_share : exist.author_profit_share,
-        description ?? exist.description, now(), exist.id);
-    db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-      .run(req.user.username, '更新市场商品', `${agent.name}（${price_type || exist.price_type}）`, req.ip, now());
+        description ?? exist.description, now(), exist.id]);
+    dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '更新市场商品', `${agent.name}（${price_type || exist.price_type}）`, req.ip, now()]);
     return res.json({ code: 0, msg: '商品已更新' });
   }
-  db.prepare('INSERT INTO market_products (agent_id,name,price_type,price,subscription_period,author_profit_share,description,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)')
-    .run(agent_id, agent.name, price_type || 'free', price || 0, subscription_period || 'month', author_profit_share || 0.8, description || '', 'active', now(), now());
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(req.user.username, '发布市场商品', `${agent.name}（${price_type || 'free'}）`, req.ip, now());
+  dal.runq('INSERT INTO market_products (agent_id,name,price_type,price,subscription_period,author_profit_share,description,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)', [agent_id, agent.name, price_type || 'free', price || 0, subscription_period || 'month', author_profit_share || 0.8, description || '', 'active', now(), now()]);
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '发布市场商品', `${agent.name}（${price_type || 'free'}）`, req.ip, now()]);
   res.json({ code: 0, msg: '商品已发布' });
 });
 
 /* ---------- 更新商品信息 ---------- */
 router.put('/:id', adminOnly, (req, res) => {
-  const p = db.prepare('SELECT * FROM market_products WHERE id=?').get(req.params.id);
+  const p = dal.getq('SELECT * FROM market_products WHERE id=?', [req.params.id]);
   if (!p) return res.json({ code: 404, msg: '商品不存在' });
   const { price_type, price, subscription_period, author_profit_share, description, status } = req.body || {};
-  db.prepare('UPDATE market_products SET price_type=?,price=?,subscription_period=?,author_profit_share=?,description=?,status=?,updated_at=? WHERE id=?')
-    .run(price_type || p.price_type, price != null ? price : p.price,
+  dal.runq('UPDATE market_products SET price_type=?,price=?,subscription_period=?,author_profit_share=?,description=?,status=?,updated_at=? WHERE id=?', [price_type || p.price_type, price != null ? price : p.price,
       subscription_period || p.subscription_period, author_profit_share != null ? author_profit_share : p.author_profit_share,
-      description ?? p.description, status ?? p.status, now(), p.id);
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(req.user.username, '更新市场商品', `#${p.id}`, req.ip, now());
+      description ?? p.description, status ?? p.status, now(), p.id]);
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '更新市场商品', `#${p.id}`, req.ip, now()]);
   res.json({ code: 0, msg: '已更新' });
 });
 
 /* ---------- 下架商品 ---------- */
 router.delete('/:id', adminOnly, (req, res) => {
-  const p = db.prepare('SELECT * FROM market_products WHERE id=?').get(req.params.id);
+  const p = dal.getq('SELECT * FROM market_products WHERE id=?', [req.params.id]);
   if (!p) return res.json({ code: 404, msg: '商品不存在' });
-  db.prepare('DELETE FROM market_products WHERE id=?').run(p.id);
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(req.user.username, '下架市场商品', p.name, req.ip, now());
+  dal.runq('DELETE FROM market_products WHERE id=?', [p.id]);
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '下架市场商品', p.name, req.ip, now()]);
   res.json({ code: 0, msg: '已下架' });
 });
 
@@ -110,7 +104,7 @@ router.get('/revenue', adminOnly, (req, res) => {
   if (!/^\d{4}-\d{2}$/.test(month)) return res.json({ code: 400, msg: '月份格式非法，应为 YYYY-MM' });
   const months = month;
   const nextMonth = month.slice(0, 5) + String(+month.slice(5, 7) + 1).padStart(2, '0');
-  const rows = db.prepare(`
+  const rows = dal.q(`
     SELECT mp.id AS product_id, mp.name AS product_name, mp.price_type, a.name AS agent_name,
       COUNT(o.id) AS orders, COALESCE(SUM(o.price),0) AS revenue,
       COALESCE(SUM(o.price * mp.author_profit_share),0) AS author_share,
@@ -120,7 +114,7 @@ router.get('/revenue', adminOnly, (req, res) => {
     LEFT JOIN market_orders o ON o.product_id = mp.id AND o.status IN ('paid','completed')
       AND o.paid_at >= ? AND o.paid_at < ?
     GROUP BY mp.id ORDER BY revenue DESC LIMIT 200
-  `).all(`${months}-01 00:00:00`, `${nextMonth}-01 00:00:00`);
+  `, [`${months}-01 00:00:00`, `${nextMonth}-01 00:00:00`]);
   const total = {
     revenue: rows.reduce((s, r) => s + r.revenue, 0),
     authorShare: rows.reduce((s, r) => s + r.author_share, 0),

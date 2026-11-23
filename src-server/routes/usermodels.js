@@ -4,6 +4,7 @@
  *  隐私保护：列表接口不回传完整 Key（仅显示头尾掩码）；编辑时不回传明文，占位提交保留旧值。
  */
 const express = require('express');
+const dal = require('../lib/dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const { db, now } = require('../db');
 const { auth } = require('../lib/auth');
 const { encrypt, decrypt } = require('../lib/crypto-util');
@@ -24,7 +25,7 @@ function parseModels(models, oldJson) {
 }
 
 router.get('/', (req, res) => {
-  const rows = db.prepare('SELECT * FROM user_providers WHERE username=? ORDER BY id').all(req.user.username);
+  const rows = dal.q('SELECT * FROM user_providers WHERE username=? ORDER BY id', [req.user.username]);
   res.json({
     code: 0,
     data: rows.map(r => ({ ...r, api_key: maskKey(decrypt(r.api_key)), key_set: !!r.api_key })),
@@ -37,19 +38,17 @@ router.post('/', async (req, res) => {
   if (!base_url?.trim()) return res.json({ code: 400, msg: '服务地址不能为空（OpenAI 兼容，如 https://api.xxx.com/v1）' });
   // SEC-05：SSRF 校验（拒绝私网/环回/云元数据地址，除非管理员 AGENT_FETCH_ALLOW_PRIVATE=1）
   try { await assertPublicHttpUrl(base_url.trim()); } catch (e) { return res.json({ code: 400, msg: e.message }); }
-  const cnt = db.prepare('SELECT COUNT(*) c FROM user_providers WHERE username=?').get(req.user.username).c;
+  const cnt = dal.getq('SELECT COUNT(*) c FROM user_providers WHERE username=?', [req.user.username]).c;
   if (cnt >= 10) return res.json({ code: 400, msg: '每人最多接入 10 个模型源' });
   const ms = parseModels(models, '[]');
   if (!ms.length) return res.json({ code: 400, msg: '请至少填写一个模型标识（逗号或空格分隔）' });
-  const info = db.prepare('INSERT INTO user_providers (username,name,base_url,api_key,models,status,created_at) VALUES (?,?,?,?,?,1,?)')
-    .run(req.user.username, name.trim(), base_url.trim(), api_key ? encrypt(api_key) : '', JSON.stringify(ms), now());
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(req.user.username, '接入我的模型', `${name.trim()}（${ms.length} 个模型）`, req.ip, now());
+  const info = dal.runq('INSERT INTO user_providers (username,name,base_url,api_key,models,status,created_at) VALUES (?,?,?,?,?,1,?)', [req.user.username, name.trim(), base_url.trim(), api_key ? encrypt(api_key) : '', JSON.stringify(ms), now()]);
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '接入我的模型', `${name.trim()}（${ms.length} 个模型）`, req.ip, now()]);
   res.json({ code: 0, data: { id: info.lastInsertRowid } });
 });
 
 router.put('/:id', async (req, res) => {
-  const old = db.prepare('SELECT * FROM user_providers WHERE id=? AND username=?').get(req.params.id, req.user.username);
+  const old = dal.getq('SELECT * FROM user_providers WHERE id=? AND username=?', [req.params.id, req.user.username]);
   if (!old) return res.json({ code: 404, msg: '模型源不存在' });
   const { name, base_url, api_key, models, status } = req.body || {};
   // SEC-05：改地址同样过 SSRF 校验
@@ -57,20 +56,19 @@ router.put('/:id', async (req, res) => {
   const ms = parseModels(models, old.models);
   // Key 编辑保护：未传/传空/传掩码（****）都保留旧值；只有传新明文才覆盖
   const keepKey = (api_key == null || api_key === '' || String(api_key).includes('****')) ? old.api_key : encrypt(api_key);
-  db.prepare('UPDATE user_providers SET name=?,base_url=?,api_key=?,models=?,status=? WHERE id=?')
-    .run(name?.trim() || old.name, base_url?.trim() || old.base_url, keepKey, JSON.stringify(ms),
-      status == null ? old.status : (status ? 1 : 0), old.id);
+  dal.runq('UPDATE user_providers SET name=?,base_url=?,api_key=?,models=?,status=? WHERE id=?', [name?.trim() || old.name, base_url?.trim() || old.base_url, keepKey, JSON.stringify(ms),
+      status == null ? old.status : (status ? 1 : 0), old.id]);
   res.json({ code: 0, msg: '已保存' });
 });
 
 router.delete('/:id', (req, res) => {
-  db.prepare('DELETE FROM user_providers WHERE id=? AND username=?').run(req.params.id, req.user.username);
+  dal.runq('DELETE FROM user_providers WHERE id=? AND username=?', [req.params.id, req.user.username]);
   res.json({ code: 0, msg: '已删除' });
 });
 
 // 连通测试（与后台模型接入同一套两级校验）：① /models 列表（网络与鉴权）② 清单第一个模型真实调用（调用权限）
 router.post('/:id/test', async (req, res) => {
-  const old = db.prepare('SELECT * FROM user_providers WHERE id=? AND username=?').get(req.params.id, req.user.username);
+  const old = dal.getq('SELECT * FROM user_providers WHERE id=? AND username=?', [req.params.id, req.user.username]);
   if (!old) return res.json({ code: 404, msg: '模型源不存在' });
   if (!old.base_url) return res.json({ code: 0, data: { ok: false, msg: '❌ 未配置服务地址' } });
   // SEC-05：连通测试是真实出站请求——先过 SSRF 校验（防把本机/内网地址作为探测目标）

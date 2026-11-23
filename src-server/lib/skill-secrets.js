@@ -11,6 +11,7 @@
  * 本模块是用户级、每个用户为自己的技能各配各的。
  */
 const { db, now } = require('../db');
+const dal = require('./dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const { encrypt, decrypt } = require('./crypto-util');
 
 const NAME_RE = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
@@ -30,34 +31,32 @@ function setSecret(owner, skillId, name, value) {
   const n = String(name || '').trim();
   if (!isValidName(n)) return { ok: false, msg: '密钥名仅支持字母/数字/下划线，字母或下划线开头，≤64 字符' };
   if (value == null || String(value) === '') return { ok: false, msg: '密钥值不能为空' };
-  const old = db.prepare('SELECT id FROM skill_secrets WHERE owner=? AND skill_id=? AND name=?').get(owner, skillId, n);
+  const old = dal.getq('SELECT id FROM skill_secrets WHERE owner=? AND skill_id=? AND name=?', [owner, skillId, n]);
   const enc = encrypt(String(value));
   if (old) {
-    db.prepare("UPDATE skill_secrets SET value=?, updated_at=datetime('now','localtime') WHERE id=?").run(enc, old.id);
+    dal.runq("UPDATE skill_secrets SET value=?, updated_at=datetime('now','localtime') WHERE id=?", [enc, old.id]);
     return { ok: true, action: 'updated', name: n };
   }
-  db.prepare("INSERT INTO skill_secrets (owner, skill_id, name, value, created_at, updated_at) VALUES (?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))")
-    .run(owner, skillId, n, enc);
+  dal.runq("INSERT INTO skill_secrets (owner, skill_id, name, value, created_at, updated_at) VALUES (?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))", [owner, skillId, n, enc]);
   return { ok: true, action: 'created', name: n };
 }
 
 /** 删除 */
 function deleteSecret(owner, skillId, name) {
-  const r = db.prepare('DELETE FROM skill_secrets WHERE owner=? AND skill_id=? AND name=?').run(owner, skillId, String(name || ''));
+  const r = dal.runq('DELETE FROM skill_secrets WHERE owner=? AND skill_id=? AND name=?', [owner, skillId, String(name || '')]);
   return r.changes > 0;
 }
 
 /** 列出密钥（掩码回显，绝不回明文）：[{ name, masked, updated_at }] */
 function listSecrets(owner, skillId) {
-  return db.prepare('SELECT name, value, updated_at FROM skill_secrets WHERE owner=? AND skill_id=? ORDER BY name')
-    .all(owner, skillId)
+  return dal.q('SELECT name, value, updated_at FROM skill_secrets WHERE owner=? AND skill_id=? ORDER BY name', [owner, skillId])
     .map(r => ({ name: r.name, masked: maskValue(decrypt(r.value)), has_value: !!r.value, updated_at: r.updated_at }));
 }
 
 /** 运行期取用（明文；仅供 skill-runner 注入沙箱）：{ name: plaintext } */
 function getSecretsForRun(owner, skillId) {
   const out = {};
-  for (const r of db.prepare('SELECT name, value FROM skill_secrets WHERE owner=? AND skill_id=?').all(owner, skillId)) {
+  for (const r of dal.q('SELECT name, value FROM skill_secrets WHERE owner=? AND skill_id=?', [owner, skillId])) {
     const v = decrypt(r.value);
     if (v) out[r.name] = v;
   }
@@ -66,7 +65,7 @@ function getSecretsForRun(owner, skillId) {
 
 /** 删除某技能的全部密钥（技能删除时级联） */
 function purgeSkill(owner, skillId) {
-  db.prepare('DELETE FROM skill_secrets WHERE owner=? AND skill_id=?').run(owner, skillId);
+  dal.runq('DELETE FROM skill_secrets WHERE owner=? AND skill_id=?', [owner, skillId]);
 }
 
 /**

@@ -3,6 +3,7 @@
  *  已读状态按用户区分（广播通知每人独立已读：read_marks 记 username+notification_id）。
  */
 const express = require('express');
+const dal = require('../lib/dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const { db, now } = require('../db');
 const { auth } = require('../lib/auth');
 const { parseLimit } = require('../lib/pagination'); // P1-3 2026-11-04：limit 容错（原 ?limit=abc → NaN LIMIT 必 500）
@@ -16,7 +17,7 @@ router.get('/', (req, res) => {
   // P1-3 分页容错：limit 非法（abc→NaN）/负数（SQLite 负 LIMIT=无限制）一律回落默认 30，上限 100
   const limit = parseLimit(req, { def: 30, max: 100 });
   const marks = new Set(
-    db.prepare('SELECT notification_id FROM notification_reads WHERE username=?').all(req.user.username).map(r => r.notification_id)
+    dal.q('SELECT notification_id FROM notification_reads WHERE username=?', [req.user.username]).map(r => r.notification_id)
   );
   let sql = `SELECT * FROM notifications WHERE (username=? OR username='*')`;
   const args = [req.user.username];
@@ -26,24 +27,21 @@ router.get('/', (req, res) => {
   }
   sql += ' ORDER BY id DESC LIMIT ?';
   args.push(limit);
-  const list = db.prepare(sql).all(...args).map(n => ({ ...n, is_read: marks.has(n.id) ? 1 : 0 }));
-  const unreadCount = db.prepare(`SELECT COUNT(*) c FROM notifications WHERE (username=? OR username='*') AND id NOT IN (SELECT notification_id FROM notification_reads WHERE username=?)`)
-    .get(req.user.username, req.user.username).c;
+  const list = dal.q(sql, [...args]).map(n => ({ ...n, is_read: marks.has(n.id) ? 1 : 0 }));
+  const unreadCount = dal.getq(`SELECT COUNT(*) c FROM notifications WHERE (username=? OR username='*') AND id NOT IN (SELECT notification_id FROM notification_reads WHERE username=?)`, [req.user.username, req.user.username]).c;
   res.json({ code: 0, data: { list, unread: unreadCount } });
 });
 
 // 标记单条已读
 router.post('/:id/read', (req, res) => {
-  db.prepare('INSERT OR IGNORE INTO notification_reads (username,notification_id,read_at) VALUES (?,?,?)')
-    .run(req.user.username, req.params.id, now());
+  dal.runq('INSERT OR IGNORE INTO notification_reads (username,notification_id,read_at) VALUES (?,?,?)', [req.user.username, req.params.id, now()]);
   res.json({ code: 0, msg: '已读' });
 });
 
 // 全部已读
 router.post('/read-all', (req, res) => {
-  const ids = db.prepare(`SELECT id FROM notifications WHERE (username=? OR username='*')`).all(req.user.username);
-  const ins = db.prepare('INSERT OR IGNORE INTO notification_reads (username,notification_id,read_at) VALUES (?,?,?)');
-  ids.forEach(r => ins.run(req.user.username, r.id, now()));
+  const ids = dal.q(`SELECT id FROM notifications WHERE (username=? OR username='*')`, [req.user.username]);
+  ids.forEach(r => dal.runq('INSERT OR IGNORE INTO notification_reads (username,notification_id,read_at) VALUES (?,?,?)', [req.user.username, r.id, now()]));
   res.json({ code: 0, msg: '已全部标记为已读' });
 });
 

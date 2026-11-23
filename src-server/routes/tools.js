@@ -7,6 +7,7 @@
  * GET  /api/tools/categories    — 工具分类列表（用于前端筛选）
  */
 const express = require('express');
+const dal = require('../lib/dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const { db, now } = require('../db');
 const { auth } = require('../lib/auth');
 const { TOOL_DEFS } = require('../lib/tools');
@@ -45,7 +46,7 @@ function getAllTools() {
 
   // 2) MCP 工具
   try {
-    const mcpServers = db.prepare('SELECT * FROM mcp_servers').all();
+    const mcpServers = dal.q('SELECT * FROM mcp_servers');
     for (const s of mcpServers) {
       let tc = [];
       try { tc = JSON.parse(s.tools_cache || '[]'); } catch { tc = []; }
@@ -65,7 +66,7 @@ function getAllTools() {
 
   // 3) 子智能体工具
   try {
-    const agents = db.prepare("SELECT id, name, description FROM agents WHERE status='published' AND source NOT IN ('system','platform')").all();
+    const agents = dal.q("SELECT id, name, description FROM agents WHERE status='published' AND source NOT IN ('system','platform')");
     for (const a of agents) {
       tools.push({
         name: `agent:${a.id}`,

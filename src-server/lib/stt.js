@@ -8,6 +8,7 @@
  *  语义保证：本函数永不 reject（无法连接失败返回 { ok:false }），调用方无需 try-catch。
  */
 const { db } = require('../db');
+const dal = require('./dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 
 async function ensureFfmpeg() { /* 检查 ffmpeg（用于音频格式转换） */
   try {
@@ -34,8 +35,8 @@ async function stt({ audio, format, language, provider }) {
   // 1) 尝试从 voice_providers 获取 STT 供应商
   try {
     const providers = provider
-      ? [db.prepare('SELECT * FROM voice_providers WHERE id=? AND type IN (\'stt\',\'both\')').get(+provider)]
-      : db.prepare("SELECT * FROM voice_providers WHERE type IN ('stt','both') AND configured=1 ORDER BY is_default DESC, id ASC").all();
+      ? [dal.getq('SELECT * FROM voice_providers WHERE id=? AND type IN (\'stt\',\'both\')', [+provider])]
+      : dal.q("SELECT * FROM voice_providers WHERE type IN ('stt','both') AND configured=1 ORDER BY is_default DESC, id ASC");
     for (const p of providers) {
       if (!p) continue;
       const result = await whisperSTT(buf, p);
@@ -45,7 +46,7 @@ async function stt({ audio, format, language, provider }) {
 
   // 2) 回退：兼容 OpenAI Whisper API
   try {
-    const openaiProviders = db.prepare("SELECT name, api_key, base_url FROM providers WHERE configured=1").all();
+    const openaiProviders = dal.q("SELECT name, api_key, base_url FROM providers WHERE configured=1");
     for (const p of openaiProviders) {
       const base = p.base_url?.replace(/\/+$/, '') || 'https://api.openai.com';
       const url = base + '/v1/audio/transcriptions';
@@ -108,8 +109,8 @@ function effectiveStreamMode(provider) {
 /** 选取 STT 供应商行（按指定 ID 或默认优先，含 stream_type）；无则 null */
 function pickSttProvider(providerId) {
   try {
-    if (providerId) return db.prepare("SELECT * FROM voice_providers WHERE id=? AND type IN ('stt','both')").get(+providerId) || null;
-    return db.prepare("SELECT * FROM voice_providers WHERE type IN ('stt','both') AND configured=1 ORDER BY is_default DESC, id ASC").get() || null;
+    if (providerId) return dal.getq("SELECT * FROM voice_providers WHERE id=? AND type IN ('stt','both')", [+providerId]) || null;
+    return dal.getq("SELECT * FROM voice_providers WHERE type IN ('stt','both') AND configured=1 ORDER BY is_default DESC, id ASC") || null;
   } catch { return null; }
 }
 

@@ -15,6 +15,7 @@
  * 新增 tenantCostOfMonth / tenantReport 聚合，实现「tenant_id → username」两级账单口径（两租户互不串账）。
  */
 const { db, now } = require('../db');
+const dal = require('./dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 
 /** 有效租户号判定：null/undefined/'' → false（"全部租户"语义，零过滤）。
  *  注意：Number.isFinite(Number(null)) 为 true，故必须先排除空值，否则会把"全部"误当 tenant_id=0。 */
@@ -25,7 +26,7 @@ function hasTenant(tenantId) {
 /** 用户所属租户（写入时快照；容错返回 null）。*/ 
 function userTenantId(username) {
   try {
-    const r = db.prepare('SELECT tenant_id FROM users WHERE username=?').get(username);
+    const r = dal.getq('SELECT tenant_id FROM users WHERE username=?', [username]);
     return r && r.tenant_id != null ? Number(r.tenant_id) : null;
   } catch { return null; }
 }
@@ -54,12 +55,12 @@ function priceOf(modelName, providerName, tenantId) {
   let rows;
   if (providerName) {
     rows = useTenant
-      ? db.prepare('SELECT model_price, models, tenant_id FROM providers WHERE name=? AND (tenant_id=0 OR tenant_id=?) ORDER BY tenant_id DESC').all(providerName, Number(tenantId))
-      : db.prepare('SELECT model_price, models, tenant_id FROM providers WHERE name=?').all(providerName);
+      ? dal.q('SELECT model_price, models, tenant_id FROM providers WHERE name=? AND (tenant_id=0 OR tenant_id=?) ORDER BY tenant_id DESC', [providerName, Number(tenantId)])
+      : dal.q('SELECT model_price, models, tenant_id FROM providers WHERE name=?', [providerName]);
   } else if (useTenant) {
-    rows = db.prepare('SELECT model_price, models, tenant_id FROM providers WHERE configured=1 AND (tenant_id=0 OR tenant_id=?) ORDER BY tenant_id DESC').all(Number(tenantId));
+    rows = dal.q('SELECT model_price, models, tenant_id FROM providers WHERE configured=1 AND (tenant_id=0 OR tenant_id=?) ORDER BY tenant_id DESC', [Number(tenantId)]);
   } else {
-    rows = db.prepare('SELECT model_price, models, tenant_id FROM providers WHERE configured=1').all();
+    rows = dal.q('SELECT model_price, models, tenant_id FROM providers WHERE configured=1');
   }
   // 指定供应商：其单价表里有该模型 → 命中（按 tenant_id 降序，租户专有覆盖全局）
   for (const r of rows) {
@@ -86,17 +87,16 @@ function computeCost(promptTokens, completionTokens, price) {
 function recordModelUsage({ username, model, provider, promptTokens = 0, completionTokens = 0, meta } = {}) {
   if (!username || !model) return null;
   try {
-    const u = db.prepare('SELECT dept_id, tenant_id FROM users WHERE username=?').get(username);
+    const u = dal.getq('SELECT dept_id, tenant_id FROM users WHERE username=?', [username]);
     const tid = u && u.tenant_id != null ? Number(u.tenant_id) : null;
     const price = priceOf(model, provider, tid);
     const cost = computeCost(promptTokens, completionTokens, price);
     const tokens = Math.max(0, Math.ceil(+promptTokens || 0)) + Math.max(0, Math.ceil(+completionTokens || 0));
     const metaObj = Object.assign({ provider: provider || '', priced: !!price }, meta || {});
     if (price) { metaObj.price_input = price.input; metaObj.price_output = price.output; } // 单价快照（后续调价不影响历史成本可审计性）
-    db.prepare(`INSERT INTO usage_records (username, dimension, dimension_key, tokens, count, cost, meta, prompt_tokens, completion_tokens, dept_id, tenant_id, created_at)
-      VALUES (?, 'model', ?, ?, 1, ?, ?, ?, ?, ?, ?, datetime('now','localtime'))`)
-      .run(username, String(model), tokens, cost, JSON.stringify(metaObj),
-        Math.max(0, Math.ceil(+promptTokens || 0)), Math.max(0, Math.ceil(+completionTokens || 0)), u ? u.dept_id : null, tid);
+    dal.runq(`INSERT INTO usage_records (username, dimension, dimension_key, tokens, count, cost, meta, prompt_tokens, completion_tokens, dept_id, tenant_id, created_at)
+      VALUES (?, 'model', ?, ?, 1, ?, ?, ?, ?, ?, ?, datetime('now','localtime'))`, [username, String(model), tokens, cost, JSON.stringify(metaObj),
+        Math.max(0, Math.ceil(+promptTokens || 0)), Math.max(0, Math.ceil(+completionTokens || 0)), u ? u.dept_id : null, tid]);
     return { priced: !!price, cost };
   } catch (e) {
     console.error('[billing] 用量记账失败（不阻断对话）：', e.message);
@@ -111,12 +111,12 @@ function deptCostOfMonth(month) {
   const m = /^\d{4}-\d{2}$/.test(month || '')
     ? month
     : new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Shanghai' }).slice(0, 7);
-  const rows = db.prepare(`SELECT ur.dept_id, d.name AS dept_name, d.monthly_budget AS budget,
+  const rows = dal.q(`SELECT ur.dept_id, d.name AS dept_name, d.monthly_budget AS budget,
       COUNT(DISTINCT ur.username) AS members, SUM(ur.tokens) AS tokens, SUM(ur.cost) AS cost
     FROM usage_records ur
     LEFT JOIN departments d ON d.id = ur.dept_id
     WHERE ur.dimension='model' AND ur.created_at LIKE ? || '%'
-    GROUP BY ur.dept_id`).all(m);
+    GROUP BY ur.dept_id`, [m]);
   // LEFT JOIN 未命中 name 的（dept_id 为 NULL 或部门已删）归入「未归属」
   const noDept = { dept_id: null, dept_name: '未归属', members: 0, tokens: 0, cost: 0, budget: 0 };
   const out = [];
@@ -135,8 +135,7 @@ function recordKbFederatedUsage({ username, query, tokens = 1, sourceOrg = '', k
   try {
     const dimKey = `kb_federated:${(sourceOrg || '').slice(0, 30)}:${(kbName || '').slice(0, 30)}`;
     const finalCost = cost != null ? cost : Number((tokens * 0.001).toFixed(6));
-    db.prepare("INSERT INTO usage_records (username, dimension, dimension_key, tokens, count, cost, meta, tenant_id, created_at) VALUES (?, 'kb', ?, ?, 1, ?, ?, ?, datetime('now','localtime'))")
-      .run(username, dimKey, tokens, finalCost, JSON.stringify({ sourceOrg, kbName, query, type: 'kb_federated' }), userTenantId(username));
+    dal.runq("INSERT INTO usage_records (username, dimension, dimension_key, tokens, count, cost, meta, tenant_id, created_at) VALUES (?, 'kb', ?, ?, 1, ?, ?, ?, datetime('now','localtime'))", [username, dimKey, tokens, finalCost, JSON.stringify({ sourceOrg, kbName, query, type: 'kb_federated' }), userTenantId(username)]);
     return { ok: true, cost: finalCost };
   } catch (e) {
     console.error('[billing] kb_federated 计费失败（不阻断）：', e.message);
@@ -156,12 +155,12 @@ function tenantCostOfMonth(month, tenantId = null) {
     : new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Shanghai' }).slice(0, 7);
   const limit = hasTenant(tenantId) ? ' AND ur.tenant_id = ?' : '';
   const args = limit ? [m, Number(tenantId)] : [m];
-  const rows = db.prepare(`SELECT ur.tenant_id, t.name AS tenant_name,
+  const rows = dal.q(`SELECT ur.tenant_id, t.name AS tenant_name,
       COUNT(DISTINCT ur.username) AS members, SUM(ur.tokens) AS tokens, SUM(ur.cost) AS cost
     FROM usage_records ur
     LEFT JOIN tenants t ON t.id = ur.tenant_id
     WHERE ur.dimension='model' AND ur.created_at LIKE ? || '%'${limit}
-    GROUP BY ur.tenant_id`).all(...args);
+    GROUP BY ur.tenant_id`, [...args]);
   const tenants = rows.map(r => ({
     tenant_id: r.tenant_id,
     tenant_name: r.tenant_name || (r.tenant_id == null ? '未归属' : `租户#${r.tenant_id}`),
@@ -183,11 +182,11 @@ function tenantReport({ month, tenantId = null } = {}) {
     : new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Shanghai' }).slice(0, 7);
   const limit = hasTenant(tenantId) ? ' AND ur.tenant_id = ?' : '';
   const mArgs = limit ? [m, Number(tenantId)] : [m];
-  const users = db.prepare(`SELECT ur.username, SUM(ur.tokens) AS tokens, SUM(ur.cost) AS cost,
+  const users = dal.q(`SELECT ur.username, SUM(ur.tokens) AS tokens, SUM(ur.cost) AS cost,
       SUM(ur.prompt_tokens) AS prompt_tokens, SUM(ur.completion_tokens) AS completion_tokens, COUNT(*) AS calls
     FROM usage_records ur
     WHERE ur.dimension='model' AND ur.created_at LIKE ? || '%'${limit}
-    GROUP BY ur.username ORDER BY cost DESC`).all(...mArgs)
+    GROUP BY ur.username ORDER BY cost DESC`, [...mArgs])
     .map(r => ({
       username: r.username,
       calls: r.calls || 0,
@@ -198,7 +197,7 @@ function tenantReport({ month, tenantId = null } = {}) {
     }));
   const monthlyTotal = Number(users.reduce((s, r) => s + r.cost, 0).toFixed(6));
   const lArgs = limit ? [Number(tenantId)] : [];
-  const life = db.prepare(`SELECT SUM(cost) AS cost FROM usage_records ur WHERE ur.dimension='model'${limit}`).get(...lArgs);
+  const life = dal.getq(`SELECT SUM(cost) AS cost FROM usage_records ur WHERE ur.dimension='model'${limit}`, [...lArgs]);
   return {
     month: m,
     tenantId: hasTenant(tenantId) ? Number(tenantId) : null,
@@ -214,12 +213,11 @@ function tenantReport({ month, tenantId = null } = {}) {
  */
 function tenantReportCsv({ month, tenantId = null } = {}) {
   const rep = tenantReport({ month, tenantId });
-  const rows = db.prepare(`SELECT ur.tenant_id, t.name AS tenant_name, ur.username,
+  const rows = dal.q(`SELECT ur.tenant_id, t.name AS tenant_name, ur.username,
       SUM(ur.tokens) AS tokens, SUM(ur.prompt_tokens) AS pt, SUM(ur.completion_tokens) AS ct, SUM(ur.cost) AS cost, COUNT(*) AS calls
     FROM usage_records ur LEFT JOIN tenants t ON t.id = ur.tenant_id
     WHERE ur.dimension='model' AND ur.created_at LIKE ? || '%'${hasTenant(tenantId) ? ' AND ur.tenant_id = ?' : ''}
-    GROUP BY ur.tenant_id, ur.username ORDER BY ur.tenant_id, cost DESC`)
-    .all(...(hasTenant(tenantId) ? [rep.month, Number(tenantId)] : [rep.month]));
+    GROUP BY ur.tenant_id, ur.username ORDER BY ur.tenant_id, cost DESC`, [...(hasTenant(tenantId) ? [rep.month, Number(tenantId)] : [rep.month])]);
   const esc = (v) => {
     const s = String(v ?? '');
     return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;

@@ -1,3 +1,4 @@
+const dal = require('./dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 /**
  * 空间工具（V2.4 #9 租户化 2026-10-31；2026-11-02 收尾；M1/MT-04 多租户重写 2026-11-22）
  * 统一的空间过滤函数，供 agents/knowledge/tasks 等资源路由复用，
@@ -25,7 +26,7 @@ function getMySpaceIds(db, username, opts = {}) {
   const enforce = opts.tenantId != null;
   const sql = `SELECT id FROM spaces WHERE type=? AND owner=?${enforce ? ' AND tenant_id=?' : ''}`;
   const args = enforce ? ['personal', username, opts.tenantId] : ['personal', username];
-  const rows = db.prepare(sql).all(...args);
+  const rows = dal.q(sql, [...args]);
   return rows.map(r => r.id);
 }
 
@@ -34,7 +35,7 @@ function getOwnedSpaceIds(db, username, opts = {}) {
   const enforce = opts.tenantId != null;
   const sql = `SELECT id FROM spaces WHERE owner=?${enforce ? ' AND tenant_id=?' : ''}`;
   const args = enforce ? [username, opts.tenantId] : [username];
-  const rows = db.prepare(sql).all(...args);
+  const rows = dal.q(sql, [...args]);
   return rows.map(r => r.id);
 }
 
@@ -65,7 +66,7 @@ function spaceVisibleTo(db, spaceId, username, opts = {}) {
   // ① 租户硬边界：资源租户与请求租户不一致 → 拒绝（跨租户不可见）
   if (enforce && opts.resourceTenantId != null && Number(opts.resourceTenantId) !== Number(opts.tenantId)) return false;
   if (!spaceId) return true; // 无归属（0/NULL/''）→ 本租户内全员可见（租户边界由 ① 兜底）
-  const sp = db.prepare('SELECT type, owner, tenant_id FROM spaces WHERE id=?').get(spaceId);
+  const sp = dal.getq('SELECT type, owner, tenant_id FROM spaces WHERE id=?', [spaceId]);
   // SEC-04（2026-11-22）：空间不存在（脏数据/已删空间）→ fail-closed 不可见，与 spaceFilterSql 的 SQL 语义对齐。
   if (!sp) return false;
   // ② 空间所属租户必须匹配

@@ -5,6 +5,7 @@
  * - MT-12：租户隔离——平台全局层(tenant_id=0) 由平台超管维护；租户管理员仅管理本租户层（他租户不可见）
  */
 const express = require('express');
+const dal = require('../lib/dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const { db, now } = require('../db');
 const { auth, adminOnly } = require('../lib/auth');
 const secrets = require('../lib/secrets');
@@ -37,10 +38,10 @@ router.post('/', (req, res) => {
   const scope = mgmtScope(req);
   const action = secrets.upsert(n, value, remark, scope);
   if (action === 'deleted') {
-    db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)').run(req.user.username, '删除密钥', `${n}（租户层 ${scope}）`, req.ip, now());
+    dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '删除密钥', `${n}（租户层 ${scope}）`, req.ip, now()]);
     return res.json({ code: 0, msg: '已删除' });
   }
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)').run(req.user.username, action === 'created' ? '新增密钥' : '更新密钥', `${n}（租户层 ${scope}）`, req.ip, now());
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, action === 'created' ? '新增密钥' : '更新密钥', `${n}（租户层 ${scope}）`, req.ip, now()]);
   res.json({ code: 0, msg: action === 'created' ? '已创建（画布中用 {{env.' + n + '}} 引用）' : '已更新' });
 });
 

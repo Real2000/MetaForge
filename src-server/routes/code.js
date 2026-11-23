@@ -10,6 +10,7 @@
  *       设置后仅允许登记其下的目录；写盘仅限仓库根内且必须先 propose 再 apply。
  */
 const express = require('express');
+const dal = require('../lib/dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const fs = require('fs');
 const path = require('path');
 const { db, now } = require('../db');
@@ -27,7 +28,7 @@ const INDEX_TOKEN_BUDGET = 4000;  // 单块送入向量的字符上限
 
 /** 归属可见性：管理员可见全部；其他用户仅可见自己登记的仓库（读/写一致，防按 id 越权读文件） */
 function repoOf(id, user) {
-  const r = db.prepare('SELECT * FROM code_repos WHERE id=?').get(id);
+  const r = dal.getq('SELECT * FROM code_repos WHERE id=?', [id]);
   if (!r) return null;
   if (isAdmin(user)) return r;
   return r.owner === user.username ? r : null;
@@ -64,8 +65,8 @@ function resolveRoot(rootPath) {
 
 router.get('/repos', (req, res) => {
   const rows = isAdmin(req.user)
-    ? db.prepare('SELECT * FROM code_repos ORDER BY id DESC').all()
-    : db.prepare('SELECT * FROM code_repos WHERE owner=? ORDER BY id DESC').all(req.user.username);
+    ? dal.q('SELECT * FROM code_repos ORDER BY id DESC')
+    : dal.q('SELECT * FROM code_repos WHERE owner=? ORDER BY id DESC', [req.user.username]);
   res.json({ code: 0, data: rows });
 });
 
@@ -75,29 +76,27 @@ router.post('/repos', (req, res) => {
   if (!name) return res.json({ code: 400, msg: '仓库名称不能为空' });
   const rr = resolveRoot(b.root_path);
   if (!rr.ok) return res.json({ code: 400, msg: rr.msg });
-  const info = db.prepare(`INSERT INTO code_repos (owner,name,root_path,description,status,created_at)
-    VALUES (?,?,?,?,?,?)`)
-    .run(req.user.username, name.slice(0, 100), rr.real, String(b.description || '').slice(0, 500), 'new', now());
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(req.user.username, '登记代码仓库', `${name}（${rr.real}）`, req.ip, now());
-  res.json({ code: 0, data: db.prepare('SELECT * FROM code_repos WHERE id=?').get(info.lastInsertRowid) });
+  const info = dal.runq(`INSERT INTO code_repos (owner,name,root_path,description,status,created_at)
+    VALUES (?,?,?,?,?,?)`, [req.user.username, name.slice(0, 100), rr.real, String(b.description || '').slice(0, 500), 'new', now()]);
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '登记代码仓库', `${name}（${rr.real}）`, req.ip, now()]);
+  res.json({ code: 0, data: dal.getq('SELECT * FROM code_repos WHERE id=?', [info.lastInsertRowid]) });
 });
 
 router.get('/repos/:id', (req, res) => {
   const r = repoOf(req.params.id, req.user);
   if (!r) return res.json({ code: 404, msg: '仓库不存在或不可见' });
-  const byKind = db.prepare("SELECT chunk_kind k, COUNT(*) c FROM code_index WHERE repo_id=? GROUP BY chunk_kind").all(r.id);
-  const langStat = db.prepare("SELECT lang, COUNT(DISTINCT file_path) files FROM code_index WHERE repo_id=? GROUP BY lang ORDER BY files DESC").all(r.id);
+  const byKind = dal.q("SELECT chunk_kind k, COUNT(*) c FROM code_index WHERE repo_id=? GROUP BY chunk_kind", [r.id]);
+  const langStat = dal.q("SELECT lang, COUNT(DISTINCT file_path) files FROM code_index WHERE repo_id=? GROUP BY lang ORDER BY files DESC", [r.id]);
   res.json({ code: 0, data: { ...r, by_kind: byKind, langs: langStat } });
 });
 
 router.delete('/repos/:id', (req, res) => {
   const r = repoOf(req.params.id, req.user);
   if (!r) return res.json({ code: 404, msg: '仓库不存在（只能删除自己登记的仓库）' });
-  db.prepare('DELETE FROM code_index WHERE repo_id=?').run(r.id);
-  db.prepare('DELETE FROM code_patches WHERE repo_id=?').run(r.id);
-  db.prepare('DELETE FROM code_patch_backups WHERE repo_id=?').run(r.id);
-  db.prepare('DELETE FROM code_repos WHERE id=?').run(r.id);
+  dal.runq('DELETE FROM code_index WHERE repo_id=?', [r.id]);
+  dal.runq('DELETE FROM code_patches WHERE repo_id=?', [r.id]);
+  dal.runq('DELETE FROM code_patch_backups WHERE repo_id=?', [r.id]);
+  dal.runq('DELETE FROM code_repos WHERE id=?', [r.id]);
   res.json({ code: 0, msg: '已删除' });
 });
 
@@ -112,12 +111,13 @@ router.post('/repos/:id/index', (req, res) => {
   const t0 = Date.now();
   const files = ci.scanFiles(root, { maxFiles: Number(req.body && req.body.maxFiles) || 20000 });
   // 清旧索引，重建
-  db.prepare('DELETE FROM code_index WHERE repo_id=?').run(r.id);
-  const ins = db.prepare(`INSERT INTO code_index
+  dal.runq('DELETE FROM code_index WHERE repo_id=?', [r.id]);
+  const INS_SQL = `INSERT INTO code_index
     (repo_id,owner,file_path,lang,chunk_kind,symbol_name,symbol_parent,start_line,end_line,content,embedding,created_at)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`);
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`;
   let chunkCount = 0, symbolCount = 0, fileCount = 0;
-  const insertMany = db.transaction((rows) => { for (const row of rows) ins.run(...row); });
+  // 事务包装保留 db.transaction（BEGIN/COMMIT 同一连接语义）；语句层走 dal 统一出口（行数组即参数数组）
+  const insertMany = db.transaction((rows) => { for (const row of rows) dal.runq(INS_SQL, row); });
   let batch = [];
   const flush = () => { if (batch.length) { insertMany(batch); batch = []; } };
 
@@ -141,10 +141,8 @@ router.post('/repos/:id/index', (req, res) => {
   }
   flush();
   const durationMs = Date.now() - t0;
-  db.prepare('UPDATE code_repos SET status=?, file_count=?, symbol_count=?, chunk_count=?, error=?, indexed_at=? WHERE id=?')
-    .run('ready', fileCount, symbolCount, chunkCount, '', now(), r.id);
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(req.user.username, '建立代码索引', `${r.name}（${fileCount} 文件 / ${symbolCount} 符号 / ${chunkCount} 块 / ${durationMs}ms）`, req.ip, now());
+  dal.runq('UPDATE code_repos SET status=?, file_count=?, symbol_count=?, chunk_count=?, error=?, indexed_at=? WHERE id=?', ['ready', fileCount, symbolCount, chunkCount, '', now(), r.id]);
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '建立代码索引', `${r.name}（${fileCount} 文件 / ${symbolCount} 符号 / ${chunkCount} 块 / ${durationMs}ms）`, req.ip, now()]);
   res.json({ code: 0, data: { file_count: fileCount, symbol_count: symbolCount, chunk_count: chunkCount, duration_ms: durationMs } });
 });
 
@@ -158,7 +156,7 @@ router.get('/repos/:id/search', async (req, res) => {
   const topN = Math.min(50, Math.max(1, Number(req.query.top) || 8));
   const lang = String(req.query.lang || '').trim();
   const pathLike = String(req.query.path || '').trim();
-  let rows = db.prepare('SELECT * FROM code_index WHERE repo_id=?').all(r.id);
+  let rows = dal.q('SELECT * FROM code_index WHERE repo_id=?', [r.id]);
   if (lang) rows = rows.filter(x => x.lang === lang);
   if (pathLike) rows = rows.filter(x => x.file_path.includes(pathLike));
   if (rows.length > 50000) rows = rows.slice(0, 50000); // 超大仓搜索上限（V1 边界）
@@ -195,27 +193,25 @@ router.post('/repos/:id/patch/propose', (req, res) => {
   if (!ar.ok) return res.json({ code: 400, msg: ar.msg });
   if (ar.content === rd.content) return res.json({ code: 400, msg: '替换后内容无变化' });
   const d = ci.unifiedDiff(rd.content, ar.content, 'a/' + rel, 'b/' + rel);
-  const info = db.prepare(`INSERT INTO code_patches (repo_id,owner,file_path,old_content,new_content,diff,additions,deletions,status,created_at)
-    VALUES (?,?,?,?,?,?,?,?, 'proposed', ?)`)
-    .run(r.id, req.user.username, rel, rd.content, ar.content, d.diff, d.additions, d.deletions, now());
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(req.user.username, '提议代码补丁', `${r.name} / ${rel}（+${d.additions} -${d.deletions}）`, req.ip, now());
+  const info = dal.runq(`INSERT INTO code_patches (repo_id,owner,file_path,old_content,new_content,diff,additions,deletions,status,created_at)
+    VALUES (?,?,?,?,?,?,?,?, 'proposed', ?)`, [r.id, req.user.username, rel, rd.content, ar.content, d.diff, d.additions, d.deletions, now()]);
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '提议代码补丁', `${r.name} / ${rel}（+${d.additions} -${d.deletions}）`, req.ip, now()]);
   res.json({ code: 0, data: { patch_id: info.lastInsertRowid, path: rel, diff: d.diff, additions: d.additions, deletions: d.deletions, replace_count: ar.count, status: 'proposed' } });
 });
 
 router.get('/repos/:id/patches', (req, res) => {
   const r = repoOf(req.params.id, req.user);
   if (!r) return res.json({ code: 404, msg: '仓库不存在或不可见' });
-  const rows = db.prepare(`SELECT p.id,p.file_path,p.status,p.additions,p.deletions,p.diff,p.created_at,p.applied_at,
+  const rows = dal.q(`SELECT p.id,p.file_path,p.status,p.additions,p.deletions,p.diff,p.created_at,p.applied_at,
       (SELECT id FROM code_patch_backups b WHERE b.patch_id=p.id ORDER BY b.id DESC LIMIT 1) AS backup_id
-    FROM code_patches p WHERE p.repo_id=? ORDER BY p.id DESC LIMIT 50`).all(r.id);
+    FROM code_patches p WHERE p.repo_id=? ORDER BY p.id DESC LIMIT 50`, [r.id]);
   res.json({ code: 0, data: rows });
 });
 
 router.post('/repos/:id/patch/:pid/apply', (req, res) => {
   const r = repoOf(req.params.id, req.user);
   if (!r) return res.json({ code: 404, msg: '仓库不存在（只能对自己的仓库应用补丁）' });
-  const p = db.prepare('SELECT * FROM code_patches WHERE id=? AND repo_id=?').get(req.params.pid, r.id);
+  const p = dal.getq('SELECT * FROM code_patches WHERE id=? AND repo_id=?', [req.params.pid, r.id]);
   if (!p) return res.json({ code: 404, msg: '补丁不存在' });
   if (p.status !== 'proposed') return res.json({ code: 400, msg: `补丁状态为 ${p.status}，不可重复应用` });
   let root; try { root = fs.realpathSync(r.root_path); } catch { return res.json({ code: 400, msg: '仓库目录不可访问' }); }
@@ -225,13 +221,12 @@ router.post('/repos/:id/patch/:pid/apply', (req, res) => {
   if (rd.content !== p.old_content) return res.json({ code: 409, msg: '文件在提议后已被修改，请重新提议补丁（拒绝覆盖外部改动）' });
   // 写前备份
   const abs = path.join(root, p.file_path);
-  const bk = db.prepare(`INSERT INTO code_patch_backups (repo_id,owner,file_path,patch_id,content,status,created_at)
-    VALUES (?,?,?,?,?, 'active', ?)`).run(r.id, req.user.username, p.file_path, p.id, rd.content, now());
+  const bk = dal.runq(`INSERT INTO code_patch_backups (repo_id,owner,file_path,patch_id,content,status,created_at)
+    VALUES (?,?,?,?,?, 'active', ?)`, [r.id, req.user.username, p.file_path, p.id, rd.content, now()]);
   try { fs.writeFileSync(abs, p.new_content, 'utf8'); }
-  catch (e) { db.prepare("UPDATE code_patch_backups SET status='failed' WHERE id=?").run(bk.lastInsertRowid); return res.json({ code: 500, msg: '写盘失败：' + e.message }); }
-  db.prepare("UPDATE code_patches SET status='applied', applied_at=? WHERE id=?").run(now(), p.id);
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(req.user.username, '应用代码补丁', `${r.name} / ${p.file_path}（备份 #${bk.lastInsertRowid}）`, req.ip, now());
+  catch (e) { dal.runq("UPDATE code_patch_backups SET status='failed' WHERE id=?", [bk.lastInsertRowid]); return res.json({ code: 500, msg: '写盘失败：' + e.message }); }
+  dal.runq("UPDATE code_patches SET status='applied', applied_at=? WHERE id=?", [now(), p.id]);
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '应用代码补丁', `${r.name} / ${p.file_path}（备份 #${bk.lastInsertRowid}）`, req.ip, now()]);
   res.json({ code: 0, msg: '补丁已应用', data: { patch_id: p.id, backup_id: bk.lastInsertRowid, file_path: p.file_path, additions: p.additions, deletions: p.deletions } });
 });
 
@@ -239,17 +234,16 @@ router.post('/repos/:id/patch/rollback', (req, res) => {
   const r = repoOf(req.params.id, req.user);
   if (!r) return res.json({ code: 404, msg: '仓库不存在（只能回滚自己的仓库）' });
   const bid = req.body && req.body.backup_id;
-  const bk = db.prepare('SELECT * FROM code_patch_backups WHERE id=? AND repo_id=? AND owner=?').get(bid, r.id, req.user.username);
+  const bk = dal.getq('SELECT * FROM code_patch_backups WHERE id=? AND repo_id=? AND owner=?', [bid, r.id, req.user.username]);
   if (!bk) return res.json({ code: 404, msg: '备份不存在' });
   if (bk.status !== 'active') return res.json({ code: 400, msg: `备份状态为 ${bk.status}，不可回滚` });
   let root; try { root = fs.realpathSync(r.root_path); } catch { return res.json({ code: 400, msg: '仓库目录不可访问' }); }
   const abs = path.join(root, bk.file_path);
   try { fs.writeFileSync(abs, bk.content, 'utf8'); }
   catch (e) { return res.json({ code: 500, msg: '回滚写盘失败：' + e.message }); }
-  db.prepare("UPDATE code_patch_backups SET status='rolled_back' WHERE id=?").run(bk.id);
-  db.prepare("UPDATE code_patches SET status='rolled_back' WHERE id=?").run(bk.patch_id);
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(req.user.username, '回滚代码补丁', `${r.name} / ${bk.file_path}`, req.ip, now());
+  dal.runq("UPDATE code_patch_backups SET status='rolled_back' WHERE id=?", [bk.id]);
+  dal.runq("UPDATE code_patches SET status='rolled_back' WHERE id=?", [bk.patch_id]);
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '回滚代码补丁', `${r.name} / ${bk.file_path}`, req.ip, now()]);
   res.json({ code: 0, msg: '已回滚到备份版本', data: { file_path: bk.file_path, backup_id: bk.id } });
 });
 

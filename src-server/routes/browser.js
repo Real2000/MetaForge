@@ -6,6 +6,7 @@
  * POST /api/browser/automations/run  — 执行浏览器自动化任务
  */
 const express = require('express');
+const dal = require('../lib/dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const { db, now } = require('../db');
 const { auth, adminOnly } = require('../lib/auth');
 
@@ -20,7 +21,7 @@ router.get('/automations', (req, res) => {
   if (status) { sql += ' AND status=?'; args.push(status); }
   sql += ' ORDER BY id DESC LIMIT ? OFFSET ?';
   args.push(+pageSize, (+page - 1) * +pageSize);
-  const rows = db.prepare(sql).all(...args);
+  const rows = dal.q(sql, [...args]);
   res.json({ code: 0, data: { list: rows, page: +page, pageSize: +pageSize } });
 });
 

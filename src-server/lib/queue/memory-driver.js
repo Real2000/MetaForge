@@ -11,6 +11,7 @@
  * 集群注意：进程内队列不支持多进程共享，PM2 cluster 下需由 P2 选主锁保证仅单实例执行。
  */
 const { db, now } = require('../../db');
+const dal = require('../dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const clusterLock = require('../cluster-lock'); // U2-1 / N7-P2 集群选主（跨进程仅 leader 处理队列）
 const crypto = require('crypto');
 
@@ -30,8 +31,7 @@ function create(registry) {
     const delay = opts.delay || 0;
     const maxRetries = opts.maxRetries != null ? opts.maxRetries : MAX_RETRIES;
     const priority = opts.priority || 0;
-    db.prepare(`INSERT INTO task_queue (job_id, name, payload, status, priority, max_retries, retry_count, delay_ms, created_at, scheduled_at) VALUES (?,?,?,?,?,?,0,?,?,?)`)
-      .run(jobId, name, JSON.stringify(payload), 'pending', priority, maxRetries, delay, now(), delay ? new Date(Date.now() + delay).toISOString().replace('T', ' ').slice(0, 19) : now());
+    dal.runq(`INSERT INTO task_queue (job_id, name, payload, status, priority, max_retries, retry_count, delay_ms, created_at, scheduled_at) VALUES (?,?,?,?,?,?,0,?,?,?)`, [jobId, name, JSON.stringify(payload), 'pending', priority, maxRetries, delay, now(), delay ? new Date(Date.now() + delay).toISOString().replace('T', ' ').slice(0, 19) : now()]);
     if (!delay) setImmediate(() => processQueue());
     else setTimeout(() => processQueue(), delay);
     return jobId;
@@ -42,25 +42,24 @@ function create(registry) {
     // U2-1 / N7-P2：集群模式下内存 worker 仅 leader 执行，避免多进程重复处理同一条 pending 任务。
     // 非集群模式 isLeader 恒为 true，行为与引入前一致（不读写锁表）。
     if (!clusterLock.isLeader(clusterLock.LOCK_NAME)) return;
-    const job = db.prepare(`SELECT * FROM task_queue WHERE status='pending' AND (scheduled_at IS NULL OR scheduled_at <= datetime('now','localtime')) ORDER BY priority DESC, id ASC LIMIT 1`).get();
+    const job = dal.getq(`SELECT * FROM task_queue WHERE status='pending' AND (scheduled_at IS NULL OR scheduled_at <= datetime('now','localtime')) ORDER BY priority DESC, id ASC LIMIT 1`);
     if (!job) return;
     const entry = registry.get(job.name);
-    if (!entry) { db.prepare(`UPDATE task_queue SET status='failed' WHERE id=?`).run(job.id); return; }
-    db.prepare(`UPDATE task_queue SET status='running', started_at=datetime('now','localtime'), worker_id=?, locked_at=datetime('now','localtime') WHERE id=?`).run(clusterLock.ownerId(), job.id);
+    if (!entry) { dal.runq(`UPDATE task_queue SET status='failed' WHERE id=?`, [job.id]); return; }
+    dal.runq(`UPDATE task_queue SET status='running', started_at=datetime('now','localtime'), worker_id=?, locked_at=datetime('now','localtime') WHERE id=?`, [clusterLock.ownerId(), job.id]);
     try {
       let payload = null;
       try { payload = JSON.parse(job.payload || '{}'); } catch { payload = {}; }
       const result = await entry.handler(payload);
-      db.prepare(`UPDATE task_queue SET status='success', finished_at=datetime('now','localtime'), result=? WHERE id=?`).run(JSON.stringify(result || {}), job.id);
+      dal.runq(`UPDATE task_queue SET status='success', finished_at=datetime('now','localtime'), result=? WHERE id=?`, [JSON.stringify(result || {}), job.id]);
     } catch (e) {
       const retries = (job.retry_count || 0) + 1;
       if (retries < (job.max_retries || MAX_RETRIES)) {
         const delay = RETRY_BASE_DELAY * Math.pow(2, retries - 1);
-        db.prepare(`UPDATE task_queue SET status='pending', retry_count=?, scheduled_at=datetime('now','localtime',?||' seconds'), error=? WHERE id=?`)
-          .run(retries, String(delay / 1000), e.message, job.id);
+        dal.runq(`UPDATE task_queue SET status='pending', retry_count=?, scheduled_at=datetime('now','localtime',?||' seconds'), error=? WHERE id=?`, [retries, String(delay / 1000), e.message, job.id]);
         setTimeout(() => processQueue(), delay);
       } else {
-        db.prepare(`UPDATE task_queue SET status='failed', finished_at=datetime('now','localtime'), error=? WHERE id=?`).run(e.message, job.id);
+        dal.runq(`UPDATE task_queue SET status='failed', finished_at=datetime('now','localtime'), error=? WHERE id=?`, [e.message, job.id]);
       }
     }
     setImmediate(() => processQueue());
@@ -69,19 +68,19 @@ function create(registry) {
   /** 清理过期历史任务 */
   function cleanupHistory() {
     const cutoff = new Date(Date.now() - TASK_HISTORY_KEEP_DAYS * 86400000).toISOString().replace('T', ' ').slice(0, 19);
-    const r = db.prepare(`DELETE FROM task_queue WHERE finished_at IS NOT NULL AND finished_at < ?`).run(cutoff);
+    const r = dal.runq(`DELETE FROM task_queue WHERE finished_at IS NOT NULL AND finished_at < ?`, [cutoff]);
     if (r.changes) console.log(`[task-queue] 清理 ${r.changes} 条过期历史任务（> ${TASK_HISTORY_KEEP_DAYS} 天）`);
     return r.changes || 0;
   }
 
   /** 获取任务状态 */
   function getJob(jobId) {
-    return db.prepare('SELECT * FROM task_queue WHERE job_id=?').get(jobId);
+    return dal.getq('SELECT * FROM task_queue WHERE job_id=?', [jobId]);
   }
 
   /** 获取队列状态 */
   function queueStats() {
-    const r = db.prepare(`SELECT status, COUNT(*) c FROM task_queue GROUP BY status`).all();
+    const r = dal.q(`SELECT status, COUNT(*) c FROM task_queue GROUP BY status`);
     const stats = {};
     for (const row of r) stats[row.status] = row.c;
     return stats;

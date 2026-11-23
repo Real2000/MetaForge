@@ -9,6 +9,7 @@
  * 运行时配置存储于 _config 表，可在不重启服务的前提下热更。
  */
 const { db, now } = require('../db');
+const dal = require('./dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const crypto = require('crypto');
 
 /* ---------- 配置定义 ---------- */
@@ -90,7 +91,7 @@ function initConfig() {
 
   // 3. 数据库覆盖（运行时配置）
   try {
-    const dbConfigs = db.prepare('SELECT key, value FROM _config').all();
+    const dbConfigs = dal.q('SELECT key, value FROM _config');
     for (const c of dbConfigs) {
       const def = CONFIG_DEFS.find(d => d.key === c.key);
       if (def) {
@@ -132,7 +133,7 @@ function set(key, value) {
   }
 
   // 写入数据库
-  db.prepare('INSERT OR REPLACE INTO _config (key, value, updated_at) VALUES (?, ?, ?)').run(key, String(coerced), now());
+  dal.runq('INSERT OR REPLACE INTO _config (key, value, updated_at) VALUES (?, ?, ?)', [key, String(coerced), now()]);
   // 刷新缓存
   configMap.set(key, coerced);
   return coerced;
@@ -141,7 +142,7 @@ function set(key, value) {
 /* ---------- 配置表创建 ---------- */
 
 function ensureConfigTable() {
-  db.exec('CREATE TABLE IF NOT EXISTS _config (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT)');
+  dal.exec('CREATE TABLE IF NOT EXISTS _config (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT)');
 }
 
 ensureConfigTable();

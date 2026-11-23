@@ -1,5 +1,6 @@
 /** 会话 + 对话（SSE 流式：敏感词→知识库检索→模型/模拟→输出过滤→落库统计） */
 const express = require('express');
+const dal = require('../lib/dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const fs = require('fs');
 const path = require('path');
 const { db, now, upsertCheckpoint, getCheckpoint, deleteCheckpoint } = require('../db');
@@ -56,7 +57,7 @@ async function genSuggestions(userInput, assistantReply, agentName) {
  *  既有行而非新增近义重复）+ 向量随写缓存（供召回侧 Top-K 相关性排序）；嵌入失败静默降级，绝不阻断 */
 async function extractMemory(agent, username, userInput, assistantReply) {
   try {
-    const existingFacts = db.prepare('SELECT fact FROM agent_memories WHERE agent_id=? AND username=?').all(agent.id, username).map(r => r.fact);
+    const existingFacts = dal.q('SELECT fact FROM agent_memories WHERE agent_id=? AND username=?', [agent.id, username]).map(r => r.fact);
     const r = await chatOnce([
       { role: 'system', content: `你是用户记忆提取器。根据对话内容提取值得长期记住的当前用户特征事实（如职业、偏好、称呼、业务背景），忽略一次性问题内容。
 规则：只输出 JSON 数组（如 ["用户是银行客户经理","用户偏好简洁回复"]），最多 3 条，每条不超过 25 字；没有值得记住的内容输出 []；不要其他任何文字。` },
@@ -75,7 +76,7 @@ async function extractMemory(agent, username, userInput, assistantReply) {
  *  生成后经 SSE 'title' 事件推送，前端实时更新侧栏会话列表，无需刷新 */
 async function genSessionTitle(sessionId, userInput, agentName) {
   try {
-    const sess = db.prepare('SELECT title FROM sessions WHERE id=?').get(sessionId);
+    const sess = dal.getq('SELECT title FROM sessions WHERE id=?', [sessionId]);
     if (!sess || (sess.title !== '新会话' && sess.title !== '默认会话')) return null; // 仅首次命名
     const r = await chatOnce([
       { role: 'system', content: '你会话标题生成器。根据用户的第一条提问，生成一个 4~12 字的简洁中文标题（名词短语，无标点、无引号）。只输出标题本身。' },
@@ -83,11 +84,11 @@ async function genSessionTitle(sessionId, userInput, agentName) {
     ], { temperature: 0.3, max_reply: 30, agentName: '标题生成' });
     let title = (r.full || '').trim().replace(/^["'「『]|["'」』]$/g, '').slice(0, 20);
     if (!title || title.includes('\n')) title = userInput.trim().slice(0, 20); // 兜底：输入截断
-    db.prepare('UPDATE sessions SET title=? WHERE id=?').run(title, sessionId);
+    dal.runq('UPDATE sessions SET title=? WHERE id=?', [title, sessionId]);
     return title;
   } catch {
     const fallback = userInput.trim().slice(0, 20);
-    try { db.prepare("UPDATE sessions SET title=? WHERE id=? AND (title='新会话' OR title='默认会话')").run(fallback, sessionId); } catch { }
+    try { dal.runq("UPDATE sessions SET title=? WHERE id=? AND (title='新会话' OR title='默认会话')", [fallback, sessionId]); } catch { }
     return fallback;
   }
 }
@@ -110,23 +111,22 @@ router.get('/sessions', (req, res) => {
     args.push(`%${kw}%`, `%${kw}%`);
   }
   sql += ' ORDER BY s.updated_at DESC LIMIT 100';
-  res.json({ code: 0, data: db.prepare(sql).all(...args) });
+  res.json({ code: 0, data: dal.q(sql, [...args]) });
 });
 
 // 会话消息（关联 chat_traces 回填引用来源与工具调用，历史消息同样可见；含追问建议）
 // P5.30 安全止血：此前仅按 session_id 查询、不校验归属——任何登录用户可凭他人会话 id 读取全部对话内容（IDOR）。
 // 对齐评价类路由的归属校验模式；管理端查用户会话走 /api/stats/*（已有 adminOnly 防护），本路由保持仅本人可读
 router.get('/sessions/:id/messages', (req, res) => {
-  const sess = db.prepare('SELECT username FROM sessions WHERE id=?').get(req.params.id);
+  const sess = dal.getq('SELECT username FROM sessions WHERE id=?', [req.params.id]);
   if (!sess) return res.json({ code: 404, msg: '会话不存在' });
   if (sess.username !== req.user.username) return res.json({ code: 403, msg: '无权访问该会话' });
   // P1-6 分支回放：?branch=br-xxx 查看归档线；默认返回当前活跃线（sessions.active_branch，老数据 main）
-  const branch = String(req.query.branch || '').trim() || (db.prepare('SELECT active_branch FROM sessions WHERE id=?').get(req.params.id)?.active_branch || 'main');
-  const rows = db.prepare('SELECT * FROM messages WHERE session_id=? AND branch=? ORDER BY id').all(req.params.id, branch);
-  const traceStmt = db.prepare('SELECT kb_hits, tool_calls, suggestions FROM chat_traces WHERE message_id=? ORDER BY id DESC LIMIT 1');
+  const branch = String(req.query.branch || '').trim() || (dal.getq('SELECT active_branch FROM sessions WHERE id=?', [req.params.id])?.active_branch || 'main');
+  const rows = dal.q('SELECT * FROM messages WHERE session_id=? AND branch=? ORDER BY id', [req.params.id, branch]);
   const out = rows.map(m => {
     if (m.role !== 'assistant') return m;
-    const t = traceStmt.get(m.id);
+    const t = dal.getq('SELECT kb_hits, tool_calls, suggestions FROM chat_traces WHERE message_id=? ORDER BY id DESC LIMIT 1', [m.id]);
     if (!t) return m;
     try {
       return { ...m, kbHits: JSON.parse(t.kb_hits || '[]'), toolCalls: JSON.parse(t.tool_calls || '[]'), suggestions: JSON.parse(t.suggestions || '[]') };
@@ -138,7 +138,7 @@ router.get('/sessions/:id/messages', (req, res) => {
 // ---------------- P1-6 会话检查点 v2：断点续跑 + 分支回放（2026-11-12） ----------------
 // ① GET /chat/sessions/:id/checkpoint —— 查询未完成检查点（前端打开会话时探测「继续生成」卡片）
 router.get('/sessions/:id/checkpoint', (req, res) => {
-  const sess = db.prepare('SELECT username FROM sessions WHERE id=?').get(req.params.id);
+  const sess = dal.getq('SELECT username FROM sessions WHERE id=?', [req.params.id]);
   if (!sess) return res.json({ code: 404, msg: '会话不存在' });
   if (sess.username !== req.user.username) return res.json({ code: 403, msg: '无权访问该会话' });
   const ck = getCheckpoint(req.params.id);
@@ -150,7 +150,7 @@ router.get('/sessions/:id/checkpoint', (req, res) => {
 // ② POST /chat/sessions/:id/resume —— 续跑：把 partial 作为前情继续生成，产出一条完整 assistant 消息
 //    不重复写 user 消息；续写不带工具/检索（纯文本续写，避免重复副作用）
 router.post('/sessions/:id/resume', async (req, res) => {
-  const sess = db.prepare('SELECT * FROM sessions WHERE id=?').get(req.params.id);
+  const sess = dal.getq('SELECT * FROM sessions WHERE id=?', [req.params.id]);
   if (!sess) return res.json({ code: 404, msg: '会话不存在' });
   if (sess.username !== req.user.username) return res.json({ code: 403, msg: '无权访问该会话' });
   const ck = getCheckpoint(req.params.id);
@@ -168,7 +168,7 @@ router.post('/sessions/:id/resume', async (req, res) => {
   const send = (event, data) => { if (!clientClosed && !res.writableEnded) res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); };
   try {
     // 续跑前情：历史 + partial 快照 + 续写指令（明确要求接续而非重答）
-    const history = db.prepare('SELECT role, content FROM messages WHERE session_id=? AND branch=IFNULL((SELECT active_branch FROM sessions WHERE id=?),"main") ORDER BY id').all(req.params.id, req.params.id)
+    const history = dal.q('SELECT role, content FROM messages WHERE session_id=? AND branch=IFNULL((SELECT active_branch FROM sessions WHERE id=?),"main") ORDER BY id', [req.params.id, req.params.id])
       .map(m => ({ role: m.role, content: m.content }));
     const resumePrompt = [
       `你之前的回复在生成中途意外中断，已生成内容如下（可能不完整，句子可能戛然而止）：`,
@@ -204,8 +204,7 @@ router.post('/sessions/:id/resume', async (req, res) => {
 
     // 续跑完成：完整内容落库为一条 assistant 消息 + 清检查点
     const tokens = Math.ceil(full.length * 0.6);
-    const msgInfo = db.prepare('INSERT INTO messages (session_id,role,content,tokens,created_at) VALUES (?,?,?,?,?)')
-      .run(req.params.id, 'assistant', full, tokens, now());
+    const msgInfo = dal.runq('INSERT INTO messages (session_id,role,content,tokens,created_at) VALUES (?,?,?,?,?)', [req.params.id, 'assistant', full, tokens, now()]);
     addUsage(req.user.username, tokens);
     // U1-6 成本归因（续跑链路）：模型取检查点/路由记录的 model，输入按检查点存量内容估算
     try {
@@ -218,15 +217,14 @@ router.post('/sessions/:id/resume', async (req, res) => {
         meta: { mode: 'resumed' },
       });
     } catch (e) { console.error('[chat] U1-6 续跑成本归因失败（不阻断）：', e.message); }
-    db.prepare('UPDATE sessions SET updated_at=? WHERE id=?').run(now(), req.params.id);
+    dal.runq('UPDATE sessions SET updated_at=? WHERE id=?', [now(), req.params.id]);
     deleteCheckpoint(req.params.id);
-    db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-      .run(req.user.username, '断点续跑', `会话 #${req.params.id} 从 ${ck.partial_content.length} 字符处续写至 ${full.length} 字符`, req.ip, now());
+    dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '断点续跑', `会话 #${req.params.id} 从 ${ck.partial_content.length} 字符处续写至 ${full.length} 字符`, req.ip, now()]);
     send('done', { content: full, tokens, model: genMeta?.model, provider: genMeta?.provider, mid: Number(msgInfo.lastInsertRowid), resumed: true });
     res.end();
   } catch (e) {
     console.error('[chat] 续跑异常：', e);
-    db.prepare('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)').run('chat-service', '断点续跑异常：' + e.message, now());
+    dal.runq('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)', ['chat-service', '断点续跑异常：' + e.message, now()]);
     send('error', { msg: '续跑失败：' + e.message });
     res.end();
   }
@@ -235,11 +233,11 @@ router.post('/sessions/:id/resume', async (req, res) => {
 // ③ GET /chat/sessions/:id/branches —— 分支列表（回放产生的归档线）
 //    main = 当前活跃线；br-{ts} = 从某消息回放后归档的旧线（只读保留，防误删上下文）
 router.get('/sessions/:id/branches', (req, res) => {
-  const sess = db.prepare('SELECT username FROM sessions WHERE id=?').get(req.params.id);
+  const sess = dal.getq('SELECT username FROM sessions WHERE id=?', [req.params.id]);
   if (!sess) return res.json({ code: 404, msg: '会话不存在' });
   if (sess.username !== req.user.username) return res.json({ code: 403, msg: '无权访问该会话' });
-  const rows = db.prepare(`SELECT branch, COUNT(*) AS msgs, MIN(created_at) AS since, MAX(created_at) AS until
-    FROM messages WHERE session_id=? GROUP BY branch ORDER BY branch='main' DESC, since DESC`).all(req.params.id);
+  const rows = dal.q(`SELECT branch, COUNT(*) AS msgs, MIN(created_at) AS since, MAX(created_at) AS until
+    FROM messages WHERE session_id=? GROUP BY branch ORDER BY branch='main' DESC, since DESC`, [req.params.id]);
   res.json({ code: 0, data: rows });
 });
 
@@ -247,7 +245,7 @@ router.get('/sessions/:id/branches', (req, res) => {
 //    语义：锚点之后的所有消息从 main 归档到 br-{ts}（只读保留），main 截断至锚点，
 //    模型对锚点消息（user 问句）重新作答。原消息保留在归档线，不删除任何内容。
 router.post('/messages/:id/replay', async (req, res) => {
-  const m = db.prepare('SELECT m.*, s.username AS sess_owner FROM messages m JOIN sessions s ON s.id=m.session_id WHERE m.id=?').get(req.params.id);
+  const m = dal.getq('SELECT m.*, s.username AS sess_owner FROM messages m JOIN sessions s ON s.id=m.session_id WHERE m.id=?', [req.params.id]);
   if (!m) return res.json({ code: 404, msg: '消息不存在' });
   if (m.sess_owner !== req.user.username) return res.json({ code: 403, msg: '无权回放该会话消息' });
   if (m.role !== 'assistant') return res.json({ code: 400, msg: '只能从 AI 回复处回放' });
@@ -255,19 +253,15 @@ router.post('/messages/:id/replay', async (req, res) => {
   if ((m.branch || 'main') !== 'main') return res.json({ code: 400, msg: '归档分支为只读，请回到当前主线回放' });
 
   // 锚点的问句：锚点本身是 assistant → 其前面最近的一条 user 消息（同 main 分支）
-  const anchorUser = db.prepare(`SELECT id, content FROM messages WHERE session_id=? AND role='user' AND branch='main' AND id<? ORDER BY id DESC LIMIT 1`)
-    .get(m.session_id, m.id);
+  const anchorUser = dal.getq(`SELECT id, content FROM messages WHERE session_id=? AND role='user' AND branch='main' AND id<? ORDER BY id DESC LIMIT 1`, [m.session_id, m.id]);
   if (!anchorUser) return res.json({ code: 400, msg: '未找到锚点对应的用户问句，无法回放' });
 
   const branchName = `br-${Date.now()}`;
   // 归档锚点及其后所有 main 分支消息 → br-{ts}；main 截断在锚点之前（事务保证原子）
   const tx = db.transaction(() => {
-    db.prepare(`UPDATE messages SET branch=? WHERE session_id=? AND branch='main' AND id>=?`)
-      .run(branchName, m.session_id, m.id);
-    db.prepare('UPDATE sessions SET active_branch=?, updated_at=? WHERE id=?')
-      .run('main', now(), m.session_id);
-    db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-      .run(req.user.username, '分支回放', `会话 #${m.session_id}：消息 #${m.id} 起归档为 ${branchName}，主线将重新生成`, req.ip, now());
+    dal.runq(`UPDATE messages SET branch=? WHERE session_id=? AND branch='main' AND id>=?`, [branchName, m.session_id, m.id]);
+    dal.runq('UPDATE sessions SET active_branch=?, updated_at=? WHERE id=?', ['main', now(), m.session_id]);
+    dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '分支回放', `会话 #${m.session_id}：消息 #${m.id} 起归档为 ${branchName}，主线将重新生成`, req.ip, now()]);
   });
   tx();
   res.json({ code: 0, data: { branch: branchName, anchor_msg_id: m.id, user_question_id: anchorUser.id, user_question: anchorUser.content }, msg: '已回放，正在重新生成' });
@@ -276,22 +270,22 @@ router.post('/messages/:id/replay', async (req, res) => {
 // ---------- 对话质量反馈（2026-10-20 体验优化） ----------
 // 👍/👎 消息级评价落库（校验消息属于本人会话；再次点击同一值=取消，不同值=改评）
 router.post('/messages/:id/rating', (req, res) => {
-  const m = db.prepare('SELECT m.*, s.username FROM messages m JOIN sessions s ON s.id=m.session_id WHERE m.id=?').get(req.params.id);
+  const m = dal.getq('SELECT m.*, s.username FROM messages m JOIN sessions s ON s.id=m.session_id WHERE m.id=?', [req.params.id]);
   if (!m) return res.json({ code: 404, msg: '消息不存在' });
   if (m.username !== req.user.username) return res.json({ code: 403, msg: '只能评价自己会话中的消息' });
   const v = (req.body || {}).value === 1 ? 1 : ((req.body || {}).value === -1 ? -1 : 0);
   if (!v) return res.json({ code: 400, msg: '评价值无效（1 或 -1）' });
-  db.prepare('UPDATE messages SET rating=? WHERE id=?').run(m.rating === v ? 0 : v, m.id);
+  dal.runq('UPDATE messages SET rating=? WHERE id=?', [m.rating === v ? 0 : v, m.id]);
   res.json({ code: 0, msg: m.rating === v ? '已取消评价' : '感谢你的反馈' });
 });
 
 // 「这个回答解决你的问题了吗」二选一调研落库（1=解决了 0=没解决）
 router.post('/messages/:id/solved', (req, res) => {
-  const m = db.prepare('SELECT m.*, s.username FROM messages m JOIN sessions s ON s.id=m.session_id WHERE m.id=?').get(req.params.id);
+  const m = dal.getq('SELECT m.*, s.username FROM messages m JOIN sessions s ON s.id=m.session_id WHERE m.id=?', [req.params.id]);
   if (!m) return res.json({ code: 404, msg: '消息不存在' });
   if (m.username !== req.user.username) return res.json({ code: 403, msg: '只能评价自己会话中的消息' });
   const v = (req.body || {}).value ? 1 : 0;
-  db.prepare('UPDATE messages SET solved=? WHERE id=?').run(v ? 1 : 2, m.id);
+  dal.runq('UPDATE messages SET solved=? WHERE id=?', [v ? 1 : 2, m.id]);
   res.json({ code: 0, msg: '感谢你的反馈' });
 });
 
@@ -300,7 +294,7 @@ router.post('/messages/:id/solved', (req, res) => {
 // 三新块；原有 list/stat 字段与结构保持不变（防破坏现有前端），由 public/js/admin/quality.js 四视图消费。
 // 聚合全部 SQL 下推（stats.js L17 教训：禁止全表读进内存 JS 聚合——SUM/GROUP BY + LIMIT），仅对聚合结果做 ≤14 行空天补齐
 router.get('/quality', adminOnly, (req, res) => {
-  const rows = db.prepare(`
+  const rows = dal.q(`
     SELECT m.id, m.session_id, m.content, m.rating, m.solved, m.created_at,
            s.username, s.agent_id, s.title AS session_title,
            u.nickname, a.name AS agent_name,
@@ -310,12 +304,12 @@ router.get('/quality', adminOnly, (req, res) => {
     LEFT JOIN users u ON u.username=s.username
     LEFT JOIN agents a ON a.id=s.agent_id
     WHERE m.role='assistant' AND (m.rating=-1 OR m.solved=2)
-    ORDER BY m.id DESC LIMIT 200`).all();
+    ORDER BY m.id DESC LIMIT 200`);
   const stat = {
-    rated_up: db.prepare("SELECT COUNT(*) c FROM messages WHERE rating=1").get().c,
-    rated_down: db.prepare("SELECT COUNT(*) c FROM messages WHERE rating=-1").get().c,
-    solved_yes: db.prepare("SELECT COUNT(*) c FROM messages WHERE solved=1").get().c,
-    solved_no: db.prepare("SELECT COUNT(*) c FROM messages WHERE solved=2").get().c,
+    rated_up: dal.getq("SELECT COUNT(*) c FROM messages WHERE rating=1").c,
+    rated_down: dal.getq("SELECT COUNT(*) c FROM messages WHERE rating=-1").c,
+    solved_yes: dal.getq("SELECT COUNT(*) c FROM messages WHERE solved=1").c,
+    solved_no: dal.getq("SELECT COUNT(*) c FROM messages WHERE solved=2").c,
   };
   stat.satisfaction = (stat.rated_up + stat.rated_down) ? Math.round(stat.rated_up / (stat.rated_up + stat.rated_down) * 100) : null;
   stat.resolve_rate = (stat.solved_yes + stat.solved_no) ? Math.round(stat.solved_yes / (stat.solved_yes + stat.solved_no) * 100) : null;
@@ -325,21 +319,21 @@ router.get('/quality', adminOnly, (req, res) => {
   const days14 = Array.from({ length: 14 }, (_, i) =>
     new Date(Date.now() - (13 - i) * 86400000).toLocaleDateString('sv-SE', { timeZone: 'Asia/Shanghai' }));
   const since14 = days14[0] + ' 00:00:00';
-  const dayRows = db.prepare(`SELECT substr(created_at,1,10) AS d, COALESCE(SUM(tokens),0) AS tokens, COUNT(*) AS calls
-    FROM chat_traces WHERE created_at >= ? GROUP BY substr(created_at,1,10)`).all(since14);
+  const dayRows = dal.q(`SELECT substr(created_at,1,10) AS d, COALESCE(SUM(tokens),0) AS tokens, COUNT(*) AS calls
+    FROM chat_traces WHERE created_at >= ? GROUP BY substr(created_at,1,10)`, [since14]);
   const dayMap = new Map(dayRows.map(r => [r.d, r]));
   const llm = {
     // 按天（空天补 0，保证前端 14 天柱状连续）
     tokens_by_day: days14.map(d => ({ day: d, tokens: dayMap.get(d)?.tokens || 0, calls: dayMap.get(d)?.calls || 0 })),
     // 按模型 TOP10（空 model 归「未知」）
-    tokens_by_model: db.prepare(`SELECT CASE WHEN model IS NULL OR model='' THEN '未知' ELSE model END AS model,
+    tokens_by_model: dal.q(`SELECT CASE WHEN model IS NULL OR model='' THEN '未知' ELSE model END AS model,
       COALESCE(SUM(tokens),0) AS tokens, COUNT(*) AS calls
-      FROM chat_traces GROUP BY model ORDER BY tokens DESC LIMIT 10`).all(),
+      FROM chat_traces GROUP BY model ORDER BY tokens DESC LIMIT 10`),
     // 按智能体 TOP10（agent 已删显示「已删除」；agent_id 为 NULL = 首页助手直连对话）
-    tokens_by_agent: db.prepare(`SELECT CASE WHEN t.agent_id IS NULL THEN '首页助手' ELSE COALESCE(a.name,'已删除') END AS agent_name,
+    tokens_by_agent: dal.q(`SELECT CASE WHEN t.agent_id IS NULL THEN '首页助手' ELSE COALESCE(a.name,'已删除') END AS agent_name,
       COALESCE(SUM(t.tokens),0) AS tokens, COUNT(*) AS calls
       FROM chat_traces t LEFT JOIN agents a ON a.id=t.agent_id
-      GROUP BY t.agent_id ORDER BY tokens DESC LIMIT 10`).all(),
+      GROUP BY t.agent_id ORDER BY tokens DESC LIMIT 10`),
   };
 
   // ---------- #10 LLMOps：kb 块（检索命中率） ----------
@@ -349,10 +343,10 @@ router.get('/quality', adminOnly, (req, res) => {
   // 命中定义 = kb_hits 为非空 JSON 数组（写入端 JSON.stringify(kbHits)：未命中/外部链路固定写 '[]'，
   // 正常不会产生 NULL/''，SQL 仍防御性排除）。「挂库未命中」在分母内、「历史未挂库」已排除——
   // 本表内可区分的边界即止于此，无法区分的部分不计入（宁少勿错）。
-  const kbRow = db.prepare(`SELECT COUNT(*) AS total,
+  const kbRow = dal.getq(`SELECT COUNT(*) AS total,
     COALESCE(SUM(CASE WHEN t.kb_hits IS NOT NULL AND t.kb_hits != '' AND t.kb_hits != '[]' THEN 1 ELSE 0 END),0) AS hit
     FROM chat_traces t JOIN agents a ON a.id=t.agent_id
-    WHERE a.kb_id IS NOT NULL AND a.kb_id != ''`).get();
+    WHERE a.kb_id IS NOT NULL AND a.kb_id != ''`);
   const kb = {
     hit_rate: kbRow.total ? Math.round(kbRow.hit / kbRow.total * 100) : null, // 无挂库对话时 null（前端显示「—」）
     hit_count: kbRow.hit,
@@ -362,9 +356,9 @@ router.get('/quality', adminOnly, (req, res) => {
   // ---------- #10 LLMOps：eval 块（评测得分趋势，V1.3 #6 evaluations 表） ----------
   // 近 14 天每次重跑的按天平均得分趋势；仅计入 status='done' 的已完结评测（running 时 score 无意义）；
   // agent 级与知识库级（type='agent'/'kb'）合并统计口径（LLMOps 质量大盘不区分用途）；无数据返回空数组
-  const evalTrend = db.prepare(`SELECT substr(created_at,1,10) AS day, ROUND(AVG(score),2) AS avg_score, COUNT(*) AS runs
+  const evalTrend = dal.q(`SELECT substr(created_at,1,10) AS day, ROUND(AVG(score),2) AS avg_score, COUNT(*) AS runs
     FROM evaluations WHERE created_at >= ? AND status='done'
-    GROUP BY substr(created_at,1,10) ORDER BY day`).all(since14);
+    GROUP BY substr(created_at,1,10) ORDER BY day`, [since14]);
 
   res.json({ code: 0, data: { list: rows, stat, llm, kb, eval: evalTrend } });
 });
@@ -377,7 +371,7 @@ function buildChildTools(childIds) {
   if (!ids.length) return [];
   // P3 修复（2026-10-22）：补 tools/mcp_servers 列——子智能体编排执行时同样启用其挂载的工具
   // V1.2 #2 2026-10-30：补 kb_metadata_filter 列——子智能体知识库检索同样联动其元数据过滤声明
-  const children = db.prepare(`SELECT id,name,description,prompt,model,temperature,top_p,max_reply,kb_id,kb_metadata_filter,tools,mcp_servers FROM agents WHERE id IN (${ids.map(() => '?').join(',')}) AND status='published'`).all(...ids);
+  const children = dal.q(`SELECT id,name,description,prompt,model,temperature,top_p,max_reply,kb_id,kb_metadata_filter,tools,mcp_servers FROM agents WHERE id IN (${ids.map(() => '?').join(',')}) AND status='published'`, [...ids]);
   return children.map(c => ({
     schema: {
       type: 'function',
@@ -475,7 +469,7 @@ async function planTaskGraph(agent, childTools, userInput, history) {
   try {
     const taskType = experience.classifyTask(userInput);
     const agents = childTools.map(c => ({ id: c.child.id, name: c.child.name }));
-    const records = db.prepare('SELECT * FROM agent_experience').all();
+    const records = dal.q('SELECT * FROM agent_experience');
     hint = experience.experienceHint(experience.rankAgents(agents, records, taskType));
   } catch { /* 经验读取失败不影响编排 */ }
   const sys = `你是专家团编排器。把用户的复杂任务拆解为「任务图 JSON」，由多个子智能体分工并尽可能并行完成，最后安排一个验证节点验收。
@@ -531,23 +525,22 @@ async function synthesizeOrchestration(agent, input, runResult, graph) {
 
 router.post('/sessions', (req, res) => {
   const { agent_id, title } = req.body || {};
-  const info = db.prepare('INSERT INTO sessions (agent_id,title,username,created_at,updated_at) VALUES (?,?,?,?,?)')
-    .run(agent_id || null, title || '新会话', req.user.username, now(), now());
+  const info = dal.runq('INSERT INTO sessions (agent_id,title,username,created_at,updated_at) VALUES (?,?,?,?,?)', [agent_id || null, title || '新会话', req.user.username, now(), now()]);
   // 广场使用统计：创建智能体会话时 +1（SinguX 广场卡片使用数口径）
   if (agent_id) {
-    try { db.prepare('UPDATE agents SET use_count=use_count+1 WHERE id=?').run(agent_id); } catch { }
+    try { dal.runq('UPDATE agents SET use_count=use_count+1 WHERE id=?', [agent_id]); } catch { }
   }
   res.json({ code: 0, data: { id: info.lastInsertRowid } });
 });
 
 router.delete('/sessions/:id', (req, res) => {
-  db.prepare('DELETE FROM sessions WHERE id=? AND username=?').run(req.params.id, req.user.username);
-  db.prepare('DELETE FROM messages WHERE session_id=?').run(req.params.id);
+  dal.runq('DELETE FROM sessions WHERE id=? AND username=?', [req.params.id, req.user.username]);
+  dal.runq('DELETE FROM messages WHERE session_id=?', [req.params.id]);
   res.json({ code: 0, msg: '已删除' });
 });
 
 router.patch('/sessions/:id', (req, res) => {
-  db.prepare('UPDATE sessions SET title=? WHERE id=? AND username=?').run((req.body || {}).title || '新会话', req.params.id, req.user.username);
+  dal.runq('UPDATE sessions SET title=? WHERE id=? AND username=?', [(req.body || {}).title || '新会话', req.params.id, req.user.username]);
   res.json({ code: 0 });
 });
 
@@ -558,7 +551,7 @@ const { classifyModel } = require('../lib/model-types');
 router.get('/models', (req, res) => {
   // P3-8（2026-11-09）：SELECT 移除 api_key 列——原仅用于 truthiness（real 标记），改为 SQL 端布尔表达式
   // has_key，密钥材料不再进入 JS 内存/响应链路，防后续维护误用（真实 Key 使用方一律走 decrypt 专用查询）
-  const ps = db.prepare("SELECT name, models, configured, (api_key IS NOT NULL AND api_key != '') AS has_key, is_default FROM providers WHERE configured=1").all();
+  const ps = dal.q("SELECT name, models, configured, (api_key IS NOT NULL AND api_key != '') AS has_key, is_default FROM providers WHERE configured=1");
   const out = [];
   for (const p of ps) {
     let ms = [];
@@ -567,7 +560,7 @@ router.get('/models', (req, res) => {
     ms.forEach(m => out.push({ name: m, provider: p.name, real: !!p.has_key, is_default: p.is_default, source: 'platform', type: classifyModel(m) }));
   }
   // P3 用户自有模型：本人启用中的模型源追加（自带 Key，下拉标注「我的」；类型实时分类）
-  const ups = db.prepare("SELECT id, name, models FROM user_providers WHERE username=? AND status=1 AND api_key != '' AND base_url != '' ORDER BY id").all(req.user.username);
+  const ups = dal.q("SELECT id, name, models FROM user_providers WHERE username=? AND status=1 AND api_key != '' AND base_url != '' ORDER BY id", [req.user.username]);
   for (const up of ups) {
     let ms = [];
     try { ms = JSON.parse(up.models || '[]'); } catch { ms = []; }
@@ -613,7 +606,7 @@ router.get('/approvals', adminOnly, (req, res) => {
   const args = [];
   if (status && status !== 'all') { wh.push('status=?'); args.push(status); }
   if (q) { wh.push('(tool_name LIKE ? OR requester LIKE ? OR approver LIKE ?)'); args.push(`%${q}%`, `%${q}%`, `%${q}%`); }
-  const rows = db.prepare(`SELECT * FROM tool_approvals${wh.length ? ' WHERE ' + wh.join(' AND ') : ''} ORDER BY id DESC LIMIT 200`).all(...args);
+  const rows = dal.q(`SELECT * FROM tool_approvals${wh.length ? ' WHERE ' + wh.join(' AND ') : ''} ORDER BY id DESC LIMIT 200`, [...args]);
   res.json({ code: 0, data: rows });
 });
 
@@ -629,7 +622,7 @@ router.post('/stream', async (req, res) => {
   // P5.30 安全止血：会话归属校验必须在 writeHead(SSE) 之前——stream 链路的消息落库/会话更新/历史上下文读取
   // 全部以 session_id 为键（不校验归属），任何登录用户可向他人会话写入消息并污染其模型上下文（IDOR）
   if (session_id) {
-    const own = db.prepare('SELECT id FROM sessions WHERE id=? AND username=?').get(session_id, req.user.username);
+    const own = dal.getq('SELECT id FROM sessions WHERE id=? AND username=?', [session_id, req.user.username]);
     if (!own) return res.status(403).json({ code: 403, msg: '无权访问该会话' });
   }
   res.writeHead(200, {
@@ -673,8 +666,7 @@ router.post('/stream', async (req, res) => {
     const quotaMsg = checkQuota(req.user.username);
     if (quotaMsg) {
       send('blocked', { msg: quotaMsg });
-      db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-        .run(req.user.username, '配额拦截', 'Token 配额已耗尽', req.ip, now());
+      dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '配额拦截', 'Token 配额已耗尽', req.ip, now()]);
       return res.end();
     }
 
@@ -682,8 +674,7 @@ router.post('/stream', async (req, res) => {
     const gate = billingGate.precheck({ username: req.user.username, model: model || '', provider: '', promptText: input });
     if (!gate.ok) {
       send('blocked', { msg: gate.reason });
-      db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-        .run(req.user.username, '计费拦截', `${gate.code}：${gate.reason}`, req.ip, now());
+      dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '计费拦截', `${gate.code}：${gate.reason}`, req.ip, now()]);
       return res.end();
     }
     gateId = gate.request_id; // 预留成功——后续 settle 结算 / release 回滚
@@ -693,11 +684,9 @@ router.post('/stream', async (req, res) => {
     if (inCheck.blocked) {
       countHits(inCheck.words);
       send('blocked', { msg: `您的输入包含违规词汇（${inCheck.words.map(w => w.word).join('、')}），已被安全合规策略拦截。` });
-      db.prepare('INSERT INTO messages (session_id,role,content,tokens,created_at) VALUES (?,?,?,?,?)')
-        .run(session_id, 'user', input, 0, now());
-      db.prepare('INSERT INTO messages (session_id,role,content,tokens,created_at) VALUES (?,?,?,?,?)')
-        .run(session_id, 'assistant', '【内容安全拦截】您的输入包含违规词汇，无法处理，请文明提问。', 0, now());
-      db.prepare('UPDATE sessions SET updated_at=? WHERE id=?').run(now(), session_id);
+      dal.runq('INSERT INTO messages (session_id,role,content,tokens,created_at) VALUES (?,?,?,?,?)', [session_id, 'user', input, 0, now()]);
+      dal.runq('INSERT INTO messages (session_id,role,content,tokens,created_at) VALUES (?,?,?,?,?)', [session_id, 'assistant', '【内容安全拦截】您的输入包含违规词汇，无法处理，请文明提问。', 0, now()]);
+      dal.runq('UPDATE sessions SET updated_at=? WHERE id=?', [now(), session_id]);
       return res.end();
     }
 
@@ -706,11 +695,9 @@ router.post('/stream', async (req, res) => {
     if (inject.risk >= 5) {
       logSecurityEvent('injection_blocked', `风险分${inject.risk}：${inject.hits.map(h => h.msg).join('、')} | 输入：${input.slice(0, 100)}`, '拦截', 'chat');
       send('blocked', { msg: `检测到疑似提示词注入攻击（${inject.hits.map(h => h.msg).join('、')}），已按安全策略拦截。` });
-      db.prepare('INSERT INTO messages (session_id,role,content,tokens,created_at) VALUES (?,?,?,?,?)')
-        .run(session_id, 'user', input, 0, now());
-      db.prepare('INSERT INTO messages (session_id,role,content,tokens,created_at) VALUES (?,?,?,?,?)')
-        .run(session_id, 'assistant', '【安全拦截】检测到疑似提示词注入，无法处理该请求。', 0, now());
-      db.prepare('UPDATE sessions SET updated_at=? WHERE id=?').run(now(), session_id);
+      dal.runq('INSERT INTO messages (session_id,role,content,tokens,created_at) VALUES (?,?,?,?,?)', [session_id, 'user', input, 0, now()]);
+      dal.runq('INSERT INTO messages (session_id,role,content,tokens,created_at) VALUES (?,?,?,?,?)', [session_id, 'assistant', '【安全拦截】检测到疑似提示词注入，无法处理该请求。', 0, now()]);
+      dal.runq('UPDATE sessions SET updated_at=? WHERE id=?', [now(), session_id]);
       return res.end();
     }
     if (inject.risk > 0) {
@@ -727,8 +714,7 @@ router.post('/stream', async (req, res) => {
 
     // 1d. 创作技能分流（首页 AI 助手多模态：图片/视频/PPT/语音，绕过智能体链路）
     if (skill === 'image' || skill === 'video' || skill === 'ppt' || skill === 'tts') {
-      db.prepare('INSERT INTO messages (session_id,role,content,tokens,created_at) VALUES (?,?,?,?,?)')
-        .run(session_id, 'user', input, 0, now());
+      dal.runq('INSERT INTO messages (session_id,role,content,tokens,created_at) VALUES (?,?,?,?,?)', [session_id, 'user', input, 0, now()]);
       const t0 = Date.now();
       send('delta', { text: '' }); // 触发前端“生成中”状态
       try {
@@ -760,13 +746,13 @@ router.post('/stream', async (req, res) => {
           opAction: 'AI创作', opDetail: `技能 ${skill}：${input.slice(0, 50)}`,
         });
       } catch (e) {
-        db.prepare('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)').run('skill', `${skill} 生成失败：${e.message}`, now());
+        dal.runq('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)', ['skill', `${skill} 生成失败：${e.message}`, now()]);
         send('error', { msg: `生成失败：${e.message}` });
       }
       return res.end();
     }
 
-    const agent = agent_id ? db.prepare('SELECT * FROM agents WHERE id=?').get(agent_id) : null;
+    const agent = agent_id ? dal.getq('SELECT * FROM agents WHERE id=?', [agent_id]) : null;
     if (agent_id && !agent) { send('error', { msg: '智能体不存在' }); return res.end(); }
     // P3 协作与可见性：受限/草稿智能体仅名单内可见，防止绕过前端直接调接口对话
     if (agent && !canView(agent, req.user)) { send('error', { msg: '无权使用该智能体（未对你开放）' }); return res.end(); }
@@ -774,7 +760,7 @@ router.post('/stream', async (req, res) => {
     // ---------- 外部 Dify 智能体：真实转发（敏感词检测前置已通过） ----------
     const tStart = Date.now();
     if (agent && agent.source === 'dify' && agent.external_app_id) {
-      const plat = db.prepare('SELECT * FROM platforms WHERE type=? AND status=1 ORDER BY id DESC').get('dify');
+      const plat = dal.getq('SELECT * FROM platforms WHERE type=? AND status=1 ORDER BY id DESC', ['dify']);
       if (!plat) { send('error', { msg: '未找到启用的 Dify 平台接入配置' }); return res.end(); }
       if (!agent.external_api_key) { send('error', { msg: '该外部智能体未配置 Service API Key，请在外挂平台重新同步' }); return res.end(); }
       if (agent.external_mode !== 'chat' && agent.external_mode !== 'completion') {
@@ -782,10 +768,9 @@ router.post('/stream', async (req, res) => {
         return res.end();
       }
 
-      db.prepare('INSERT INTO messages (session_id,role,content,tokens,created_at) VALUES (?,?,?,?,?)')
-        .run(session_id, 'user', input, Math.ceil(input.length * 0.6), now());
+      dal.runq('INSERT INTO messages (session_id,role,content,tokens,created_at) VALUES (?,?,?,?,?)', [session_id, 'user', input, Math.ceil(input.length * 0.6), now()]);
 
-      const sess = session_id ? db.prepare('SELECT * FROM sessions WHERE id=?').get(session_id) : null;
+      const sess = session_id ? dal.getq('SELECT * FROM sessions WHERE id=?', [session_id]) : null;
       let full = '';
       let usage = null;
       let extConvId = sess?.ext_conversation_id || '';
@@ -808,7 +793,7 @@ router.post('/stream', async (req, res) => {
         }
       } catch (e) {
         console.error('[chat] Dify 转发异常：', e);
-        db.prepare('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)').run('chat-service', 'Dify 转发异常：' + e.message, now());
+        dal.runq('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)', ['chat-service', 'Dify 转发异常：' + e.message, now()]);
         send('error', { msg: '外部智能体调用失败：' + e.message });
         return res.end();
       }
@@ -831,15 +816,13 @@ router.post('/stream', async (req, res) => {
     if (agent && agent.source === 'coze' && agent.external_app_id) {
       // 工作流类型应用（低代码项目）：经 /v1/workflow/run 真实调用（长任务，阻塞等待后返回视频链接）
       if (agent.external_mode === 'workflow') {
-        db.prepare('INSERT INTO messages (session_id,role,content,tokens,created_at) VALUES (?,?,?,?,?)')
-          .run(session_id, 'user', input, Math.ceil(input.length * 0.6), now());
+        dal.runq('INSERT INTO messages (session_id,role,content,tokens,created_at) VALUES (?,?,?,?,?)', [session_id, 'user', input, Math.ceil(input.length * 0.6), now()]);
 
-        const plat = db.prepare('SELECT * FROM platforms WHERE type=? AND status=1 ORDER BY id DESC').get('coze');
+        const plat = dal.getq('SELECT * FROM platforms WHERE type=? AND status=1 ORDER BY id DESC', ['coze']);
         const token = plat?.token?.startsWith('pat_') ? plat.token : (agent.external_api_key || '');
         if (!token.startsWith('pat_')) {
           const msg = '未配置有效的扣子个人访问令牌（PAT），请在接入管理中配置';
-          db.prepare('INSERT INTO messages (session_id,role,content,tokens,created_at) VALUES (?,?,?,?,?)')
-            .run(session_id, 'assistant', msg, 0, now());
+          dal.runq('INSERT INTO messages (session_id,role,content,tokens,created_at) VALUES (?,?,?,?,?)', [session_id, 'assistant', msg, 0, now()]);
           send('delta', { text: msg });
           send('done', { content: msg, tokens: 0 });
           return res.end();
@@ -879,23 +862,21 @@ router.post('/stream', async (req, res) => {
           return res.end();
         } catch (e) {
           console.error('[chat] Coze 工作流调用异常：', e);
-          db.prepare('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)').run('chat-service', 'Coze 工作流调用异常：' + e.message, now());
+          dal.runq('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)', ['chat-service', 'Coze 工作流调用异常：' + e.message, now()]);
           const errMsg = '扣子工作流调用失败：' + e.message + '\n\n可稍后重试，或到扣子工作台直接运行。';
-          db.prepare('INSERT INTO messages (session_id,role,content,tokens,created_at) VALUES (?,?,?,?,?)')
-            .run(session_id, 'assistant', errMsg, 0, now());
+          dal.runq('INSERT INTO messages (session_id,role,content,tokens,created_at) VALUES (?,?,?,?,?)', [session_id, 'assistant', errMsg, 0, now()]);
           send('delta', { text: errMsg });
           send('done', { content: errMsg, tokens: 0 });
           return res.end();
         }
       }
-      const plat = db.prepare('SELECT * FROM platforms WHERE type=? AND status=1 ORDER BY id DESC').get('coze');
+      const plat = dal.getq('SELECT * FROM platforms WHERE type=? AND status=1 ORDER BY id DESC', ['coze']);
       const token = plat?.token?.startsWith('pat_') ? plat.token : (agent.external_api_key || '');
       if (!token.startsWith('pat_')) { send('error', { msg: '未配置有效的扣子个人访问令牌（PAT），请在接入管理中配置后重新同步' }); return res.end(); }
 
-      db.prepare('INSERT INTO messages (session_id,role,content,tokens,created_at) VALUES (?,?,?,?,?)')
-        .run(session_id, 'user', input, Math.ceil(input.length * 0.6), now());
+      dal.runq('INSERT INTO messages (session_id,role,content,tokens,created_at) VALUES (?,?,?,?,?)', [session_id, 'user', input, Math.ceil(input.length * 0.6), now()]);
 
-      const sess = session_id ? db.prepare('SELECT * FROM sessions WHERE id=?').get(session_id) : null;
+      const sess = session_id ? dal.getq('SELECT * FROM sessions WHERE id=?', [session_id]) : null;
       let full = '';
       let usage = null;
       let extConvId = sess?.ext_conversation_id || '';
@@ -912,7 +893,7 @@ router.post('/stream', async (req, res) => {
         }
       } catch (e) {
         console.error('[chat] Coze 转发异常：', e);
-        db.prepare('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)').run('chat-service', 'Coze 转发异常：' + e.message, now());
+        dal.runq('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)', ['chat-service', 'Coze 转发异常：' + e.message, now()]);
         send('error', { msg: '外部扣子智能体调用失败：' + e.message });
         return res.end();
       }
@@ -934,7 +915,7 @@ router.post('/stream', async (req, res) => {
 
     // 1f. P3 @技能解析：提取 @技能名（本人技能优先 → 他人已发布），技能提示词注入 system、工具并入 function calling；
     //     标记从送模型的内容中移除（用户消息原文保留展示，检索/理解更准）
-    const skillPool = db.prepare('SELECT * FROM skill_assets WHERE status=1 OR owner=?').all(req.user.username);
+    const skillPool = dal.q('SELECT * FROM skill_assets WHERE status=1 OR owner=?', [req.user.username]);
     const { skills: usedSkills, content: _c1 } = parseSkillMentions(input, skillPool, req.user.username);
     if (usedSkills.length) {
       send('notice', { msg: `✨ 已启用技能：${usedSkills.map(s => `${s.icon || '✨'} ${s.name}`).join('、')}` });
@@ -942,7 +923,7 @@ router.post('/stream', async (req, res) => {
 
     // 1g. P5.24 @专家解析：剩余 @ 标记匹配已发布智能体（canView 过滤：公开 + 本人有权限的受限智能体），
     //     专家 prompt 注入 system（以专业身份回答）；与技能同语法、链式接在技能解析之后（同名时技能优先）
-    const expertPool = db.prepare("SELECT id,name,icon,type,description,prompt,tools,owner,status,visibility,collaborators,visible_members,visible_depts FROM agents WHERE status='published'").all()
+    const expertPool = dal.q("SELECT id,name,icon,type,description,prompt,tools,owner,status,visibility,collaborators,visible_members,visible_depts FROM agents WHERE status='published'")
       .filter(a => canView(a, req.user));
     const { agents: usedExperts, content: chatInput } = parseAgentMentions(_c1, expertPool);
     if (usedExperts.length) {
@@ -955,8 +936,8 @@ router.post('/stream', async (req, res) => {
     // P1-2 修复：attachments 注入 wf_files 数据时仅查询自己上传的文件（非管理员）
     // 如果 attachRows.length < attachIds.length 说明有文件被过滤（非己上传），通知用户
     const ownFilter = (req.user?.role !== 'admin' && req.user?.username)
-      ? (id) => db.prepare('SELECT * FROM wf_files WHERE id=? AND created_by=?').get(id, req.user.username)
-      : (id) => db.prepare('SELECT * FROM wf_files WHERE id=?').get(id);
+      ? (id) => dal.getq('SELECT * FROM wf_files WHERE id=? AND created_by=?', [id, req.user.username])
+      : (id) => dal.getq('SELECT * FROM wf_files WHERE id=?', [id]);
     const attachRows = attachIds.map(id => ownFilter(id)).filter(Boolean);
     if (attachIds.length !== attachRows.length) send('notice', { msg: '⚠️ 部分附件不存在或已被清理' });
     let attachVarMap = null; // 画布 file 变量 → fileId 映射（有映射时不拼文本防重复）
@@ -988,8 +969,8 @@ router.post('/stream', async (req, res) => {
 
     // 3. 组装 messages 用的历史轮数（AI-01：提前到检索之前，供多轮指代消解改写查询使用）
     let history = agent?.context_rounds
-      ? db.prepare('SELECT role, content FROM (SELECT * FROM messages WHERE session_id=? ORDER BY id DESC LIMIT ?) ORDER BY id').all(session_id, agent.context_rounds * 2)
-      : db.prepare('SELECT role, content FROM (SELECT * FROM messages WHERE session_id=? ORDER BY id DESC LIMIT 20) ORDER BY id').all(session_id);
+      ? dal.q('SELECT role, content FROM (SELECT * FROM messages WHERE session_id=? ORDER BY id DESC LIMIT ?) ORDER BY id', [session_id, agent.context_rounds * 2])
+      : dal.q('SELECT role, content FROM (SELECT * FROM messages WHERE session_id=? ORDER BY id DESC LIMIT 20) ORDER BY id', [session_id]);
 
     // 2. 知识库检索（混合检索：BM25 + 向量，RRF 融合；@技能标记已移除，检索更准）
     let kbContext = [];
@@ -1043,7 +1024,7 @@ router.post('/stream', async (req, res) => {
       try {
         memRows = await require('../lib/memory-recall').recallMemories(agent.id, req.user.username, chatInput.trim() || input, { topK: 8, trace: retrievalTrace });
       } catch {
-        memRows = db.prepare('SELECT fact, type, confidence FROM agent_memories WHERE agent_id=? AND username=? ORDER BY type ASC, confidence DESC LIMIT 20').all(agent.id, req.user.username);
+        memRows = dal.q('SELECT fact, type, confidence FROM agent_memories WHERE agent_id=? AND username=? ORDER BY type ASC, confidence DESC LIMIT 20', [agent.id, req.user.username]);
       }
       if (memRows.length) {
         system += `\n\n【长期记忆】已记住的当前用户特征（回复时自然利用，无需重复询问）：\n${memRows.map(m => '- ' + m.fact).join('\n')}`;
@@ -1073,8 +1054,7 @@ router.post('/stream', async (req, res) => {
     } catch { /* 压缩失败不影响对话 */ }
     const messages = [{ role: 'system', content: system }, ...history, { role: 'user', content: (chatInput.trim() || '（用户通过 @ 调用了技能/专家，请按其设定开始服务）') + attachText }]; // P5.14：附件文本化注入（表单/普通链路）
 
-    db.prepare('INSERT INTO messages (session_id,role,content,tokens,created_at) VALUES (?,?,?,?,?)')
-      .run(session_id, 'user', input, Math.ceil(input.length * 0.6), now());
+    dal.runq('INSERT INTO messages (session_id,role,content,tokens,created_at) VALUES (?,?,?,?,?)', [session_id, 'user', input, Math.ceil(input.length * 0.6), now()]);
 
     // 4. 模型调用（真实/模拟），流式转发；智能体配置了工具时启用 function calling（内置 + MCP）
     let full = '';
@@ -1139,12 +1119,11 @@ router.post('/stream', async (req, res) => {
             // P5.7 会话变量：从会话行加载持久值（容错；未持久过的变量由 Runner 用 start 定义默认值兜底）
             let wfSessionVars = {};
             try {
-              const sessRow = session_id ? db.prepare('SELECT wf_vars FROM sessions WHERE id=?').get(session_id) : null;
+              const sessRow = session_id ? dal.getq('SELECT wf_vars FROM sessions WHERE id=?', [session_id]) : null;
               wfSessionVars = JSON.parse(sessRow?.wf_vars || '{}') || {};
               if (typeof wfSessionVars !== 'object' || Array.isArray(wfSessionVars)) wfSessionVars = {};
             } catch { wfSessionVars = {}; }
-            const runInfo = db.prepare(`INSERT INTO workflow_runs (agent_id, trigger_type, status, inputs, started_at) VALUES (?,?,?,?,datetime('now','localtime'))`)
-              .run(agent.id, 'chat', 'running', maskSecrets(JSON.stringify({ input: chatInput.trim() || input, session_vars: wfSessionVars })).slice(0, 4000));
+            const runInfo = dal.runq(`INSERT INTO workflow_runs (agent_id, trigger_type, status, inputs, started_at) VALUES (?,?,?,?,datetime('now','localtime'))`, [agent.id, 'chat', 'running', maskSecrets(JSON.stringify({ input: chatInput.trim() || input, session_vars: wfSessionVars })).slice(0, 4000)]);
             // P5.6 Chatflow 直接回复：answer 节点内容即时走 delta 通道流式转发；执行结束 done.content 与汇总一致（前端整体替换，不重复）
             const deltas = [];
             let wake = null, runSettled = false;
@@ -1166,19 +1145,17 @@ router.post('/stream', async (req, res) => {
             }).then(rr => {
               runSettled = true; wake?.();
               const totalTokens = rr.usage?.totalTokens ?? 0; // P5.13 改用 Runner usage 汇总（不再正则扫日志）
-              db.prepare(`UPDATE workflow_runs SET status='success', outputs=?, node_logs=?, total_tokens=?, total_duration_ms=?, finished_at=datetime('now','localtime') WHERE id=?`)
-                .run(maskSecrets(String(rr.output ?? '')).slice(0, 8000), JSON.stringify(rr.logs).slice(0, 100000), totalTokens, Date.now() - wfT0, runInfo.lastInsertRowid);
+              dal.runq(`UPDATE workflow_runs SET status='success', outputs=?, node_logs=?, total_tokens=?, total_duration_ms=?, finished_at=datetime('now','localtime') WHERE id=?`, [maskSecrets(String(rr.output ?? '')).slice(0, 8000), JSON.stringify(rr.logs).slice(0, 100000), totalTokens, Date.now() - wfT0, runInfo.lastInsertRowid]);
               // P5.7 会话变量写回：本轮结束快照持久化到会话行（下一轮 start 注入；值过长截断防护）
               try {
                 if (rr.sessionVars && Object.keys(rr.sessionVars).length) {
-                  db.prepare('UPDATE sessions SET wf_vars=? WHERE id=?').run(maskSecrets(JSON.stringify(rr.sessionVars)).slice(0, 20000), session_id);
+                  dal.runq('UPDATE sessions SET wf_vars=? WHERE id=?', [maskSecrets(JSON.stringify(rr.sessionVars)).slice(0, 20000), session_id]);
                 }
               } catch { /* 会话变量持久化失败不影响对话 */ }
               return rr;
             }).catch(err => {
               runSettled = true; wake?.();
-              db.prepare(`UPDATE workflow_runs SET status='error', outputs='', node_logs=?, error=?, total_duration_ms=?, finished_at=datetime('now','localtime') WHERE id=?`)
-                .run(JSON.stringify(err.logs || []).slice(0, 100000), maskSecrets(String(err.message || '')).slice(0, 500), Date.now() - wfT0, runInfo.lastInsertRowid);
+              dal.runq(`UPDATE workflow_runs SET status='error', outputs='', node_logs=?, error=?, total_duration_ms=?, finished_at=datetime('now','localtime') WHERE id=?`, [JSON.stringify(err.logs || []).slice(0, 100000), maskSecrets(String(err.message || '')).slice(0, 500), Date.now() - wfT0, runInfo.lastInsertRowid]);
               throw err;
             });
             while (true) {
@@ -1230,8 +1207,7 @@ router.post('/stream', async (req, res) => {
         orchestrateGen = (async function* () {
           send('notice', { msg: `🧩 专家团并行编排：${v.graph.nodes.length} 节点 / ${v.levels.length} 层（同层并行）` });
           const t0 = Date.now();
-          const runInfo = db.prepare(`INSERT INTO orchestration_runs (agent_id,session_id,username,status,graph,started_at) VALUES (?,?,?,?,?,?)`)
-            .run(agent.id, session_id || null, req.user.username, 'running', JSON.stringify(v.graph), now());
+          const runInfo = dal.runq(`INSERT INTO orchestration_runs (agent_id,session_id,username,status,graph,started_at) VALUES (?,?,?,?,?,?)`, [agent.id, session_id || null, req.user.username, 'running', JSON.stringify(v.graph), now()]);
           const runId = runInfo.lastInsertRowid;
           const nodeLogs = {};
           const evTag = evt => `${evt.title || evt.nodeId}（${evt.type === 'verify' ? '验收' : '子智能体#' + evt.agent_id}）`;
@@ -1254,8 +1230,7 @@ router.post('/stream', async (req, res) => {
               onNodeState: (id, st) => { nodeLogs[id] = { status: st.status, error: st.error, retries: st.retries, durationMs: st.durationMs, tokens: st.tokens }; },
             });
           } catch (e) {
-            db.prepare(`UPDATE orchestration_runs SET status='error', error=?, node_logs=?, total_duration_ms=?, finished_at=? WHERE id=?`)
-              .run(String(e.message || e).slice(0, 500), JSON.stringify(nodeLogs), Date.now() - t0, now(), runId);
+            dal.runq(`UPDATE orchestration_runs SET status='error', error=?, node_logs=?, total_duration_ms=?, finished_at=? WHERE id=?`, [String(e.message || e).slice(0, 500), JSON.stringify(nodeLogs), Date.now() - t0, now(), runId]);
             throw e;
           }
           // D3-2 经验自进化：把各子智能体节点的产出结果回写为经验（按节点任务归类累积「专家×任务类型」可靠度）；
@@ -1273,8 +1248,7 @@ router.post('/stream', async (req, res) => {
           catch (e) { final = '（汇总失败，以下为各环节产出）\n' + String(e.message || e); }
           const summary = orchestrator.summarizeRun(runResult);
           const out = final + `\n\n> 🧩 专家团编排：${summary.total} 节点 / ${summary.levels} 层 / ${summary.done} 成功${summary.failed ? ' · ' + summary.failed + ' 失败' : ''} · 并行度 ${Math.round(summary.parallelRatio * 100)}% · 耗时 ${(summary.durationMs / 1000).toFixed(1)}s`;
-          db.prepare(`UPDATE orchestration_runs SET status=?, node_logs=?, result=?, total_tokens=?, total_duration_ms=?, finished_at=? WHERE id=?`)
-            .run(runResult.ok ? 'success' : 'partial', JSON.stringify(runResult.nodes), out.slice(0, 8000), runResult.totalTokens, summary.durationMs, now(), runId);
+          dal.runq(`UPDATE orchestration_runs SET status=?, node_logs=?, result=?, total_tokens=?, total_duration_ms=?, finished_at=? WHERE id=?`, [runResult.ok ? 'success' : 'partial', JSON.stringify(runResult.nodes), out.slice(0, 8000), runResult.totalTokens, summary.durationMs, now(), runId]);
           yield { delta: out };
           return { full: out, model: agent.model, provider: 'orchestrate' };
         })();
@@ -1287,11 +1261,9 @@ router.post('/stream', async (req, res) => {
     // P1-14 HITL 五态审批：pending → approved/rejected/expired；批准且执行完 → executed
     // 每次确认全程落 tool_approvals（含审批人与决策时间），审计可查
     const waitUserConfirm = (toolKey, name, argsJson) => new Promise(resolve => {
-      db.prepare('INSERT INTO tool_approvals (confirm_key, tool_name, args_json, requester, status, created_at) VALUES (?,?,?,?,"pending",?)')
-        .run(toolKey, name, String(argsJson || '').slice(0, 500), req.user.username, now());
+      dal.runq('INSERT INTO tool_approvals (confirm_key, tool_name, args_json, requester, status, created_at) VALUES (?,?,?,?,"pending",?)', [toolKey, name, String(argsJson || '').slice(0, 500), req.user.username, now()]);
       const finalizeApproval = (status, approver, reason) => {
-        db.prepare('UPDATE tool_approvals SET status=?, approver=?, decision_at=?, reason=? WHERE confirm_key=? AND status=\'pending\'')
-          .run(status, approver || '', now(), String(reason || '').slice(0, 200), toolKey);
+        dal.runq('UPDATE tool_approvals SET status=?, approver=?, decision_at=?, reason=? WHERE confirm_key=? AND status=\'pending\'', [status, approver || '', now(), String(reason || '').slice(0, 200), toolKey]);
       };
       const timer = setTimeout(() => { toolConfirmRegistry.del(toolKey); finalizeApproval('expired'); resolve('timeout'); }, 120000);
       // P5.29：用户停止生成时立即结束确认等待（否则主循环会卡到 120s 超时才落库 partial）
@@ -1341,15 +1313,14 @@ router.post('/stream', async (req, res) => {
           send('notice', { msg: `⛔ ${name} 未执行：${reason}` });
           return `工具 ${name} 未获得用户授权（${reason}）。请基于已有信息回答，或询问用户是否允许执行该操作。`;
         }
-        const approvedRow = db.prepare('SELECT id FROM tool_approvals WHERE confirm_key=? AND status=?').get(toolKey, 'approved');
+        const approvedRow = dal.getq('SELECT id FROM tool_approvals WHERE confirm_key=? AND status=?', [toolKey, 'approved']);
         approvedApprovalId = approvedRow ? approvedRow.id : null;
       }
       // P1-14：工具真正执行完毕（含异常）才把审批升为 executed——"批准且已兑现"语义
       const markExecuted = () => {
         if (approvedApprovalId != null) {
           try {
-            db.prepare('UPDATE tool_approvals SET status=?, decision_at=? WHERE id=? AND status=?')
-              .run('executed', now(), approvedApprovalId, 'approved');
+            dal.runq('UPDATE tool_approvals SET status=?, decision_at=? WHERE id=? AND status=?', ['executed', now(), approvedApprovalId, 'approved']);
           } catch { /* 审计回写失败不影响工具结果 */ }
         }
       };
@@ -1486,8 +1457,7 @@ router.post('/stream', async (req, res) => {
 
     const tokens = Math.ceil(outMasked.length * 0.6);
     const promptChars = messages.reduce((s, m) => s + (m.content || '').length, 0);
-    const msgInfo = db.prepare('INSERT INTO messages (session_id,role,content,tokens,created_at) VALUES (?,?,?,?,?)')
-      .run(session_id, 'assistant', outMasked, tokens, now());
+    const msgInfo = dal.runq('INSERT INTO messages (session_id,role,content,tokens,created_at) VALUES (?,?,?,?,?)', [session_id, 'assistant', outMasked, tokens, now()]);
     addUsage(req.user.username, tokens); // P2 配额记账（本地模型链路）
     // D2-2 计费结算：按真实用量与单价精确结算预留（幂等；与成本归因同基数）
     settleGate({ promptTokens: Math.ceil(promptChars * 0.6), completionTokens: tokens, model: genMeta?.model || model || agent?.model || 'default', provider: genMeta?.provider });
@@ -1502,14 +1472,12 @@ router.post('/stream', async (req, res) => {
         meta: { mode: 'real' },
       });
     } catch (e) { console.error('[chat] U1-6 成本归因失败（不阻断）：', e.message); }
-    db.prepare('UPDATE sessions SET updated_at=? WHERE id=?').run(now(), session_id);
-    db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-      .run(req.user.username, '对话调用', `与 ${agent ? '「' + agent.name + '」' : '首页助手'} 对话（${tokens} tokens${stopped ? '，用户停止生成' : ''}${usedSkills.length ? '，@技能 ' + usedSkills.map(s => s.name).join('/') : ''}${toolTrace.length ? '，工具×' + toolTrace.length : ''}${genMeta?.provider ? '，@' + genMeta.provider + '/' + (genMeta.model || model || '') : ''}）`, req.ip, now());
+    dal.runq('UPDATE sessions SET updated_at=? WHERE id=?', [now(), session_id]);
+    dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '对话调用', `与 ${agent ? '「' + agent.name + '」' : '首页助手'} 对话（${tokens} tokens${stopped ? '，用户停止生成' : ''}${usedSkills.length ? '，@技能 ' + usedSkills.map(s => s.name).join('/') : ''}${toolTrace.length ? '，工具×' + toolTrace.length : ''}${genMeta?.provider ? '，@' + genMeta.provider + '/' + (genMeta.model || model || '') : ''}）`, req.ip, now()]);
     // 全链路追踪落库（model+provider 记录实际路由到的供应商，多供应商路由后可追溯）
-    db.prepare('INSERT INTO chat_traces (session_id,message_id,agent_id,model,mode,latency_ms,tokens,prompt_chars,kb_hits,tool_calls,blocked,retrieval_trace,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)')
-      .run(session_id, msgInfo.lastInsertRowid, agent?.id || null, genMeta?.model || model || agent?.model || '', 'real', Date.now() - tStart, tokens, promptChars,
+    dal.runq('INSERT INTO chat_traces (session_id,message_id,agent_id,model,mode,latency_ms,tokens,prompt_chars,kb_hits,tool_calls,blocked,retrieval_trace,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)', [session_id, msgInfo.lastInsertRowid, agent?.id || null, genMeta?.model || model || agent?.model || '', 'real', Date.now() - tStart, tokens, promptChars,
         JSON.stringify(kbHits.map(h => ({ file: h.file, kb: h.kb, score: h.score, bm25: h.bm25, vec: h.vec, rerank_score: h.rerank_score, excerpt: h.content.slice(0, 120) }))),
-        JSON.stringify(toolTrace), blockedNote, JSON.stringify(retrievalTrace), now());
+        JSON.stringify(toolTrace), blockedNote, JSON.stringify(retrievalTrace), now()]);
 
     send('done', { content: outMasked, tokens, model: genMeta?.model, provider: genMeta?.provider, mid: Number(msgInfo.lastInsertRowid) });
 
@@ -1528,7 +1496,7 @@ router.post('/stream', async (req, res) => {
         if (list.length) {
           send('suggestions', { list });
           try {
-            db.prepare('UPDATE chat_traces SET suggestions=? WHERE message_id=?').run(JSON.stringify(list), msgInfo.lastInsertRowid);
+            dal.runq('UPDATE chat_traces SET suggestions=? WHERE message_id=?', [JSON.stringify(list), msgInfo.lastInsertRowid]);
           } catch { /* 回写失败不影响对话 */ }
         }
         // 会话标题自动生成（P2）：首条对话后命名「新会话」，SSE 推送前端实时更新侧栏
@@ -1547,7 +1515,7 @@ router.post('/stream', async (req, res) => {
     return;
   } catch (e) {
     console.error('[chat] 对话异常：', e);
-    db.prepare('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)').run('chat-service', '对话链路异常：' + e.message, now());
+    dal.runq('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)', ['chat-service', '对话链路异常：' + e.message, now()]);
     // P1-6：异常中断——检查点标记 aborted（保留 partial 快照），用户重开会话可「继续生成」；
     // 顺带把已流出的 partial 落一条 assistant 消息（带续跑标记），前端据此展示续跑卡片
     try {
@@ -1638,7 +1606,7 @@ router.get('/video/tasks/:taskId/content', async (req, res) => {
 
 // GET /api/chat/sessions/:id/vars — 获取会话变量
 router.get('/sessions/:id/vars', auth, (req, res) => {
-  const s = db.prepare('SELECT id, wf_vars FROM sessions WHERE id=?').get(req.params.id);
+  const s = dal.getq('SELECT id, wf_vars FROM sessions WHERE id=?', [req.params.id]);
   if (!s) return res.json({ code: 404, msg: '会话不存在' });
   let vars = {};
   try { vars = JSON.parse(s.wf_vars || '{}'); } catch { vars = {}; }
@@ -1647,17 +1615,17 @@ router.get('/sessions/:id/vars', auth, (req, res) => {
 
 // PUT /api/chat/sessions/:id/vars — 更新会话变量（全量替换）
 router.put('/sessions/:id/vars', auth, (req, res) => {
-  const s = db.prepare('SELECT id FROM sessions WHERE id=?').get(req.params.id);
+  const s = dal.getq('SELECT id FROM sessions WHERE id=?', [req.params.id]);
   if (!s) return res.json({ code: 404, msg: '会话不存在' });
   const { vars } = req.body || {};
   const payload = typeof vars === 'object' && vars !== null ? JSON.stringify(vars) : (vars || '{}');
-  db.prepare('UPDATE sessions SET wf_vars=?,updated_at=datetime(\'now\',\'localtime\') WHERE id=?').run(payload, s.id);
+  dal.runq('UPDATE sessions SET wf_vars=?,updated_at=datetime(\'now\',\'localtime\') WHERE id=?', [payload, s.id]);
   res.json({ code: 0 });
 });
 
 // PATCH /api/chat/sessions/:id/vars — 合并更新会话变量（增量）
 router.patch('/sessions/:id/vars', auth, (req, res) => {
-  const s = db.prepare('SELECT id, wf_vars FROM sessions WHERE id=?').get(req.params.id);
+  const s = dal.getq('SELECT id, wf_vars FROM sessions WHERE id=?', [req.params.id]);
   if (!s) return res.json({ code: 404, msg: '会话不存在' });
   let current = {};
   try { current = JSON.parse(s.wf_vars || '{}'); } catch { current = {}; }
@@ -1665,13 +1633,13 @@ router.patch('/sessions/:id/vars', auth, (req, res) => {
   if (typeof vars === 'object' && vars !== null) {
     Object.assign(current, vars);
   }
-  db.prepare('UPDATE sessions SET wf_vars=?,updated_at=datetime(\'now\',\'localtime\') WHERE id=?').run(JSON.stringify(current), s.id);
+  dal.runq('UPDATE sessions SET wf_vars=?,updated_at=datetime(\'now\',\'localtime\') WHERE id=?', [JSON.stringify(current), s.id]);
   res.json({ code: 0, data: current });
 });
 
 // GET /api/chat/sessions/:id/state — 获取会话状态（约定键集：phase/status/context）
 router.get('/sessions/:id/state', auth, (req, res) => {
-  const s = db.prepare('SELECT id, wf_vars FROM sessions WHERE id=?').get(req.params.id);
+  const s = dal.getq('SELECT id, wf_vars FROM sessions WHERE id=?', [req.params.id]);
   if (!s) return res.json({ code: 404, msg: '会话不存在' });
   let vars = {};
   try { vars = JSON.parse(s.wf_vars || '{}'); } catch { vars = {}; }
@@ -1707,7 +1675,7 @@ router.post('/stt', auth, sttUpload.single('audio'), async (req, res) => {
 
 // ===== D1-2 专家团编排：运行查询 + 单节点重跑（失败可重跑单节点）=====
 function loadOrchestration(id, user) {
-  const row = db.prepare('SELECT * FROM orchestration_runs WHERE id=?').get(id);
+  const row = dal.getq('SELECT * FROM orchestration_runs WHERE id=?', [id]);
   if (!row) return { err: { code: 404, msg: '编排运行不存在' } };
   if (row.username && row.username !== user.username && user.role !== 'admin') return { err: { code: 403, msg: '无权访问该编排运行' } };
   return { row };
@@ -1728,7 +1696,7 @@ router.post('/orchestrations/:id/rerun-node', async (req, res) => {
     if (err) return res.json(err);
     const nodeId = String((req.body || {}).node_id || '').trim();
     if (!nodeId) return res.json({ code: 400, msg: '缺少 node_id' });
-    const agent = db.prepare('SELECT * FROM agents WHERE id=?').get(row.agent_id);
+    const agent = dal.getq('SELECT * FROM agents WHERE id=?', [row.agent_id]);
     if (!agent) return res.json({ code: 404, msg: '智能体不存在' });
     let graph = null; try { graph = JSON.parse(row.graph || 'null'); } catch { }
     if (!graph || !Array.isArray(graph.nodes)) return res.json({ code: 400, msg: '任务图缺失，无法重跑' });
@@ -1744,7 +1712,7 @@ router.post('/orchestrations/:id/rerun-node', async (req, res) => {
     };
     const runVerify = (node, ctx) => runVerifyNode(agent, node, { ...ctx, input }).then(t => ({ text: t }));
     const st = await orchestrator.rerunNode(graph, nodes, nodeId, { runAgent, runVerify, input, timeoutMs: orchestrator.DEFAULT_TIMEOUT_MS, retry: 1 });
-    db.prepare('UPDATE orchestration_runs SET node_logs=? WHERE id=?').run(JSON.stringify(nodes), row.id);
+    dal.runq('UPDATE orchestration_runs SET node_logs=? WHERE id=?', [JSON.stringify(nodes), row.id]);
     res.json({ code: 0, data: { node: st }, msg: `节点 ${nodeId} 已重跑：${st.status}` });
   } catch (e) {
     res.json({ code: 500, msg: '重跑失败：' + (e.message || e) });

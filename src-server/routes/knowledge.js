@@ -52,9 +52,9 @@ function denyIfNotAllowed(kb, user) {
 router.get('/', (req, res) => {
   // V1.2 审查加固 2026-10-30：库列表加 owner 过滤——此前任意登录用户可看全平台库名/描述/配置（含
   // auto_metadata、分块参数），与 agents 挂库归属校验组合是攻击链的侦察环节；管理员仍见全部（管理页需要）
-  const rows = db.prepare(`
+  const rows = dal.q(`
     SELECT k.*, (SELECT COUNT(*) FROM kb_files f WHERE f.kb_id=k.id) AS file_count
-    FROM kbs k WHERE (?='admin' OR k.owner=?) ORDER BY k.id DESC`).all(req.user.role, req.user.username);
+    FROM kbs k WHERE (?='admin' OR k.owner=?) ORDER BY k.id DESC`, [req.user.role, req.user.username]);
   // V2.4 #9 2026-10-31 空间隔离——知识库的读取/创建均关联 space_id
   // space_id 已预加（ALTER TABLE kbs ADD COLUMN space_id INTEGER DEFAULT 0），
   // 0 = 无空间归属（所有用户可见），非 0 值 = 空间 ID（当前是改进程中的过渡语义）。
@@ -80,7 +80,7 @@ router.post('/', (req, res) => {
   const { getSoftLimit } = require('../lib/plans');
   const softLimit = getSoftLimit('kb', req.user.username);
   if (softLimit > 0 && !req.user.plan) {
-    const count = db.prepare('SELECT COUNT(*) c FROM kbs WHERE owner=?').get(req.user.username).c;
+    const count = dal.getq('SELECT COUNT(*) c FROM kbs WHERE owner=?', [req.user.username]).c;
     if (count >= softLimit) {
       return res.json({ code: 402, msg: `社区版最多创建 ${softLimit} 个知识库（当前 ${count} 个），请升级专业版或企业版`, data: { upgrade_hint: true } });
     }
@@ -89,18 +89,17 @@ router.post('/', (req, res) => {
   // 若无匹配的个人空间，则写入 0（无空间归属，默认所有用户可见）。
   // 创建空间前找到当前用户拥有的第一个个人空间，如果没有则设为 0（无归属）。
   let spaceId = 0;
-  const mySpace = db.prepare('SELECT id FROM spaces WHERE type=? AND owner=? LIMIT 1').get('personal', req.user.username);
+  const mySpace = dal.getq('SELECT id FROM spaces WHERE type=? AND owner=? LIMIT 1', ['personal', req.user.username]);
   if (mySpace) spaceId = mySpace.id;
   // 知识库数据：name,description,enabled,owner,space_id 写入
-  const info = db.prepare(`INSERT INTO kbs (name,description,enabled,owner,space_id,created_at) VALUES (?,?,1,?,?,datetime('now','localtime'))`)
-    .run(name.trim(), description || '', req.user.username, spaceId);
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)').run(req.user.username, '创建知识库', name.trim(), req.ip, now());
+  const info = dal.runq(`INSERT INTO kbs (name,description,enabled,owner,space_id,created_at) VALUES (?,?,1,?,?,datetime('now','localtime'))`, [name.trim(), description || '', req.user.username, spaceId]);
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '创建知识库', name.trim(), req.ip, now()]);
   res.json({ code: 0, data: { id: info.lastInsertRowid } });
 });
 
 router.put('/:id', (req, res) => {
   const { name, description, enabled, chunk_size, chunk_overlap, chunk_separator, auto_metadata, pipeline, vision_model, rerank_enabled, rerank_model, rerank_top_n, rerank_threshold } = req.body || {};
-  const old = db.prepare('SELECT * FROM kbs WHERE id=?').get(req.params.id);
+  const old = dal.getq('SELECT * FROM kbs WHERE id=?', [req.params.id]);
   const deny = denyIfNotAllowed(old, req.user);
   if (deny) return res.json(deny);
   // V1.2 #2 2026-10-30：auto_metadata 开关归一（0/1；未传保留原值）——开启后上传文件后台 LLM 自动抽取元数据
@@ -145,10 +144,9 @@ router.put('/:id', (req, res) => {
     : (rerank_top_n === null ? null : (Number.isFinite(+rerank_top_n) ? Math.max(1, Math.min(50, Math.floor(+rerank_top_n))) : (old.rerank_top_n ?? null)));
   const normRerankThreshold = rerank_threshold === undefined ? (old.rerank_threshold ?? null)
     : (rerank_threshold === null ? null : (Number.isFinite(+rerank_threshold) ? +rerank_threshold : (old.rerank_threshold ?? null)));
-  db.prepare('UPDATE kbs SET name=?,description=?,enabled=?,chunk_size=?,chunk_overlap=?,chunk_separator=?,auto_metadata=?,pipeline=?,vision_model=?,rerank_enabled=?,rerank_model=?,rerank_top_n=?,rerank_threshold=? WHERE id=?')
-     .run(name || old.name, description ?? old.description, enabled ?? old.enabled,
+  dal.runq('UPDATE kbs SET name=?,description=?,enabled=?,chunk_size=?,chunk_overlap=?,chunk_separator=?,auto_metadata=?,pipeline=?,vision_model=?,rerank_enabled=?,rerank_model=?,rerank_top_n=?,rerank_threshold=? WHERE id=?', [name || old.name, description ?? old.description, enabled ?? old.enabled,
        nextSize, nextOverlap, nextSep, autoMeta, nextPipeline, nextVm,
-       normRerankEnabled, normRerankModel, normRerankTopN, normRerankThreshold, old.id);
+       normRerankEnabled, normRerankModel, normRerankTopN, normRerankThreshold, old.id]);
   // V1.3 #6 2026-10-30：切片参数任一实际变化（与 old 逐项比对；数值归一比较防字符串/数字形态误判）
   // → fire-and-forget 召回评测回归：重跑该库全部评测集 + 通知 owner，异步执行不阻塞保存响应
   const chunkChanged = Number(nextSize) !== Number(old.chunk_size)
@@ -157,20 +155,20 @@ router.put('/:id', (req, res) => {
   // V2.3 #5 2026-10-31：pipeline 变更与 chunk 参数变更同语义——仅影响【后续上传】的执行步骤/切片方式，
   // 不自动重切存量分块（存量需重切按既有流程重传文件）；故 pipeline 变更不并入下方回归触发条件
   if (chunkChanged) runKbRegression(old.id, { username: req.user.username, ip: req.ip }).catch(e => {
-    try { db.prepare('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)').run('kb-regression', `库#${old.id} 变更触发回归失败：${e.message}`, now()); } catch { }
+    try { dal.runq('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)', ['kb-regression', `库#${old.id} 变更触发回归失败：${e.message}`, now()]); } catch { }
   });
   res.json({ code: 0, msg: '已保存' });
 });
 
 router.delete('/:id', (req, res) => {
-  const old = db.prepare('SELECT * FROM kbs WHERE id=?').get(req.params.id);
+  const old = dal.getq('SELECT * FROM kbs WHERE id=?', [req.params.id]);
   const deny = denyIfNotAllowed(old, req.user);
   if (deny) return res.json(deny);
-  db.prepare('DELETE FROM kb_chunks WHERE kb_id=?').run(req.params.id);
-  db.prepare('DELETE FROM kb_files WHERE kb_id=?').run(req.params.id);
-  db.prepare('DELETE FROM kbs WHERE id=?').run(req.params.id);
+  dal.runq('DELETE FROM kb_chunks WHERE kb_id=?', [req.params.id]);
+  dal.runq('DELETE FROM kb_files WHERE kb_id=?', [req.params.id]);
+  dal.runq('DELETE FROM kbs WHERE id=?', [req.params.id]);
   if (old) vectorIndex.drop(old.id); // AI-02 收尾：库删 → 影子表一并清除（幂等，防索引残留孤儿向量）
-  if (old) db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)').run(req.user.username, '删除知识库', old.name, req.ip, now());
+  if (old) dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '删除知识库', old.name, req.ip, now()]);
   res.json({ code: 0, msg: '已删除' });
 });
 
@@ -178,34 +176,34 @@ router.delete('/:id', (req, res) => {
 // V1.1 审查加固 2026-10-30：补归属校验——此前无校验，任意登录用户可看他人库文件元数据；
 // 本轮 error_msg（含解析器内部报错）入库后若继续敞开，/:id/logs 的收紧设计将被旁路，故与 logs 同权
 router.get('/:id/files', (req, res) => {
-  const kb = db.prepare('SELECT * FROM kbs WHERE id=?').get(req.params.id);
+  const kb = dal.getq('SELECT * FROM kbs WHERE id=?', [req.params.id]);
   const deny = denyIfNotAllowed(kb, req.user);
   if (deny) return res.json(deny);
-  res.json({ code: 0, data: db.prepare('SELECT * FROM kb_files WHERE kb_id=? ORDER BY id DESC').all(req.params.id) });
+  res.json({ code: 0, data: dal.q('SELECT * FROM kb_files WHERE kb_id=? ORDER BY id DESC', [req.params.id]) });
 });
 
 // V1.1 #1 2026-10-30：解析日志——分页列表 + 四态汇总统计（前端「解析日志」页数据源）
 // 权限比 files 列表更严（admin/owner 才可看）：日志含失败原因细节（可能带解析器内部报错信息），不向普通用户开放
 // processing/pending 态在当前同步架构下恒为 0，为 #5 摄取管道异步化后的预留演进位（非缺陷）
 router.get('/:id/logs', (req, res) => {
-  const kb = db.prepare('SELECT * FROM kbs WHERE id=?').get(req.params.id);
+  const kb = dal.getq('SELECT * FROM kbs WHERE id=?', [req.params.id]);
   const deny = denyIfNotAllowed(kb, req.user);
   if (deny) return res.json(deny);
   // P1-3 分页容错 2026-11-04：改用 lib/pagination 统一解析（原手写式碰巧已容错，收口为全项目同语义；page_size 字段名保持前端兼容）
   const { page, size: pageSize, offset } = parsePagination(req, { sizeKey: 'page_size' });
-  const total = db.prepare('SELECT COUNT(*) AS c FROM kb_files WHERE kb_id=?').get(kb.id).c;
-  const list = db.prepare(`SELECT id,name,source,size,status,chunk_count,error_msg,parsed_at,created_at
-    FROM kb_files WHERE kb_id=? ORDER BY id DESC LIMIT ? OFFSET ?`).all(kb.id, pageSize, offset);
+  const total = dal.getq('SELECT COUNT(*) AS c FROM kb_files WHERE kb_id=?', [kb.id]).c;
+  const list = dal.q(`SELECT id,name,source,size,status,chunk_count,error_msg,parsed_at,created_at
+    FROM kb_files WHERE kb_id=? ORDER BY id DESC LIMIT ? OFFSET ?`, [kb.id, pageSize, offset]);
   // V1.1 审查加固 2026-10-30：stats 由 5 次独立 COUNT 合并为单条 GROUP BY（配合 idx_kb_files_kb 索引，防行数膨胀后同步驱动阻塞事件循环）
   const stats = { total, success: 0, failed: 0, processing: 0, bytes: 0, chunks: 0 };
-  db.prepare('SELECT status, COUNT(*) AS c FROM kb_files WHERE kb_id=? GROUP BY status').all(kb.id).forEach(r => {
+  dal.q('SELECT status, COUNT(*) AS c FROM kb_files WHERE kb_id=? GROUP BY status', [kb.id]).forEach(r => {
     if (r.status === 'success') stats.success = r.c;
     else if (r.status === 'failed') stats.failed = r.c;
     else if (r.status === 'processing' || r.status === 'pending') stats.processing += r.c; // 四态预设计：#5 管道异步化后的预留态
   });
   // P2-4 存储统计（2026-11-05）：库级存储量（bytes=SUM(size)）与分块总量（chunks=SUM(chunk_count)）——
   // 单条聚合查询与 GROUP BY 同走 idx_kb_files_kb，均为 O(该库文件数)
-  const agg = db.prepare('SELECT COALESCE(SUM(size),0) AS bytes, COALESCE(SUM(chunk_count),0) AS chunks FROM kb_files WHERE kb_id=?').get(kb.id);
+  const agg = dal.getq('SELECT COALESCE(SUM(size),0) AS bytes, COALESCE(SUM(chunk_count),0) AS chunks FROM kb_files WHERE kb_id=?', [kb.id]);
   stats.bytes = agg.bytes; stats.chunks = agg.chunks;
   res.json({
     code: 0,
@@ -228,7 +226,7 @@ router.get('/:id/logs', (req, res) => {
 //   { code:0, data:{ id, status:'pending', async:true } }；终态轮询 GET /:id/files（单文件 status）或
 //   GET /:id/logs（四态汇总；pending/processing 态自此不再是恒 0 预留位）
 router.post('/:id/files', async (req, res) => {
-  const kb = db.prepare('SELECT * FROM kbs WHERE id=?').get(req.params.id);
+  const kb = dal.getq('SELECT * FROM kbs WHERE id=?', [req.params.id]);
   if (!kb) return res.json({ code: 404, msg: '知识库不存在' });
   const deny = denyIfNotAllowed(kb, req.user); // P5.30：防向他人知识库注入内容（归属校验留在路由层，不进管道）
   if (deny) return res.json(deny);
@@ -255,7 +253,7 @@ router.post('/:id/files', async (req, res) => {
   if (req.query.async === '1') {
     // V2.3 审查加固（S2-1）：每库在途上限——认证用户高频 async 上传可堆积海量后台管道（TOC LLM 调用等
     // 无队列背压），堆积至 ≥5 拒绝新的 async 上传（同步模式不受限——请求并发天然限流）防 DoS 自伤
-    const inflight = db.prepare("SELECT COUNT(*) c FROM kb_files WHERE kb_id=? AND status IN ('pending','processing')").get(kb.id).c;
+    const inflight = dal.getq("SELECT COUNT(*) c FROM kb_files WHERE kb_id=? AND status IN ('pending','processing')", [kb.id]).c;
     if (inflight >= 5) {
       return res.json({ code: 429, msg: `该库摄取队列繁忙（在途 ${inflight} 个，上限 5），请稍后重试或改用同步上传`, data: { retry_after: 5 } });
     }
@@ -269,12 +267,10 @@ router.post('/:id/files', async (req, res) => {
       // 兜底：管道内部已对步骤失败落 failed 且永不 reject，此处仅兜执行器自身意外
       //（如 failPipeline 落库抛错）——置 failed + err_logs 留痕，保证 pending 行不会悬挂
       try {
-        db.prepare(`UPDATE kb_files SET status='failed', error_msg=?, parsed_at=NULL WHERE id=?`)
-          .run(String(e?.message || e || '未知原因').slice(0, 500), started.fileId);
+        dal.runq(`UPDATE kb_files SET status='failed', error_msg=?, parsed_at=NULL WHERE id=?`, [String(e?.message || e || '未知原因').slice(0, 500), started.fileId]);
       } catch { }
       try {
-        db.prepare('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)')
-          .run('kb-ingestion', `库#${kb.id} 异步摄取失败：${e?.message || e}`, now());
+        dal.runq('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)', ['kb-ingestion', `库#${kb.id} 异步摄取失败：${e?.message || e}`, now()]);
       } catch { }
     });
     return res.json({ code: 0, data: { id: started.fileId, status: 'pending', async: true } });
@@ -287,15 +283,15 @@ router.post('/:id/files', async (req, res) => {
 });
 
 router.delete('/files/:fileId', (req, res) => {
-  const f = db.prepare('SELECT * FROM kb_files WHERE id=?').get(req.params.fileId);
-  const kb = f ? db.prepare('SELECT * FROM kbs WHERE id=?').get(f.kb_id) : null;
+  const f = dal.getq('SELECT * FROM kb_files WHERE id=?', [req.params.fileId]);
+  const kb = f ? dal.getq('SELECT * FROM kbs WHERE id=?', [f.kb_id]) : null;
   const deny = denyIfNotAllowed(kb, req.user); // P5.30：文件级写操作同样校验库归属
   if (deny) return res.json(deny);
-  db.prepare('DELETE FROM kb_chunks WHERE file_id=?').run(req.params.fileId);
-  db.prepare('DELETE FROM kb_files WHERE id=?').run(req.params.fileId);
+  dal.runq('DELETE FROM kb_chunks WHERE file_id=?', [req.params.fileId]);
+  dal.runq('DELETE FROM kb_files WHERE id=?', [req.params.fileId]);
   if (f) {
     // AI-02 收尾：文件删 → 其分块的影子表向量同步失效（覆盖度闸下次检索不再命中已删内容）
-    const ids = db.prepare('SELECT id FROM kb_chunks WHERE file_id=?').all(req.params.fileId).map(r => r.id);
+    const ids = dal.q('SELECT id FROM kb_chunks WHERE file_id=?', [req.params.fileId]).map(r => r.id);
     vectorIndex.remove(f.kb_id, ids);
   }
   res.json({ code: 0, msg: '已删除' });
@@ -303,23 +299,23 @@ router.delete('/files/:fileId', (req, res) => {
 
 // 重新解析（演示：仅刷新时间戳）
 router.post('/files/:fileId/reparse', (req, res) => {
-  const f = db.prepare('SELECT * FROM kb_files WHERE id=?').get(req.params.fileId);
+  const f = dal.getq('SELECT * FROM kb_files WHERE id=?', [req.params.fileId]);
   if (!f) return res.json({ code: 404, msg: '文件不存在' });
-  const kb = db.prepare('SELECT * FROM kbs WHERE id=?').get(f.kb_id);
+  const kb = dal.getq('SELECT * FROM kbs WHERE id=?', [f.kb_id]);
   const deny = denyIfNotAllowed(kb, req.user); // P5.30：同上
   if (deny) return res.json(deny);
-  db.prepare("UPDATE kb_files SET status='success' WHERE id=?").run(f.id);
+  dal.runq("UPDATE kb_files SET status='success' WHERE id=?", [f.id]);
   res.json({ code: 0, msg: '重新解析完成' });
 });
 
 // 分块管理（P1 2026-10-28：列出/编辑/合并/删除单个 chunk）
 router.get('/files/:fileId/chunks', (req, res) => {
-  const f = db.prepare('SELECT * FROM kb_files WHERE id=?').get(req.params.fileId);
+  const f = dal.getq('SELECT * FROM kb_files WHERE id=?', [req.params.fileId]);
   if (!f) return res.json({ code: 404, msg: '文件不存在' });
-  const kb = db.prepare('SELECT * FROM kbs WHERE id=?').get(f.kb_id);
+  const kb = dal.getq('SELECT * FROM kbs WHERE id=?', [f.kb_id]);
   const deny = denyIfNotAllowed(kb, req.user);
   if (deny) return res.json(deny);
-  const rows = db.prepare('SELECT c.id, c.content, c.file_id, c.kb_id, c.keywords, c.metadata FROM kb_chunks c WHERE c.file_id=? ORDER BY c.id').all(req.params.fileId); // V1.2 #2：带出 metadata（分块编辑回显）
+  const rows = dal.q('SELECT c.id, c.content, c.file_id, c.kb_id, c.keywords, c.metadata FROM kb_chunks c WHERE c.file_id=? ORDER BY c.id', [req.params.fileId]); // V1.2 #2：带出 metadata（分块编辑回显）
   // P2-4 文件预览（2026-11-05）：file 字段补全 size/status/chunk_count/parsed_at/created_at——
   // 前端「全文预览」头部信息与文件管理页对齐（f 本就是 SELECT * 全行，此前只回 3 字段是窄化）
   res.json({ code: 0, data: { file: { id: f.id, name: f.name, kb_id: f.kb_id, size: f.size, status: f.status, chunk_count: f.chunk_count, parsed_at: f.parsed_at, created_at: f.created_at }, chunks: rows } });
@@ -329,39 +325,37 @@ router.get('/files/:fileId/chunks', (req, res) => {
 router.post('/files/:fileId/generate-metadata', async (req, res) => {
   // V1.2 审查加固 2026-10-30：手动补抽取元数据（复刻 generate-keywords 交互）——先传文件后开
   // auto_metadata 的存量文件补抽取途径；库未开启开关时显式提示（防误以为已抽取）
-  const f = db.prepare('SELECT * FROM kb_files WHERE id=?').get(req.params.fileId);
+  const f = dal.getq('SELECT * FROM kb_files WHERE id=?', [req.params.fileId]);
   if (!f) return res.json({ code: 404, msg: '文件不存在' });
-  const kb = db.prepare('SELECT * FROM kbs WHERE id=?').get(f.kb_id);
+  const kb = dal.getq('SELECT * FROM kbs WHERE id=?', [f.kb_id]);
   const deny = denyIfNotAllowed(kb, req.user);
   if (deny) return res.json(deny);
   const r = await extractMetadataForFile(f.id);
   if (!r.ok) return res.json({ code: 400, msg: r.msg });
   if (r.skipped === 'no_provider') return res.json({ code: 0, data: { ...r, msg: '未配置可用模型供应商，已跳过抽取' } });
   if (r.skipped === 'disabled') return res.json({ code: 400, msg: '该库未开启「自动元数据」，请先在库设置中开启' });
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(req.user.username, '补抽取元数据', `${kb.name} / ${f.name}（成功 ${r.extracted}/${r.total}）`, req.ip, now());
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '补抽取元数据', `${kb.name} / ${f.name}（成功 ${r.extracted}/${r.total}）`, req.ip, now()]);
   res.json({ code: 0, data: r });
 });
 
 router.post('/files/:fileId/generate-keywords', async (req, res) => {
-  const f = db.prepare('SELECT * FROM kb_files WHERE id=?').get(req.params.fileId);
+  const f = dal.getq('SELECT * FROM kb_files WHERE id=?', [req.params.fileId]);
   if (!f) return res.json({ code: 404, msg: '文件不存在' });
-  const kb = db.prepare('SELECT * FROM kbs WHERE id=?').get(f.kb_id);
+  const kb = dal.getq('SELECT * FROM kbs WHERE id=?', [f.kb_id]);
   const deny = denyIfNotAllowed(kb, req.user);
   if (deny) return res.json(deny);
   const r = await generateForFile(f.id);
   if (!r.ok) return res.json({ code: 400, msg: r.msg });
   if (r.skipped === 'no_provider') return res.json({ code: 0, data: { ...r, msg: '未配置可用模型供应商，已跳过生成' } });
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(req.user.username, '生成关键词', `${kb.name} / ${f.name}（成功 ${r.generated}/${r.total}）`, req.ip, now());
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '生成关键词', `${kb.name} / ${f.name}（成功 ${r.generated}/${r.total}）`, req.ip, now()]);
   res.json({ code: 0, data: r });
 });
 
 // 更新单个 chunk 内容（V1.2 #2 2026-10-30：同步接受 metadata 手工编辑——sanitizeMetadata 清洗后存 JSON 字符串；null/空对象存 NULL 即清除）
 router.put('/chunks/:chunkId', (req, res) => {
-  const c = db.prepare('SELECT * FROM kb_chunks WHERE id=?').get(req.params.chunkId);
+  const c = dal.getq('SELECT * FROM kb_chunks WHERE id=?', [req.params.chunkId]);
   if (!c) return res.json({ code: 404, msg: '分块不存在' });
-  const kb = db.prepare('SELECT * FROM kbs WHERE id=?').get(c.kb_id);
+  const kb = dal.getq('SELECT * FROM kbs WHERE id=?', [c.kb_id]);
   const deny = denyIfNotAllowed(kb, req.user);
   if (deny) return res.json(deny);
   const { content, metadata } = req.body || {};
@@ -371,9 +365,9 @@ router.put('/chunks/:chunkId', (req, res) => {
   if (metadata !== undefined) {
     const clean = sanitizeMetadata(metadata);
     const metaSql = Object.keys(clean).length ? JSON.stringify(clean) : null;
-    db.prepare('UPDATE kb_chunks SET content=?, metadata=?, embedding=NULL WHERE id=?').run(String(content || ''), metaSql, c.id);
+    dal.runq('UPDATE kb_chunks SET content=?, metadata=?, embedding=NULL WHERE id=?', [String(content || ''), metaSql, c.id]);
   } else {
-    db.prepare('UPDATE kb_chunks SET content=?, embedding=NULL WHERE id=?').run(String(content || ''), c.id);
+    dal.runq('UPDATE kb_chunks SET content=?, embedding=NULL WHERE id=?', [String(content || ''), c.id]);
   }
   vectorIndex.remove(c.kb_id, [c.id]); // AI-02 收尾：内容变更 → 影子表向量同步失效（下次检索回填新内容向量）
   // 更新文件 chunk_count（不做严格同步，简单 +1 即可）
@@ -382,12 +376,12 @@ router.put('/chunks/:chunkId', (req, res) => {
 
 // 删除单个 chunk
 router.delete('/chunks/:chunkId', (req, res) => {
-  const c = db.prepare('SELECT * FROM kb_chunks WHERE id=?').get(req.params.chunkId);
+  const c = dal.getq('SELECT * FROM kb_chunks WHERE id=?', [req.params.chunkId]);
   if (!c) return res.json({ code: 404, msg: '分块不存在' });
-  const kb = db.prepare('SELECT * FROM kbs WHERE id=?').get(c.kb_id);
+  const kb = dal.getq('SELECT * FROM kbs WHERE id=?', [c.kb_id]);
   const deny = denyIfNotAllowed(kb, req.user);
   if (deny) return res.json(deny);
-  db.prepare('DELETE FROM kb_chunks WHERE id=?').run(c.id);
+  dal.runq('DELETE FROM kb_chunks WHERE id=?', [c.id]);
   vectorIndex.remove(c.kb_id, [c.id]); // AI-02 收尾：分块删 → 影子表同步失效
   res.json({ code: 0, msg: '已删除' });
 });
@@ -396,16 +390,16 @@ router.delete('/chunks/:chunkId', (req, res) => {
 router.post('/chunks/merge', (req, res) => {
   const { sourceId, targetId } = req.body || {};
   if (!sourceId || !targetId) return res.json({ code: 400, msg: '请指定要合并的两个分块 ID' });
-  const source = db.prepare('SELECT * FROM kb_chunks WHERE id=?').get(sourceId);
-  const target = db.prepare('SELECT * FROM kb_chunks WHERE id=?').get(targetId);
+  const source = dal.getq('SELECT * FROM kb_chunks WHERE id=?', [sourceId]);
+  const target = dal.getq('SELECT * FROM kb_chunks WHERE id=?', [targetId]);
   if (!source || !target) return res.json({ code: 404, msg: '分块不存在' });
   if (source.kb_id !== target.kb_id) return res.json({ code: 400, msg: '不能合并不同知识库的分块' });
-  const kb = db.prepare('SELECT * FROM kbs WHERE id=?').get(source.kb_id);
+  const kb = dal.getq('SELECT * FROM kbs WHERE id=?', [source.kb_id]);
   const deny = denyIfNotAllowed(kb, req.user);
   if (deny) return res.json(deny);
   // AI-02：合并后目标分块内容变更→同步失效其向量缓存（下次检索重算）；源分块行删除即携带其向量一并清除
-  db.prepare('UPDATE kb_chunks SET content=?, embedding=NULL WHERE id=?').run((source.content + '\n' + target.content).trim(), target.id);
-  db.prepare('DELETE FROM kb_chunks WHERE id=?').run(source.id);
+  dal.runq('UPDATE kb_chunks SET content=?, embedding=NULL WHERE id=?', [(source.content + '\n' + target.content).trim(), target.id]);
+  dal.runq('DELETE FROM kb_chunks WHERE id=?', [source.id]);
   vectorIndex.remove(source.kb_id, [target.id, source.id]); // AI-02 收尾：目标重算 + 源删除，两侧向量同步失效
   res.json({ code: 0, msg: '已合并' });
 });
@@ -421,7 +415,7 @@ router.post('/recall-test', async (req, res) => {
   if (!query?.trim()) return res.json({ code: 400, msg: '请输入测试问题' });
   let kbId = kb_id || null;
   if (file_id) {
-    const f = db.prepare('SELECT * FROM kb_files WHERE id=?').get(file_id);
+    const f = dal.getq('SELECT * FROM kb_files WHERE id=?', [file_id]);
     kbId = f ? f.kb_id : kbId;
   }
   // V1.1 读侧收口（V1.2 #2 2026-10-30 补齐）：召回测试可检索他人库内容，同样属读越权——
@@ -461,7 +455,7 @@ router.post('/image-search', async (req, res) => {
   const { kb_id, image_base64, top_n } = req.body || {};
   const kbId = Number(kb_id);
   if (!Number.isInteger(kbId) || kbId <= 0) return res.json({ code: 400, msg: '请提供 kb_id（知识库）' });
-  const kb = db.prepare('SELECT * FROM kbs WHERE id=?').get(kbId);
+  const kb = dal.getq('SELECT * FROM kbs WHERE id=?', [kbId]);
   const deny = denyIfNotAllowed(kb, req.user);
   if (deny) return res.json(deny);
   const b64 = String(image_base64 || '').replace(/^data:image\/[a-z]+;base64,/, '').trim();
@@ -489,7 +483,7 @@ router.post('/image-search', async (req, res) => {
 // 保存评测集（召回测试面板「保存为评测集」入口；dataset 校验：非空数组、每条 query 非空、
 // expect_terms 归一为字符串数组截 8 项；整集截 50 条防超长重跑阻塞——沿用 agents.js 测评 slice 截断先例）
 router.post('/:id/evaluations', (req, res) => {
-  const kb = db.prepare('SELECT * FROM kbs WHERE id=?').get(req.params.id);
+  const kb = dal.getq('SELECT * FROM kbs WHERE id=?', [req.params.id]);
   const deny = denyIfNotAllowed(kb, req.user);
   if (deny) return res.json(deny);
   const { name, dataset } = req.body || {};
@@ -505,21 +499,19 @@ router.post('/:id/evaluations', (req, res) => {
     items.push({ query, expect_terms: terms });
   }
   // score=NULL（从未重跑，列表显 '—'）+ result='[]'；type='kb' + kb_id 与智能体侧隔离
-  const info = db.prepare(`INSERT INTO evaluations (name,kb_id,type,dataset,status,score,result,created_at)
-    VALUES (?,?,?,?,'done',NULL,'[]',datetime('now','localtime'))`)
-    .run(safeName, kb.id, 'kb', JSON.stringify(items));
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(req.user.username, '保存知识库评测集', `${kb.name} / ${safeName}（${items.length} 条）`, req.ip, now());
+  const info = dal.runq(`INSERT INTO evaluations (name,kb_id,type,dataset,status,score,result,created_at)
+    VALUES (?,?,?,?,'done',NULL,'[]',datetime('now','localtime'))`, [safeName, kb.id, 'kb', JSON.stringify(items)]);
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '保存知识库评测集', `${kb.name} / ${safeName}（${items.length} 条）`, req.ip, now()]);
   res.json({ code: 0, data: { id: info.lastInsertRowid, count: items.length } });
 });
 
 // 评测集列表（该库全部，id DESC；score=NULL 表示从未重跑，前端显 '—'；附带 dataset 条数）
 router.get('/:id/evaluations', (req, res) => {
-  const kb = db.prepare('SELECT * FROM kbs WHERE id=?').get(req.params.id);
+  const kb = dal.getq('SELECT * FROM kbs WHERE id=?', [req.params.id]);
   const deny = denyIfNotAllowed(kb, req.user);
   if (deny) return res.json(deny);
   // AI-03（2026-11-23）：metrics 一并返回——列表页展示 hit@K/召回@K/MRR/NDCG 聚合（未评测/旧数据为 null）
-  const rows = db.prepare(`SELECT id,name,score,created_at,dataset,metrics FROM evaluations WHERE kb_id=? AND type='kb' ORDER BY id DESC`).all(kb.id);
+  const rows = dal.q(`SELECT id,name,score,created_at,dataset,metrics FROM evaluations WHERE kb_id=? AND type='kb' ORDER BY id DESC`, [kb.id]);
   const data = rows.map(r => {
     let count = 0;
     try { const arr = JSON.parse(r.dataset || '[]'); if (Array.isArray(arr)) count = arr.length; } catch { count = 0; }
@@ -532,29 +524,27 @@ router.get('/:id/evaluations', (req, res) => {
 
 // 重跑单个评测集并返回 diff（旧 score=null → diff='首次'；变化 ±0.02 内 → '持平'；否则 ±x.xx）
 router.post('/:id/evaluations/:eid/rerun', async (req, res) => {
-  const kb = db.prepare('SELECT * FROM kbs WHERE id=?').get(req.params.id);
+  const kb = dal.getq('SELECT * FROM kbs WHERE id=?', [req.params.id]);
   const deny = denyIfNotAllowed(kb, req.user);
   if (deny) return res.json(deny);
-  const ev = db.prepare('SELECT * FROM evaluations WHERE id=?').get(req.params.eid);
+  const ev = dal.getq('SELECT * FROM evaluations WHERE id=?', [req.params.eid]);
   // 归属校验：评测集必须存在于该库（防跨库 eid 越权重跑他人评测集）
   if (!ev || ev.type !== 'kb' || ev.kb_id !== kb.id) return res.json({ code: 404, msg: '评测集不存在或不属于该知识库' });
   const r = await rerunEvalSet(ev);
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(req.user.username, '知识库评测回归', `${kb.name} / ${ev.name}：${r.prev_score == null ? '首次' : r.prev_score} → ${r.score}（${r.diff}）`, req.ip, now());
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '知识库评测回归', `${kb.name} / ${ev.name}：${r.prev_score == null ? '首次' : r.prev_score} → ${r.score}（${r.diff}）`, req.ip, now()]);
   res.json({ code: 0, data: r });
 });
 
 // 删除评测集（知识库侧独立端点——agents.js 的 DELETE /evaluations/:id 是智能体侧路由且按 agent_id
 // 归属校验，kb 型行无 agent_id 会被其 404 拦截，故此处按库归属校验后删，前端「评测集」页专用）
 router.delete('/:id/evaluations/:eid', (req, res) => {
-  const kb = db.prepare('SELECT * FROM kbs WHERE id=?').get(req.params.id);
+  const kb = dal.getq('SELECT * FROM kbs WHERE id=?', [req.params.id]);
   const deny = denyIfNotAllowed(kb, req.user);
   if (deny) return res.json(deny);
-  const ev = db.prepare('SELECT * FROM evaluations WHERE id=?').get(req.params.eid);
+  const ev = dal.getq('SELECT * FROM evaluations WHERE id=?', [req.params.eid]);
   if (!ev || ev.type !== 'kb' || ev.kb_id !== kb.id) return res.json({ code: 404, msg: '评测集不存在或不属于该知识库' });
-  db.prepare('DELETE FROM evaluations WHERE id=?').run(ev.id);
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(req.user.username, '删除知识库评测集', `${kb.name} / ${ev.name}`, req.ip, now());
+  dal.runq('DELETE FROM evaluations WHERE id=?', [ev.id]);
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '删除知识库评测集', `${kb.name} / ${ev.name}`, req.ip, now()]);
   res.json({ code: 0, msg: '已删除' });
 });
 
@@ -563,7 +553,7 @@ router.post('/:id/graph-search', async (req, res) => {
   const { query, top_k } = req.body || {};
   if (!query?.trim()) return res.json({ code: 400, msg: '请输入查询内容' });
   // V1.1 读侧收口（V1.2 #2 2026-10-30 补齐）：图谱检索同样暴露库内容，与 logs/files 同模式校验归属
-  const kb = db.prepare('SELECT * FROM kbs WHERE id=?').get(req.params.id);
+  const kb = dal.getq('SELECT * FROM kbs WHERE id=?', [req.params.id]);
   const deny = denyIfNotAllowed(kb, req.user);
   if (deny) return res.json(deny);
   const data = retrieveGraph(query, req.params.id, top_k || 5);
@@ -573,7 +563,7 @@ router.post('/:id/graph-search', async (req, res) => {
 // V1.2 #2 2026-10-30：元数据筛选选项——返回该库全部分块的 distinct 元数据键值聚合（前端筛选下拉数据源）。
 // metadata 为 JSON 文本，从 JS 侧解析聚合（SQL 不便按键展开）；损坏 JSON/非对象值跳过；owner/admin 可见（denyIfNotAllowed 同权）
 router.get('/:id/meta-options', (req, res) => {
-  const kb = db.prepare('SELECT * FROM kbs WHERE id=?').get(req.params.id);
+  const kb = dal.getq('SELECT * FROM kbs WHERE id=?', [req.params.id]);
   const deny = denyIfNotAllowed(kb, req.user);
   if (deny) return res.json(deny);
   // BE-C1：走 dal 统一出口 + 租户边界（kb 归属已由 denyIfNotAllowed 校验，chunk 随库走，双保险）

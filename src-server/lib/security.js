@@ -2,19 +2,19 @@
  * 敏感词检测：输入/输出双向拦截 + 计数
  */
 const { db } = require('../db');
+const dal = require('./dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 
 /** 检查文本，返回 {blocked, words:[{id,word,category}]} 仅统计 input_block/output_block 开启的词 */
 function check(text, dir /* 'input' | 'output' */) {
   const col = dir === 'input' ? 'input_block' : 'output_block';
-  const words = db.prepare(`SELECT w.id, w.word, c.name AS category FROM words w LEFT JOIN word_categories c ON c.id=w.category_id WHERE w.${col}=1`).all();
+  const words = dal.q(`SELECT w.id, w.word, c.name AS category FROM words w LEFT JOIN word_categories c ON c.id=w.category_id WHERE w.${col}=1`);
   const hits = words.filter(w => text.includes(w.word));
   return { blocked: hits.length > 0, words: hits };
 }
 
 /** 命中计数 +1 */
 function countHits(hits) {
-  const upd = db.prepare('UPDATE words SET hit_count = hit_count + 1 WHERE id=?');
-  hits.forEach(h => upd.run(h.id));
+  hits.forEach(h => dal.runq('UPDATE words SET hit_count = hit_count + 1 WHERE id=?', [h.id]));
 }
 
 /** 输出过滤：命中词替换为 *** */
@@ -94,8 +94,7 @@ function detectInjection(text) {
 /** 记录安全事件 */
 function logSecurityEvent(type, detail, action, source) {
   try {
-    db.prepare('INSERT INTO security_events (type,detail,action,source,created_at) VALUES (?,?,?,?,datetime(\'now\',\'localtime\'))')
-      .run(type, String(detail || '').slice(0, 500), action || '', source || '');
+    dal.runq('INSERT INTO security_events (type,detail,action,source,created_at) VALUES (?,?,?,?,datetime(\'now\',\'localtime\'))', [type, String(detail || '').slice(0, 500), action || '', source || '']);
   } catch { }
 }
 

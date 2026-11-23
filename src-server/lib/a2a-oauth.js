@@ -8,6 +8,7 @@
  * 访问令牌复用 lib/auth.js 的无状态 HMAC 签名（typ='a2a_token'，默认 1 小时，可吊销）。
  */
 const { db } = require('../db');
+const dal = require('./dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const { sign, verify } = require('./auth');
 const jws = require('./a2a-jws');
 
@@ -70,7 +71,7 @@ function exchangeClientCredentials({ assertion, expectedAud = '', now } = {}) {
     if (!ok) return { error: 'invalid_client' };
   }
 
-  const row = db.prepare('SELECT org_name, scopes, status FROM a2a_api_keys WHERE key_id=?').get(header.kid);
+  const row = dal.getq('SELECT org_name, scopes, status FROM a2a_api_keys WHERE key_id=?', [header.kid]);
   if (!row || !row.status) return { error: 'invalid_client' };
 
   jws.touchKey(header.kid);

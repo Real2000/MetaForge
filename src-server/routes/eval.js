@@ -93,8 +93,7 @@ router.post('/baselines', adminOnly, (req, res) => {
     cases: cases || undefined, evaluation_id: b.evaluation_id != null ? b.evaluation_id : undefined,
     created_by: req.user.username,
   });
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(req.user.username, '采集评测基线', `${row.suite}：成功率 ${row.metrics.successRate}% / 步数 ${row.metrics.avgSteps} / 干预率 ${row.metrics.interventionRate}%`, req.ip, require('../db').now());
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '采集评测基线', `${row.suite}：成功率 ${row.metrics.successRate}% / 步数 ${row.metrics.avgSteps} / 干预率 ${row.metrics.interventionRate}%`, req.ip, require('../db').now()]);
   res.json({ code: 0, data: row });
 });
 
@@ -161,8 +160,7 @@ router.post('/runner/swe-bench-lite', adminOnly, async (req, res) => {
       cases: out.cases, created_by: req.user.username,
     });
   }
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(req.user.username, 'SWE-bench-lite runner 执行', `${instances.length} 实例：成功率 ${out.metrics.successRate}% / 步数 ${out.metrics.avgSteps} / 干预率 ${out.metrics.interventionRate}%`, req.ip, require('../db').now());
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, 'SWE-bench-lite runner 执行', `${instances.length} 实例：成功率 ${out.metrics.successRate}% / 步数 ${out.metrics.avgSteps} / 干预率 ${out.metrics.interventionRate}%`, req.ip, require('../db').now()]);
   res.json({ code: 0, data: { predictions: out.predictions, cases: out.cases, metrics: out.metrics, baseline, command: out.command } });
 });
 

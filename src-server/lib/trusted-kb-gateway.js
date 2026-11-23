@@ -19,6 +19,7 @@
  *   - 检索结果自动水印
  */
 const { db, now } = require('../db');
+const dal = require('./dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 
 const REQUEST_TIMEOUT = 8000;
 const API_ENDPOINTS = {
@@ -131,7 +132,7 @@ function injectWatermark(chunks, kb, user) {
   if (!Array.isArray(chunks)) return [];
   let orgName = '', sourceName = '';
   try {
-    const source = db.prepare("SELECT * FROM external_sources WHERE kb_id=? AND enabled=1 AND org_name!='' LIMIT 1").get(kb?.id || kb);
+    const source = dal.getq("SELECT * FROM external_sources WHERE kb_id=? AND enabled=1 AND org_name!='' LIMIT 1", [kb?.id || kb]);
     if (source) { orgName = source.org_name; sourceName = source.name; }
   } catch { /* 容错 */ }
   if (!orgName) return chunks;
@@ -154,7 +155,7 @@ function safeParse(str, def) {
 function resolveSecret(ref) {
   if (!ref) return '';
   try {
-    const row = db.prepare("SELECT value FROM secrets WHERE name=?").get(ref);
+    const row = dal.getq("SELECT value FROM secrets WHERE name=?", [ref]);
     return row?.value || '';
   } catch { return ''; }
 }

@@ -1,5 +1,6 @@
 /** 系统监控：操作日志 / 异常日志 / 服务监控（真实系统指标） */
 const express = require('express');
+const dal = require('../lib/dal'); // BE-C1 统一查询出口——顶层注入（codemod 误判函数内局部 require 为已有定义）
 const os = require('os');
 const fs = require('fs');
 const { db, now } = require('../db');
@@ -15,23 +16,23 @@ router.get('/op-logs', (req, res) => {
   const { page, size, offset } = parsePagination(req);
   let sql = 'SELECT * FROM op_logs WHERE 1=1', args = [];
   if (keyword) { sql += ' AND (username LIKE ? OR action LIKE ? OR detail LIKE ?)'; args.push(`%${keyword}%`, `%${keyword}%`, `%${keyword}%`); }
-  const total = db.prepare(sql.replace('SELECT *', 'SELECT COUNT(*) c')).get(...args).c;
+  const total = dal.getq(sql.replace('SELECT *', 'SELECT COUNT(*) c'), [...args]).c;
   sql += ' ORDER BY id DESC LIMIT ? OFFSET ?';
   args.push(size, offset);
-  res.json({ code: 0, data: { list: db.prepare(sql).all(...args), total } });
+  res.json({ code: 0, data: { list: dal.q(sql, [...args]), total } });
 });
 
 router.get('/err-logs', (req, res) => {
   // P1-3 分页容错：同 op-logs 统一解析（原 +req.query.page 写法碰巧不 500，但与全项目语义不一）
   const { size, offset } = parsePagination(req);
-  const total = db.prepare('SELECT COUNT(*) c FROM err_logs').get().c;
-  const list = db.prepare('SELECT * FROM err_logs ORDER BY id DESC LIMIT ? OFFSET ?').all(size, offset);
+  const total = dal.getq('SELECT COUNT(*) c FROM err_logs').c;
+  const list = dal.q('SELECT * FROM err_logs ORDER BY id DESC LIMIT ? OFFSET ?', [size, offset]);
   res.json({ code: 0, data: { list, total } });
 });
 
 router.delete('/err-logs', (req, res) => {
-  db.prepare('DELETE FROM err_logs').run();
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)').run(req.user.username, '清空异常日志', '手动清理', req.ip, now());
+  dal.runq('DELETE FROM err_logs');
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '清空异常日志', '手动清理', req.ip, now()]);
   res.json({ code: 0, msg: '已清空' });
 });
 

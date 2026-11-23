@@ -19,6 +19,7 @@
  */
 
 const crypto = require('crypto');
+const dal = require('./dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 
 /** 可配用户 API Key 的工具元数据（P3-2，单一事实来源）：
  *  routes/tool-keys.js（CRUD 白名单）、routes/skills-market.js（市场展示 keyed 标记）共同引用，
@@ -49,7 +50,7 @@ async function getUserToolKey(ctx, toolName) {
   if (!username || !toolName) return null;
   try {
     const { db } = require('../db');
-    const row = db.prepare('SELECT api_key, status FROM user_tool_keys WHERE username=? AND tool_name=?').get(String(username), String(toolName));
+    const row = dal.getq('SELECT api_key, status FROM user_tool_keys WHERE username=? AND tool_name=?', [String(username), String(toolName)]);
     if (!row || !row.status || !row.api_key) return null;
     const { decrypt } = require('./crypto-util');
     return decrypt(row.api_key) || null;

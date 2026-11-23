@@ -11,6 +11,7 @@
  * 全部路由要求 JWT 认证（router.use(auth)），资源按 owner 归属隔离（管理员可见全部）。
  */
 const fs = require('fs');
+const dal = require('../lib/dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const path = require('path');
 const express = require('express');
 const { db, now } = require('../db');
@@ -68,10 +69,10 @@ function stub3D(body) {
 
 /** 执行一次 3D 生成任务（落库 → 调用 → 更新状态 → 登记素材） */
 async function runTask(taskId) {
-  const task = db.prepare('SELECT * FROM model3d_tasks WHERE id=?').get(taskId);
+  const task = dal.getq('SELECT * FROM model3d_tasks WHERE id=?', [taskId]);
   if (!task) return null;
   const t0 = Date.now();
-  db.prepare('UPDATE model3d_tasks SET status=?, provider=? WHERE id=?').run('running', '', task.id);
+  dal.runq('UPDATE model3d_tasks SET status=?, provider=? WHERE id=?', ['running', '', task.id]);
   const body = model3d.buildGenRequest(task.prompt, { format: task.format });
   let result = null, err = '';
   try {
@@ -81,21 +82,18 @@ async function runTask(taskId) {
   const duration = Date.now() - t0;
   if (result) {
     // 登记为创作资产（kind='3d'），与 D1-3 创作资产闭环打通
-    const info = db.prepare(`INSERT INTO assets (project_id,kind,name,url,thumb,source,prompt,tags,real_person,digital_human,meta,owner,space_id,created_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-      .run(task.project_id != null ? task.project_id : null, '3d',
+    const info = dal.runq(`INSERT INTO assets (project_id,kind,name,url,thumb,source,prompt,tags,real_person,digital_human,meta,owner,space_id,created_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, [task.project_id != null ? task.project_id : null, '3d',
         String(task.prompt || '3D 资产').slice(0, 60), result.url, '', 'generated',
         String(task.prompt || '').slice(0, 2000), '[]', 0, 0,
         JSON.stringify({ format: result.format, provider: result.provider, task_id: task.id, stub: !!result.stub }),
-        task.username, 0, now());
+        task.username, 0, now()]);
     const assetId = info.lastInsertRowid;
-    db.prepare('UPDATE model3d_tasks SET status=?,model=?,provider=?,url=?,asset_id=?,duration_ms=?,finished_at=? WHERE id=?')
-      .run('success', result.model, result.provider, result.url, assetId, duration, now(), task.id);
+    dal.runq('UPDATE model3d_tasks SET status=?,model=?,provider=?,url=?,asset_id=?,duration_ms=?,finished_at=? WHERE id=?', ['success', result.model, result.provider, result.url, assetId, duration, now(), task.id]);
   } else {
-    db.prepare('UPDATE model3d_tasks SET status=?,error=?,duration_ms=?,finished_at=? WHERE id=?')
-      .run('failed', String(err).slice(0, 300), duration, now(), task.id);
+    dal.runq('UPDATE model3d_tasks SET status=?,error=?,duration_ms=?,finished_at=? WHERE id=?', ['failed', String(err).slice(0, 300), duration, now(), task.id]);
   }
-  return db.prepare('SELECT * FROM model3d_tasks WHERE id=?').get(task.id);
+  return dal.getq('SELECT * FROM model3d_tasks WHERE id=?', [task.id]);
 }
 
 /* ============================ 3D 生成 ============================ */
@@ -108,12 +106,12 @@ router.post('/generate', async (req, res) => {
   const format = model3d.normFormat(b.format);
   const projectId = b.project_id != null && b.project_id !== '' ? Number(b.project_id) : null;
   if (projectId != null) {
-    const p = db.prepare('SELECT * FROM projects WHERE id=?').get(projectId);
+    const p = dal.getq('SELECT * FROM projects WHERE id=?', [projectId]);
     if (!p) return res.json({ code: 404, msg: '项目不存在' });
     if (!canSee(p.owner || '', req.user)) return res.json({ code: 403, msg: '无权操作该项目' });
   }
-  const info = db.prepare(`INSERT INTO model3d_tasks (username,project_id,prompt,format,status,created_at)
-    VALUES (?,?,?,?,?,?)`).run(req.user.username, projectId, prompt.slice(0, 2000), format, 'queued', now());
+  const info = dal.runq(`INSERT INTO model3d_tasks (username,project_id,prompt,format,status,created_at)
+    VALUES (?,?,?,?,?,?)`, [req.user.username, projectId, prompt.slice(0, 2000), format, 'queued', now()]);
   const row = await runTask(info.lastInsertRowid);
   res.json({ code: 0, data: model3d.normalizeTask(row), raw: { status: row.status, error: row.error || '' } });
 });
@@ -124,12 +122,12 @@ router.get('/tasks', (req, res) => {
   if (!isAdmin(req.user)) { cond.push('username=?'); args.push(req.user.username); }
   if (req.query.project_id != null && req.query.project_id !== '') { cond.push('project_id=?'); args.push(Number(req.query.project_id)); }
   if (req.query.status) { cond.push('status=?'); args.push(String(req.query.status)); }
-  const rows = db.prepare(`SELECT * FROM model3d_tasks ${cond.length ? 'WHERE ' + cond.join(' AND ') : ''} ORDER BY id DESC LIMIT 200`).all(...args);
+  const rows = dal.q(`SELECT * FROM model3d_tasks ${cond.length ? 'WHERE ' + cond.join(' AND ') : ''} ORDER BY id DESC LIMIT 200`, [...args]);
   res.json({ code: 0, data: rows.map(model3d.normalizeTask), stats: model3d.taskStats(rows) });
 });
 
 router.get('/tasks/:id', (req, res) => {
-  const row = db.prepare('SELECT * FROM model3d_tasks WHERE id=?').get(req.params.id);
+  const row = dal.getq('SELECT * FROM model3d_tasks WHERE id=?', [req.params.id]);
   if (!row) return res.json({ code: 404, msg: '任务不存在' });
   if (!canSee(row.username, req.user)) return res.json({ code: 403, msg: '无权访问该任务' });
   res.json({ code: 0, data: model3d.normalizeTask(row) });
@@ -137,11 +135,11 @@ router.get('/tasks/:id', (req, res) => {
 
 /** 重跑失败/历史任务（生成新任务，保留原记录用于成功率追溯） */
 router.post('/tasks/:id/retry', async (req, res) => {
-  const row = db.prepare('SELECT * FROM model3d_tasks WHERE id=?').get(req.params.id);
+  const row = dal.getq('SELECT * FROM model3d_tasks WHERE id=?', [req.params.id]);
   if (!row) return res.json({ code: 404, msg: '任务不存在' });
   if (!canSee(row.username, req.user)) return res.json({ code: 403, msg: '无权操作该任务' });
-  const info = db.prepare(`INSERT INTO model3d_tasks (username,project_id,prompt,format,status,created_at)
-    VALUES (?,?,?,?,?,?)`).run(row.username, row.project_id, row.prompt, row.format, 'queued', now());
+  const info = dal.runq(`INSERT INTO model3d_tasks (username,project_id,prompt,format,status,created_at)
+    VALUES (?,?,?,?,?,?)`, [row.username, row.project_id, row.prompt, row.format, 'queued', now()]);
   const newRow = await runTask(info.lastInsertRowid);
   res.json({ code: 0, data: model3d.normalizeTask(newRow), raw: { status: newRow.status, error: newRow.error || '' } });
 });
@@ -150,7 +148,7 @@ router.post('/tasks/:id/retry', async (req, res) => {
 
 /** 导出 3D 资产到目标格式 */
 router.post('/assets/:id/export', (req, res) => {
-  const a = db.prepare('SELECT * FROM assets WHERE id=?').get(req.params.id);
+  const a = dal.getq('SELECT * FROM assets WHERE id=?', [req.params.id]);
   if (!a) return res.json({ code: 404, msg: '素材不存在' });
   if (!canSee(a.owner || '', req.user)) return res.json({ code: 403, msg: '无权导出该素材' });
   const meta = parseJson(a.meta, {});
@@ -160,10 +158,9 @@ router.post('/assets/:id/export', (req, res) => {
   if (!plan.ok) return res.json({ code: 400, msg: plan.message });
   // 同格式直接指向源文件；需转换的记录转换计划（真实几何转换由下游服务完成，V1 记录可转换性）
   const url = plan.needConvert ? '' : a.url;
-  const info = db.prepare(`INSERT INTO asset_exports (asset_id,username,source_format,target_format,need_convert,status,url,note,created_at)
-    VALUES (?,?,?,?,?,?,?,?,?)`)
-    .run(a.id, req.user.username, sourceFormat, targetFormat, plan.needConvert ? 1 : 0,
-      plan.needConvert ? 'pending' : 'done', url, plan.message, now());
+  const info = dal.runq(`INSERT INTO asset_exports (asset_id,username,source_format,target_format,need_convert,status,url,note,created_at)
+    VALUES (?,?,?,?,?,?,?,?,?)`, [a.id, req.user.username, sourceFormat, targetFormat, plan.needConvert ? 1 : 0,
+      plan.needConvert ? 'pending' : 'done', url, plan.message, now()]);
   res.json({ code: 0, data: {
     id: info.lastInsertRowid, asset_id: a.id, source_format: sourceFormat, target_format: targetFormat,
     need_convert: plan.needConvert, status: plan.needConvert ? 'pending' : 'done', url, message: plan.message,
@@ -174,7 +171,7 @@ router.get('/exports', (req, res) => {
   const cond = [], args = [];
   if (!isAdmin(req.user)) { cond.push('username=?'); args.push(req.user.username); }
   if (req.query.asset_id != null && req.query.asset_id !== '') { cond.push('asset_id=?'); args.push(Number(req.query.asset_id)); }
-  const rows = db.prepare(`SELECT * FROM asset_exports ${cond.length ? 'WHERE ' + cond.join(' AND ') : ''} ORDER BY id DESC LIMIT 200`).all(...args);
+  const rows = dal.q(`SELECT * FROM asset_exports ${cond.length ? 'WHERE ' + cond.join(' AND ') : ''} ORDER BY id DESC LIMIT 200`, [...args]);
   res.json({ code: 0, data: rows });
 });
 
@@ -193,17 +190,15 @@ router.post('/dh/assess', (req, res) => {
   const assetId = b.asset_id != null && b.asset_id !== '' ? Number(b.asset_id) : null;
   const projectId = b.project_id != null && b.project_id !== '' ? Number(b.project_id) : null;
   if (assetId != null) {
-    const a = db.prepare('SELECT * FROM assets WHERE id=?').get(assetId);
+    const a = dal.getq('SELECT * FROM assets WHERE id=?', [assetId]);
     if (!a) return res.json({ code: 404, msg: '素材不存在' });
     if (!canSee(a.owner || '', req.user)) return res.json({ code: 403, msg: '无权评估该素材' });
     // 评估结论回写到素材合规标记（decision!==approve → 标记 digital_human 待复核）
-    db.prepare('UPDATE assets SET digital_human=?, meta=? WHERE id=?')
-      .run(result.decision === 'approve' ? 0 : 1, JSON.stringify({ ...parseJson(a.meta, {}), dh_assessment: { decision: result.decision, level: result.level, score: result.score } }), assetId);
+    dal.runq('UPDATE assets SET digital_human=?, meta=? WHERE id=?', [result.decision === 'approve' ? 0 : 1, JSON.stringify({ ...parseJson(a.meta, {}), dh_assessment: { decision: result.decision, level: result.level, score: result.score } }), assetId]);
   }
-  const info = db.prepare(`INSERT INTO dh_assessments (asset_id,project_id,username,answers,score,level,decision,reasons,note,created_at)
-    VALUES (?,?,?,?,?,?,?,?,?,?)`)
-    .run(assetId, projectId, req.user.username, JSON.stringify(answers), result.score, result.level, result.decision,
-      JSON.stringify(result.reasons), String(b.note || '').slice(0, 500), now());
+  const info = dal.runq(`INSERT INTO dh_assessments (asset_id,project_id,username,answers,score,level,decision,reasons,note,created_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?)`, [assetId, projectId, req.user.username, JSON.stringify(answers), result.score, result.level, result.decision,
+      JSON.stringify(result.reasons), String(b.note || '').slice(0, 500), now()]);
   res.json({ code: 0, data: { id: info.lastInsertRowid, asset_id: assetId, project_id: projectId, ...result } });
 });
 
@@ -213,7 +208,7 @@ router.get('/dh/assessments', (req, res) => {
   if (!isAdmin(req.user)) { cond.push('username=?'); args.push(req.user.username); }
   if (req.query.project_id != null && req.query.project_id !== '') { cond.push('project_id=?'); args.push(Number(req.query.project_id)); }
   if (req.query.asset_id != null && req.query.asset_id !== '') { cond.push('asset_id=?'); args.push(Number(req.query.asset_id)); }
-  const rows = db.prepare(`SELECT * FROM dh_assessments ${cond.length ? 'WHERE ' + cond.join(' AND ') : ''} ORDER BY id DESC LIMIT 200`).all(...args)
+  const rows = dal.q(`SELECT * FROM dh_assessments ${cond.length ? 'WHERE ' + cond.join(' AND ') : ''} ORDER BY id DESC LIMIT 200`, [...args])
     .map((r) => ({ ...r, answers: parseJson(r.answers, {}), reasons: parseJson(r.reasons, []) }));
   res.json({ code: 0, data: rows });
 });
@@ -223,12 +218,12 @@ router.get('/dh/assessments', (req, res) => {
 /** 3D 任务成功率（验收 ≥ 70%）+ 导出/合规概览 */
 router.get('/stats', (req, res) => {
   const all = isAdmin(req.user)
-    ? db.prepare('SELECT * FROM model3d_tasks').all()
-    : db.prepare('SELECT * FROM model3d_tasks WHERE username=?').all(req.user.username);
+    ? dal.q('SELECT * FROM model3d_tasks')
+    : dal.q('SELECT * FROM model3d_tasks WHERE username=?', [req.user.username]);
   const stats = model3d.taskStats(all);
   const recent = all.slice(-20).reverse().map(model3d.normalizeTask);
-  const exports = db.prepare('SELECT * FROM asset_exports ORDER BY id DESC LIMIT 50').all();
-  const dh = db.prepare('SELECT decision, COUNT(*) c FROM dh_assessments GROUP BY decision').all();
+  const exports = dal.q('SELECT * FROM asset_exports ORDER BY id DESC LIMIT 50');
+  const dh = dal.q('SELECT decision, COUNT(*) c FROM dh_assessments GROUP BY decision');
   const dhSummary = { approve: 0, review: 0, reject: 0 };
   for (const r of dh) dhSummary[r.decision] = r.c;
   res.json({ code: 0, data: { stats, recent, exports, dh: dhSummary } });

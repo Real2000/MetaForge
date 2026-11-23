@@ -13,17 +13,18 @@
  * 现有 isFailoverWorthy 已判定 Timeout 类错误走故障转移（failover 下一候选重新计时）。
  */
 const { db } = require('../db');
+const dal = require('./dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const circuit = require('./circuit');
 
 function getDefaultProvider() {
-  const p = db.prepare('SELECT * FROM providers WHERE is_default=1 AND tenant_id=0').get();
-  return p || db.prepare('SELECT * FROM providers WHERE is_default=1 ORDER BY tenant_id LIMIT 1').get() || null;
+  const p = dal.getq('SELECT * FROM providers WHERE is_default=1 AND tenant_id=0');
+  return p || dal.getq('SELECT * FROM providers WHERE is_default=1 ORDER BY tenant_id LIMIT 1') || null;
 }
 
 /** MT-12：由 username 反查租户（容错 null）——用于构建租户可见的供应商候选。*/
 function tenantOfUser(username) {
   if (!username) return null;
-  try { const r = db.prepare('SELECT tenant_id FROM users WHERE username=?').get(username); return r && r.tenant_id != null ? Number(r.tenant_id) : null; } catch { return null; }
+  try { const r = dal.getq('SELECT tenant_id FROM users WHERE username=?', [username]); return r && r.tenant_id != null ? Number(r.tenant_id) : null; } catch { return null; }
 }
 
 /* ---------------- 网络容错层（2026-10-14）：瞬时故障自动重试 ----------------
@@ -325,9 +326,9 @@ const NON_TEXT_MODEL_RE = /tts|asr|speech|whisper|embedding|rerank|image|video|a
 function getConfiguredProviders(tenantId) {
   const base = "SELECT * FROM providers WHERE configured=1 AND api_key != '' AND base_url != ''";
   if (Number.isFinite(Number(tenantId))) {
-    return db.prepare(`${base} AND (tenant_id=0 OR tenant_id=?) ORDER BY is_default DESC, id`).all(Number(tenantId));
+    return dal.q(`${base} AND (tenant_id=0 OR tenant_id=?) ORDER BY is_default DESC, id`, [Number(tenantId)]);
   }
-  return db.prepare(`${base} ORDER BY is_default DESC, id`).all();
+  return dal.q(`${base} ORDER BY is_default DESC, id`);
 }
 
 function safeModels(p) {
@@ -354,7 +355,7 @@ function buildCandidates(model, opts = {}) {
   };
   // ⓪ P3 用户自有供应商：虚拟 id 'u{n}'（与平台供应商的熔断 key 天然隔离，互不串扰）
   if (model && opts.username && !NON_TEXT_MODEL_RE.test(model)) {
-    const ups = db.prepare("SELECT id, name, base_url, api_key, models FROM user_providers WHERE username=? AND status=1 AND api_key != '' AND base_url != '' ORDER BY id").all(opts.username);
+    const ups = dal.q("SELECT id, name, base_url, api_key, models FROM user_providers WHERE username=? AND status=1 AND api_key != '' AND base_url != '' ORDER BY id", [opts.username]);
     for (const up of ups) {
       const p = { ...up, id: 'u' + up.id, name: (up.name || '自有模型') + '（我的）' };
       if (safeModels(up).includes(model) && !circuit.isOpen(p, model)) push(p, model);

@@ -17,6 +17,7 @@
 'use strict';
 
 const crypto = require('crypto');
+const dal = require('./dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const { db, now } = require('../db');
 const { PLANS, planOf } = require('./plans');
 
@@ -79,14 +80,13 @@ function createOrder({ tenantId, type = 'subscribe', planKey = '', amount, chann
   }
   const orderNo = newOrderNo();
   const subj = subject || (type === 'subscribe' ? `订阅 ${planOf(planKey).name}` : `钱包充值 ¥${amt}`);
-  db.prepare(`INSERT INTO payment_orders (order_no,tenant_id,type,plan_key,amount,channel,subject,status,operator,meta,created_at)
-    VALUES (?,?,?,?,?,?,?, 'pending', ?, '{}', datetime('now','localtime'))`)
-    .run(orderNo, tid, type, planKey, amt, channel, subj, operator);
+  dal.runq(`INSERT INTO payment_orders (order_no,tenant_id,type,plan_key,amount,channel,subject,status,operator,meta,created_at)
+    VALUES (?,?,?,?,?,?,?, 'pending', ?, '{}', datetime('now','localtime'))`, [orderNo, tid, type, planKey, amt, channel, subj, operator]);
   return { ok: true, order: getOrder(orderNo) };
 }
 
 function getOrder(orderNo) {
-  return db.prepare('SELECT * FROM payment_orders WHERE order_no=?').get(orderNo) || null;
+  return dal.getq('SELECT * FROM payment_orders WHERE order_no=?', [orderNo]) || null;
 }
 
 /** 计算回调签名（供网关侧/自测使用）：HMAC-SHA256(rawBody, secret) hex */
@@ -132,13 +132,12 @@ function handleCallback({ channel, rawBody, sign, payload } = {}) {
   const ch = CHANNELS.includes(channel) ? channel : 'sandbox';
 
   // 幂等：同一 event_id 只处理一次
-  const seen = db.prepare('SELECT id FROM payment_events WHERE event_id=?').get(eventId);
+  const seen = dal.getq('SELECT id FROM payment_events WHERE event_id=?', [eventId]);
   if (seen) {
     const o = getOrder(orderNo);
     return { ok: true, status: o ? o.status : 'unknown', idempotent: true };
   }
-  db.prepare('INSERT INTO payment_events (event_id,order_no,channel,type,amount,raw,created_at) VALUES (?,?,?,?,?,?,datetime(\'now\',\'localtime\'))')
-    .run(eventId, orderNo, ch, status, amount == null ? 0 : amount, String(rawBody || '').slice(0, 4000));
+  dal.runq('INSERT INTO payment_events (event_id,order_no,channel,type,amount,raw,created_at) VALUES (?,?,?,?,?,?,datetime(\'now\',\'localtime\'))', [eventId, orderNo, ch, status, amount == null ? 0 : amount, String(rawBody || '').slice(0, 4000)]);
 
   const order = getOrder(orderNo);
   if (!order) return { ok: false, code: 404, msg: '订单不存在' };
@@ -167,8 +166,8 @@ function markPaid(orderNo, { amount, channel, eventId, operator = 'system' } = {
   if (amount != null && round6(amount) + 1e-9 < round6(order.amount)) {
     return { ok: false, msg: `回调金额 ${round6(amount)} 小于应付 ${order.amount}，拒绝` };
   }
-  const r = db.prepare(`UPDATE payment_orders SET status='paid', paid_at=datetime('now','localtime'), channel=COALESCE(NULLIF(?,''),channel)
-    WHERE order_no=? AND status='pending'`).run(channel || '', orderNo);
+  const r = dal.runq(`UPDATE payment_orders SET status='paid', paid_at=datetime('now','localtime'), channel=COALESCE(NULLIF(?,''),channel)
+    WHERE order_no=? AND status='pending'`, [channel || '', orderNo]);
   if (!r.changes) {
     const cur = getOrder(orderNo);
     return cur && cur.status === 'paid' ? { ok: true, order: cur, idempotent: true } : { ok: false, msg: '订单状态不可支付' };
@@ -187,16 +186,14 @@ function activate(order) {
       const d = new Date(); d.setMonth(d.getMonth() + 1);
       return d.toLocaleDateString('sv-SE', { timeZone: 'Asia/Shanghai' });
     })();
-    const existing = db.prepare('SELECT id FROM tenant_subscriptions WHERE tenant_id=?').get(tid);
+    const existing = dal.getq('SELECT id FROM tenant_subscriptions WHERE tenant_id=?', [tid]);
     if (existing) {
-      db.prepare(`UPDATE tenant_subscriptions SET plan_key=?,status='active',period_start=?,period_end=?,quota_grant=?,price=?,order_no=?,updated_at=datetime('now','localtime') WHERE id=?`)
-        .run(order.plan_key, start, end, quota, order.amount, order.order_no, existing.id);
+      dal.runq(`UPDATE tenant_subscriptions SET plan_key=?,status='active',period_start=?,period_end=?,quota_grant=?,price=?,order_no=?,updated_at=datetime('now','localtime') WHERE id=?`, [order.plan_key, start, end, quota, order.amount, order.order_no, existing.id]);
     } else {
-      db.prepare(`INSERT INTO tenant_subscriptions (tenant_id,plan_key,status,period_start,period_end,quota_grant,price,order_no,created_at,updated_at)
-        VALUES (?,?,'active',?,?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))`)
-        .run(tid, order.plan_key, start, end, quota, order.amount, order.order_no);
+      dal.runq(`INSERT INTO tenant_subscriptions (tenant_id,plan_key,status,period_start,period_end,quota_grant,price,order_no,created_at,updated_at)
+        VALUES (?,?,'active',?,?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))`, [tid, order.plan_key, start, end, quota, order.amount, order.order_no]);
     }
-    db.prepare('UPDATE tenants SET plan=? WHERE id=?').run(order.plan_key, tid);
+    dal.runq('UPDATE tenants SET plan=? WHERE id=?', [order.plan_key, tid]);
     applyQuotaToTenant(tid, quota, order.plan_key);
   } else if (order.type === 'recharge') {
     creditWallet(tid, order.amount, `充值订单 ${order.order_no}`);
@@ -206,7 +203,7 @@ function activate(order) {
     const meta = Object.assign({}, JSON.parse(order.meta || '{}'), {
       activated: true, effective_amount: round6(order.amount), activated_at: now(),
     });
-    db.prepare('UPDATE payment_orders SET meta=? WHERE order_no=?').run(JSON.stringify(meta), order.order_no);
+    dal.runq('UPDATE payment_orders SET meta=? WHERE order_no=?', [JSON.stringify(meta), order.order_no]);
   } catch { /* 快照失败不影响生效本身 */ }
 }
 
@@ -218,7 +215,7 @@ function applyQuotaToTenant(tenantId, quota, planKey) {
   const tid = Number(tenantId);
   const q = Math.max(0, Math.floor(Number(quota) || 0));
   try {
-    db.prepare('UPDATE users SET quota_total=?, quota_used=0, quota_alert_level=0 WHERE tenant_id=?').run(q, tid);
+    dal.runq('UPDATE users SET quota_total=?, quota_used=0, quota_alert_level=0 WHERE tenant_id=?', [q, tid]);
     console.log(`[payment] 租户 ${tid} 订阅 ${planKey} 生效：成员配额 ${q === 0 ? '不限' : q} tokens`);
   } catch (e) { console.error('[payment] 下发配额失败（不阻断支付）：', e.message); }
 }
@@ -227,17 +224,17 @@ function applyQuotaToTenant(tenantId, quota, planKey) {
 function creditWallet(tenantId, delta, remark) {
   const tid = Number(tenantId);
   const d = round6(delta);
-  const w = db.prepare('SELECT * FROM tenant_wallets WHERE tenant_id=?').get(tid);
+  const w = dal.getq('SELECT * FROM tenant_wallets WHERE tenant_id=?', [tid]);
   if (w) {
-    db.prepare("UPDATE tenant_wallets SET balance=balance+?, updated_at=datetime('now','localtime') WHERE tenant_id=?").run(d, tid);
+    dal.runq("UPDATE tenant_wallets SET balance=balance+?, updated_at=datetime('now','localtime') WHERE tenant_id=?", [d, tid]);
   } else {
-    db.prepare("INSERT INTO tenant_wallets (tenant_id,balance,currency,created_at,updated_at) VALUES (?,?,'CNY',datetime('now','localtime'),datetime('now','localtime'))").run(tid, d);
+    dal.runq("INSERT INTO tenant_wallets (tenant_id,balance,currency,created_at,updated_at) VALUES (?,?,'CNY',datetime('now','localtime'),datetime('now','localtime'))", [tid, d]);
   }
   return getWallet(tid);
 }
 
 function getWallet(tenantId) {
-  return db.prepare('SELECT * FROM tenant_wallets WHERE tenant_id=?').get(Number(tenantId)) || { tenant_id: Number(tenantId), balance: 0, currency: 'CNY' };
+  return dal.getq('SELECT * FROM tenant_wallets WHERE tenant_id=?', [Number(tenantId)]) || { tenant_id: Number(tenantId), balance: 0, currency: 'CNY' };
 }
 
 /**
@@ -249,7 +246,7 @@ function refund({ orderNo, operator = '', reason = '' } = {}) {
   if (!order) return { ok: false, msg: '订单不存在' };
   if (order.status === 'refunded') return { ok: true, order, idempotent: true };
   if (order.status !== 'paid') return { ok: false, msg: '仅已支付订单可退款' };
-  const r = db.prepare("UPDATE payment_orders SET status='refunded', refunded_at=datetime('now','localtime') WHERE order_no=? AND status='paid'").run(orderNo);
+  const r = dal.runq("UPDATE payment_orders SET status='refunded', refunded_at=datetime('now','localtime') WHERE order_no=? AND status='paid'", [orderNo]);
   if (!r.changes) {
     const cur = getOrder(orderNo);
     return cur && cur.status === 'refunded' ? { ok: true, order: cur, idempotent: true } : { ok: false, msg: '订单状态不可退款' };
@@ -260,19 +257,18 @@ function refund({ orderNo, operator = '', reason = '' } = {}) {
     const back = Math.min(round6(order.amount), round6(w.balance)); // 扣至 0，不产生负余额
     if (back > 0) creditWallet(tid, -back, `退款 ${orderNo}`);
   } else if (order.type === 'subscribe') {
-    db.prepare("UPDATE tenant_subscriptions SET status='refunded', updated_at=datetime('now','localtime') WHERE tenant_id=? AND order_no=?").run(tid, orderNo);
+    dal.runq("UPDATE tenant_subscriptions SET status='refunded', updated_at=datetime('now','localtime') WHERE tenant_id=? AND order_no=?", [tid, orderNo]);
   }
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(operator || 'system', '订单退款', `${orderNo}（¥${order.amount}）${reason ? '：' + reason : ''}`, '', now());
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [operator || 'system', '订单退款', `${orderNo}（¥${order.amount}）${reason ? '：' + reason : ''}`, '', now()]);
   return { ok: true, order: getOrder(orderNo) };
 }
 
 /** 某租户商业状态（订阅 + 钱包 + 配额） */
 function tenantStatus(tenantId) {
   const tid = Number(tenantId);
-  const sub = db.prepare('SELECT * FROM tenant_subscriptions WHERE tenant_id=? ORDER BY id DESC LIMIT 1').get(tid) || null;
+  const sub = dal.getq('SELECT * FROM tenant_subscriptions WHERE tenant_id=? ORDER BY id DESC LIMIT 1', [tid]) || null;
   const wallet = getWallet(tid);
-  const tenant = db.prepare('SELECT id,name,plan,status FROM tenants WHERE id=?').get(tid) || null;
+  const tenant = dal.getq('SELECT id,name,plan,status FROM tenants WHERE id=?', [tid]) || null;
   return { tenant_id: tid, tenant, subscription: sub, wallet };
 }
 
@@ -284,7 +280,7 @@ function listOrders(scope, { status, limit = 100 } = {}) {
   if (status) { where.push('status=?'); args.push(String(status)); }
   const sql = `SELECT * FROM payment_orders ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY id DESC LIMIT ?`;
   args.push(lim);
-  return db.prepare(sql).all(...args);
+  return dal.q(sql, [...args]);
 }
 
 /**
@@ -295,7 +291,7 @@ function reconcile({ month } = {}) {
   const m = /^\d{4}-\d{2}$/.test(month || '')
     ? month
     : new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Shanghai' }).slice(0, 7);
-  const orders = db.prepare("SELECT * FROM payment_orders WHERE status='paid' AND created_at LIKE ? || '%'").all(m);
+  const orders = dal.q("SELECT * FROM payment_orders WHERE status='paid' AND created_at LIKE ? || '%'", [m]);
   let expect = 0, actual = 0;
   const items = [];
   for (const o of orders) {
@@ -319,8 +315,8 @@ function reconcile({ month } = {}) {
     diff,
     balanced: Math.abs(diff) < 1e-9,
     items,
-    wallets: db.prepare('SELECT tenant_id, balance FROM tenant_wallets ORDER BY tenant_id').all(),
-    subscriptions: db.prepare("SELECT tenant_id, plan_key, status, quota_grant, price FROM tenant_subscriptions ORDER BY tenant_id").all(),
+    wallets: dal.q('SELECT tenant_id, balance FROM tenant_wallets ORDER BY tenant_id'),
+    subscriptions: dal.q("SELECT tenant_id, plan_key, status, quota_grant, price FROM tenant_subscriptions ORDER BY tenant_id"),
   };
 }
 

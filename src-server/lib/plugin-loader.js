@@ -16,6 +16,7 @@
  *   - 运行时：install / enable / update 后手动调用 loadPlugin(id) / unloadPlugin(id)。
  */
 const { db, now } = require('../db');
+const dal = require('./dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 
 // 插件注册表：{ pluginId -> { schema, run } }
 // 注意：TOOL_DEFS 在 tools.js 中为 const，但对其属性赋值是允许的（TOOL_DEFS['mcp_get_x'] 模式同款）
@@ -23,7 +24,7 @@ const PLUGIN_REGISTRY = new Map();
 
 /** 从 plugins 表加载所有已启用的插件，注册到 TOOL_DEFS。启动时调用一次。 */
 function loadAll() {
-  const plugins = db.prepare("SELECT * FROM plugins WHERE enabled=1").all();
+  const plugins = dal.q("SELECT * FROM plugins WHERE enabled=1");
   for (const p of plugins) {
     loadPlugin(p);
   }
@@ -39,7 +40,7 @@ function loadAll() {
  * @returns {boolean} 是否加载成功
  */
 function loadPlugin(pluginOrId) {
-  const p = typeof pluginOrId === 'object' ? pluginOrId : db.prepare('SELECT * FROM plugins WHERE id=?').get(pluginOrId);
+  const p = typeof pluginOrId === 'object' ? pluginOrId : dal.getq('SELECT * FROM plugins WHERE id=?', [pluginOrId]);
   if (!p) return false;
   if (!p.enabled) return false;
   try {
@@ -82,7 +83,7 @@ function loadPlugin(pluginOrId) {
     return true;
   } catch (e) {
     console.error(`[plugin-loader] 插件「${p.plugin_id}」加载失败：`, e.message);
-    db.prepare('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)').run('plugin-loader', `插件「${p.plugin_id}」加载失败：${e.message}`, now());
+    dal.runq('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)', ['plugin-loader', `插件「${p.plugin_id}」加载失败：${e.message}`, now()]);
     return false;
   }
 }
@@ -93,7 +94,7 @@ function loadPlugin(pluginOrId) {
  */
 function unloadPlugin(pluginIdOrId) {
   const pid = typeof pluginIdOrId === 'number'
-    ? (db.prepare('SELECT plugin_id FROM plugins WHERE id=?').get(pluginIdOrId)?.plugin_id)
+    ? (dal.getq('SELECT plugin_id FROM plugins WHERE id=?', [pluginIdOrId])?.plugin_id)
     : pluginIdOrId;
   if (!pid) return;
   const { TOOL_DEFS } = require('./tools');

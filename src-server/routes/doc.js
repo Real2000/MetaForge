@@ -8,6 +8,7 @@
  * 前端 public/js/viewer.js 通过这两个接口加载文档，知识库分块预览走 /api/knowledge/files/:id/chunks。
  */
 const express = require('express');
+const dal = require('../lib/dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const fs = require('fs');
 const { auth } = require('../lib/auth');
 const { db, now } = require('../db');
@@ -74,8 +75,7 @@ router.post('/preview-log', (req, res) => {
   const r = resolvePreview(req.user, { src, id, path: p });
   if (!r.ok) return res.json({ code: r.code, msg: r.msg });
   try {
-    db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-      .run(req.user.username, '预览文档', `${r.kind}:${r.name}${name && name !== r.name ? '（' + name + '）' : ''}`, req.ip, now());
+    dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '预览文档', `${r.kind}:${r.name}${name && name !== r.name ? '（' + name + '）' : ''}`, req.ip, now()]);
   } catch { }
   res.json({ code: 0 });
 });

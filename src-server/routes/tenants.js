@@ -6,6 +6,7 @@
  * 审计：每次写操作落 op_logs（含平台超管操作者），停用同时踢出该租户全部在线会话。
  */
 const express = require('express');
+const dal = require('../lib/dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const { db, now } = require('../db');
 const { auth, platformAdminOnly } = require('../lib/auth');
 const tenantLib = require('../lib/tenant');
@@ -15,8 +16,7 @@ router.use(auth, platformAdminOnly);
 
 function audit(actor, action, detail, ip) {
   try {
-    db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-      .run(actor, action, detail, ip, now());
+    dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [actor, action, detail, ip, now()]);
   } catch { /* 审计失败不阻断 */ }
 }
 
@@ -29,7 +29,7 @@ router.get('/', (req, res) => {
 router.get('/:id', (req, res) => {
   const t = tenantLib.getTenant(Number(req.params.id));
   if (!t) return res.json({ code: 404, msg: '租户不存在' });
-  const users = db.prepare('SELECT id, username, nickname, role, status FROM users WHERE tenant_id=? ORDER BY role=\'admin\' DESC, id').all(t.id);
+  const users = dal.q('SELECT id, username, nickname, role, status FROM users WHERE tenant_id=? ORDER BY role=\'admin\' DESC, id', [t.id]);
   res.json({ code: 0, data: { ...t, users } });
 });
 

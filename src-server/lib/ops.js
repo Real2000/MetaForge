@@ -39,7 +39,7 @@ function dailyBackup() {
     if (excludeTables.length) {
       const tmpTarget = path.join(BACKUP_DIR, `.tmp-${fname}`);
       // 先 VACUUM INTO 到临时文件
-      db.prepare(`VACUUM INTO ?`).run(tmpTarget);
+      dal.runq(`VACUUM INTO ?`, [tmpTarget]);
       // 然后打开临时库删表
       const tmpDb = require('better-sqlite3')(tmpTarget);
       for (const tbl of excludeTables) {
@@ -48,7 +48,7 @@ function dailyBackup() {
       tmpDb.close();
       fs.renameSync(tmpTarget, target);
     } else {
-      db.prepare(`VACUUM INTO ?`).run(target);
+      dal.runq(`VACUUM INTO ?`, [target]);
     }
 
     // 清理超量旧备份
@@ -59,8 +59,7 @@ function dailyBackup() {
     const sizeMB = (fs.statSync(target).size / 1048576).toFixed(2);
     const msg = `${fname}（${sizeMB} MB，共保留 ${all.length} 份${excludeTables.length ? `，排除表：${excludeTables.join(',')}` : ''}）`;
     console.log(`[ops] 数据库已备份：${msg}`);
-    db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-      .run('system', '数据库备份', msg, '', now());
+    dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', ['system', '数据库备份', msg, '', now()]);
     return { ok: true, msg: fname, sizeMB };
   } catch (e) {
     console.error('[ops] 备份失败：', e.message);
@@ -95,8 +94,7 @@ function cleanupUploads() {
     }
     if (removed) {
       console.log(`[ops] 已清理 ${removed} 个过期生成产物（${freedMB.toFixed(1)} MB，> ${UPLOAD_TTL_DAYS} 天）`);
-      db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-        .run('system', '产物清理', `${removed} 个文件（${freedMB.toFixed(1)} MB）`, '', now());
+      dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', ['system', '产物清理', `${removed} 个文件（${freedMB.toFixed(1)} MB）`, '', now()]);
     }
     return { ok: true, removed, freedMB: +freedMB.toFixed(1) };
   } catch (e) {
@@ -117,8 +115,7 @@ function archiveLogs() {
     const total = t.op_logs + t.err_logs + t.task_runs;
     if (total) {
       console.log(`[ops] 日志归档：清理 ${total} 条过期记录（> ${LOG_TTL_DAYS} 天）`);
-      db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-        .run('system', '日志归档', `op_logs ${t.op_logs} / err_logs ${t.err_logs} / task_runs ${t.task_runs}`, '', now());
+      dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', ['system', '日志归档', `op_logs ${t.op_logs} / err_logs ${t.err_logs} / task_runs ${t.task_runs}`, '', now()]);
     }
     return { ok: true, ...t };
   } catch (e) {
@@ -131,42 +128,40 @@ function archiveLogs() {
 function digestMemories() {
   const today = dayKey();
   try {
-    const rows = db.prepare(`
+    const rows = dal.q(`
       SELECT s.agent_id, s.username
       FROM sessions s
       JOIN messages m ON m.session_id = s.id
       JOIN agents a ON a.id = s.agent_id AND a.long_memory = 1
       WHERE m.created_at >= datetime('now','-1 day') AND m.role = 'user'
       GROUP BY s.id HAVING COUNT(m.id) >= 5
-    `).all();
+    `);
     if (!rows.length) return { ok: true, skipped: true, msg: '今日无待摘要会话' };
     const seen = new Set();
     for (const r of rows) {
       const key = `${r.agent_id}:${r.username}`;
       if (seen.has(key)) continue;
-      const hasDigest = db.prepare("SELECT id FROM agent_memories WHERE agent_id=? AND username=? AND source='digest' LIMIT 1").get(r.agent_id, r.username);
+      const hasDigest = dal.getq("SELECT id FROM agent_memories WHERE agent_id=? AND username=? AND source='digest' LIMIT 1", [r.agent_id, r.username]);
       if (hasDigest) { seen.add(key); continue; }
-      const msgs = db.prepare(`
+      const msgs = dal.q(`
         SELECT role, content FROM messages m JOIN sessions s ON s.id = m.session_id
         WHERE s.agent_id = ? AND s.username = ? ORDER BY m.id DESC LIMIT 30
-      `).all(r.agent_id, r.username);
+      `, [r.agent_id, r.username]);
       const userMsgs = msgs.filter(x => x.role === 'user').map(x => (x.content || '').slice(0, 200)).filter(Boolean);
       if (!userMsgs.length) continue;
       const topics = userMsgs.slice(0, 5).map(t => t.length > 50 ? t.slice(0, 50) + '…' : t);
       const summary = `用户提出 ${userMsgs.length} 条消息。话题：${topics.join('； ')}。`;
-      db.prepare(`INSERT INTO agent_memories (agent_id,username,fact,type,confidence,source,summary,created_at) VALUES (?,?,?,?,?,?,?,datetime('now','localtime'))`)
-        .run(r.agent_id, r.username, summary, 'fact', 0.5, 'digest', summary);
+      dal.runq(`INSERT INTO agent_memories (agent_id,username,fact,type,confidence,source,summary,created_at) VALUES (?,?,?,?,?,?,?,datetime('now','localtime'))`, [r.agent_id, r.username, summary, 'fact', 0.5, 'digest', summary]);
       seen.add(key);
     }
     if (seen.size) {
       console.log(`[ops] 记忆摘要：已蒸馏 ${seen.size} 条（${today}）`);
-      db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-        .run('system', '记忆摘要', `${seen.size} 条摘要（${today}）`, '', now());
+      dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', ['system', '记忆摘要', `${seen.size} 条摘要（${today}）`, '', now()]);
     }
     return { ok: true, digested: seen.size };
   } catch (e) {
     console.error('[ops] 记忆摘要失败：', e.message);
-    db.prepare('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)').run('ops-digest', e.message, now());
+    dal.runq('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)', ['ops-digest', e.message, now()]);
     return { ok: false, msg: e.message };
   }
 }
@@ -175,19 +170,18 @@ function digestMemories() {
 function runEvalRegression() {
   const today = dayKey();
   try {
-    const kbs = db.prepare("SELECT id, name, owner FROM kbs WHERE enabled=1").all();
+    const kbs = dal.q("SELECT id, name, owner FROM kbs WHERE enabled=1");
     let totalEvalCount = 0;
     for (const kb of kbs) {
-      const evals = db.prepare("SELECT id, name, score, dataset, kb_id FROM evaluations WHERE kb_id=? AND type='kb'").all(kb.id);
+      const evals = dal.q("SELECT id, name, score, dataset, kb_id FROM evaluations WHERE kb_id=? AND type='kb'", [kb.id]);
       totalEvalCount += evals.length;
       for (const ev of evals) {
         const { rerunEvalSet } = require('./kb-eval-regression');
         rerunEvalSet(ev).then(r => {
           if (r && r.score !== undefined) {
-            db.prepare(`INSERT INTO recall_eval_results (kb_id, eval_name, version, type, total_questions, avg_recall, avg_accuracy, scores, negatives, missees, triggered_by, created_by, created_at)
-              VALUES (?,?,?,?,?,?,?,?,?,?,'schedule',?,?)`)
-              .run(kb.id, ev.name, r.version || 'v1', 'full', r.items_count || 0, r.score || 0, 0,
-                JSON.stringify(r.detail || []), '[]', '[]', 'system', now());
+            dal.runq(`INSERT INTO recall_eval_results (kb_id, eval_name, version, type, total_questions, avg_recall, avg_accuracy, scores, negatives, missees, triggered_by, created_by, created_at)
+              VALUES (?,?,?,?,?,?,?,?,?,?,'schedule',?,?)`, [kb.id, ev.name, r.version || 'v1', 'full', r.items_count || 0, r.score || 0, 0,
+                JSON.stringify(r.detail || []), '[]', '[]', 'system', now()]);
             console.log(`[ops] 评测回归：kb#${kb.id}「${ev.name}」= ${r.score}`);
           }
         }).catch(e => console.warn(`[ops] 评测回归失败：kb#${kb.id}/eval#${ev.id}`, e.message));
@@ -195,13 +189,12 @@ function runEvalRegression() {
     }
     if (totalEvalCount) {
       console.log(`[ops] 评测回归：今日计划执行 ${totalEvalCount} 个评测集（${today}）`);
-      db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-        .run('system', '评测回归', `计划 ${totalEvalCount} 个评测集（${today}）`, '', now());
+      dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', ['system', '评测回归', `计划 ${totalEvalCount} 个评测集（${today}）`, '', now()]);
     }
     return { ok: true, total: totalEvalCount };
   } catch (e) {
     console.error('[ops] 评测回归失败：', e.message);
-    db.prepare('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)').run('ops-eval', e.message, now());
+    dal.runq('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)', ['ops-eval', e.message, now()]);
     return { ok: false, msg: e.message };
   }
 }
@@ -226,22 +219,21 @@ function checkDeptBudgets() {
       if (!d.dept_id || !d.budget || d.budget <= 0) continue; // 未归属行与未设预算部门不告警
       const pct = d.cost / d.budget;
       const level = pct >= 1 ? 2 : (pct >= 0.8 ? 1 : 0);
-      const row = db.prepare('SELECT budget_alert_level FROM departments WHERE id=?').get(d.dept_id);
+      const row = dal.getq('SELECT budget_alert_level FROM departments WHERE id=?', [d.dept_id]);
       if (!row || level <= (row.budget_alert_level || 0)) continue; // 已提醒过同档/更高档不重复发
       const pctTxt = Math.round(pct * 100);
       const content = level === 2
         ? `「${d.name}」本月模型成本已达预算 100%（${d.cost.toFixed(2)} 元 / 预算 ${d.budget} 元）。已超额支出，请尽快调整预算或限制部门用量。`
         : `「${d.name}」本月模型成本已达预算 ${pctTxt}%（${d.cost.toFixed(2)} 元 / 预算 ${d.budget} 元），接近上限。可提前调整预算或关注部门用量趋势。`;
-      db.prepare('INSERT INTO notifications (username,title,content,type,link,is_read,created_at) VALUES (?,?,?,?,?,0,?)')
-        .run('*', `💸 部门预算${level === 2 ? '超支' : '预警'}：${d.name}`, content, 'budget', '#/admin/dashboard', now());
-      db.prepare('UPDATE departments SET budget_alert_level=? WHERE id=?').run(level, d.dept_id);
+      dal.runq('INSERT INTO notifications (username,title,content,type,link,is_read,created_at) VALUES (?,?,?,?,?,0,?)', ['*', `💸 部门预算${level === 2 ? '超支' : '预警'}：${d.name}`, content, 'budget', '#/admin/dashboard', now()]);
+      dal.runq('UPDATE departments SET budget_alert_level=? WHERE id=?', [level, d.dept_id]);
       console.log(`[ops] ⚠️ 部门预算告警：${d.name} 当月 ${d.cost.toFixed(2)}/${d.budget} 元（第 ${level} 档，${month}）`);
       alerted++;
     }
     return { ok: true, alerted };
   } catch (e) {
     console.error('[ops] 部门预算检查失败：', e.message);
-    db.prepare('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)').run('ops-budget', e.message, now());
+    dal.runq('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)', ['ops-budget', e.message, now()]);
     return { ok: false, msg: e.message };
   }
 }

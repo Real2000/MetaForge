@@ -5628,7 +5628,9 @@ function t(name, fn) {
     });
     await t('测试轮修复回归：copy 路由 INSERT 列数与占位符配比（防占位符丢失回归）', () => {
       const src = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'routes', 'agents.js'), 'utf8');
-      const re = /INSERT INTO agents \(([^)]*)\)\s*VALUES\s*\(([\s\S]*?)\)\s*\.run\(/g;
+      // BE-C1（2026-11-23）：裸查已收敛 dal——INSERT 语句改作 dal.runq 首实参（VALUES 闭括号后跟 ', [' 参数数组），
+      // 守卫正则同步适配两种形态（老 db.prepare(...).run( / 新 dal.runq(..., [)），守护意图不变：列数=占位数+datetime数
+      const re = /INSERT INTO agents \(([^)]*)\)\s*VALUES\s*\(([\s\S]*?)\)\s*(?:\.run\(|['`"']?\s*,\s*\[)/g;
       let found = null, m;
       while ((m = re.exec(src))) { if (m[1].includes('long_memory') && m[1].includes('child_ids')) { found = m; break; } }
       assert.ok(found, 'copy 的 INSERT 语句存在');
@@ -5654,7 +5656,8 @@ function t(name, fn) {
     });
     await t('测试轮修复回归：err-logs 清空带 .run()（S2 假成功修复）', () => {
       const src = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'routes', 'logs.js'), 'utf8');
-      assert.ok(/DELETE FROM err_logs'\)\.run\(\)/.test(src), 'DELETE FROM err_logs 必须带 .run()（prepare 只编译不执行，曾 77→77 假成功）');
+      // BE-C1（2026-11-23）适配：dal.runq('DELETE FROM err_logs') 与 .run() 同为真实执行语义（prepare 仅编译不执行的假成功防护不变）
+      assert.ok(/DELETE FROM err_logs'\)\.run\(\)|dal\.runq\('DELETE FROM err_logs'/.test(src), 'DELETE FROM err_logs 必须带 .run()/dal.runq 真实执行（prepare 只编译不执行，曾 77→77 假成功）');
     });
     await t('DB优化：热表索引齐备（6 热表 11 索引 + agents 4 索引 = 15 条新索引，防误删）', () => {
       const must = ['idx_messages_session','idx_messages_created','idx_chat_traces_msg','idx_chat_traces_agent',
@@ -6310,7 +6313,8 @@ function t(name, fn) {
     });
     await t('P3-8：/chat/models 不再 SELECT api_key 列（truthiness 改由 SQL has_key 表达）', () => {
       const src = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'routes', 'chat.js'), 'utf8');
-      const m = /router\.get\('\/models',[\s\S]{0,400}?db\.prepare\((['"`])([\s\S]*?)\1\)/.exec(src);
+      // BE-C1（2026-11-23）适配：裸查已收敛 dal——/models 的 SQL 现为 dal.q( 首实参，守卫定位正则同步适配
+      const m = /router\.get\('\/models',[\s\S]{0,400}?(?:db\.prepare|dal\.q|dal\.getq|dal\.runq)\((['"`])([\s\S]*?)\1\)/.exec(src);
       assert.ok(m, '应能定位 /chat/models 的 SQL');
       const sql = m[2];
       // SELECT 列清单（FROM 之前）不得包含 api_key 原始列（新实现仅允许 api_key 出现在 has_key 布尔表达式内）

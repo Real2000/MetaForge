@@ -17,6 +17,7 @@
  * 与有状态池管理分离，后者供 routes/sandbox.js 复用，前者被 test/smoke.js 直接单测。
  */
 const { spawn } = require('child_process');
+const dal = require('./dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
@@ -102,7 +103,7 @@ function defaultQuota(tenant) {
 /** 读取某租户配额（无记录 → 默认值，enabled=1） */
 function quotaOf(tenant) {
   const t = String(tenant || 'default');
-  const row = db.prepare('SELECT * FROM sandbox_pools WHERE tenant=?').get(t);
+  const row = dal.getq('SELECT * FROM sandbox_pools WHERE tenant=?', [t]);
   const q = row ? {
     tenant: row.tenant,
     max_concurrent: Number(row.max_concurrent),
@@ -114,7 +115,7 @@ function quotaOf(tenant) {
 }
 
 function listPools() {
-  const rows = db.prepare('SELECT * FROM sandbox_pools ORDER BY id').all().map(r => ({ ...r, enabled: !!r.enabled }));
+  const rows = dal.q('SELECT * FROM sandbox_pools ORDER BY id').map(r => ({ ...r, enabled: !!r.enabled }));
   const busy = Object.fromEntries(busyByTenant);
   return rows.map(r => ({ ...r, busy: busy[r.tenant] || 0, pool: poolSummary([...idlePool.values()].map(w => ({ tenant: w.tenant, state: 'idle' }))) }));
 }
@@ -123,17 +124,15 @@ function listPools() {
 function upsertPool({ tenant, max_concurrent, max_idle, warm_size, enabled, createdBy }) {
   const t = String(tenant || '').trim();
   if (!t) throw new Error('租户（tenant）不能为空');
-  const old = db.prepare('SELECT * FROM sandbox_pools WHERE tenant=?').get(t);
+  const old = dal.getq('SELECT * FROM sandbox_pools WHERE tenant=?', [t]);
   const mc = max_concurrent === undefined ? (old ? old.max_concurrent : DEFAULT_MAX_CONCURRENT) : Math.max(0, Number(max_concurrent) || 0);
   const mi = max_idle === undefined ? (old ? old.max_idle : DEFAULT_WARM_SIZE) : Math.max(0, Number(max_idle) || 0);
   const ws = warm_size === undefined ? (old ? old.warm_size : DEFAULT_WARM_SIZE) : Math.max(0, Math.min(MAX_WARM_TOTAL, Number(warm_size) || 0));
   const en = enabled === undefined ? (old ? old.enabled : 1) : (enabled ? 1 : 0);
   if (old) {
-    db.prepare('UPDATE sandbox_pools SET max_concurrent=?,max_idle=?,warm_size=?,enabled=?,updated_at=? WHERE tenant=?')
-      .run(mc, mi, ws, en, now(), t);
+    dal.runq('UPDATE sandbox_pools SET max_concurrent=?,max_idle=?,warm_size=?,enabled=?,updated_at=? WHERE tenant=?', [mc, mi, ws, en, now(), t]);
   } else {
-    db.prepare('INSERT INTO sandbox_pools (tenant,max_concurrent,max_idle,warm_size,enabled,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)')
-      .run(t, mc, mi, ws, en, String(createdBy || ''), now(), now());
+    dal.runq('INSERT INTO sandbox_pools (tenant,max_concurrent,max_idle,warm_size,enabled,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)', [t, mc, mi, ws, en, String(createdBy || ''), now(), now()]);
   }
   return quotaOf(t);
 }
@@ -171,37 +170,37 @@ function createSnapshot({ name, source, createdBy }) {
   fs.mkdirSync(path.dirname(destAbs), { recursive: true });
   fs.cpSync(abs, destAbs, { recursive: true });
   const rel = path.join(SNAPSHOT_REL_ROOT, slug);
-  const info = db.prepare(`INSERT INTO sandbox_snapshots (name, source_dir, snapshot_path, node_version, prelude_hash, size_bytes, active, created_by, created_at)
-    VALUES (?,?,?,?,?,?,0,?,?)`).run(n, src, rel, process.versions.node, preludeHash(), bytes, String(createdBy || ''), now());
-  return snapshotMeta(db.prepare('SELECT * FROM sandbox_snapshots WHERE id=?').get(info.lastInsertRowid));
+  const info = dal.runq(`INSERT INTO sandbox_snapshots (name, source_dir, snapshot_path, node_version, prelude_hash, size_bytes, active, created_by, created_at)
+    VALUES (?,?,?,?,?,?,0,?,?)`, [n, src, rel, process.versions.node, preludeHash(), bytes, String(createdBy || ''), now()]);
+  return snapshotMeta(dal.getq('SELECT * FROM sandbox_snapshots WHERE id=?', [info.lastInsertRowid]));
 }
 
 function listSnapshots() {
-  return db.prepare('SELECT * FROM sandbox_snapshots ORDER BY id DESC').all().map(snapshotMeta);
+  return dal.q('SELECT * FROM sandbox_snapshots ORDER BY id DESC').map(snapshotMeta);
 }
 
 /** 激活某快照（同一时刻仅一个激活；新工作进程目录从激活快照播种） */
 function activateSnapshot(id) {
-  const s = db.prepare('SELECT * FROM sandbox_snapshots WHERE id=?').get(Number(id));
+  const s = dal.getq('SELECT * FROM sandbox_snapshots WHERE id=?', [Number(id)]);
   if (!s) throw new Error('快照不存在');
-  db.prepare('UPDATE sandbox_snapshots SET active=0').run();
-  db.prepare('UPDATE sandbox_snapshots SET active=1 WHERE id=?').run(s.id);
+  dal.runq('UPDATE sandbox_snapshots SET active=0');
+  dal.runq('UPDATE sandbox_snapshots SET active=1 WHERE id=?', [s.id]);
   // 已预热的空闲进程目录不含新快照 → 回收，下次按新快照重建
   recycleAllIdle();
-  return snapshotMeta(db.prepare('SELECT * FROM sandbox_snapshots WHERE id=?').get(s.id));
+  return snapshotMeta(dal.getq('SELECT * FROM sandbox_snapshots WHERE id=?', [s.id]));
 }
 
 function deleteSnapshot(id) {
-  const s = db.prepare('SELECT * FROM sandbox_snapshots WHERE id=?').get(Number(id));
+  const s = dal.getq('SELECT * FROM sandbox_snapshots WHERE id=?', [Number(id)]);
   if (!s) throw new Error('快照不存在');
   const abs = path.join(process.cwd(), s.snapshot_path);
   try { fs.rmSync(abs, { recursive: true, force: true }); } catch { /* 忽略 */ }
-  db.prepare('DELETE FROM sandbox_snapshots WHERE id=?').run(s.id);
+  dal.runq('DELETE FROM sandbox_snapshots WHERE id=?', [s.id]);
   return { deleted: s.id };
 }
 
 function activeSnapshotDir() {
-  const s = db.prepare('SELECT * FROM sandbox_snapshots WHERE active=1 ORDER BY id DESC LIMIT 1').get();
+  const s = dal.getq('SELECT * FROM sandbox_snapshots WHERE active=1 ORDER BY id DESC LIMIT 1');
   if (!s) return null;
   const abs = path.join(process.cwd(), s.snapshot_path);
   return fs.existsSync(abs) ? abs : null;
@@ -318,8 +317,8 @@ function monkeyPatchResultCapture(w) {
 /** 写审计行（sandbox_runs，run_env='pool'） */
 function auditStart({ tenant, owner, agentId, sessionId, code }) {
   const digest = crypto.createHash('sha256').update(String(code || '')).digest('hex').slice(0, 16);
-  const info = db.prepare(`INSERT INTO sandbox_runs (run_env, tenant, owner, agent_id, session_id, status, code_digest, pool_hit, created_at)
-    VALUES ('pool', ?, ?, ?, ?, 'running', ?, 0, ?)`).run(String(tenant || ''), owner || '', agentId, sessionId, digest, now());
+  const info = dal.runq(`INSERT INTO sandbox_runs (run_env, tenant, owner, agent_id, session_id, status, code_digest, pool_hit, created_at)
+    VALUES ('pool', ?, ?, ?, ?, 'running', ?, 0, ?)`, [String(tenant || ''), owner || '', agentId, sessionId, digest, now()]);
   return Number(info.lastInsertRowid);
 }
 
@@ -368,8 +367,7 @@ async function runPooled(opts = {}) {
     const status = result.status || 'failed';
     const stdout = String(result.stdout || '').slice(0, OUT_LIMIT);
     const stderr = String(result.stderr || '').slice(0, OUT_LIMIT);
-    db.prepare('UPDATE sandbox_runs SET status=?, exit_code=?, duration_ms=?, node_version=?, stdout_excerpt=?, stderr_excerpt=?, pool_hit=?, cold_start_ms=? WHERE id=?')
-      .run(status, result.exitCode ?? -1, durationMs, process.versions.node, stdout.slice(0, 2000), stderr.slice(0, 1000), poolHit ? 1 : 0, coldStartMs, runId);
+    dal.runq('UPDATE sandbox_runs SET status=?, exit_code=?, duration_ms=?, node_version=?, stdout_excerpt=?, stderr_excerpt=?, pool_hit=?, cold_start_ms=? WHERE id=?', [status, result.exitCode ?? -1, durationMs, process.versions.node, stdout.slice(0, 2000), stderr.slice(0, 1000), poolHit ? 1 : 0, coldStartMs, runId]);
     // 一次性进程用完即毁（保隔离）；后台补足预热
     destroyWorker(worker);
     replenish(t);
@@ -385,7 +383,7 @@ function poolStats() {
   sweepIdle();
   const workers = [...idlePool.values()].map(w => ({ tenant: w.tenant, state: 'idle' }));
   const sum = poolSummary(workers);
-  const runs = db.prepare("SELECT * FROM sandbox_runs WHERE run_env='pool'").all();
+  const runs = dal.q("SELECT * FROM sandbox_runs WHERE run_env='pool'");
   const cold = runs.filter(r => Number(r.pool_hit) === 0 && r.cold_start_ms != null);
   const warm = runs.filter(r => Number(r.pool_hit) === 1);
   const avg = (a) => a.length ? Math.round(a.reduce((s, x) => s + x, 0) / a.length) : null;

@@ -12,6 +12,7 @@
  *  - GET  /api/biz/insights         我的智能体使用分析 + 优化建议 + 模板推荐（客户成功）
  */
 const express = require('express');
+const dal = require('../lib/dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const { db, now } = require('../db');
 const { auth, adminOnly } = require('../lib/auth');
 const { PLANS, planOf, planUsage } = require('../lib/plans');
@@ -36,21 +37,19 @@ router.post('/lead', (req, res) => {
   if (!c || !n) return res.json({ code: 400, msg: '请填写公司名称与联系人' });
   if (!phone && !email) return res.json({ code: 400, msg: '请至少留一个联系方式（手机或邮箱）' });
   // 提交频控（按 IP）：60 秒 1 次
-  const recent = db.prepare(`SELECT COUNT(*) c FROM enterprise_leads WHERE created_at >= datetime('now','-60 second','localtime') AND id IN (SELECT id FROM enterprise_leads ORDER BY id DESC LIMIT 50)`).get().c;
+  const recent = dal.getq(`SELECT COUNT(*) c FROM enterprise_leads WHERE created_at >= datetime('now','-60 second','localtime') AND id IN (SELECT id FROM enterprise_leads ORDER BY id DESC LIMIT 50)`).c;
   if (recent) {
-    const lastIpRow = db.prepare('SELECT id FROM enterprise_leads ORDER BY id DESC LIMIT 1').get();
+    const lastIpRow = dal.getq('SELECT id FROM enterprise_leads ORDER BY id DESC LIMIT 1');
     if (lastIpRow) return res.json({ code: 429, msg: '提交太频繁，请稍后再试' });
   }
-  const info = db.prepare("INSERT INTO enterprise_leads (company,contact_name,phone,email,scale,demand,status,created_at) VALUES (?,?,?,?,?,?,'new',?)")
-    .run(c.slice(0, 80), n.slice(0, 30), String(phone || '').slice(0, 30), String(email || '').slice(0, 60),
-      String(scale || '').slice(0, 20), String(demand || '').slice(0, 500), now());
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(contact_name, '企业定制线索', `${c}${scale ? '（' + scale + '）' : ''}`, req.ip, now());
+  const info = dal.runq("INSERT INTO enterprise_leads (company,contact_name,phone,email,scale,demand,status,created_at) VALUES (?,?,?,?,?,?,'new',?)", [c.slice(0, 80), n.slice(0, 30), String(phone || '').slice(0, 30), String(email || '').slice(0, 60),
+      String(scale || '').slice(0, 20), String(demand || '').slice(0, 500), now()]);
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [contact_name, '企业定制线索', `${c}${scale ? '（' + scale + '）' : ''}`, req.ip, now()]);
   res.json({ code: 0, data: { id: info.lastInsertRowid }, msg: '已收到你的需求，销售顾问将在 1 个工作日内联系你' });
 });
 
 router.get('/leads', auth, adminOnly, (req, res) => {
-  const rows = db.prepare(`SELECT l.*, (SELECT COUNT(*) c FROM enterprise_leads) total FROM enterprise_leads l ORDER BY l.id DESC LIMIT 200`).all();
+  const rows = dal.q(`SELECT l.*, (SELECT COUNT(*) c FROM enterprise_leads) total FROM enterprise_leads l ORDER BY l.id DESC LIMIT 200`);
   const stat = {
     total: rows.length,
     new: rows.filter(r => r.status === 'new').length,
@@ -61,24 +60,23 @@ router.get('/leads', auth, adminOnly, (req, res) => {
 });
 
 router.put('/leads/:id', auth, adminOnly, (req, res) => {
-  const lead = db.prepare('SELECT * FROM enterprise_leads WHERE id=?').get(req.params.id);
+  const lead = dal.getq('SELECT * FROM enterprise_leads WHERE id=?', [req.params.id]);
   if (!lead) return res.json({ code: 404, msg: '线索不存在' });
   const { status, note } = req.body || {};
   const ST = ['new', 'contacted', 'won', 'lost'];
   if (status && !ST.includes(status)) return res.json({ code: 400, msg: '状态无效' });
-  db.prepare('UPDATE enterprise_leads SET status=?, note=?, handler=? WHERE id=?')
-    .run(status || lead.status, String(note ?? lead.note).slice(0, 500), req.user.username, lead.id);
+  dal.runq('UPDATE enterprise_leads SET status=?, note=?, handler=? WHERE id=?', [status || lead.status, String(note ?? lead.note).slice(0, 500), req.user.username, lead.id]);
   res.json({ code: 0, msg: '已保存跟进记录' });
 });
 
 // ---------- 账单（auth）：月度用量明细 + 套餐概览 ----------
 router.get('/billing', auth, (req, res) => {
   // 近 6 个月按月聚合（messages join sessions 归属本人）
-  const months = db.prepare(`
+  const months = dal.q(`
     SELECT substr(m.created_at,1,7) month, COUNT(*) msgs, COALESCE(SUM(m.tokens),0) tokens
     FROM messages m JOIN sessions s ON s.id=m.session_id
     WHERE s.username=? AND m.created_at >= datetime('now','-6 month','localtime')
-    GROUP BY month ORDER BY month DESC`).all(req.user.username);
+    GROUP BY month ORDER BY month DESC`, [req.user.username]);
   const plan = planUsage(req.user.username);
   const fee = plan.plan === 'pro' ? 199 : (plan.plan === 'enterprise' ? null : 0);
   res.json({ code: 0, data: {
@@ -90,7 +88,7 @@ router.get('/billing', auth, (req, res) => {
 
 // ---------- 发票申请（auth） ----------
 router.get('/invoices', auth, (req, res) => {
-  const rows = db.prepare('SELECT * FROM invoices WHERE username=? ORDER BY id DESC LIMIT 50').all(req.user.username);
+  const rows = dal.q('SELECT * FROM invoices WHERE username=? ORDER BY id DESC LIMIT 50', [req.user.username]);
   res.json({ code: 0, data: rows });
 });
 
@@ -105,20 +103,17 @@ router.post('/invoices', auth, (req, res) => {
   // 范围查询替代 substr(created_at,1,7)=?（函数包裹列会阻断 idx_messages_created 索引）
   const monthStart = m + '-01 00:00:00';
   const nextMonth = m.slice(0, 5) + String(+m.slice(5, 7) + 1).padStart(2, '0') + '-01 00:00:00';
-  const usage = db.prepare(`SELECT COALESCE(SUM(m.tokens),0) c FROM messages m JOIN sessions s ON s.id=m.session_id WHERE s.username=? AND m.created_at >= ? AND m.created_at < ?`)
-    .get(req.user.username, monthStart, nextMonth).c;
-  const plan = planOf(db.prepare('SELECT plan FROM users WHERE username=?').get(req.user.username)?.plan);
-  const pending = db.prepare("SELECT COUNT(*) c FROM invoices WHERE username=? AND month=? AND status='pending'").get(req.user.username, m).c;
+  const usage = dal.getq(`SELECT COALESCE(SUM(m.tokens),0) c FROM messages m JOIN sessions s ON s.id=m.session_id WHERE s.username=? AND m.created_at >= ? AND m.created_at < ?`, [req.user.username, monthStart, nextMonth]).c;
+  const plan = planOf(dal.getq('SELECT plan FROM users WHERE username=?', [req.user.username])?.plan);
+  const pending = dal.getq("SELECT COUNT(*) c FROM invoices WHERE username=? AND month=? AND status='pending'", [req.user.username, m]).c;
   if (pending) return res.json({ code: 400, msg: `「${m}」已有一笔待处理的发票申请` });
-  const info = db.prepare('INSERT INTO invoices (username,title,tax_no,amount_type,month,tokens,email,note,status,created_at) VALUES (?,?,?,?,?,?,?,?,\'pending\',?)')
-    .run(req.user.username, t.slice(0, 100), String(tax_no || '').slice(0, 40), plan.key, m, usage, String(email || '').slice(0, 60), String(note || '').slice(0, 300), now());
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(req.user.username, '申请发票', `${m}（当月 ${usage.toLocaleString('zh-CN')} tokens，${plan.name}）`, req.ip, now());
+  const info = dal.runq('INSERT INTO invoices (username,title,tax_no,amount_type,month,tokens,email,note,status,created_at) VALUES (?,?,?,?,?,?,?,?,\'pending\',?)', [req.user.username, t.slice(0, 100), String(tax_no || '').slice(0, 40), plan.key, m, usage, String(email || '').slice(0, 60), String(note || '').slice(0, 300), now()]);
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '申请发票', `${m}（当月 ${usage.toLocaleString('zh-CN')} tokens，${plan.name}）`, req.ip, now()]);
   res.json({ code: 0, data: { id: info.lastInsertRowid }, msg: '发票申请已提交，财务将在 3 个工作日内处理' });
 });
 
 router.get('/invoices/all', auth, adminOnly, (req, res) => {
-  const rows = db.prepare(`SELECT i.*, u.nickname FROM invoices i LEFT JOIN users u ON u.username=i.username ORDER BY i.id DESC LIMIT 200`).all();
+  const rows = dal.q(`SELECT i.*, u.nickname FROM invoices i LEFT JOIN users u ON u.username=i.username ORDER BY i.id DESC LIMIT 200`);
   const stat = {
     total: rows.length,
     pending: rows.filter(r => r.status === 'pending').length,
@@ -129,15 +124,14 @@ router.get('/invoices/all', auth, adminOnly, (req, res) => {
 });
 
 router.put('/invoices/:id', auth, adminOnly, (req, res) => {
-  const inv = db.prepare('SELECT * FROM invoices WHERE id=?').get(req.params.id);
+  const inv = dal.getq('SELECT * FROM invoices WHERE id=?', [req.params.id]);
   if (!inv) return res.json({ code: 404, msg: '发票申请不存在' });
   const { status } = req.body || {};
   if (!['issued', 'rejected', 'pending'].includes(status)) return res.json({ code: 400, msg: '状态无效（issued/rejected）' });
-  db.prepare('UPDATE invoices SET status=?, handler=?, handled_at=? WHERE id=?').run(status, req.user.username, now(), inv.id);
+  dal.runq('UPDATE invoices SET status=?, handler=?, handled_at=? WHERE id=?', [status, req.user.username, now(), inv.id]);
   // 处理结果站内信闭环（开票/驳回均通知申请人）
   const msg = status === 'issued' ? '你的发票申请已开出，请查收邮箱' : status === 'rejected' ? '你的发票申请未通过（如有疑问请联系管理员）' : '发票申请已重新进入待处理';
-  db.prepare('INSERT INTO notifications (username,title,content,type,link,is_read,created_at) VALUES (?,?,?,?,?,0,?)')
-    .run(inv.username, '🧾 发票申请处理结果', `「${inv.month}」发票申请：${msg}`, 'billing', '#/billing', now());
+  dal.runq('INSERT INTO notifications (username,title,content,type,link,is_read,created_at) VALUES (?,?,?,?,?,0,?)', [inv.username, '🧾 发票申请处理结果', `「${inv.month}」发票申请：${msg}`, 'billing', '#/billing', now()]);
   res.json({ code: 0, msg: '已处理并通知申请人' });
 });
 
@@ -145,14 +139,14 @@ router.put('/invoices/:id', auth, adminOnly, (req, res) => {
 router.get('/insights', auth, (req, res) => {
   const username = req.user.username;
   // 我名下的智能体（owner 归属，含草稿；调用统计只算有会话的）
-  const agents = db.prepare("SELECT id, name, icon, status, kb_id, opening, suggest_enabled, allow_copy, created_at FROM agents WHERE owner=? AND source='self' ORDER BY id DESC LIMIT 50").all(username);
+  const agents = dal.q("SELECT id, name, icon, status, kb_id, opening, suggest_enabled, allow_copy, created_at FROM agents WHERE owner=? AND source='self' ORDER BY id DESC LIMIT 50", [username]);
   const list = agents.map(a => {
-    const week = db.prepare(`SELECT COUNT(*) c FROM sessions WHERE agent_id=? AND created_at >= datetime('now','-7 day','localtime')`).get(a.id).c;
-    const totalCalls = db.prepare(`SELECT COUNT(*) c FROM chat_traces WHERE agent_id=?`).get(a.id).c;
-    const activeUsers = db.prepare(`SELECT COUNT(DISTINCT username) c FROM sessions WHERE agent_id=? AND created_at >= datetime('now','-7 day','localtime')`).get(a.id).c;
-    const rating = db.prepare(`SELECT SUM(CASE WHEN m.rating=1 THEN 1 WHEN m.rating=-1 THEN -1 ELSE 0 END) c, SUM(CASE WHEN m.rating!=0 THEN 1 ELSE 0 END) t FROM messages m JOIN sessions s ON s.id=m.session_id WHERE s.agent_id=? AND m.role='assistant'`).get(a.id);
-    const kbHit = a.kb_id ? db.prepare(`SELECT COUNT(*) c FROM chat_traces WHERE agent_id=? AND kb_hits != '[]' AND kb_hits != ''`).get(a.id).c : 0;
-    const kbTotal = a.kb_id ? db.prepare(`SELECT COUNT(*) c FROM chat_traces WHERE agent_id=?`).get(a.id).c : 0;
+    const week = dal.getq(`SELECT COUNT(*) c FROM sessions WHERE agent_id=? AND created_at >= datetime('now','-7 day','localtime')`, [a.id]).c;
+    const totalCalls = dal.getq(`SELECT COUNT(*) c FROM chat_traces WHERE agent_id=?`, [a.id]).c;
+    const activeUsers = dal.getq(`SELECT COUNT(DISTINCT username) c FROM sessions WHERE agent_id=? AND created_at >= datetime('now','-7 day','localtime')`, [a.id]).c;
+    const rating = dal.getq(`SELECT SUM(CASE WHEN m.rating=1 THEN 1 WHEN m.rating=-1 THEN -1 ELSE 0 END) c, SUM(CASE WHEN m.rating!=0 THEN 1 ELSE 0 END) t FROM messages m JOIN sessions s ON s.id=m.session_id WHERE s.agent_id=? AND m.role='assistant'`, [a.id]);
+    const kbHit = a.kb_id ? dal.getq(`SELECT COUNT(*) c FROM chat_traces WHERE agent_id=? AND kb_hits != '[]' AND kb_hits != ''`, [a.id]).c : 0;
+    const kbTotal = a.kb_id ? dal.getq(`SELECT COUNT(*) c FROM chat_traces WHERE agent_id=?`, [a.id]).c : 0;
     return {
       ...a,
       weekCalls: week,

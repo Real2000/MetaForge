@@ -12,6 +12,7 @@
  *    （license_key 本身在 lib/edition.js 即只留前缀展示，双层防泄露）。
  */
 const express = require('express');
+const dal = require('../lib/dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const { db, now } = require('../db');
 const { auth } = require('../lib/auth');
 const { currentEdition, refreshLicense, reasonDescription } = require('../lib/edition');
@@ -44,13 +45,12 @@ router.post('/reload', (req, res) => {
     ? `${cur.name}（到期 ${cur.expires_at}）`
     : `社区版（原因：${reasonDescription(cur.reason)}）`;
   try {
-    db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-      .run(req.user.username, 'License热重载', detail, req.ip, now());
+    dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, 'License热重载', detail, req.ip, now()]);
   } catch (e) {
     console.warn('[edition] 热重载审计写入失败（不影响重载结果）：' + e.message);
     // V2.3 审查加固（S3-3）：双通道痕迹——op_logs 写失败时补写 err_logs（不同表更可能成功），
     // 避免磁盘满/锁等存储异常时热重载操作完全无痕
-    try { db.prepare('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)').run('edition', `License热重载审计写入失败（${req.user.username}：${detail}）：${e.message}`, now()); } catch { }
+    try { dal.runq('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)', ['edition', `License热重载审计写入失败（${req.user.username}：${detail}）：${e.message}`, now()]); } catch { }
   }
   res.json({ code: 0, msg: 'License 已热重载', data: cur }); // 管理员视角完整快照
 });

@@ -14,6 +14,7 @@
  *   - 唯一键为 (name, tenant_id)，同一密钥名可在不同租户各自定义
  */
 const { db } = require('../db');
+const dal = require('./dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const { encrypt, decrypt, resetKeyCache } = require('./crypto-util'); // V2.4 #4 加密工具（resetKeyCache：SEC-10 密钥热更新）
 
 const CACHE_TTL = 60 * 1000;
@@ -28,7 +29,7 @@ function normTenant(tenantId) {
 
 /** 读取某租户层原始行（含解密） */
 function _loadTier(tenantId) {
-  const rows = db.prepare('SELECT name, value FROM secrets WHERE tenant_id=?').all(tenantId);
+  const rows = dal.q('SELECT name, value FROM secrets WHERE tenant_id=?', [tenantId]);
   const obj = {};
   for (const r of rows) {
     obj[r.name] = r.name === 'ENCRYPTION_KEY' ? r.value : decrypt(r.value);
@@ -71,7 +72,7 @@ function renderEnv(tpl, tenantId) {
 /** 列出某租户层自身的密钥名（管理页用；不含值）。默认 0=平台全局层。 */
 function listNames(tenantId) {
   const tid = normTenant(tenantId);
-  return db.prepare('SELECT id, name, remark, created_at, updated_at, tenant_id, length(value) AS len FROM secrets WHERE tenant_id=? ORDER BY name').all(tid);
+  return dal.q('SELECT id, name, remark, created_at, updated_at, tenant_id, length(value) AS len FROM secrets WHERE tenant_id=? ORDER BY name', [tid]);
 }
 
 /**
@@ -83,17 +84,17 @@ function listNames(tenantId) {
  */
 function upsert(name, value, remark, tenantId) {
   const tid = normTenant(tenantId);
-  const old = db.prepare('SELECT id FROM secrets WHERE name=? AND tenant_id=?').get(name, tid);
+  const old = dal.getq('SELECT id FROM secrets WHERE name=? AND tenant_id=?', [name, tid]);
   if (value == null || value === '') {
-    if (old) db.prepare('DELETE FROM secrets WHERE id=?').run(old.id);
+    if (old) dal.runq('DELETE FROM secrets WHERE id=?', [old.id]);
     invalidate();
     if (name === 'ENCRYPTION_KEY') { try { resetKeyCache(); } catch { /* 忽略 */ } }
     return old ? 'deleted' : 'noop';
   }
   // V2.4 #4：对值加密后存储；ENCRYPTION_KEY 自身不加密（保持明文）
   const storedValue = name === 'ENCRYPTION_KEY' ? value : encrypt(value);
-  if (old) db.prepare("UPDATE secrets SET value=?, remark=?, updated_at=datetime('now','localtime') WHERE id=?").run(storedValue, remark || old.remark || '', old.id);
-  else db.prepare("INSERT INTO secrets (name, value, remark, tenant_id, created_at, updated_at) VALUES (?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))").run(name, storedValue, remark || '', tid);
+  if (old) dal.runq("UPDATE secrets SET value=?, remark=?, updated_at=datetime('now','localtime') WHERE id=?", [storedValue, remark || old.remark || '', old.id]);
+  else dal.runq("INSERT INTO secrets (name, value, remark, tenant_id, created_at, updated_at) VALUES (?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))", [name, storedValue, remark || '', tid]);
   invalidate();
   // SEC-10：ENCRYPTION_KEY 变更后立即失效 crypto-util 密钥缓存，保证热更新（否则 60s 内仍用旧钥）
   if (name === 'ENCRYPTION_KEY') { try { resetKeyCache(); } catch { /* 忽略 */ } }
@@ -109,7 +110,7 @@ function maskSecrets(text) {
   if (_unionCache && Date.now() - _unionAt < CACHE_TTL) union = _unionCache;
   else {
     union = _loadTier(0);
-    const tenants = db.prepare('SELECT DISTINCT tenant_id FROM secrets WHERE tenant_id != 0').all();
+    const tenants = dal.q('SELECT DISTINCT tenant_id FROM secrets WHERE tenant_id != 0');
     for (const t of tenants) Object.assign(union, _loadTier(t.tenant_id));
     _unionCache = union; _unionAt = Date.now();
   }

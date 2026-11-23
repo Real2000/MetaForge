@@ -17,6 +17,7 @@
  *  环境变量 LICENSE_PUBKEY_HEX 覆盖）→ 新签发 License 全部走新钥；旧 License 到期后自然收敛失效。
  */
 const fs = require('fs');
+const dal = require('./dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const path = require('path');
 const crypto = require('crypto');
 
@@ -214,14 +215,13 @@ function checkExpiryNotice() {
     const { db, now } = require('../db'); // 懒加载：本模块被无 DB 场景（纯函数测试）引用时不触发建库
     const title = `License 将于 ${cur.days_left} 天后到期`;
     // 收件人：全体启用管理员（Y5：硬编码 admin 在多管理员/自定义用户名部署下无人可见）
-    const admins = db.prepare("SELECT username FROM users WHERE role='admin' AND status=1").all();
+    const admins = dal.q("SELECT username FROM users WHERE role='admin' AND status=1");
     if (!admins.length) return false;
     // 当日去重：同一天多次调度（重启/手动触发）不重复打扰
-    const dup = db.prepare(`SELECT id FROM notifications WHERE username=? AND title=? AND created_at >= datetime('now','localtime','start of day')`).get(admins[0].username, title);
+    const dup = dal.getq(`SELECT id FROM notifications WHERE username=? AND title=? AND created_at >= datetime('now','localtime','start of day')`, [admins[0].username, title]);
     if (dup) return false;
     const content = `${cur.name} License 将于 ${cur.expires_at}（${cur.days_left} 天后）到期，请联系供应商续期并替换 data/license.json；到期后平台将降级为社区版（基础功能可用，高级特性关闭）。`;
-    const ins = db.prepare('INSERT INTO notifications (username,title,content,type,link,is_read,created_at) VALUES (?, ?, ?, \'system\', \'\', 0, ?)');
-    for (const a of admins) ins.run(a.username, title, content, now());
+    for (const a of admins) dal.runq('INSERT INTO notifications (username,title,content,type,link,is_read,created_at) VALUES (?,?,?,\'system\',\'\',0,?)', [a.username, title, content, now()]);
     return true;
   } catch (e) {
     console.warn('[edition] 到期提醒写入失败（不影响运行）：' + e.message);

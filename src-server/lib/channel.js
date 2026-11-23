@@ -20,6 +20,7 @@
  *  渠道未配置 → 自动降级站内信（notify.js 的 notifications 表）+ 审计留痕
  */
 const express = require('express');
+const dal = require('./dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const { db, now } = require('../db');
 const { loadSecrets } = require('./secrets');
 const { auth } = require('./auth');
@@ -157,16 +158,16 @@ function normalizeInbound(body, channelHint) {
 /** 入站消息审计落库（event_id 幂等去重；失败不阻断投递）。返回 { id } */
 function auditInbound(model) {
   try {
-    const exists = model.eventId ? db.prepare('SELECT id FROM channel_messages WHERE event_id=?').get(model.eventId) : null;
+    const exists = model.eventId ? dal.getq('SELECT id FROM channel_messages WHERE event_id=?', [model.eventId]) : null;
     if (exists) {
-      db.prepare('UPDATE channel_messages SET created_at=? WHERE id=?').run(now(), exists.id);
+      dal.runq('UPDATE channel_messages SET created_at=? WHERE id=?', [now(), exists.id]);
       return { id: exists.id, deduped: true };
     }
-    const info = db.prepare(`INSERT INTO channel_messages (event_id, channel, sender_id, chat_id, chat_type, text, attachments, raw, created_at)
-      VALUES (?,?,?,?,?,?,?,?,?)`).run(
+    const info = dal.runq(`INSERT INTO channel_messages (event_id, channel, sender_id, chat_id, chat_type, text, attachments, raw, created_at)
+      VALUES (?,?,?,?,?,?,?,?,?)`, [
       model.eventId, model.channel, model.sender.id, model.chat.id, model.chat.type,
       String(model.text || '').slice(0, 2000), JSON.stringify(model.attachments || []),
-      JSON.stringify(model.raw || {}).slice(0, 5000), now());
+      JSON.stringify(model.raw || {}).slice(0, 5000), now()]);
     return { id: info.lastInsertRowid };
   } catch { return { id: null }; }
 }
@@ -175,9 +176,8 @@ function auditInbound(model) {
 
 /** 站内信降级/直达渠道（notifications 表，username='*' 为广播） */
 function sendInbox(username, message) {
-  db.prepare('INSERT INTO notifications (username,title,content,type,link,is_read,created_at) VALUES (?,?,?,?,?,0,?)')
-    .run(username === '*' ? '*' : String(username), String(message.title || '').slice(0, 60) || '通知',
-      String(message.content || '').slice(0, 2000), 'system', '', now());
+  dal.runq('INSERT INTO notifications (username,title,content,type,link,is_read,created_at) VALUES (?,?,?,?,?,0,?)', [username === '*' ? '*' : String(username), String(message.title || '').slice(0, 60) || '通知',
+      String(message.content || '').slice(0, 2000), 'system', '', now()]);
   return { ok: true, channel: 'inbox', receivers: [username] };
 }
 
@@ -266,7 +266,7 @@ async function send(to, message) {
   if (channel === 'wecom' || channel === 'feishu' || channel === 'wechat-mp') {
     const chType = channel;
     const label = { wecom: '企业微信', feishu: '飞书', 'wechat-mp': '公众号' }[chType] || chType;
-    const chRow = db.prepare("SELECT id FROM channels WHERE type=? AND enabled=1 LIMIT 1").get(chType);
+    const chRow = dal.getq("SELECT id FROM channels WHERE type=? AND enabled=1 LIMIT 1", [chType]);
     if (!chRow) {
       sendInbox('*', { title: `${label}未配置`, content: `该渠道未配置，消息已降级站内信：${title ? '【' + title + '】' : ''}${content}` });
       return { ok: true, channel: 'inbox', degraded: true, receivers, mock: true };
@@ -333,7 +333,7 @@ async function sendCard(channel, receivers, title, card, message) {
 
   // ② 企微/飞书/公众号：适配器原生卡片（公众号无交互卡 → 适配器内文本化降级）
   if (channel === 'wecom' || channel === 'feishu' || channel === 'wechat-mp') {
-    const chRow = db.prepare('SELECT id FROM channels WHERE type=? AND enabled=1 LIMIT 1').get(channel);
+    const chRow = dal.getq('SELECT id FROM channels WHERE type=? AND enabled=1 LIMIT 1', [channel]);
     if (!chRow) return degradeCardToInbox(channel, receivers, title, card, message);
     try {
       const { getAdapter } = require('./im-adapters');
@@ -374,28 +374,26 @@ function upsertChannel({ id, name, type, config, enabled, createdBy }) {  const 
   const cfgJson = JSON.stringify(cfgPlain);
   const cfgEnc = cfgJson === '{}' ? '' : (encrypt(cfgJson) || cfgJson); // 加密失败兜底明文（crypto-util 约定）
   if (id) {
-    const old = db.prepare('SELECT * FROM channels WHERE id=?').get(id);
+    const old = dal.getq('SELECT * FROM channels WHERE id=?', [id]);
     if (!old) throw new Error('渠道不存在');
     // 校验仅在显式传 type 时做；未传沿用旧类型
     if (effType && !CHANNEL_TYPES.includes(effType)) throw new Error(`不支持的字段类型：${effType}（可选：${CHANNEL_TYPES.join('/')}）`);
     const finalType = effType || old.type;
     const finalName = n || old.name;
-    db.prepare('UPDATE channels SET name=?, type=?, config=?, enabled=?, updated_at=? WHERE id=?')
-      .run(finalName, finalType, config === undefined ? old.config : cfgEnc, enabled === undefined ? old.enabled : (enabled ? 1 : 0), now(), id);
-    return db.prepare('SELECT * FROM channels WHERE id=?').get(id);
+    dal.runq('UPDATE channels SET name=?, type=?, config=?, enabled=?, updated_at=? WHERE id=?', [finalName, finalType, config === undefined ? old.config : cfgEnc, enabled === undefined ? old.enabled : (enabled ? 1 : 0), now(), id]);
+    return dal.getq('SELECT * FROM channels WHERE id=?', [id]);
   }
   if (!effType) throw new Error('新增渠道必须指定 type');
   const t = effType;
   if (!CHANNEL_TYPES.includes(t)) throw new Error(`不支持的字段类型：${t}（可选：${CHANNEL_TYPES.join('/')}）`);
-  const info = db.prepare(`INSERT INTO channels (name, type, config, enabled, created_by, created_at, updated_at)
-    VALUES (?,?,?,?,?,?,?)`)
-    .run(n, t, cfgEnc, enabled === undefined ? 1 : (enabled ? 1 : 0), String(createdBy || ''), now(), now());
-  return db.prepare('SELECT * FROM channels WHERE id=?').get(info.lastInsertRowid);
+  const info = dal.runq(`INSERT INTO channels (name, type, config, enabled, created_by, created_at, updated_at)
+    VALUES (?,?,?,?,?,?,?)`, [n, t, cfgEnc, enabled === undefined ? 1 : (enabled ? 1 : 0), String(createdBy || ''), now(), now()]);
+  return dal.getq('SELECT * FROM channels WHERE id=?', [info.lastInsertRowid]);
 }
 
 /** 渠道列表（配置解密后按敏感键脱敏：*Secret/secret/Key/appSecret 一律 ••••） */
 function listChannels() {
-  const rows = db.prepare('SELECT * FROM channels ORDER BY id').all();
+  const rows = dal.q('SELECT * FROM channels ORDER BY id');
   return rows.map(r => {
     let cfg = {};
     try { cfg = r.config ? JSON.parse(decrypt(r.config) || r.config) : {}; } catch { cfg = {}; }
@@ -409,7 +407,7 @@ function listChannels() {
 
 /** 渠道详情（内部消费：解密明文配置，不脱敏——仅 lib 内部/发消息用） */
 function getChannelConfig(id) {
-  const r = db.prepare('SELECT * FROM channels WHERE id=?').get(id);
+  const r = dal.getq('SELECT * FROM channels WHERE id=?', [id]);
   if (!r) return null;
   try { return { ...r, config: r.config ? JSON.parse(decrypt(r.config) || r.config) : {} }; } catch { return { ...r, config: {} }; }
 }
@@ -417,23 +415,22 @@ function getChannelConfig(id) {
 /** 回调状态上报（入站投递/回调处理结果写回渠道行——排障与看板消费） */
 function updateCallbackStatus(channelId, status, err) {
   const s = ['ok', 'warning', 'error', 'pending'].includes(status) ? status : 'pending';
-  db.prepare('UPDATE channels SET callback_status=?, callback_last_at=?, callback_err=?, updated_at=? WHERE id=?')
-    .run(s, now(), String(err || '').slice(0, 300), now(), channelId);
+  dal.runq('UPDATE channels SET callback_status=?, callback_last_at=?, callback_err=?, updated_at=? WHERE id=?', [s, now(), String(err || '').slice(0, 300), now(), channelId]);
 }
 
 /** 启停切换 */
 function toggleChannel(id) {
-  const old = db.prepare('SELECT id, enabled FROM channels WHERE id=?').get(id);
+  const old = dal.getq('SELECT id, enabled FROM channels WHERE id=?', [id]);
   if (!old) throw new Error('渠道不存在');
   const next = old.enabled ? 0 : 1;
-  db.prepare('UPDATE channels SET enabled=?, updated_at=? WHERE id=?').run(next, now(), id);
+  dal.runq('UPDATE channels SET enabled=?, updated_at=? WHERE id=?', [next, now(), id]);
   return { id, enabled: !!next };
 }
 
 /** 删除渠道（级联清 OAuth states） */
 function deleteChannel(id) {
-  db.prepare('DELETE FROM connector_oauth_states WHERE channel_id=?').run(id);
-  db.prepare('DELETE FROM channels WHERE id=?').run(id);
+  dal.runq('DELETE FROM connector_oauth_states WHERE channel_id=?', [id]);
+  dal.runq('DELETE FROM channels WHERE id=?', [id]);
 }
 
 // ---------------- ④ U0-5 R2 用户↔渠道身份绑定（user_channel_bindings） ----------------
@@ -446,16 +443,15 @@ function upsertUserBinding({ username, channelId, channelUserId, channelUserName
   if (!u) throw new Error('username 必填');
   if (!cid) throw new Error('channel_id 必填');
   if (!cuid) throw new Error('channel_user_id 必填');
-  if (!db.prepare('SELECT id FROM channels WHERE id=?').get(cid)) throw new Error('渠道不存在');
-  const old = db.prepare('SELECT id FROM user_channel_bindings WHERE username=? AND channel_id=?').get(u, cid);
+  if (!dal.getq('SELECT id FROM channels WHERE id=?', [cid])) throw new Error('渠道不存在');
+  const old = dal.getq('SELECT id FROM user_channel_bindings WHERE username=? AND channel_id=?', [u, cid]);
   if (old) {
-    db.prepare('UPDATE user_channel_bindings SET channel_user_id=?, channel_user_name=?, updated_at=? WHERE id=?')
-      .run(cuid, String(channelUserName || '').slice(0, 120), now(), old.id);
-    return db.prepare('SELECT * FROM user_channel_bindings WHERE id=?').get(old.id);
+    dal.runq('UPDATE user_channel_bindings SET channel_user_id=?, channel_user_name=?, updated_at=? WHERE id=?', [cuid, String(channelUserName || '').slice(0, 120), now(), old.id]);
+    return dal.getq('SELECT * FROM user_channel_bindings WHERE id=?', [old.id]);
   }
-  const info = db.prepare(`INSERT INTO user_channel_bindings (username, channel_id, channel_user_id, channel_user_name, created_at, updated_at)
-    VALUES (?,?,?,?,?,?)`).run(u, cid, cuid, String(channelUserName || '').slice(0, 120), now(), now());
-  return db.prepare('SELECT * FROM user_channel_bindings WHERE id=?').get(info.lastInsertRowid);
+  const info = dal.runq(`INSERT INTO user_channel_bindings (username, channel_id, channel_user_id, channel_user_name, created_at, updated_at)
+    VALUES (?,?,?,?,?,?)`, [u, cid, cuid, String(channelUserName || '').slice(0, 120), now(), now()]);
+  return dal.getq('SELECT * FROM user_channel_bindings WHERE id=?', [info.lastInsertRowid]);
 }
 
 /** 绑定列表（可按 username 过滤；联表带出渠道名/类型/启用态） */
@@ -463,19 +459,19 @@ function listUserBindings(username) {
   const sql = `SELECT b.*, c.name AS channel_name, c.type AS channel_type, c.enabled AS channel_enabled
     FROM user_channel_bindings b LEFT JOIN channels c ON c.id=b.channel_id`;
   return username
-    ? db.prepare(sql + ' WHERE b.username=? ORDER BY b.id').all(String(username))
-    : db.prepare(sql + ' ORDER BY b.id').all();
+    ? dal.q(sql + ' WHERE b.username=? ORDER BY b.id', [String(username)])
+    : dal.q(sql + ' ORDER BY b.id');
 }
 
 /** 取用户「已启用渠道」的绑定（HITL 推送用；未启用渠道不推） */
 function getUserChannelBindings(username) {
-  return db.prepare(`SELECT b.*, c.type AS channel_type FROM user_channel_bindings b
-    JOIN channels c ON c.id=b.channel_id AND c.enabled=1 WHERE b.username=?`).all(String(username));
+  return dal.q(`SELECT b.*, c.type AS channel_type FROM user_channel_bindings b
+    JOIN channels c ON c.id=b.channel_id AND c.enabled=1 WHERE b.username=?`, [String(username)]);
 }
 
 /** 解绑 */
 function deleteUserBinding(id) {
-  db.prepare('DELETE FROM user_channel_bindings WHERE id=?').run(Number(id));
+  dal.runq('DELETE FROM user_channel_bindings WHERE id=?', [Number(id)]);
 }
 
 // ---------------- ⑤ U0-5 R4/R6 卡片回调决议核心 ----------------
@@ -495,7 +491,7 @@ function resolveCardCallback(p) {
   const key = String(p?.callbackData || '');
   const action = String(p?.action || '');
   if (!key || !['approve', 'reject'].includes(action)) return { ok: false, code: 400, msg: '缺少 callbackData 或 action' };
-  const row = db.prepare('SELECT * FROM tool_approvals WHERE confirm_key=?').get(key);
+  const row = dal.getq('SELECT * FROM tool_approvals WHERE confirm_key=?', [key]);
   if (!row) return { ok: false, code: 404, msg: '审批记录不存在（可能已过期或已被处理）' };
 
   // R6 归属校验：能通过「渠道绑定」把渠道侧身份映射回平台用户名时，决议人必须与审批发起人一致
@@ -503,8 +499,7 @@ function resolveCardCallback(p) {
   const channelId = Number(p?.channelId) || 0;
   const channelUserId = String(p?.userId || '');
   if (channelId && channelUserId) {
-    const bind = db.prepare('SELECT username FROM user_channel_bindings WHERE channel_id=? AND channel_user_id=?')
-      .get(channelId, channelUserId);
+    const bind = dal.getq('SELECT username FROM user_channel_bindings WHERE channel_id=? AND channel_user_id=?', [channelId, channelUserId]);
     if (bind && bind.username) {
       if (bind.username !== row.requester) {
         return { ok: false, code: 403, msg: '决议人与审批发起人不一致，已拒绝该决议', requester: row.requester };
@@ -519,8 +514,7 @@ function resolveCardCallback(p) {
 
   const newStatus = action === 'approve' ? 'approved' : 'rejected';
   // 先写库终态（即使本进程无等待项也能落审计）；resolveByKey 命中的 finalizeApproval 会以同一 approver 再写一次，值一致
-  db.prepare('UPDATE tool_approvals SET status=?, approver=?, decision_at=?, reason=? WHERE confirm_key=? AND status=\'pending\'')
-    .run(newStatus, approver, now(), String(p?.reason || '').slice(0, 200), key);
+  dal.runq('UPDATE tool_approvals SET status=?, approver=?, decision_at=?, reason=? WHERE confirm_key=? AND status=\'pending\'', [newStatus, approver, now(), String(p?.reason || '').slice(0, 200), key]);
   const resumed = toolConfirmRegistry.resolveByKey(key, action === 'approve', approver, p?.reason);
   return { ok: true, status: newStatus, resumed, requester: row.requester, toolName: row.tool_name };
 }

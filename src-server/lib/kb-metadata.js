@@ -8,6 +8,7 @@
  * 合并写入：已有 metadata（人工编辑）优先，LLM 仅填充缺失键，不覆盖人工数据。
  */
 const { db } = require('../db');
+const dal = require('./dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const { chatOnce, getConfiguredProviders } = require('./llm');
 
 const CONCURRENCY = 4;   // 并发抽取数（避免打爆网关限流，与 keywordgen 同口径）
@@ -93,20 +94,19 @@ async function genForChunk(content) {
  * 合并写入：先读现值，已有 metadata（人工编辑）优先，LLM 仅填充缺失键。
  */
 async function extractMetadataForFile(fileId) {
-  const file = db.prepare('SELECT id, kb_id, name FROM kb_files WHERE id=?').get(fileId);
+  const file = dal.getq('SELECT id, kb_id, name FROM kb_files WHERE id=?', [fileId]);
   if (!file) return { ok: false, msg: '文件不存在' };
-  const kb = db.prepare('SELECT id, auto_metadata FROM kbs WHERE id=?').get(file.kb_id);
+  const kb = dal.getq('SELECT id, auto_metadata FROM kbs WHERE id=?', [file.kb_id]);
   if (!kb || !kb.auto_metadata) return { ok: true, extracted: 0, skipped: 'disabled' };
   if (getConfiguredProviders().length === 0) return { ok: true, extracted: 0, skipped: 'no_provider' };
   // 可检索单元：无子分片引用的块（与 keywordgen 同口径——父分片是拼接容器，跳过避免重复消耗）
-  const rows = db.prepare(`
+  const rows = dal.q(`
     SELECT c.id, c.content, c.metadata FROM kb_chunks c
     WHERE c.file_id = ? AND c.content IS NOT NULL AND length(trim(c.content)) >= 8
       AND NOT EXISTS (SELECT 1 FROM kb_chunks p WHERE p.parent_id = c.id)
-  `).all(fileId);
+  `, [fileId]);
   if (!rows.length) return { ok: true, extracted: 0, skipped: 'no_chunks' };
   const targets = rows.slice(0, MAX_CHUNKS);
-  const upd = db.prepare('UPDATE kb_chunks SET metadata=? WHERE id=?');
   let extracted = 0, failed = 0, idx = 0;
   const worker = async () => {
     while (idx < targets.length) {
@@ -119,7 +119,7 @@ async function extractMetadataForFile(fileId) {
         // 同一块时，若按任务开始时的快照合并会覆盖用户刚保存的人工值（读-改-写竞态）
         let existing = {};
         try {
-          const fresh = db.prepare('SELECT metadata FROM kb_chunks WHERE id=?').get(row.id);
+          const fresh = dal.getq('SELECT metadata FROM kb_chunks WHERE id=?', [row.id]);
           if (fresh && fresh.metadata && fresh.metadata !== '{}') {
             const e = JSON.parse(fresh.metadata);
             if (e && typeof e === 'object' && !Array.isArray(e)) existing = e;
@@ -127,7 +127,7 @@ async function extractMetadataForFile(fileId) {
         } catch { /* 现值损坏 JSON 视为无元数据，LLM 结果整体写入 */ }
         const clean = sanitizeMetadata({ ...meta, ...existing }); // existing 在后覆盖 meta：人工值优先
         if (Object.keys(clean).length) {
-          upd.run(JSON.stringify(clean), row.id);
+          dal.runq('UPDATE kb_chunks SET metadata=? WHERE id=?', [JSON.stringify(clean), row.id]);
           extracted++;
         } else failed++;
       } catch { failed++; }

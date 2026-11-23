@@ -11,6 +11,7 @@
  * ctx: { kbId, mcpServers }（runTool 透传）
  */
 const fs = require('fs');
+const dal = require('./dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const path = require('path');
 const storage = require('./storage'); // P1-19 对象存储抽象层
 const { db, now } = require('../db');
@@ -120,12 +121,12 @@ const db_query = {
     const question = String(args.question || '').trim();
     if (!question) return '缺少 question 参数';
     // 1. 读取库 schema（排除敏感表），供 LLM 生成 SQL
-    const tables = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`).all()
+    const tables = dal.q(`SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`)
       .map(r => r.name).filter(t => !DB_DENY_TABLES.has(t));
     const schemaParts = [];
     for (const t of tables) {
       try {
-        const cols = db.prepare(`PRAGMA table_info("${t}")`).all()
+        const cols = dal.q(`PRAGMA table_info("${t}")`)
           .map(c => `${c.name} ${c.type || 'TEXT'}${c.pk ? ' PK' : ''}`);
         schemaParts.push(`${t}(${cols.join(', ')})`);
       } catch { }
@@ -807,7 +808,7 @@ const doc_review = {
     // 典型链路：画布 start(file 变量) → doc_review 工具节点 args {"file_id":"{{#start.contract#}}"} → 富对象直达
     const fid = fileIdOf(args.file_id);
     if (fid) {
-      const wf = db.prepare('SELECT * FROM wf_files WHERE id=?').get(fid);
+      const wf = dal.getq('SELECT * FROM wf_files WHERE id=?', [fid]);
       if (!wf) return `文件 #${fid} 不存在或已被清理，请重新上传后重试。`;
       const full = String(wf.text_content || '').trim();
       if (!full) return `文件「${wf.name}」未解析出文本内容，无法评审（扫描版 PDF 需先 OCR）。`;
@@ -819,21 +820,21 @@ const doc_review = {
     let file = null;
     if (kbId) {
       file = nameLike
-        ? db.prepare('SELECT * FROM kb_files WHERE kb_id=? AND name LIKE ? ORDER BY id DESC').get(kbId, nameLike)
-        : db.prepare('SELECT * FROM kb_files WHERE kb_id=? ORDER BY id DESC').get(kbId);
+        ? dal.getq('SELECT * FROM kb_files WHERE kb_id=? AND name LIKE ? ORDER BY id DESC', [kbId, nameLike])
+        : dal.getq('SELECT * FROM kb_files WHERE kb_id=? ORDER BY id DESC', [kbId]);
     } else {
       // 未关联知识库：在全部知识库中查找（按文件名匹配；无文件名则取最新一份）
       file = nameLike
-        ? db.prepare('SELECT * FROM kb_files WHERE name LIKE ? ORDER BY id DESC').get(nameLike)
-        : db.prepare('SELECT * FROM kb_files ORDER BY id DESC').get();
+        ? dal.getq('SELECT * FROM kb_files WHERE name LIKE ? ORDER BY id DESC', [nameLike])
+        : dal.getq('SELECT * FROM kb_files ORDER BY id DESC');
     }
     if (!file) {
-      const list = db.prepare('SELECT f.name, k.name AS kb FROM kb_files f LEFT JOIN kbs k ON f.kb_id=k.id ORDER BY f.id DESC LIMIT 10').all()
+      const list = dal.q('SELECT f.name, k.name AS kb FROM kb_files f LEFT JOIN kbs k ON f.kb_id=k.id ORDER BY f.id DESC LIMIT 10')
         .map(f => `${f.name}（${f.kb || '未命名库'}）`).join('、');
       return `未找到${args.file_name ? `「${args.file_name}」` : '可评审的文档'}。`
         + (list ? `平台现有已解析文档：${list}。请确认文件名，或将待评审文件上传到任意知识库后告诉我文件名，或直接以附件上传（file_id 直达）。` : '平台还没有已解析的文档，请先在「知识库管理」上传（PDF/DOCX/TXT 均可），或以附件上传待评审文件。');
     }
-    const chunks = db.prepare('SELECT content FROM kb_chunks WHERE file_id=? ORDER BY id').all(file.id);
+    const chunks = dal.q('SELECT content FROM kb_chunks WHERE file_id=? ORDER BY id', [file.id]);
     const full = chunks.map(c => c.content || '').join('\n').trim();
     if (!full) return `文档「${file.name}」还没有解析出文本内容，无法评审。`;
     return await reviewBody({ name: file.name, full }, args);
@@ -1007,8 +1008,8 @@ const local_exec = {
     if (!OPS_WHITELIST.includes(op)) return `⛔ 不支持的操作「${op}」（白名单：${OPS_WHITELIST.join('/')}）`;
     const username = ctx.username;
     if (!username) return '⛔ 缺少用户上下文，无法路由到设备';
-    const dev = db.prepare('SELECT * FROM localbridge_devices WHERE username=? AND is_default=1').get(username)
-      || db.prepare('SELECT * FROM localbridge_devices WHERE username=? ORDER BY last_seen DESC LIMIT 1').get(username);
+    const dev = dal.getq('SELECT * FROM localbridge_devices WHERE username=? AND is_default=1', [username])
+      || dal.getq('SELECT * FROM localbridge_devices WHERE username=? ORDER BY last_seen DESC LIMIT 1', [username]);
     if (!dev) {
       return `❌ 您还没有配对的本地设备。请：1) 下载安装「TeleAgent 智能体平台助手」（平台右上角「设备」页有安装包与引导）；2) 安装后首次打开会提示输入网页端生成的 6 位配对码；3) 配对成功后即可让我操作您的电脑（建文件夹/开应用等白名单操作）。请向用户转述此引导。`;
     }
@@ -1061,19 +1062,17 @@ const local_exec = {
     }
     if (op === 'run_python') params.code = String(args.code || '').slice(0, 20000);
     // 入队
-    const info = db.prepare('INSERT INTO localbridge_tasks (device_id,username,op,params,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?)')
-      .run(dev.id, username, op, JSON.stringify(params), 'pending', now(), now());
+    const info = dal.runq('INSERT INTO localbridge_tasks (device_id,username,op,params,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?)', [dev.id, username, op, JSON.stringify(params), 'pending', now(), now()]);
     const logAudit = (status, detail, duration) => {
       if (!username) return;
-      db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at,duration_ms) VALUES (?,?,?,?,?,?)')
-        .run(username, `本地桥:${op}`, `设备${dev.device_name}: ${(detail || '').slice(0, 200)}` + (status === 'done' ? '' : '（失败）'), ctx._ip || '', now(), duration || null);
+      dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at,duration_ms) VALUES (?,?,?,?,?,?)', [username, `本地桥:${op}`, `设备${dev.device_name}: ${(detail || '').slice(0, 200)}` + (status === 'done' ? '' : '（失败）'), ctx._ip || '', now(), duration || null]);
     };
     const taskId = info.lastInsertRowid;
     // 等待回推（500ms 轮询 DB，60s 超时）
     const t0 = Date.now();
     while (Date.now() - t0 < LOCAL_EXEC_WAIT_MS) {
       await new Promise(r => setTimeout(r, 500));
-      const t = db.prepare('SELECT status, result FROM localbridge_tasks WHERE id=?').get(taskId);
+      const t = dal.getq('SELECT status, result FROM localbridge_tasks WHERE id=?', [taskId]);
       if (t && (t.status === 'done' || t.status === 'failed')) {
         let result = {}; try { result = JSON.parse(t.result || '{}'); } catch { }
         if (t.status === 'done' && result.ok) {
@@ -1291,7 +1290,7 @@ const create_task = {
     const nextTs = nextFire(schedule);
     if (!nextTs) return `⛔ 该计划在一年内不会触发（如「2 月 30 日」类无效日期组合），请修正 schedule。`;
     // 用户行（角色判断 + 权限校验用）
-    const me = db.prepare('SELECT id, username, nickname, role, dept FROM users WHERE username=? AND status=1').get(username);
+    const me = dal.getq('SELECT id, username, nickname, role, dept FROM users WHERE username=? AND status=1', [username]);
     if (!me) return '⛔ 当前账号不可用，无法创建任务';
     // P5.33 审查修复（Y7）：任务指令过输入敏感词检测——模型转写的 prompt 是间接内容，
     // 注入可借它把违规指令固化成 7×24 自动执行；blocked 时拒绝创建
@@ -1301,7 +1300,7 @@ const create_task = {
     }
     // 数量配额（管理员不受限）
     if (me.role !== 'admin') {
-      const cnt = db.prepare('SELECT COUNT(*) c FROM tasks WHERE username=? AND enabled=1').get(username).c;
+      const cnt = dal.getq('SELECT COUNT(*) c FROM tasks WHERE username=? AND enabled=1', [username]).c;
       if (cnt >= MAX_USER_TASKS) {
         return `⛔ 已达任务数量上限（启用中 ${MAX_USER_TASKS} 个）。请先在「任务管理」页停用或删除不需要的任务后再创建。`;
       }
@@ -1309,19 +1308,18 @@ const create_task = {
     // 执行主体：显式指定 → 校验可见性（与对话链路 canView 同权限）；未指定 → 系统智能体
     let agent = null;
     if (agentId) {
-      agent = db.prepare("SELECT * FROM agents WHERE id=? AND status='published'").get(agentId);
+      agent = dal.getq("SELECT * FROM agents WHERE id=? AND status='published'", [agentId]);
       if (!agent) return `⛔ 指定的智能体（id=${agentId}）不存在或未发布，请改用其他智能体或留空`;
       const { canView } = require('./agent-access');
       if (!canView(agent, me)) return `⛔ 无权绑定智能体「${agent.name}」（未对你开放）`;
     } else {
       // P5.34（Y4 完整方案）：按 system_key 稳定标识查找系统执行智能体（agents.name 无唯一约束，
       // 名称查找可被用户自建同名智能体劫持；system_key 由 db.js 迁移打标 + 部分唯一索引保证）
-      agent = db.prepare("SELECT * FROM agents WHERE system_key='system_task_runner' AND status='published'").get();
+      agent = dal.getq("SELECT * FROM agents WHERE system_key='system_task_runner' AND status='published'");
       if (!agent) return '⛔ 系统执行智能体未初始化，请联系管理员检查服务启动日志后重试';
     }
-    const info = db.prepare(`INSERT INTO tasks (name,target_type,target_id,exec_type,cron,params,enabled,username,created_at)
-      VALUES (?,?,?,?,?,?,1,?,datetime('now','localtime'))`)
-      .run(name, 'agent', agent.id, 'cron', schedule, JSON.stringify({ input: prompt.slice(0, 4000) }), username);
+    const info = dal.runq(`INSERT INTO tasks (name,target_type,target_id,exec_type,cron,params,enabled,username,created_at)
+      VALUES (?,?,?,?,?,?,1,?,datetime('now','localtime'))`, [name, 'agent', agent.id, 'cron', schedule, JSON.stringify({ input: prompt.slice(0, 4000) }), username]);
     const planText = scheduleDesc || describeCron(schedule);
     const nextText = new Date(nextTs).toLocaleString('sv-SE', { timeZone: 'Asia/Shanghai' }).replace('T', ' ').slice(0, 16);
     return [

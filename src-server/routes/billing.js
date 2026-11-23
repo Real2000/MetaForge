@@ -11,6 +11,7 @@
  * - GET  /api/billing/tenant/export?month=      MT-11 租户账单导出（CSV，Excel 直开）
  */
 const express = require('express');
+const dal = require('../lib/dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const { db, now } = require('../db');
 const { auth, adminOnly } = require('../lib/auth');
 const gate = require('../lib/billing-gate');
@@ -30,8 +31,8 @@ router.get('/holds', adminOnly, (req, res) => {
   const limit = Math.min(500, Math.max(1, Math.floor(+req.query.limit || 100)));
   const tid = scopeTenant(req);
   const rows = tid == null
-    ? db.prepare('SELECT * FROM billing_holds ORDER BY id DESC LIMIT ?').all(limit)
-    : db.prepare('SELECT * FROM billing_holds WHERE tenant_id=? ORDER BY id DESC LIMIT ?').all(tid, limit);
+    ? dal.q('SELECT * FROM billing_holds ORDER BY id DESC LIMIT ?', [limit])
+    : dal.q('SELECT * FROM billing_holds WHERE tenant_id=? ORDER BY id DESC LIMIT ?', [tid, limit]);
   res.json({ code: 0, data: rows });
 });
 
@@ -51,8 +52,7 @@ router.get('/tenant', adminOnly, (req, res) => {
 router.get('/tenant/export', adminOnly, (req, res) => {
   const tid = scopeTenant(req);
   const { csv, month, total, rowCount } = billing.tenantReportCsv({ month: req.query.month, tenantId: tid });
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(req.user.username, '导出租户账单', `${month}（${rowCount} 行，合计 ¥${total}）`, req.ip, now());
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '导出租户账单', `${month}（${rowCount} 行，合计 ¥${total}）`, req.ip, now()]);
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
   res.setHeader('Content-Disposition', `attachment; filename="tenant-billing-${month}.csv"`);
   res.send(csv);
@@ -66,7 +66,7 @@ router.get('/stats', adminOnly, (req, res) => {
 // 本人计费状态（对话页/个人中心展示并发与成本配额）
 router.get('/my', (req, res) => {
   const username = req.user.username;
-  const u = db.prepare('SELECT quota_total, quota_used, cost_quota, max_concurrency FROM users WHERE username=?').get(username) || {};
+  const u = dal.getq('SELECT quota_total, quota_used, cost_quota, max_concurrency FROM users WHERE username=?', [username]) || {};
   res.json({
     code: 0,
     data: {
@@ -82,7 +82,7 @@ router.get('/my', (req, res) => {
 
 // 设置用户计费参数（成本配额 / 并发上限，0=不限）
 router.put('/users/:username', adminOnly, (req, res) => {
-  const u = db.prepare('SELECT * FROM users WHERE username=?').get(req.params.username);
+  const u = dal.getq('SELECT * FROM users WHERE username=?', [req.params.username]);
   if (!u) return res.json({ code: 404, msg: '用户不存在' });
   // MT-11：租户管理员仅能调整本租户用户计费参数（跨租户 fail-closed）
   const scopeTid = scopeTenant(req);
@@ -93,17 +93,16 @@ router.put('/users/:username', adminOnly, (req, res) => {
   const sets = [], detail = [];
   if (body.cost_quota !== undefined) {
     const v = Math.max(0, Number(body.cost_quota) || 0);
-    db.prepare('UPDATE users SET cost_quota=? WHERE username=?').run(v, u.username);
+    dal.runq('UPDATE users SET cost_quota=? WHERE username=?', [v, u.username]);
     sets.push('cost_quota'); detail.push(`成本配额 → ${v === 0 ? '不限' : '¥' + v.toFixed(2) + '/月'}`);
   }
   if (body.max_concurrency !== undefined) {
     const v = Math.max(0, Math.floor(Number(body.max_concurrency) || 0));
-    db.prepare('UPDATE users SET max_concurrency=? WHERE username=?').run(v, u.username);
+    dal.runq('UPDATE users SET max_concurrency=? WHERE username=?', [v, u.username]);
     sets.push('max_concurrency'); detail.push(`并发上限 → ${v === 0 ? '不限' : v}`);
   }
   if (!sets.length) return res.json({ code: 400, msg: '无可更新字段（cost_quota / max_concurrency）' });
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(req.user.username, '设置计费参数', `${u.username}：${detail.join('，')}`, req.ip, now());
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '设置计费参数', `${u.username}：${detail.join('，')}`, req.ip, now()]);
   res.json({ code: 0, msg: '已保存：' + detail.join('，') });
 });
 

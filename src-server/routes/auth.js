@@ -1,5 +1,6 @@
 /** 认证路由：登录 / 当前用户 / 修改密码 / 钉钉扫码登录（V1.3 #4 2026-10-30 mock 骨架） */
 const express = require('express');
+const dal = require('../lib/dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const crypto = require('crypto');
 const { db, hashPwd, verifyPwd, hashPwdAsync, now } = require('../db');
 const { sign, auth, adminOnly, revokeToken, bumpTokenVersion, TOKEN_TTL_MS, setAuthCookie, clearAuthCookie } = require('../lib/auth');
@@ -17,28 +18,26 @@ const LOCKOUT_DURATION_MIN = 15;    // 锁定 15 分钟（用于显示）
 
 /** 记录登录失败（次数 + 时间戳 + 锁定时间）*/
 function countFailedLogin(username, ip) {
-  const row = db.prepare('SELECT * FROM login_attempts WHERE username=?').get(username);
+  const row = dal.getq('SELECT * FROM login_attempts WHERE username=?', [username]);
   if (!row) {
     const until = new Date(Date.now() + LOCKOUT_DURATION_MS).toISOString();
     // 修复（2026-11-12 P1-2 bug）：INSERT 列序与实参错位——last_attempt 收到 until、
     // locked_until 收到 now()（本地时间字符串），导致首次失败即被"永久锁定"
     // （本地时间字符串被 new Date() 按 UTC 解析恒大于当前时刻）。
     // 正确对位：attempts=1, last_attempt=now(), locked_until=null（未达 5 次不锁）
-    db.prepare('INSERT INTO login_attempts (username, ip, attempts, last_attempt, locked_until, created_at) VALUES (?,?,1,?,?,?)')
-      .run(username, ip, now(), null, now());
+    dal.runq('INSERT INTO login_attempts (username, ip, attempts, last_attempt, locked_until, created_at) VALUES (?,?,1,?,?,?)', [username, ip, now(), null, now()]);
     return;
   }
   const next_attempts = row.attempts + 1;
   const until = new Date(Date.now() + LOCKOUT_DURATION_MS).toISOString();
   // 检查是否已被锁定
   if (row.locked_until && new Date(row.locked_until) > new Date()) return; // 已锁定，不动递增计数
-  db.prepare('UPDATE login_attempts SET attempts=?, ip=?, last_attempt=?, locked_until=? WHERE id=?')
-    .run(next_attempts, ip, now(), next_attempts >= MAX_LOGIN_ATTEMPTS ? until : null, row.id);
+  dal.runq('UPDATE login_attempts SET attempts=?, ip=?, last_attempt=?, locked_until=? WHERE id=?', [next_attempts, ip, now(), next_attempts >= MAX_LOGIN_ATTEMPTS ? until : null, row.id]);
 }
 
 /** 检查登录锁定状态：返回 { locked, remaining, msg } */
 function checkLoginLock(username) {
-  const row = db.prepare('SELECT * FROM login_attempts WHERE username=?').get(username);
+  const row = dal.getq('SELECT * FROM login_attempts WHERE username=?', [username]);
   if (!row) return { locked: false, remaining: MAX_LOGIN_ATTEMPTS, msg: '' };
   // 检查锁定时间是否已过
   if (row.locked_until && new Date(row.locked_until) > new Date()) {
@@ -51,7 +50,7 @@ function checkLoginLock(username) {
 
 /** 登录成功后清除失败计数 */
 function clearLoginAttempts(username) {
-  db.prepare('DELETE FROM login_attempts WHERE username=?').run(username);
+  dal.runq('DELETE FROM login_attempts WHERE username=?', [username]);
 }
 
 // P5.30 安全止血：登录接口按 IP 限流（此前可无限暴力尝试；与 share/openapi 同一套滑动窗口实现，10 次/分钟/IP）
@@ -65,16 +64,14 @@ router.post('/login', loginLimiter, async (req, res) => {
   // P1-2 失败锁定检查
   const lock = checkLoginLock(username);
   if (lock.locked) {
-    db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-      .run(username, '登录失败', lock.msg, ip, now());
+    dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [username, '登录失败', lock.msg, ip, now()]);
     return res.json({ code: 401, msg: lock.msg });
   }
 
-  const user = db.prepare('SELECT * FROM users WHERE username=? AND status=1').get(username);
+  const user = dal.getq('SELECT * FROM users WHERE username=? AND status=1', [username]);
   const v = user ? await verifyPwd(password, user.password) : { ok: false };
   if (!user || !v.ok) {
-    db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-      .run(username, '登录失败', '账号或密码错误', ip, now());
+    dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [username, '登录失败', '账号或密码错误', ip, now()]);
     countFailedLogin(username, ip);
     // 二次查询检查锁定状态更新后的剩余次数
     const lockAfter = checkLoginLock(username);
@@ -83,20 +80,18 @@ router.post('/login', loginLimiter, async (req, res) => {
   }
   // MT-10（2026-11-22）：租户停用拦截——停用租户下全部账号一律拒绝登录（fail-closed）
   const utid = user.tenant_id || 1;
-  const tenant = db.prepare('SELECT status FROM tenants WHERE id=?').get(utid);
+  const tenant = dal.getq('SELECT status FROM tenants WHERE id=?', [utid]);
   if (tenant && tenant.status === 'disabled') {
-    db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-      .run(username, '登录失败', `租户 #${utid} 已停用`, ip, now());
+    dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [username, '登录失败', `租户 #${utid} 已停用`, ip, now()]);
     return res.json({ code: 403, msg: '所属租户已停用，请联系平台管理员' });
   }
   // 登录成功：清除失败计数
   clearLoginAttempts(username);
   // 旧 SALT 密码平滑迁移：登录成功即重写为新 SALT 哈希（一次性，用户无感）
-  if (v.legacy) db.prepare('UPDATE users SET password=? WHERE id=?').run(await hashPwdAsync(password), user.id);
+  if (v.legacy) dal.runq('UPDATE users SET password=? WHERE id=?', [await hashPwdAsync(password), user.id]);
   // MT-08：token 内嵌 tenant_id claim（多租户解析的次要来源，服务端 users.tenant_id 仍为权威）
   const token = sign({ uid: user.id, exp: Date.now() + TOKEN_TTL_MS, tv: user.token_version || 0, tenant_id: utid });
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(user.username, '登录系统', '密码登录成功', ip, now());
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [user.username, '登录系统', '密码登录成功', ip, now()]);
   setAuthCookie(res, token); // P2-3：HttpOnly Cookie 签发（token 不再依赖前端 storage 持久化）
   res.json({ code: 0, data: { token, user: { id: user.id, username: user.username, nickname: user.nickname, role: user.role, dept: user.dept, onboarded: user.onboarded ? 1 : 0, tenant_id: utid, platform_admin: user.platform_admin ? 1 : 0 }, must_change_pwd: user.must_change_pwd ? 1 : 0 } });
 });
@@ -112,20 +107,20 @@ router.post('/logout', auth, (req, res) => {
 
 // 新手引导完成标记（完成或跳过均标记，仅弹一次）
 router.post('/onboarding', auth, (req, res) => {
-  db.prepare('UPDATE users SET onboarded=1 WHERE id=?').run(req.user.id);
+  dal.runq('UPDATE users SET onboarded=1 WHERE id=?', [req.user.id]);
   res.json({ code: 0, msg: '引导已完成' });
 });
 
 router.post('/login/change-password', auth, async (req, res) => {
   const { oldPwd, newPwd } = req.body || {};
-  const user = db.prepare('SELECT * FROM users WHERE id=?').get(req.user.id);
+  const user = dal.getq('SELECT * FROM users WHERE id=?', [req.user.id]);
   const v = await verifyPwd(oldPwd || '', user.password);
   if (!v.ok) return res.json({ code: 400, msg: '原密码错误' });
   if (!newPwd || newPwd.length < 6) return res.json({ code: 400, msg: '新密码至少 6 位' });
   // 弱口令限制：新密码不得与常见默认密码相同（P0 安全要求）
   const WEAK = ['123456', 'admin123', 'demo123', 'password', '111111', '000000', 'abc123'];
   if (WEAK.includes(newPwd)) return res.json({ code: 400, msg: '新密码过于简单（常见默认口令），请换一个' });
-  db.prepare('UPDATE users SET password=?, must_change_pwd=0 WHERE id=?').run(await hashPwdAsync(newPwd), user.id);
+  dal.runq('UPDATE users SET password=?, must_change_pwd=0 WHERE id=?', [await hashPwdAsync(newPwd), user.id]);
   // 改密后吊销当前 token（旧 token 立即失效）——P2-3 连带修复（2026-11-09）：吊销后必须重新签发，
   // 否则改密成功即死会话（旧 Cookie 已吊销 / 前端无可用凭据，进入平台即被 401 踢回登录页）；
   // 该缺陷属存量问题，此前因 must_change_pwd 标记失效（P1-3）+ 前端路径 404 双重死链从未暴露
@@ -135,8 +130,7 @@ router.post('/login/change-password', auth, async (req, res) => {
   const newTv = bumpTokenVersion(user.id);
   const freshToken = sign({ uid: user.id, exp: Date.now() + TOKEN_TTL_MS, tv: newTv });
   setAuthCookie(res, freshToken); // 旧 Cookie 同名覆盖，浏览器立即换新
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(user.username, '修改密码', '密码已更新' + (user.must_change_pwd ? '（弱口令强制改密完成）' : ''), req.ip, now());
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [user.username, '修改密码', '密码已更新' + (user.must_change_pwd ? '（弱口令强制改密完成）' : ''), req.ip, now()]);
   res.json({ code: 0, msg: '密码修改成功', data: { token: freshToken } });
 });
 
@@ -179,8 +173,7 @@ router.get('/dingtalk/url', dingUrlLimiter, (req, res) => {
     else if (!reqOrigin) origin = `${req.protocol}://${req.headers.host}`;
   } catch { origin = ''; }
   if (!origin) {
-    db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-      .run('dingtalk-sync', '钉钉登录发起源校验失败', `Origin=${reqOrigin.slice(0, 60)} Host=${req.headers.host}`, clientIp(req), now());
+    dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', ['dingtalk-sync', '钉钉登录发起源校验失败', `Origin=${reqOrigin.slice(0, 60)} Host=${req.headers.host}`, clientIp(req), now()]);
     return res.json({ code: 403, msg: '发起源校验失败（Origin 与当前站点不同源）' });
   }
   const state = crypto.randomBytes(16).toString('hex');
@@ -204,8 +197,7 @@ router.get('/dingtalk/callback', async (req, res) => {
   const ip = clientIp(req);
   const { code, state } = req.query || {};
   const fail = (detail, status, msg) => {
-    db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-      .run('dingtalk-sync', '钉钉扫码登录', '失败：' + detail, ip, now());
+    dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', ['dingtalk-sync', '钉钉扫码登录', '失败：' + detail, ip, now()]);
     return res.status(status).json({ code: status, msg });
   };
   // ① state 校验（过期/伪造/重复消费均拒绝）；通过即一次性删除（防重放）
@@ -249,8 +241,7 @@ router.get('/dingtalk/callback', async (req, res) => {
   }
   // ⑤ 签发与密码登录完全同构的 token（sign 自动加 jti，TOKEN_TTL_MS 同 TTL，/api/auth/me 可直接校验）
   const token = sign({ uid: user.id, exp: Date.now() + TOKEN_TTL_MS, tv: user.token_version || 0 });
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(user.username, '钉钉扫码登录', '成功（' + (user.created ? '新建用户' : '匹配已有用户') + '）', ip, now());
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [user.username, '钉钉扫码登录', '成功（' + (user.created ? '新建用户' : '匹配已有用户') + '）', ip, now()]);
   // ⑥ 302 重定向回前端（token 走 URL hash 不随请求发服务器；前端适配不在本轮）
   // V1.3 审查加固（H1 止血）：回调时校验 st.origin 的 host 与当前请求 host 一致——原实现直接信任
   // 签发时存的 origin（而它可能来自伪造的 Origin 头），不一致按 fail 拒绝（防签发 token 302 到第三方站点）
@@ -293,9 +284,8 @@ router.post('/invites', auth, adminOnly, (req, res) => {
   const { role, dept, quota_total, max_use, expires_at } = req.body || {};
   const inviteCode = crypto.randomBytes(6).toString('hex'); // 12 位 hex 码
   const max = Math.min(Math.max(parseInt(max_use) || 1, 1), 100);
-  db.prepare(`INSERT INTO invited_users (invite_code, role, dept, quota_total, max_use, expires_at, created_by, enabled, created_at, updated_at)
-    VALUES (?,?,?,?,?,?,?,1,datetime('now','localtime'),datetime('now','localtime'))`)
-    .run(inviteCode, role || 'user', dept || '', parseInt(quota_total) || 0, max, expires_at || null, req.user.username);
+  dal.runq(`INSERT INTO invited_users (invite_code, role, dept, quota_total, max_use, expires_at, created_by, enabled, created_at, updated_at)
+    VALUES (?,?,?,?,?,?,?,1,datetime('now','localtime'),datetime('now','localtime'))`, [inviteCode, role || 'user', dept || '', parseInt(quota_total) || 0, max, expires_at || null, req.user.username]);
   res.json({ code: 0, data: { invite_code: inviteCode } });
 });
 
@@ -303,26 +293,24 @@ router.post('/invites', auth, adminOnly, (req, res) => {
 router.post('/register', async (req, res) => {
   const { username, password, nickname, invite_code } = req.body || {};
   if (!username || !password || !invite_code) return res.json({ code: 400, msg: '缺少必要参数' });
-  let codeInfo = db.prepare('SELECT * FROM invited_users WHERE invite_code=? AND enabled=1').get(invite_code);
+  let codeInfo = dal.getq('SELECT * FROM invited_users WHERE invite_code=? AND enabled=1', [invite_code]);
   if (!codeInfo) return res.json({ code: 400, msg: '邀请码无效' });
   // 检查过期
   if (codeInfo.expires_at && new Date(codeInfo.expires_at) < new Date()) return res.json({ code: 400, msg: '邀请码已过期' });
   // 检查使用次数
   if (codeInfo.max_use > 0 && codeInfo.use_count >= codeInfo.max_use) return res.json({ code: 400, msg: '邀请码已被使用完毕' });
   // 检查用户名唯一性
-  const exists = db.prepare('SELECT id FROM users WHERE username=?').get(username);
+  const exists = dal.getq('SELECT id FROM users WHERE username=?', [username]);
   if (exists) return res.json({ code: 400, msg: '用户名已被占用' });
   // 创建新用户
   const pwdHash = await hashPwdAsync(password);
-  db.prepare('INSERT INTO users (username, password, nickname, role, dept, quota_total, status, must_change_pwd, created_at) VALUES (?,?,?,?,?,?,1,0,datetime(\'now\',\'localtime\'))')
-    .run(username, pwdHash, nickname || username, codeInfo.role, codeInfo.dept, codeInfo.quota_total);
+  dal.runq('INSERT INTO users (username, password, nickname, role, dept, quota_total, status, must_change_pwd, created_at) VALUES (?,?,?,?,?,?,1,0,datetime(\'now\',\'localtime\'))', [username, pwdHash, nickname || username, codeInfo.role, codeInfo.dept, codeInfo.quota_total]);
   // 增加邀请码使用计数
-  db.prepare('UPDATE invited_users SET use_count=use_count+1, updated_at=datetime(\'now\',\'localtime\') WHERE id=?').run(codeInfo.id);
+  dal.runq('UPDATE invited_users SET use_count=use_count+1, updated_at=datetime(\'now\',\'localtime\') WHERE id=?', [codeInfo.id]);
   // 记录注册日志
-  db.prepare('INSERT INTO invite_registrations (username, invite_code, ip, created_at) VALUES (?,?,?,?)')
-    .run(username, invite_code, req.ip, now());
+  dal.runq('INSERT INTO invite_registrations (username, invite_code, ip, created_at) VALUES (?,?,?,?)', [username, invite_code, req.ip, now()]);
   // 签发 Token 自动登录
-  const user = db.prepare('SELECT id, username, nickname, role, dept, onboarded, token_version FROM users WHERE username=?').get(username);
+  const user = dal.getq('SELECT id, username, nickname, role, dept, onboarded, token_version FROM users WHERE username=?', [username]);
   const token = sign({ uid: user.id, tv: user.token_version || 0 });
   setAuthCookie(res, token);
   res.json({ code: 0, msg: '注册成功', data: { token, user } });

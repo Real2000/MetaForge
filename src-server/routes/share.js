@@ -5,6 +5,7 @@
  * 页面：public/share.html（/share/:token 由 server.js 兜底到该页面）
  */
 const express = require('express');
+const dal = require('../lib/dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const { db, now } = require('../db');
 const { chat } = require('../lib/llm');
 const { retrieve } = require('../lib/retriever');
@@ -28,7 +29,7 @@ const shareChatLimit = createLimiter({
 });
 
 function getShared(token) {
-  const a = db.prepare('SELECT * FROM agents WHERE share_token=? AND share_enabled=1 AND status=?').get(token, 'published');
+  const a = dal.getq('SELECT * FROM agents WHERE share_token=? AND share_enabled=1 AND status=?', [token, 'published']);
   if (!a) return null;
   // 有效期校验（share_expires_at 为空表示永久有效）
   if (a.share_expires_at) {
@@ -84,17 +85,16 @@ router.post('/:token/chat', shareChatLimit, async (req, res) => {
     }
 
     // 会话（首次创建）
-    let session = sid ? db.prepare('SELECT * FROM share_sessions WHERE id=? AND share_token=?').get(sid, req.params.token) : null;
+    let session = sid ? dal.getq('SELECT * FROM share_sessions WHERE id=? AND share_token=?', [sid, req.params.token]) : null;
     if (!session) {
-      const info = db.prepare('INSERT INTO share_sessions (share_token,title,ext_conversation_id,created_at,updated_at) VALUES (?,?,?,?,?)')
-        .run(req.params.token, input.slice(0, 20), '', now(), now());
+      const info = dal.runq('INSERT INTO share_sessions (share_token,title,ext_conversation_id,created_at,updated_at) VALUES (?,?,?,?,?)', [req.params.token, input.slice(0, 20), '', now(), now()]);
       session = { id: info.lastInsertRowid, ext_conversation_id: '' };
       send('session', { sid: session.id });
     }
 
     // ---------- Dify 外部智能体 ----------
     if (a.source === 'dify' && a.external_api_key && (a.external_mode === 'chat' || a.external_mode === 'completion')) {
-      const plat = db.prepare('SELECT * FROM platforms WHERE type=? AND status=1 ORDER BY id DESC').get('dify');
+      const plat = dal.getq('SELECT * FROM platforms WHERE type=? AND status=1 ORDER BY id DESC', ['dify']);
       if (!plat) { send('error', { msg: '未找到启用的 Dify 平台配置' }); return res.end(); }
       let full = '', extConvId = session.ext_conversation_id || '';
       try {
@@ -128,14 +128,13 @@ router.post('/:token/chat', shareChatLimit, async (req, res) => {
     });
     const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
     try {
-      const runInfo = db.prepare(`INSERT INTO workflow_runs (agent_id, trigger_type, status, inputs, started_at) VALUES (?,?,?,?,datetime('now','localtime'))`).run(a.id, 'share_form', 'running', JSON.stringify(formData));
+      const runInfo = dal.runq(`INSERT INTO workflow_runs (agent_id, trigger_type, status, inputs, started_at) VALUES (?,?,?,?,datetime('now','localtime'))`, [a.id, 'share_form', 'running', JSON.stringify(formData)]);
       const runId = runInfo.lastInsertRowid;
       send('receipt', { runId, status: 'running', inputs: formData, createdAt: now() });
       // 异步模拟执行完成（后续可用真实 runGraph 替代）；1 秒后 update 状态
       setTimeout(() => {
         try {
-          db.prepare(`UPDATE workflow_runs SET status='success', outputs=?, finished_at=datetime('now','localtime') WHERE id=?`)
-            .run(JSON.stringify({ result: `感谢提交，已成功处理表单「${a.name}」的请求。` }), runId);
+          dal.runq(`UPDATE workflow_runs SET status='success', outputs=?, finished_at=datetime('now','localtime') WHERE id=?`, [JSON.stringify({ result: `感谢提交，已成功处理表单「${a.name}」的请求。` }), runId]);
           send('done', { runId, status: 'success', message: '工作流执行完成', finishedAt: now() });
           res.end();
         } catch { /* 超时等非关键错误不处理 */ }
@@ -159,7 +158,7 @@ router.post('/:token/chat', shareChatLimit, async (req, res) => {
         return res.end();
       }
       const out = mask(full);
-      db.prepare('UPDATE share_sessions SET ext_conversation_id=?, updated_at=? WHERE id=?').run(extConvId, now(), session.id);
+      dal.runq('UPDATE share_sessions SET ext_conversation_id=?, updated_at=? WHERE id=?', [extConvId, now(), session.id]);
       addUsage(a.owner || 'admin', Math.ceil(out.length * 0.6)); // P2：分享消耗归智能体发布者
       // U1-6：成本归因（Dify 分支；share 链路未接 usage，按输出估算口径计）
       try {
@@ -169,8 +168,7 @@ router.post('/:token/chat', shareChatLimit, async (req, res) => {
           meta: { via: 'share', agent: a.name },
         });
       } catch { /* 成本归因失败不影响分享页响应 */ }
-      db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-        .run('share', '分享对话', `智能体「${a.name}」`, req.ip, now());
+      dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', ['share', '分享对话', `智能体「${a.name}」`, req.ip, now()]);
       send('done', { content: out });
       return res.end();
     }
@@ -201,7 +199,7 @@ router.post('/:token/chat', shareChatLimit, async (req, res) => {
     }
     const out = mask(full);
     if (out !== full) send('notice', { msg: '回复内容包含违规词汇，已自动脱敏处理。' });
-    db.prepare('UPDATE share_sessions SET updated_at=? WHERE id=?').run(now(), session.id);
+    dal.runq('UPDATE share_sessions SET updated_at=? WHERE id=?', [now(), session.id]);
     addUsage(a.owner || 'admin', Math.ceil(out.length * 0.6)); // P2：分享消耗归智能体发布者
     // U1-6：成本归因（内置智能体分支；prompt 按检索注入后的完整上下文估算）
     try {
@@ -211,8 +209,7 @@ router.post('/:token/chat', shareChatLimit, async (req, res) => {
         meta: { via: 'share', agent: a.name },
       });
     } catch { /* 成本归因失败不影响分享页响应 */ }
-    db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-      .run('share', '分享对话', `智能体「${a.name}」（${Math.ceil(out.length * 0.6)} tokens）`, req.ip, now());
+    dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', ['share', '分享对话', `智能体「${a.name}」（${Math.ceil(out.length * 0.6)} tokens）`, req.ip, now()]);
     send('done', { content: out });
   } catch (e) {
     console.error('[share] 对话异常：', e);

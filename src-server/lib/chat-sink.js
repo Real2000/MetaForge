@@ -17,6 +17,7 @@
  * 注意：内部链路（含 PII/假图防御/建议生成等独有逻辑）不经过本 Sink，仍在 chat.js 主链路内。
  */
 const { db, now } = require('../db');
+const dal = require('./dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const { check, countHits, mask } = require('./security');
 const { addUsage } = require('./quota');
 const { recordModelUsage } = require('./billing'); // U1-6：成本归因（与配额记账同点位，失败内部兜底不阻断）
@@ -53,13 +54,12 @@ function finishExternalTurn(opts) {
   const finalTokens = (Number.isFinite(+tokens) && +tokens > 0) ? Math.ceil(+tokens) : Math.ceil(content.length * 0.6);
 
   // 3. assistant 消息落库 + 会话更新（extConvId 有定义时回写外部会话 id）
-  const msgInfo = db.prepare('INSERT INTO messages (session_id,role,content,tokens,created_at) VALUES (?,?,?,?,?)')
-    .run(sessionId, 'assistant', content, finalTokens, now());
+  const msgInfo = dal.runq('INSERT INTO messages (session_id,role,content,tokens,created_at) VALUES (?,?,?,?,?)', [sessionId, 'assistant', content, finalTokens, now()]);
   if (sessionId) {
     if (extConvId !== undefined) {
-      db.prepare('UPDATE sessions SET updated_at=?, ext_conversation_id=? WHERE id=?').run(now(), extConvId, sessionId);
+      dal.runq('UPDATE sessions SET updated_at=?, ext_conversation_id=? WHERE id=?', [now(), extConvId, sessionId]);
     } else {
-      db.prepare('UPDATE sessions SET updated_at=? WHERE id=?').run(now(), sessionId);
+      dal.runq('UPDATE sessions SET updated_at=? WHERE id=?', [now(), sessionId]);
     }
   }
 
@@ -82,14 +82,12 @@ function finishExternalTurn(opts) {
   // 5. op_logs 审计（明细文案可为函数，以最终 tokens 为参）；审计/trace 写入失败不阻断 done 事件（P5.33 审查修复 F10：保证前端不悬挂）
   try {
     const detailText = typeof opDetail === 'function' ? String(opDetail(finalTokens)) : String(opDetail);
-    db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-      .run(username, opAction, detailText, ip, now());
+    dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [username, opAction, detailText, ip, now()]);
   } catch (e) { console.error('[chat-sink] op_logs 写入失败：', e.message); }
 
   // 6. chat_traces 全链路追踪（外部/技能链路无知识库命中与工具调用，固定 '[]'）
   try {
-    db.prepare('INSERT INTO chat_traces (session_id,message_id,agent_id,model,mode,latency_ms,tokens,prompt_chars,kb_hits,tool_calls,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
-      .run(sessionId, msgInfo.lastInsertRowid, agent ? agent.id : null, modelLabel, modeLabel, Date.now() - tStart, finalTokens, String(input || '').length, '[]', '[]', now());
+    dal.runq('INSERT INTO chat_traces (session_id,message_id,agent_id,model,mode,latency_ms,tokens,prompt_chars,kb_hits,tool_calls,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)', [sessionId, msgInfo.lastInsertRowid, agent ? agent.id : null, modelLabel, modeLabel, Date.now() - tStart, finalTokens, String(input || '').length, '[]', '[]', now()]);
   } catch (e) { console.error('[chat-sink] chat_traces 写入失败：', e.message); }
 
   // 7. SSE done

@@ -2,6 +2,7 @@
  *  plan 字段存 users 表；quota_total 仍是配额实际控制位（管理员可单独调整，与套餐档解耦）。
  *  agents_limit / kbs_limit 为软约束：超额时友好提示升级，不做硬拦截（避免影响存量使用）。
  */
+const dal = require('./dal'); // BE-C1 统一查询出口——顶层注入（codemod 曾误插到 planUsage 函数体内：文件首个 require 位于函数内，注入随之进了局部作用域，agentQuotaBlock 运行时 dal is not defined）
 const PLANS = {
   free: {
     key: 'free', name: '免费版', price: 0, priceLabel: '¥0', period: '永久免费',
@@ -36,11 +37,11 @@ function planOf(key) {
  *  管理员豁免（2026-10-20 方案A）：role=admin 不受商业化软约束——不限智能体/知识库数，不触发升级引导 */
 function planUsage(username) {
   const { db } = require('../db');
-  const u = db.prepare('SELECT role, plan, quota_total, quota_used FROM users WHERE username=?').get(username);
+  const u = dal.getq('SELECT role, plan, quota_total, quota_used FROM users WHERE username=?', [username]);
   if (!u) return null;
   const plan = planOf(u.plan);
-  const agentsCount = db.prepare("SELECT COUNT(*) c FROM agents WHERE owner=? AND source='self'").get(username).c;
-  const kbsCount = db.prepare('SELECT COUNT(*) c FROM kbs WHERE owner=?').get(username).c;
+  const agentsCount = dal.getq("SELECT COUNT(*) c FROM agents WHERE owner=? AND source='self'", [username]).c;
+  const kbsCount = dal.getq('SELECT COUNT(*) c FROM kbs WHERE owner=?', [username]).c;
   const qTotal = u.quota_total || 0;
   const exempt = u.role === 'admin';
   return {
@@ -75,7 +76,7 @@ function buildUpgradeReasons(plan, u) {
  *  专业版/企业版用户不限制。管理员豁免（role=admin）不受此限制。 */
 function getSoftLimit(feature, username) {
   const { db } = require('../db');
-  const u = db.prepare('SELECT role, plan FROM users WHERE username=?').get(username);
+  const u = dal.getq('SELECT role, plan FROM users WHERE username=?', [username]);
   if (!u || u.role === 'admin') return 0;
   const { currentEdition } = require('./edition');
   const edition = currentEdition();

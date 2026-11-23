@@ -10,15 +10,17 @@
  *   3. 回调后验证身份 → 登录或绑定已有账号
  */
 const crypto = require('crypto');
+const dal = require('./dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const { db, now } = require('../db');
 const { encrypt, decrypt } = require('./crypto-util');
 const { sign } = require('./auth');
 
 // P1-1 SSO 表按需创建（幂等）：仅在需要时执行，与 db.js 解耦，不影响无 SSO 环境的测试
 function ensureTables() {
-  const existing = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?").pluck();
-  if (!existing.get('sso_providers')) {
-    db.exec(`CREATE TABLE IF NOT EXISTS sso_providers (
+  // BE-C1（2026-11-23）：表存在性探测改走 dal.pluck（原 prepare().pluck() 语句复用形态）
+  const tableExists = (name) => dal.pluck("SELECT name FROM sqlite_master WHERE type='table' AND name=?", [name]);
+  if (!tableExists('sso_providers')) {
+    dal.exec(`CREATE TABLE IF NOT EXISTS sso_providers (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       name TEXT NOT NULL,
       display_name TEXT DEFAULT '',
@@ -39,13 +41,13 @@ function ensureTables() {
   }
   // 2026-11-12 P1-1b 修复：早期建表语句缺 type 列（routes/sso.js INSERT/UPDATE 均用到），
   // 导致创建服务商 500「no column named type」；对已建表的老库（含生产）幂等补列
-  const ssoCols = db.prepare('PRAGMA table_info(sso_providers)').all().map(c => c.name);
+  const ssoCols = dal.q('PRAGMA table_info(sso_providers)').map(c => c.name);
   if (!ssoCols.includes('type')) {
-    db.exec("ALTER TABLE sso_providers ADD COLUMN type TEXT DEFAULT 'oidc'");
+    dal.exec("ALTER TABLE sso_providers ADD COLUMN type TEXT DEFAULT 'oidc'");
     console.log('[sso] sso_providers 表已迁移：新增 type 字段');
   }
-  if (!existing.get('sso_login_states')) {
-    db.exec(`CREATE TABLE IF NOT EXISTS sso_login_states (
+  if (!tableExists('sso_login_states')) {
+    dal.exec(`CREATE TABLE IF NOT EXISTS sso_login_states (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       state TEXT NOT NULL UNIQUE,
       nonce TEXT DEFAULT '',
@@ -55,8 +57,8 @@ function ensureTables() {
       created_at TEXT
     )`);
   }
-  if (!existing.get('user_sso_identities')) {
-    db.exec(`CREATE TABLE IF NOT EXISTS user_sso_identities (
+  if (!tableExists('user_sso_identities')) {
+    dal.exec(`CREATE TABLE IF NOT EXISTS user_sso_identities (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       username TEXT NOT NULL,
       provider TEXT NOT NULL,
@@ -77,19 +79,18 @@ ensureTables();
 function generateState(providerId, redirect, type = 'oidc') {
   const state = crypto.randomBytes(24).toString('hex');
   const nonce = type === 'oidc' ? crypto.randomBytes(32).toString('base64url') : '';
-  db.prepare('INSERT INTO sso_login_states (state, nonce, type, provider_id, redirect_uri, created_at) VALUES (?,?,?,?,?,?)')
-    .run(state, nonce, type, providerId, redirect || '', now());
+  dal.runq('INSERT INTO sso_login_states (state, nonce, type, provider_id, redirect_uri, created_at) VALUES (?,?,?,?,?,?)', [state, nonce, type, providerId, redirect || '', now()]);
   return { state, nonce };
 }
 
 /** 验证并消费 state（一次性，防重放） */
 function consumeState(state) {
-  const row = db.prepare('SELECT * FROM sso_login_states WHERE state=?').get(state);
+  const row = dal.getq('SELECT * FROM sso_login_states WHERE state=?', [state]);
   if (!row) return null;
   // 15 分钟内未使用的 state 视为过期
   const age = Date.now() - new Date(row.created_at).getTime();
-  if (age > 900000) { db.prepare('DELETE FROM sso_login_states WHERE id=?').run(row.id); return null; }
-  db.prepare('DELETE FROM sso_login_states WHERE id=?').run(row.id);
+  if (age > 900000) { dal.runq('DELETE FROM sso_login_states WHERE id=?', [row.id]); return null; }
+  dal.runq('DELETE FROM sso_login_states WHERE id=?', [row.id]);
   return row;
 }
 
@@ -159,13 +160,12 @@ async function exchangeCode(provider, code, redirectUri) {
 /** 用户身份绑定：自动开通 / 绑定已有 */
 function bindOrCreateUser(provider, userInfo) {
   // 查已有身份绑定
-  const existing = db.prepare('SELECT * FROM user_sso_identities WHERE provider=? AND subject=?').get(provider.name, userInfo.subject);
+  const existing = dal.getq('SELECT * FROM user_sso_identities WHERE provider=? AND subject=?', [provider.name, userInfo.subject]);
   if (existing) {
     // 更新最后登录时间
-    db.prepare('UPDATE user_sso_identities SET last_login=?, access_token=?, refresh_token=?, expires_at=? WHERE id=?')
-      .run(now(), userInfo.encAccessToken, userInfo.encRefreshToken, userInfo.expiresAt, existing.id);
+    dal.runq('UPDATE user_sso_identities SET last_login=?, access_token=?, refresh_token=?, expires_at=? WHERE id=?', [now(), userInfo.encAccessToken, userInfo.encRefreshToken, userInfo.expiresAt, existing.id]);
     // 查对应的平台用户
-    const user = db.prepare('SELECT id, username, nickname, role FROM users WHERE username=? AND status=1').get(existing.username);
+    const user = dal.getq('SELECT id, username, nickname, role FROM users WHERE username=? AND status=1', [existing.username]);
     return user ? { code: 0, data: { user } } : { code: 400, msg: '关联平台账号不存在或已停用' };
   }
   // 无绑定关系：按配置策略处理
@@ -178,19 +178,17 @@ function bindOrCreateUser(provider, userInfo) {
   const tempPwd = crypto.randomBytes(12).toString('hex');
   const { hashPwdAsync } = require('./db');
   return hashPwdAsync(tempPwd).then(async pwdHash => {
-    db.prepare('INSERT INTO users (username, password, nickname, role, status, must_change_pwd, quota_total, created_at) VALUES (?,?,?,?,?,?,?,?)')
-      .run(userInfo.email || userInfo.subject, pwdHash, userName, 'user', 1, 1, 0, now());
+    dal.runq('INSERT INTO users (username, password, nickname, role, status, must_change_pwd, quota_total, created_at) VALUES (?,?,?,?,?,?,?,?)', [userInfo.email || userInfo.subject, pwdHash, userName, 'user', 1, 1, 0, now()]);
     // 建立身份绑定
-    db.prepare('INSERT INTO user_sso_identities (username, provider, subject, external_username, access_token, refresh_token, expires_at, last_login, created_at) VALUES (?,?,?,?,?,?,?,?,?)')
-      .run(userInfo.email || userInfo.subject, provider.name, userInfo.subject, userInfo.name, userInfo.encAccessToken, userInfo.encRefreshToken, userInfo.expiresAt, now(), now());
-    const user = db.prepare('SELECT id, username, nickname, role FROM users WHERE username=? AND status=1').get(userInfo.email || userInfo.subject);
+    dal.runq('INSERT INTO user_sso_identities (username, provider, subject, external_username, access_token, refresh_token, expires_at, last_login, created_at) VALUES (?,?,?,?,?,?,?,?,?)', [userInfo.email || userInfo.subject, provider.name, userInfo.subject, userInfo.name, userInfo.encAccessToken, userInfo.encRefreshToken, userInfo.expiresAt, now(), now()]);
+    const user = dal.getq('SELECT id, username, nickname, role FROM users WHERE username=? AND status=1', [userInfo.email || userInfo.subject]);
     return { code: 0, data: { user } };
   });
 }
 
 /** 获取登录用 provider 列表（仅 enabled=1 的提供方） */
 function getEnabledProviders() {
-  return db.prepare('SELECT id, name, display_name, authorization_url, issuer FROM sso_providers WHERE enabled=1 ORDER BY id').all();
+  return dal.q('SELECT id, name, display_name, authorization_url, issuer FROM sso_providers WHERE enabled=1 ORDER BY id');
 }
 
 module.exports = { generateState, consumeState, exchangeCode, bindOrCreateUser, getEnabledProviders };

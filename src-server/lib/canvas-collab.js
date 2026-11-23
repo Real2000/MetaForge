@@ -34,6 +34,7 @@
  * 最后一名成员离开后保留 10 分钟再清理（短暂掉线重连不丢会话态）。
  */
 const { WebSocketServer } = require('ws');
+const dal = require('./dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const { db, now } = require('../db');
 const { verify, readToken } = require('./auth');
 const { diffWorkflows } = require('./workflow-diff');
@@ -49,18 +50,18 @@ function wsUser(req) {
   try {
     const payload = verify(readToken(req));
     if (!payload || !payload.uid) return null;
-    return db.prepare('SELECT id, username, nickname, role FROM users WHERE id=? AND status=1').get(payload.uid) || null;
+    return dal.getq('SELECT id, username, nickname, role FROM users WHERE id=? AND status=1', [payload.uid]) || null;
   } catch { return null; }
 }
 
 /** 载入（或复用）房间的协作会话态：绑定 agent 的画布为初始权威版本 */
 function loadSession(roomId) {
   if (rooms.has(roomId)) return rooms.get(roomId);
-  const room = db.prepare("SELECT * FROM collab_rooms WHERE id=?").get(roomId);
+  const room = dal.getq("SELECT * FROM collab_rooms WHERE id=?", [roomId]);
   if (!room) return { err: 404, msg: '房间不存在' };
   if (room.status !== 'active') return { err: 403, msg: '房间已关闭或归档，无法协作' };
   if (!room.agent_id) return { err: 400, msg: '该房间未绑定画布（需先在智能体编排页创建画布协作房间）' };
-  const agent = db.prepare('SELECT id, name, workflow FROM agents WHERE id=?').get(room.agent_id);
+  const agent = dal.getq('SELECT id, name, workflow FROM agents WHERE id=?', [room.agent_id]);
   if (!agent) return { err: 404, msg: '房间绑定的智能体已不存在' };
   let wf = null;
   try { wf = JSON.parse(agent.workflow || 'null'); } catch { wf = null; }
@@ -72,10 +73,10 @@ function loadSession(roomId) {
 
 /** 校验加入权限：活跃成员 / host / admin */
 function canJoin(roomId, user) {
-  const room = db.prepare('SELECT * FROM collab_rooms WHERE id=?').get(roomId);
+  const room = dal.getq('SELECT * FROM collab_rooms WHERE id=?', [roomId]);
   if (!room || room.status !== 'active') return { ok: false, msg: '房间不存在或已关闭' };
   if (user.role === 'admin' || room.host === user.username) return { ok: true };
-  const m = db.prepare("SELECT id FROM collab_room_members WHERE room_id=? AND username=? AND status='active'").get(roomId, user.username);
+  const m = dal.getq("SELECT id FROM collab_room_members WHERE room_id=? AND username=? AND status='active'", [roomId, user.username]);
   return m ? { ok: true } : { ok: false, msg: '你不是该协作房间的成员（需房主在房间管理中添加）' };
 }
 

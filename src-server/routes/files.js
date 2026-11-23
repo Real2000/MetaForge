@@ -8,6 +8,7 @@
  * 安全：登录鉴权 / 扩展名白名单（pdf docx txt md）/ 单文件 ≤ 8MB / b64 不回读明文（仅下载接口按需吐原文）
  */
 const express = require('express');
+const dal = require('../lib/dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const router = express.Router();
 const { db, now } = require('../db');
 const { auth } = require('../lib/auth');
@@ -31,15 +32,13 @@ router.post('/', async (req, res) => {
   try { text = (await parseFileBuffer(name, buf)).text; } catch (e) { return res.json({ code: 400, msg: '文件解析失败：' + e.message }); }
   if (text.length < 4) return res.json({ code: 400, msg: '解析后无有效文本内容（扫描版 PDF 需先 OCR）' });
   const src = ['manual', 'chat'].includes(source) ? source : 'manual';
-  const info = db.prepare(`INSERT INTO wf_files (name,ext,size,text_content,content_b64,source,created_by,created_at) VALUES (?,?,?,?,?,?,?,?)`)
-    .run(String(name).slice(0, 200), ext, buf.length, text, buf.toString('base64'), src, req.user?.username || '', now());
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(req.user?.username || '匿名', '上传工作流文件', `${name}（${(buf.length / 1024).toFixed(0)}KB，解析 ${text.length} 字）`, req.ip, now());
+  const info = dal.runq(`INSERT INTO wf_files (name,ext,size,text_content,content_b64,source,created_by,created_at) VALUES (?,?,?,?,?,?,?,?)`, [String(name).slice(0, 200), ext, buf.length, text, buf.toString('base64'), src, req.user?.username || '', now()]);
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user?.username || '匿名', '上传工作流文件', `${name}（${(buf.length / 1024).toFixed(0)}KB，解析 ${text.length} 字）`, req.ip, now()]);
   res.json({ code: 0, data: { id: Number(info.lastInsertRowid), name, ext, size: buf.length, text_len: text.length, url: `/api/files/${info.lastInsertRowid}/download` } });
 });
 
 router.get('/:id', (req, res) => {
-  const f = db.prepare('SELECT id,name,ext,size,length(text_content) AS text_len,source,created_at,created_by FROM wf_files WHERE id=?').get(+req.params.id);
+  const f = dal.getq('SELECT id,name,ext,size,length(text_content) AS text_len,source,created_at,created_by FROM wf_files WHERE id=?', [+req.params.id]);
   if (!f) return res.json({ code: 404, msg: '文件不存在' });
   // P1-2 修复：非管理员只能访问自己上传的文件
   if (req.user?.role !== 'admin' && f.created_by && f.created_by !== req.user?.username) {
@@ -49,7 +48,7 @@ router.get('/:id', (req, res) => {
 });
 
 router.get('/:id/download', (req, res) => {
-  const f = db.prepare('SELECT id,name,ext,content_b64,size,created_by FROM wf_files WHERE id=?').get(+req.params.id);
+  const f = dal.getq('SELECT id,name,ext,content_b64,size,created_by FROM wf_files WHERE id=?', [+req.params.id]);
   if (!f) return res.status(404).json({ code: 404, msg: '文件不存在' });
   // P1-2 修复：非管理员只能下载自己上传的文件
   if (req.user?.role !== 'admin' && f.created_by && f.created_by !== req.user?.username) {

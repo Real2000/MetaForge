@@ -5,6 +5,7 @@
  * 鉴权统一 router.use(auth)，仅登录用户可访问
  */
 const express = require('express');
+const dal = require('../lib/dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const { db, now } = require('../db');
 const { auth } = require('../lib/auth');
 
@@ -101,12 +102,10 @@ router.post('/:id/create', (req, res) => {
   const suffix = (req.body || {}).name_suffix || '';
   const name = t.name + (suffix ? `-${suffix}` : '');
   const kbId = (req.body || {}).kb_id || null;
-  const info = db.prepare(`INSERT INTO agents (name,description,type,space_id,category,prompt,model,temperature,context_rounds,max_reply,opening,opening_questions,kb_id,status,source,tools,created_at,updated_at)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))`)
-    .run(name, t.description, t.type, db.prepare('SELECT id FROM spaces WHERE type=? AND owner=? LIMIT 1').get('personal', req.user.username)?.id || 0, t.industry, t.prompt, 'qwen-plus', 0.3, 10, 2048,
-      t.opening, JSON.stringify(t.opening_questions || []), kbId, 'published', 'self', JSON.stringify(t.tools || []));
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(req.user.username, '从模板创建智能体', `${name}（模板：${t.name}）`, req.ip, now());
+  const info = dal.runq(`INSERT INTO agents (name,description,type,space_id,category,prompt,model,temperature,context_rounds,max_reply,opening,opening_questions,kb_id,status,source,tools,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))`, [name, t.description, t.type, dal.getq('SELECT id FROM spaces WHERE type=? AND owner=? LIMIT 1', ['personal', req.user.username])?.id || 0, t.industry, t.prompt, 'qwen-plus', 0.3, 10, 2048,
+      t.opening, JSON.stringify(t.opening_questions || []), kbId, 'published', 'self', JSON.stringify(t.tools || [])]);
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '从模板创建智能体', `${name}（模板：${t.name}）`, req.ip, now()]);
   res.json({ code: 0, data: { id: info.lastInsertRowid, name } });
 });
 

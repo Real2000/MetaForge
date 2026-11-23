@@ -22,6 +22,7 @@
  *   - user 离职/部门删除仅记 op_logs 软处理（不物理删，防误删）
  */
 const express = require('express');
+const dal = require('../lib/dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const crypto = require('crypto');
 const { db, hashPwd, now } = require('../db');
 const { loadSecrets } = require('../lib/secrets');
@@ -44,8 +45,7 @@ router.use(callbackLimiter);
 /** 审计落库（op_logs；钉钉链路统一系统账号 dingtalk-sync；审计失败不阻塞主流程） */
 function logOp(action, detail, ip) {
   try {
-    db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-      .run('dingtalk-sync', action, detail || '', ip || '', now());
+    dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', ['dingtalk-sync', action, detail || '', ip || '', now()]);
   } catch { /* 审计失败不影响回调 ACK */ }
 }
 
@@ -142,8 +142,7 @@ router.post('/callback', (req, res) => {
   }
   // ⑤ 幂等去重：event_id UNIQUE 冲突 = 已处理过 → 直接 ACK 不重放（钉钉最长 24h 失败重试期间可能重复投递）
   try {
-    db.prepare('INSERT INTO dingtalk_events (event_id,event_type,payload,created_at) VALUES (?,?,?,?)')
-      .run(String(eventId), String(eventType), JSON.stringify(payload), now());
+    dal.runq('INSERT INTO dingtalk_events (event_id,event_type,payload,created_at) VALUES (?,?,?,?)', [String(eventId), String(eventType), JSON.stringify(payload), now()]);
   } catch (e) {
     // V1.3 审查加固：优先 e.code 稳定 API 判定（message 文案随版本可变；失真会把真冲突误判为库故障）
     if ((e.code && /UNIQUE/i.test(e.code)) || /UNIQUE/i.test(String(e.message || ''))) {
@@ -164,8 +163,8 @@ router.post('/callback', (req, res) => {
     else logOp('钉钉回调事件忽略', `未识别的 EventType=${eventType}（记录不处理）`, ip);
   } catch (e) {
     logOp('钉钉回调事件处理失败', `EventType=${eventType}：${e.message}（已回滚去重记录，钉钉重试自愈）`, ip);
-    try { db.prepare('DELETE FROM dingtalk_events WHERE event_id=?').run(String(eventId)); } catch { }
-    try { db.prepare('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)').run('dingtalk', `事件处理失败 ${eventType}: ${e.message}（可重放）`, now()); } catch { }
+    try { dal.runq('DELETE FROM dingtalk_events WHERE event_id=?', [String(eventId)]); } catch { }
+    try { dal.runq('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)', ['dingtalk', `事件处理失败 ${eventType}: ${e.message}（可重放）`, now()]); } catch { }
   }
   // ⑦ 钉钉要求成功响应 JSON {errcode:0}（非 0 会触发重试）
   return res.status(200).json({ errcode: 0 });
@@ -175,7 +174,7 @@ router.post('/callback', (req, res) => {
 
 /** 历史部门事件 payload → Map(钉钉 DeptId → 部门名)（后写覆盖先写，dept_modify 事件可更正名称） */
 function dingDeptIdToNames() {
-  const rows = db.prepare(`SELECT payload FROM dingtalk_events WHERE event_type IN ('dept_create','dept_modify') ORDER BY id`).all();
+  const rows = dal.q(`SELECT payload FROM dingtalk_events WHERE event_type IN ('dept_create','dept_modify') ORDER BY id`);
   const m = new Map();
   for (const r of rows) {
     try {
@@ -192,7 +191,7 @@ function localDeptIdFromDing(dingId) {
   if (dingId == null) return null;
   const name = dingDeptIdToNames().get(String(dingId));
   if (!name) return null;
-  const rows = db.prepare('SELECT id FROM departments WHERE name=?').all(name);
+  const rows = dal.q('SELECT id FROM departments WHERE name=?', [name]);
   return rows.length === 1 ? rows[0].id : null; // 同名多条 → 放弃映射（歧义时保守处理）
 }
 
@@ -201,13 +200,12 @@ function upsertDingtalkDept(payload) {
   const name = String(payload.DeptName || '').trim();
   if (!name) return; // 无部门名无法建行（钉钉正常报文不会出现）
   const parentId = localDeptIdFromDing(payload.ParentId); // 映射不到 → 挂根级（含钉钉根部门 ParentId=1/0）
-  const existing = db.prepare('SELECT id FROM departments WHERE name=? AND parent_id IS ?').get(name, parentId);
+  const existing = dal.getq('SELECT id FROM departments WHERE name=? AND parent_id IS ?', [name, parentId]);
   if (existing) return existing.id; // 已存在：幂等确认（mock 阶段无 dingtalk_id 列，改名场景退化为新 INSERT，见文件头）
-  const info = db.prepare(`INSERT INTO departments (parent_id,name,path,order_num,created_at) VALUES (?,?, '', 0, datetime('now','localtime'))`)
-    .run(parentId, name);
+  const info = dal.runq(`INSERT INTO departments (parent_id,name,path,order_num,created_at) VALUES (?,?, '', 0, datetime('now','localtime'))`, [parentId, name]);
   const id = Number(info.lastInsertRowid);
-  const parentPath = parentId ? (db.prepare('SELECT path FROM departments WHERE id=?').get(parentId)?.path || '') : '';
-  db.prepare('UPDATE departments SET path=? WHERE id=?').run(parentPath + '/' + id, id); // path 自引用二级写（departments.js 同款模式）
+  const parentPath = parentId ? (dal.getq('SELECT path FROM departments WHERE id=?', [parentId])?.path || '') : '';
+  dal.runq('UPDATE departments SET path=? WHERE id=?', [parentPath + '/' + id, id]); // path 自引用二级写（departments.js 同款模式）
   return id;
 }
 
@@ -225,35 +223,32 @@ function upsertDingtalkUser({ userId, nickname, deptIdList, phone }) {
   for (const did of list) {
     const nm = nameMap.get(String(did));
     if (!nm) continue;
-    const rows = db.prepare('SELECT id FROM departments WHERE name=?').all(nm);
+    const rows = dal.q('SELECT id FROM departments WHERE name=?', [nm]);
     if (rows.length === 1) { deptName = nm; deptId = rows[0].id; break; } // V1.3 审查加固：同名多条跳过（歧义保守）
   }
   // 手机号即账号：宽松校验防垃圾 phone 误匹配（11 位数字）
   const phoneStr = String(phone || '').trim();
   if (/^1\d{10}$/.test(phoneStr)) {
-    const byPhone = db.prepare('SELECT id FROM users WHERE username=?').get(phoneStr);
+    const byPhone = dal.getq('SELECT id FROM users WHERE username=?', [phoneStr]);
     if (byPhone) {
       // V1.3 审查加固：dept_id 用 COALESCE 保留——此前裸写，映射不到（null）时直接清空已有归属，
       // 而扫码登录恒传空 deptIdList → 每次登录都把用户 dept_id 置 NULL（visible_depts 权限判定依据静默丢失）
-      db.prepare(`UPDATE users SET nickname=COALESCE(NULLIF(?,''),nickname), dept=COALESCE(NULLIF(?,''),dept), dept_id=COALESCE(?,dept_id) WHERE id=?`)
-        .run(nickname || '', deptName, deptId, byPhone.id);
+      dal.runq(`UPDATE users SET nickname=COALESCE(NULLIF(?,''),nickname), dept=COALESCE(NULLIF(?,''),dept), dept_id=COALESCE(?,dept_id) WHERE id=?`, [nickname || '', deptName, deptId, byPhone.id]);
       return { id: byPhone.id, username: phoneStr, created: false };
     }
   }
   // dingtalk_${userId}：先查后插（重名 UNIQUE 拦截兜底 try-catch）
   const username = `dingtalk_${userId}`;
-  const existing = db.prepare('SELECT id FROM users WHERE username=?').get(username);
+  const existing = dal.getq('SELECT id FROM users WHERE username=?', [username]);
   if (existing) {
     // V1.3 审查加固：同上 dept_id COALESCE 保留
-    db.prepare(`UPDATE users SET nickname=COALESCE(NULLIF(?,''),nickname), dept=COALESCE(NULLIF(?,''),dept), dept_id=COALESCE(?,dept_id) WHERE id=?`)
-      .run(nickname || '', deptName, deptId, existing.id);
+    dal.runq(`UPDATE users SET nickname=COALESCE(NULLIF(?,''),nickname), dept=COALESCE(NULLIF(?,''),dept), dept_id=COALESCE(?,dept_id) WHERE id=?`, [nickname || '', deptName, deptId, existing.id]);
     return { id: existing.id, username, created: false };
   }
   // 新建：随机占位密码（32 字节随机 hex 再哈希——无人可登录；走正常改密/绑定流程激活）
   const password = hashPwd(crypto.randomBytes(32).toString('hex'));
-  const info = db.prepare(`INSERT INTO users (username,password,nickname,role,dept,dept_id,status,must_change_pwd,created_at)
-    VALUES (?,?,?,'user',?,?,1,0,datetime('now','localtime'))`)
-    .run(username, password, nickname || username, deptName, deptId);
+  const info = dal.runq(`INSERT INTO users (username,password,nickname,role,dept,dept_id,status,must_change_pwd,created_at)
+    VALUES (?,?,?,'user',?,?,1,0,datetime('now','localtime'))`, [username, password, nickname || username, deptName, deptId]);
   return { id: Number(info.lastInsertRowid), username, created: true };
 }
 
@@ -316,7 +311,7 @@ async function getAccessToken() {
 /** 签发与密码登录完全同构的登录响应（#14 之后统一走 JSON body，token 不落 URL） */
 function loginPayload(user) {
   const token = sign({ uid: user.id, exp: Date.now() + TOKEN_TTL_MS });
-  const u = db.prepare('SELECT id, username, nickname, role, dept, onboarded, must_change_pwd FROM users WHERE id=? AND status=1').get(user.id);
+  const u = dal.getq('SELECT id, username, nickname, role, dept, onboarded, must_change_pwd FROM users WHERE id=? AND status=1', [user.id]);
   return { token, user: { id: u.id, username: u.username, nickname: u.nickname, role: u.role, dept: u.dept, onboarded: u.onboarded ? 1 : 0 }, must_change_pwd: u.must_change_pwd ? 1 : 0 };
 }
 
@@ -356,7 +351,7 @@ router.post('/h5/login', h5Limiter, async (req, res) => {
   }
   // mock 模式：mock_user 指定本地用户名直登（凭证配置后本分支自动不可达——mock 不可能进入生产）
   if (!b.mock_user || !/^[a-zA-Z0-9_]{2,32}$/.test(b.mock_user)) return res.json({ code: 400, msg: 'mock 模式需指定本地用户名（mock_user）' });
-  const user = db.prepare('SELECT * FROM users WHERE username=? AND status=1').get(b.mock_user);
+  const user = dal.getq('SELECT * FROM users WHERE username=? AND status=1', [b.mock_user]);
   if (!user) return res.json({ code: 401, msg: '本地用户不存在或已禁用：' + b.mock_user });
   logOp('钉钉H5免登', `${b.mock_user}（mock 模式——凭证未配置）`, ip);
   res.json({ code: 0, data: loginPayload(user), mock: true });

@@ -9,6 +9,7 @@
  *  POST /api/sandbox/test           本地子进程沙箱执行测试（adminOnly 验收用）
  */
 const express = require('express');
+const dal = require('../lib/dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const { db, now } = require('../db');
 const { auth, adminOnly } = require('../lib/auth');
 const { runIsolated, runCommand } = require('../lib/sandbox');
@@ -26,20 +27,20 @@ router.get('/runs', adminOnly, (req, res) => {
   if (status && status !== 'all') { wh.push('status=?'); args.push(status); }
   if (owner) { wh.push('owner=?'); args.push(owner); }
   if (q) { wh.push('(code_digest LIKE ? OR stdout_excerpt LIKE ?)'); args.push(`%${q}%`, `%${q}%`); }
-  const rows = db.prepare(`SELECT * FROM sandbox_runs${wh.length ? ' WHERE ' + wh.join(' AND ') : ''} ORDER BY id DESC LIMIT 200`).all(...args);
+  const rows = dal.q(`SELECT * FROM sandbox_runs${wh.length ? ' WHERE ' + wh.join(' AND ') : ''} ORDER BY id DESC LIMIT 200`, [...args]);
   res.json({ code: 0, data: rows });
 });
 
 router.get('/stats', adminOnly, (req, res) => {
   const stat = {
-    total: db.prepare('SELECT COUNT(*) c FROM sandbox_runs').get().c,
-    success: db.prepare("SELECT COUNT(*) c FROM sandbox_runs WHERE status='success'").get().c,
-    failed: db.prepare("SELECT COUNT(*) c FROM sandbox_runs WHERE status='failed'").get().c,
-    timeout: db.prepare("SELECT COUNT(*) c FROM sandbox_runs WHERE status='timeout'").get().c,
-    denied: db.prepare("SELECT COUNT(*) c FROM sandbox_runs WHERE status='denied'").get().c,
+    total: dal.getq('SELECT COUNT(*) c FROM sandbox_runs').c,
+    success: dal.getq("SELECT COUNT(*) c FROM sandbox_runs WHERE status='success'").c,
+    failed: dal.getq("SELECT COUNT(*) c FROM sandbox_runs WHERE status='failed'").c,
+    timeout: dal.getq("SELECT COUNT(*) c FROM sandbox_runs WHERE status='timeout'").c,
+    denied: dal.getq("SELECT COUNT(*) c FROM sandbox_runs WHERE status='denied'").c,
     byEnv: {},
   };
-  for (const r of db.prepare('SELECT run_env, COUNT(*) c FROM sandbox_runs GROUP BY run_env').all()) {
+  for (const r of dal.q('SELECT run_env, COUNT(*) c FROM sandbox_runs GROUP BY run_env')) {
     stat.byEnv[r.run_env] = r.c;
   }
   res.json({ code: 0, data: stat });
@@ -65,17 +66,16 @@ router.post('/hosts/upsert', adminOnly, (req, res) => {
 });
 
 router.post('/hosts/:id/toggle', adminOnly, (req, res) => {
-  const old = db.prepare('SELECT id, enabled FROM remote_hosts WHERE id=?').get(Number(req.params.id));
+  const old = dal.getq('SELECT id, enabled FROM remote_hosts WHERE id=?', [Number(req.params.id)]);
   if (!old) return res.json({ code: 404, msg: '主机不存在' });
   const next = old.enabled ? 0 : 1;
-  db.prepare('UPDATE remote_hosts SET enabled=?, updated_at=? WHERE id=?').run(next, now(), old.id);
+  dal.runq('UPDATE remote_hosts SET enabled=?, updated_at=? WHERE id=?', [next, now(), old.id]);
   res.json({ code: 0, data: { enabled: !!next } });
 });
 
 router.delete('/hosts/:id', adminOnly, (req, res) => {
   deleteHost(Number(req.params.id));
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(req.user.username, '删除远程主机', `#${req.params.id}`, req.ip, now());
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '删除远程主机', `#${req.params.id}`, req.ip, now()]);
   res.json({ code: 0, msg: '已删除' });
 });
 

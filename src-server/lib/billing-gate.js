@@ -15,6 +15,7 @@
  *  - 本模块只做「实测与预检」，支付闭环可后续接入，账先算准。
  */
 const { db } = require('../db');
+const dal = require('./dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const { computeCost, priceOf, userTenantId } = require('./billing');
 
 const HOLD_TTL_MS = 10 * 60 * 1000; // 预留超时：10 分钟未结算视为僵尸（如进程崩溃遗留）
@@ -36,28 +37,28 @@ function estimateTokens(text) {
 
 /** 读取用户计费元数据（配额 + 并发上限 + 租户） */
 function userMeta(username) {
-  return db.prepare('SELECT quota_total, quota_used, cost_quota, max_concurrency, tenant_id FROM users WHERE username=?').get(username) || null;
+  return dal.getq('SELECT quota_total, quota_used, cost_quota, max_concurrency, tenant_id FROM users WHERE username=?', [username]) || null;
 }
 
 /** 回收超时的 held 预留（僵尸占用并发名额 / 台账悬挂） */
 function reapStale() {
   try {
-    db.prepare(`UPDATE billing_holds SET status='released', reason='stale', settled_at=datetime('now','localtime')
-      WHERE status='held' AND (strftime('%s','now','localtime') - strftime('%s', created_at)) * 1000 > ?`).run(HOLD_TTL_MS);
+    dal.runq(`UPDATE billing_holds SET status='released', reason='stale', settled_at=datetime('now','localtime')
+      WHERE status='held' AND (strftime('%s','now','localtime') - strftime('%s', created_at)) * 1000 > ?`, [HOLD_TTL_MS]);
   } catch { /* 回收失败不阻断主流程 */ }
 }
 
 /** 某用户当前活跃并发数（held 且未过期的预留数） */
 function activeConcurrency(username) {
   reapStale();
-  const r = db.prepare("SELECT COUNT(*) c FROM billing_holds WHERE username=? AND status='held'").get(username);
+  const r = dal.getq("SELECT COUNT(*) c FROM billing_holds WHERE username=? AND status='held'", [username]);
   return r ? r.c : 0;
 }
 
 /** 某用户某月成本口径已用（元）——以 usage_records 成本归因为准（含 D2-2 之前的存量成本） */
 function monthCostOfUser(username, month) {
   const m = /^\d{4}-\d{2}$/.test(month || '') ? month : currentMonth();
-  const r = db.prepare("SELECT COALESCE(SUM(cost),0) c FROM usage_records WHERE username=? AND dimension='model' AND created_at LIKE ? || '%'").get(username, m);
+  const r = dal.getq("SELECT COALESCE(SUM(cost),0) c FROM usage_records WHERE username=? AND dimension='model' AND created_at LIKE ? || '%'", [username, m]);
   return r ? Number(r.c) : 0;
 }
 
@@ -68,7 +69,7 @@ function monthCostOfUser(username, month) {
  */
 function tenantMonthCost(tenantId, month) {
   const m = /^\d{4}-\d{2}$/.test(month || '') ? month : currentMonth();
-  const r = db.prepare("SELECT COALESCE(SUM(cost),0) c FROM usage_records WHERE tenant_id=? AND dimension='model' AND created_at LIKE ? || '%'").get(Number(tenantId), m);
+  const r = dal.getq("SELECT COALESCE(SUM(cost),0) c FROM usage_records WHERE tenant_id=? AND dimension='model' AND created_at LIKE ? || '%'", [Number(tenantId), m]);
   return r ? Number(r.c) : 0;
 }
 
@@ -102,15 +103,13 @@ function precheck({ username, model, provider, promptText, promptTokens } = {}) 
 
   const request_id = newRequestId();
   if (block) {
-    db.prepare(`INSERT INTO billing_holds (request_id,username,model,provider,est_tokens,est_cost,status,reason,tenant_id,created_at)
-      VALUES (?,?,?,?,?,?, 'blocked', ?, ?, datetime('now','localtime'))`)
-      .run(request_id, username, model || '', provider || '', est_tokens, est_cost, block.reason, tid);
+    dal.runq(`INSERT INTO billing_holds (request_id,username,model,provider,est_tokens,est_cost,status,reason,tenant_id,created_at)
+      VALUES (?,?,?,?,?,?, 'blocked', ?, ?, datetime('now','localtime'))`, [request_id, username, model || '', provider || '', est_tokens, est_cost, block.reason, tid]);
     return { ok: false, code: block.code, reason: block.reason, request_id };
   }
 
-  db.prepare(`INSERT INTO billing_holds (request_id,username,model,provider,est_tokens,est_cost,status,reason,tenant_id,created_at)
-    VALUES (?,?,?,?,?,?, 'held', '', ?, datetime('now','localtime'))`)
-    .run(request_id, username, model || '', provider || '', est_tokens, est_cost, tid);
+  dal.runq(`INSERT INTO billing_holds (request_id,username,model,provider,est_tokens,est_cost,status,reason,tenant_id,created_at)
+    VALUES (?,?,?,?,?,?, 'held', '', ?, datetime('now','localtime'))`, [request_id, username, model || '', provider || '', est_tokens, est_cost, tid]);
   return { ok: true, request_id, est_tokens, est_cost, priced: !!price };
 }
 
@@ -120,7 +119,7 @@ function precheck({ username, model, provider, promptText, promptTokens } = {}) 
  */
 function settle({ request_id, promptTokens = 0, completionTokens = 0, model, provider } = {}) {
   if (!request_id) return { ok: false, reason: '缺少 request_id' };
-  const h = db.prepare('SELECT * FROM billing_holds WHERE request_id=?').get(request_id);
+  const h = dal.getq('SELECT * FROM billing_holds WHERE request_id=?', [request_id]);
   if (!h) return { ok: false, reason: '预留不存在' };
   if (h.status === 'settled') {
     // 幂等：已结算直接返回首次结果（不重复累计）
@@ -137,11 +136,11 @@ function settle({ request_id, promptTokens = 0, completionTokens = 0, model, pro
   const actual_tokens = pt + ct;
   const actual_cost = computeCost(pt, ct, price); // 精确：单价 × 用量，无估算项
 
-  const r = db.prepare(`UPDATE billing_holds SET model=?, provider=?, actual_tokens=?, actual_cost=?, status='settled', settled_at=datetime('now','localtime')
-    WHERE request_id=? AND status='held'`).run(useModel, useProvider, actual_tokens, actual_cost, request_id);
+  const r = dal.runq(`UPDATE billing_holds SET model=?, provider=?, actual_tokens=?, actual_cost=?, status='settled', settled_at=datetime('now','localtime')
+    WHERE request_id=? AND status='held'`, [useModel, useProvider, actual_tokens, actual_cost, request_id]);
   if (!r.changes) {
     // 竞态：另一路径已结算/释放，回读当前值
-    const cur = db.prepare('SELECT status, actual_tokens, actual_cost FROM billing_holds WHERE request_id=?').get(request_id);
+    const cur = dal.getq('SELECT status, actual_tokens, actual_cost FROM billing_holds WHERE request_id=?', [request_id]);
     if (cur && cur.status === 'settled') return { ok: true, idempotent: true, actual_tokens: cur.actual_tokens, actual_cost: cur.actual_cost, priced: true };
     return { ok: false, reason: `预留状态为 ${cur ? cur.status : 'unknown'}，不可结算` };
   }
@@ -151,8 +150,8 @@ function settle({ request_id, promptTokens = 0, completionTokens = 0, model, pro
 /** 释放预留（异常/中断/未结算收尾时调用）。幂等：仅对 held 生效，重复调用无副作用。 */
 function release(request_id, reason = 'released') {
   if (!request_id) return { ok: false, reason: '缺少 request_id' };
-  const r = db.prepare(`UPDATE billing_holds SET status='released', reason=?, settled_at=datetime('now','localtime')
-    WHERE request_id=? AND status='held'`).run(String(reason || 'released').slice(0, 200), request_id);
+  const r = dal.runq(`UPDATE billing_holds SET status='released', reason=?, settled_at=datetime('now','localtime')
+    WHERE request_id=? AND status='held'`, [String(reason || 'released').slice(0, 200), request_id]);
   return { ok: true, changed: r.changes };
 }
 
@@ -163,8 +162,8 @@ function release(request_id, reason = 'released') {
  */
 function reconcile({ month } = {}) {
   const m = /^\d{4}-\d{2}$/.test(month || '') ? month : currentMonth();
-  const rows = db.prepare(`SELECT dimension_key AS model, meta, tokens, cost, prompt_tokens, completion_tokens
-    FROM usage_records WHERE dimension='model' AND created_at LIKE ? || '%'`).all(m);
+  const rows = dal.q(`SELECT dimension_key AS model, meta, tokens, cost, prompt_tokens, completion_tokens
+    FROM usage_records WHERE dimension='model' AND created_at LIKE ? || '%'`, [m]);
 
   const map = new Map(); // model -> 聚合
   let unPricedCalls = 0;
@@ -221,12 +220,12 @@ function reconcile({ month } = {}) {
   total.balanced = Math.abs(total.diff) < 1e-9;
 
   // 闸门台账汇总（held/settled/released/blocked）
-  const g = db.prepare(`SELECT status, COUNT(*) c, COALESCE(SUM(actual_cost),0) cost
-    FROM billing_holds WHERE created_at LIKE ? || '%' GROUP BY status`).all(m);
+  const g = dal.q(`SELECT status, COUNT(*) c, COALESCE(SUM(actual_cost),0) cost
+    FROM billing_holds WHERE created_at LIKE ? || '%' GROUP BY status`, [m]);
   const gate = { held: 0, settled: 0, released: 0, blocked: 0, settled_cost: 0 };
   for (const row of g) { gate[row.status] = row.c; if (row.status === 'settled') gate.settled_cost = round6(row.cost); }
   reapStale();
-  gate.active = db.prepare("SELECT COUNT(*) c FROM billing_holds WHERE status='held'").get().c;
+  gate.active = dal.getq("SELECT COUNT(*) c FROM billing_holds WHERE status='held'").c;
 
   return { month: m, items, total, gate };
 }
@@ -235,13 +234,13 @@ function reconcile({ month } = {}) {
 function stats({ month } = {}) {
   const m = /^\d{4}-\d{2}$/.test(month || '') ? month : currentMonth();
   reapStale();
-  const byCode = db.prepare(`SELECT reason, COUNT(*) c FROM billing_holds WHERE status='blocked' AND created_at LIKE ? || '%' GROUP BY reason ORDER BY c DESC LIMIT 20`).all(m);
-  const counts = db.prepare(`SELECT status, COUNT(*) c FROM billing_holds WHERE created_at LIKE ? || '%' GROUP BY status`).all(m);
+  const byCode = dal.q(`SELECT reason, COUNT(*) c FROM billing_holds WHERE status='blocked' AND created_at LIKE ? || '%' GROUP BY reason ORDER BY c DESC LIMIT 20`, [m]);
+  const counts = dal.q(`SELECT status, COUNT(*) c FROM billing_holds WHERE created_at LIKE ? || '%' GROUP BY status`, [m]);
   const c = { held: 0, settled: 0, released: 0, blocked: 0 };
   for (const row of counts) c[row.status] = row.c;
-  const active = db.prepare("SELECT COUNT(*) c FROM billing_holds WHERE status='held'").get().c;
+  const active = dal.getq("SELECT COUNT(*) c FROM billing_holds WHERE status='held'").c;
   // 当前并发 TOP（按用户）
-  const conc = db.prepare("SELECT username, COUNT(*) c FROM billing_holds WHERE status='held' GROUP BY username ORDER BY c DESC LIMIT 20").all();
+  const conc = dal.q("SELECT username, COUNT(*) c FROM billing_holds WHERE status='held' GROUP BY username ORDER BY c DESC LIMIT 20");
   return { month: m, ...c, active, blocked_by_reason: byCode, active_by_user: conc };
 }
 

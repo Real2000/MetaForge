@@ -12,6 +12,7 @@
  * P1-13：每次执行落 sandbox_runs（run_env=remote-ssh / docker）。
  */
 const { spawn } = require('child_process');
+const dal = require('./dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const crypto = require('crypto');
 const { db, now } = require('../db');
 const { encrypt, decrypt } = require('./crypto-util');
@@ -25,36 +26,34 @@ function upsertHost({ id, name, host, port, username, credential, credentialType
   const fp = String(fingerprint || '').trim();
   const mode = ['strict', 'accept-new', 'off'].includes(knownHostsMode) ? knownHostsMode : 'strict';
   if (id) {
-    const old = db.prepare('SELECT * FROM remote_hosts WHERE id=?').get(id);
+    const old = dal.getq('SELECT * FROM remote_hosts WHERE id=?', [id]);
     if (!old) throw new Error('主机不存在');
-    db.prepare(`UPDATE remote_hosts SET name=?, host=?, port=?, username=?, credential=?, credential_type=?,
-      fingerprint=?, known_hosts_mode=?, docker_enabled=?, enabled=?, updated_at=? WHERE id=?`)
-      .run(n, h, port ?? old.port, username ?? old.username,
+    dal.runq(`UPDATE remote_hosts SET name=?, host=?, port=?, username=?, credential=?, credential_type=?,
+      fingerprint=?, known_hosts_mode=?, docker_enabled=?, enabled=?, updated_at=? WHERE id=?`, [n, h, port ?? old.port, username ?? old.username,
         credential === undefined ? old.credential : enc,
         credentialType || old.credential_type, fp || old.fingerprint, mode,
         dockerEnabled === undefined ? old.docker_enabled : (dockerEnabled ? 1 : 0),
-        enabled === undefined ? old.enabled : (enabled ? 1 : 0), now(), id);
-    return db.prepare('SELECT id, name, host FROM remote_hosts WHERE id=?').get(id);
+        enabled === undefined ? old.enabled : (enabled ? 1 : 0), now(), id]);
+    return dal.getq('SELECT id, name, host FROM remote_hosts WHERE id=?', [id]);
   }
   if (mode === 'strict' && !fp) {
     throw new Error('strict 模式必须预登记主机指纹（ssh-keyscan 获取），否则无法校验主机身份');
   }
-  const info = db.prepare(`INSERT INTO remote_hosts (name, host, port, username, credential, credential_type, fingerprint, known_hosts_mode, docker_enabled, enabled, created_by, created_at, updated_at)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-    .run(n, h, port || 22, String(username || ''), enc, credentialType === 'key' ? 'key' : 'password',
+  const info = dal.runq(`INSERT INTO remote_hosts (name, host, port, username, credential, credential_type, fingerprint, known_hosts_mode, docker_enabled, enabled, created_by, created_at, updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`, [n, h, port || 22, String(username || ''), enc, credentialType === 'key' ? 'key' : 'password',
       fp, mode, dockerEnabled ? 1 : 0, enabled === undefined ? 1 : (enabled ? 1 : 0),
-      String(createdBy || ''), now(), now());
-  return db.prepare('SELECT id, name, host FROM remote_hosts WHERE id=?').get(info.lastInsertRowid);
+      String(createdBy || ''), now(), now()]);
+  return dal.getq('SELECT id, name, host FROM remote_hosts WHERE id=?', [info.lastInsertRowid]);
 }
 
 /** 列表（凭据不回显） */
 function listHosts() {
-  const rows = db.prepare('SELECT * FROM remote_hosts ORDER BY id').all();
+  const rows = dal.q('SELECT * FROM remote_hosts ORDER BY id');
   return rows.map(r => ({ ...r, credential: r.credential ? '••••••••' : '', has_credential: !!r.credential }));
 }
 
 function deleteHost(id) {
-  db.prepare('DELETE FROM remote_hosts WHERE id=?').run(id);
+  dal.runq('DELETE FROM remote_hosts WHERE id=?', [id]);
 }
 
 // ---------------- 密钥校验 ----------------
@@ -74,18 +73,18 @@ function knownHostsArgs(host, port, mode, fingerprint) {
  *  返回 { status, stdout, stderr, durationMs, runId }；永不 reject。 */
 async function execRemote(hostId, command, opts = {}) {
   const { docker = false, timeoutMs = 20000, owner = '', agentId = null, sessionId = null } = opts;
-  const row = db.prepare('SELECT * FROM remote_hosts WHERE id=?').get(hostId);
+  const row = dal.getq('SELECT * FROM remote_hosts WHERE id=?', [hostId]);
   // ① 白名单：主机必须已登记且启用
   if (!row) return { status: 'denied', stdout: '', stderr: '主机未登记（远端白名单拒绝执行）' };
   if (!row.enabled) return { status: 'denied', stdout: '', stderr: `主机「${row.name}」已停用` };
 
   const runEnv = docker && row.docker_enabled ? 'docker' : 'remote-ssh';
-  const runInfo = db.prepare(`INSERT INTO sandbox_runs (run_env, owner, agent_id, session_id, status, code_digest, created_at)
-    VALUES (?, ?, ?, ?, 'running', ?, ?)`).run(runEnv, owner, agentId, sessionId, digestOf(command), now());
+  const runInfo = dal.runq(`INSERT INTO sandbox_runs (run_env, owner, agent_id, session_id, status, code_digest, created_at)
+    VALUES (?, ?, ?, ?, 'running', ?, ?)`, [runEnv, owner, agentId, sessionId, digestOf(command), now()]);
   const runId = Number(runInfo.lastInsertRowid);
 
   if (docker && !row.docker_enabled) {
-    db.prepare('UPDATE sandbox_runs SET status=?, stderr_excerpt=? WHERE id=?').run('denied', '该主机未启用 Docker 执行', runId);
+    dal.runq('UPDATE sandbox_runs SET status=?, stderr_excerpt=? WHERE id=?', ['denied', '该主机未启用 Docker 执行', runId]);
     return { status: 'denied', stdout: '', stderr: '该主机未启用 Docker 执行（remote_hosts.docker_enabled=0）', runId };
   }
 
@@ -117,15 +116,14 @@ async function execRemote(hostId, command, opts = {}) {
     child.stderr.on('data', d => err.push(d.toString()));
     child.on('error', e => {
       clearTimeout(killer); kh.cleanup?.(); if (keyFile) try { require('fs').unlinkSync(keyFile); } catch { }
-      db.prepare('UPDATE sandbox_runs SET status=?, stderr_excerpt=?, duration_ms=? WHERE id=?').run('failed', 'ssh 启动失败（本机可能无 ssh）：' + e.message, Date.now() - t0, runId);
+      dal.runq('UPDATE sandbox_runs SET status=?, stderr_excerpt=?, duration_ms=? WHERE id=?', ['failed', 'ssh 启动失败（本机可能无 ssh）：' + e.message, Date.now() - t0, runId]);
       resolve({ status: 'failed', stdout: '', stderr: 'ssh 启动失败：' + e.message, runId });
     });
     child.on('close', (code) => {
       clearTimeout(killer); kh.cleanup?.(); if (keyFile) try { require('fs').unlinkSync(keyFile); } catch { }
       const stdout = out.join('').slice(0, 8192), stderr = err.join('').slice(0, 4096);
       const status = killed ? 'timeout' : (code === 0 ? 'success' : 'failed');
-      db.prepare('UPDATE sandbox_runs SET status=?, exit_code=?, duration_ms=?, node_version=?, stdout_excerpt=?, stderr_excerpt=? WHERE id=?')
-        .run(status, code ?? -1, Date.now() - t0, `${row.host}:${row.port}`, stdout.slice(0, 2000), stderr.slice(0, 1000), runId);
+      dal.runq('UPDATE sandbox_runs SET status=?, exit_code=?, duration_ms=?, node_version=?, stdout_excerpt=?, stderr_excerpt=? WHERE id=?', [status, code ?? -1, Date.now() - t0, `${row.host}:${row.port}`, stdout.slice(0, 2000), stderr.slice(0, 1000), runId]);
       resolve({ status, stdout, stderr, runId });
     });
   });

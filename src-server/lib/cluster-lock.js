@@ -15,6 +15,7 @@
  * 注意：本文件用 SQL 语句作为跨进程临界区，多进程各自持有独立 SQLite 连接（WAL），依赖单条 upsert 的原子性。
  */
 const os = require('os');
+const dal = require('./dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const { db } = require('../db');
 const lockRedis = require('./lock-redis'); // MT-15：跨机分布式锁后端（Redis）
 
@@ -54,14 +55,14 @@ function _resetClusterModeCache() { _clusterMode = null; }
 function acquire(name, ttlMs = DEFAULT_TTL_MS, owner = ownerId()) {
   const nowMs = Date.now();
   const exp = nowMs + ttlMs;
-  db.prepare(`
+  dal.runq(`
     INSERT INTO cluster_locks (name, owner, acquired_at, expires_at)
     VALUES (@name, @owner, @now, @exp)
     ON CONFLICT(name) DO UPDATE SET
       owner = excluded.owner, acquired_at = excluded.acquired_at, expires_at = excluded.expires_at
     WHERE cluster_locks.owner = excluded.owner OR cluster_locks.expires_at < excluded.acquired_at
-  `).run({ name, owner, now: nowMs, exp });
-  const row = db.prepare('SELECT owner, expires_at FROM cluster_locks WHERE name=?').get(name);
+  `, [{ name, owner, now: nowMs, exp }]);
+  const row = dal.getq('SELECT owner, expires_at FROM cluster_locks WHERE name=?', [name]);
   return !!(row && row.owner === owner && row.expires_at > nowMs);
 }
 
@@ -71,7 +72,7 @@ function acquire(name, ttlMs = DEFAULT_TTL_MS, owner = ownerId()) {
  */
 function isLeader(name, owner = ownerId()) {
   if (!isClusterMode()) return true;
-  const row = db.prepare('SELECT owner, expires_at FROM cluster_locks WHERE name=?').get(name);
+  const row = dal.getq('SELECT owner, expires_at FROM cluster_locks WHERE name=?', [name]);
   return !!(row && row.owner === owner && row.expires_at > Date.now());
 }
 
@@ -80,13 +81,13 @@ function renew(name, ttlMs = DEFAULT_TTL_MS, owner = ownerId()) { return acquire
 
 /** 主动让位（仅删除本进程持有的记录） */
 function release(name, owner = ownerId()) {
-  const r = db.prepare('DELETE FROM cluster_locks WHERE name=? AND owner=?').run(name, owner);
+  const r = dal.runq('DELETE FROM cluster_locks WHERE name=? AND owner=?', [name, owner]);
   return r.changes > 0;
 }
 
 /** 查询锁当前状态（监控/诊断用） */
 function info(name) {
-  return db.prepare('SELECT * FROM cluster_locks WHERE name=?').get(name) || null;
+  return dal.getq('SELECT * FROM cluster_locks WHERE name=?', [name]) || null;
 }
 
 // ===================== MT-15：锁后端选择 + 异步统一 API（支持跨机） =====================

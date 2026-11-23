@@ -6,6 +6,7 @@
  * V1.2 审查加固 2026-10-30：metadataFilter 为智能体声明的知识库元数据过滤（chat 链路按请求用户解析后传入）
  */
 const { retrieve } = require('./retriever');
+const dal = require('./dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const mcp = require('./mcp');
 const mcCreds = require('./mcp-credentials'); // D2-4：MCP 托管凭据（运行期解密注入）
 const { db } = require('../db');
@@ -284,7 +285,7 @@ function loadMcpTools(agentMcpIds) {
   let ids = [];
   try { ids = JSON.parse(agentMcpIds || '[]'); } catch { }
   if (!ids.length) return [];
-  const servers = db.prepare(`SELECT * FROM mcp_servers WHERE status=1`).all().filter(s => ids.includes(s.id));
+  const servers = dal.q(`SELECT * FROM mcp_servers WHERE status=1`).filter(s => ids.includes(s.id));
   const out = [];
   for (const s of servers) {
     let overrides = {};

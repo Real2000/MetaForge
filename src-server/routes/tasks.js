@@ -1,5 +1,6 @@
 /** 任务管理：CRUD / 立即执行 / 执行记录（P5.31：任务归属——创建者自有，管理员全局可见可管） */
 const express = require('express');
+const dal = require('../lib/dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const crypto = require('crypto');
 const { db, now } = require('../db');
 const { auth } = require('../lib/auth');
@@ -25,14 +26,14 @@ function denyIfNotTaskOwner(task, user) {
 // 「建满20→全停用→再建20→逐个重新启用」可无限绕过上限）
 function denyIfOverTaskQuota(user) {
   if (user.role === 'admin') return null;
-  const cnt = db.prepare('SELECT COUNT(*) c FROM tasks WHERE username=? AND enabled=1').get(user.username).c;
+  const cnt = dal.getq('SELECT COUNT(*) c FROM tasks WHERE username=? AND enabled=1', [user.username]).c;
   if (cnt >= 20) return { code: 400, msg: '已达任务数量上限（20 个启用中），请先停用或删除不需要的任务' };
   return null;
 }
 
 // P5.31+P5.33：非管理员绑定智能体需 published + canView（POST 与 PUT 共用；此前 PUT 可改绑任意智能体越权）
 function denyIfAgentNotAllowed(targetId, user) {
-  const agent = db.prepare('SELECT * FROM agents WHERE id=?').get(targetId);
+  const agent = dal.getq('SELECT * FROM agents WHERE id=?', [targetId]);
   if (!agent || agent.status !== 'published') return { code: 400, msg: '目标智能体不存在或未发布' };
   if (user.role !== 'admin' && !canView(agent, user)) return { code: 403, msg: '无权绑定该智能体（未对你开放）' };
   return null;
@@ -42,7 +43,7 @@ function denyIfAgentNotAllowed(targetId, user) {
 // POST /api/tasks/webhook/:token  body 可传 {input|message|text|content} 覆盖默认输入；兼容企业微信/钉钉格式
 router.post('/webhook/:token', webhookLimiter, async (req, res) => {
   const token = String(req.params.token || '');
-  const task = db.prepare('SELECT * FROM tasks WHERE webhook_token=? AND enabled=1').get(token);
+  const task = dal.getq('SELECT * FROM tasks WHERE webhook_token=? AND enabled=1', [token]);
   if (!task) return res.status(404).json({ code: 404, msg: 'Webhook 不存在或已停用' });
   if (task.exec_type !== 'webhook') return res.status(400).json({ code: 400, msg: '该任务未启用 Webhook 触发模式' });
   // 请求体覆盖默认 input：body.input / message / text / content / text.content（兼容企微钉钉）
@@ -74,9 +75,9 @@ router.get('/', (req, res) => {
   if (req.user.role !== 'admin') { conds.push('t.username=?'); args.push(req.user.username); }
   if (scope != null) { conds.push('t.tenant_id=?'); args.push(scope); }
   const where = conds.length ? ' WHERE ' + conds.join(' AND ') : '';
-  const rows = db.prepare(`
+  const rows = dal.q(`
     SELECT t.*, a.name AS agent_name FROM tasks t LEFT JOIN agents a ON a.id=t.target_id${where}
-    ORDER BY t.id DESC`).all(...args);
+    ORDER BY t.id DESC`, [...args]);
   res.json({ code: 0, data: rows });
 });
 
@@ -94,26 +95,25 @@ router.post('/', (req, res) => {
   // P5.8 #11：exec_type 支持 once/cron/webhook；webhook 自动生成鉴权 token
   const et = exec_type === 'cron' ? 'cron' : (exec_type === 'webhook' ? 'webhook' : 'once');
   const webhookToken = et === 'webhook' ? 'whk_' + crypto.randomBytes(16).toString('hex') : '';
-  const info = db.prepare(`INSERT INTO tasks (name,target_type,target_id,exec_type,cron,params,webhook_token,enabled,username,created_at)
-    VALUES (?, 'agent', ?, ?, ?, ?, ?, 1, ?, datetime('now','localtime'))`)
-    .run(name.trim(), target_id, et, et === 'cron' ? cron : null, params || '{}', webhookToken, req.user.username);
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)').run(req.user.username, '创建任务', name.trim(), req.ip, now());
+  const info = dal.runq(`INSERT INTO tasks (name,target_type,target_id,exec_type,cron,params,webhook_token,enabled,username,created_at)
+    VALUES (?, 'agent', ?, ?, ?, ?, ?, 1, ?, datetime('now','localtime'))`, [name.trim(), target_id, et, et === 'cron' ? cron : null, params || '{}', webhookToken, req.user.username]);
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '创建任务', name.trim(), req.ip, now()]);
   res.json({ code: 0, data: { id: info.lastInsertRowid, webhook_token: webhookToken || undefined } });
 });
 
 // P5.8 #11：生成/重置 Webhook token（启用 webhook 触发；返回完整调用 URL）
 router.post('/:id/webhook-token', (req, res) => {
-  const old = db.prepare('SELECT * FROM tasks WHERE id=?').get(req.params.id);
+  const old = dal.getq('SELECT * FROM tasks WHERE id=?', [req.params.id]);
   const deny = denyIfNotTaskOwner(old, req.user); // P5.31：归属校验
   if (deny) return res.json(deny);
   const token = 'whk_' + crypto.randomBytes(16).toString('hex');
-  db.prepare("UPDATE tasks SET exec_type='webhook', webhook_token=? WHERE id=?").run(token, old.id);
+  dal.runq("UPDATE tasks SET exec_type='webhook', webhook_token=? WHERE id=?", [token, old.id]);
   const host = req.get('host') || `localhost:${process.env.PORT || 3210}`;
   res.json({ code: 0, data: { webhook_token: token, url: `http://${host}/api/tasks/webhook/${token}` }, msg: 'Webhook 已启用' });
 });
 
 router.put('/:id', (req, res) => {
-  const old = db.prepare('SELECT * FROM tasks WHERE id=?').get(req.params.id);
+  const old = dal.getq('SELECT * FROM tasks WHERE id=?', [req.params.id]);
   const deny = denyIfNotTaskOwner(old, req.user); // P5.31：归属校验
   if (deny) return res.json(deny);
   const { name, target_id, exec_type, cron, params } = req.body || {};
@@ -125,13 +125,12 @@ router.put('/:id', (req, res) => {
   }
   if (exec_type === 'cron' && (!cron || !parseCron(cron))) return res.json({ code: 400, msg: 'Cron 表达式不合法' });
   const et = exec_type === 'cron' ? 'cron' : (exec_type === 'webhook' ? 'webhook' : (exec_type || old.exec_type));
-  db.prepare('UPDATE tasks SET name=?,target_id=?,exec_type=?,cron=?,params=? WHERE id=?')
-    .run(name || old.name, target_id || old.target_id, et, et === 'cron' ? (cron || old.cron) : null, params ?? old.params, old.id);
+  dal.runq('UPDATE tasks SET name=?,target_id=?,exec_type=?,cron=?,params=? WHERE id=?', [name || old.name, target_id || old.target_id, et, et === 'cron' ? (cron || old.cron) : null, params ?? old.params, old.id]);
   res.json({ code: 0, msg: '已保存' });
 });
 
 router.post('/:id/toggle', (req, res) => {
-  const old = db.prepare('SELECT * FROM tasks WHERE id=?').get(req.params.id);
+  const old = dal.getq('SELECT * FROM tasks WHERE id=?', [req.params.id]);
   const deny = denyIfNotTaskOwner(old, req.user); // P5.31：归属校验
   if (deny) return res.json(deny);
   // P5.33 审查修复（F4）：重新启用时复核任务配额（堵「建满→停用→再建→启用」的无限绕过）
@@ -139,36 +138,35 @@ router.post('/:id/toggle', (req, res) => {
     const quotaDeny = denyIfOverTaskQuota(req.user);
     if (quotaDeny) return res.json(quotaDeny);
   }
-  db.prepare('UPDATE tasks SET enabled=? WHERE id=?').run(old.enabled ? 0 : 1, old.id);
+  dal.runq('UPDATE tasks SET enabled=? WHERE id=?', [old.enabled ? 0 : 1, old.id]);
   res.json({ code: 0, msg: old.enabled ? '已停用' : '已启用' });
 });
 
 router.delete('/:id', (req, res) => {
-  const old = db.prepare('SELECT * FROM tasks WHERE id=?').get(req.params.id);
+  const old = dal.getq('SELECT * FROM tasks WHERE id=?', [req.params.id]);
   const deny = denyIfNotTaskOwner(old, req.user); // P5.31：归属校验
   if (deny) return res.json(deny);
-  db.prepare('DELETE FROM tasks WHERE id=?').run(req.params.id);
-  db.prepare('DELETE FROM task_runs WHERE task_id=?').run(req.params.id);
-  if (old) db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)').run(req.user.username, '删除任务', old.name, req.ip, now());
+  dal.runq('DELETE FROM tasks WHERE id=?', [req.params.id]);
+  dal.runq('DELETE FROM task_runs WHERE task_id=?', [req.params.id]);
+  if (old) dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '删除任务', old.name, req.ip, now()]);
   res.json({ code: 0, msg: '已删除' });
 });
 
 router.post('/:id/run', async (req, res) => {
-  const task = db.prepare('SELECT * FROM tasks WHERE id=?').get(req.params.id);
+  const task = dal.getq('SELECT * FROM tasks WHERE id=?', [req.params.id]);
   const deny = denyIfNotTaskOwner(task, req.user); // P5.31：归属校验
   if (deny) return res.json(deny);
   if (!task.enabled) return res.json({ code: 400, msg: '任务已停用，无法执行' });
   const r = await runTask(task);
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(req.user.username, '手动执行任务', `${task.name}（${r.status === 'success' ? '成功' : '失败'}）`, req.ip, now());
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '手动执行任务', `${task.name}（${r.status === 'success' ? '成功' : '失败'}）`, req.ip, now()]);
   res.json({ code: 0, data: r });
 });
 
 router.get('/:id/runs', (req, res) => {
-  const task = db.prepare('SELECT * FROM tasks WHERE id=?').get(req.params.id);
+  const task = dal.getq('SELECT * FROM tasks WHERE id=?', [req.params.id]);
   const deny = denyIfNotTaskOwner(task, req.user); // P5.31：归属校验（执行记录含产出内容，不可泄露）
   if (deny) return res.json(deny);
-  res.json({ code: 0, data: db.prepare('SELECT * FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 50').all(req.params.id) });
+  res.json({ code: 0, data: dal.q('SELECT * FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 50', [req.params.id]) });
 });
 
 module.exports = router;

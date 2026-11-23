@@ -16,6 +16,7 @@
  * P1-13：每次执行落 sandbox_runs 审计（环境/归属/状态/版本/产物）。
  */
 const { spawn } = require('child_process');
+const dal = require('./dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const storage = require('./storage'); // P1-19 对象存储抽象层
 const crypto = require('crypto');
 const fs = require('fs');
@@ -98,8 +99,8 @@ async function runIsolated(opts) {
   const workDir = path.join(os.tmpdir(), sbxId);
   const digest = digestOf(code);
   // P1-13 审计行（running 态先落库，终态回写）
-  const runInfo = db.prepare(`INSERT INTO sandbox_runs (run_env, owner, agent_id, session_id, status, code_digest, created_at)
-    VALUES ('local-process', ?, ?, ?, 'running', ?, ?)`).run(owner, agentId, sessionId, digest, now());
+  const runInfo = dal.runq(`INSERT INTO sandbox_runs (run_env, owner, agent_id, session_id, status, code_digest, created_at)
+    VALUES ('local-process', ?, ?, ?, 'running', ?, ?)`, [owner, agentId, sessionId, digest, now()]);
   const runId = Number(runInfo.lastInsertRowid);
 
   try { fs.mkdirSync(workDir, { recursive: true }); } catch { }
@@ -129,7 +130,7 @@ async function runIsolated(opts) {
       }
     }
   } catch (e) {
-    db.prepare('UPDATE sandbox_runs SET status=?, stderr_excerpt=?, created_at=? WHERE id=?').run('failed', '写入脚本失败: ' + e.message, now(), runId);
+    dal.runq('UPDATE sandbox_runs SET status=?, stderr_excerpt=?, created_at=? WHERE id=?', ['failed', '写入脚本失败: ' + e.message, now(), runId]);
     return { status: 'failed', stderr: '写入脚本失败: ' + e.message, stdout: '', artifacts: [], runId };
   }
 
@@ -151,7 +152,7 @@ async function runIsolated(opts) {
     child.on('error', e => {
       clearTimeout(killer);
       const msg = '子进程启动失败：' + e.message;
-      db.prepare('UPDATE sandbox_runs SET status=?, stderr_excerpt=?, duration_ms=? WHERE id=?').run('failed', msg, Date.now() - t0, runId);
+      dal.runq('UPDATE sandbox_runs SET status=?, stderr_excerpt=?, duration_ms=? WHERE id=?', ['failed', msg, Date.now() - t0, runId]);
       resolve({ status: 'failed', stderr: msg, stdout: '', artifacts: [], runId });
     });
     child.on('close', (exitCode) => {
@@ -180,8 +181,7 @@ async function runIsolated(opts) {
       const stderr = scrub(err.join('')).slice(0, OUT_LIMIT);
       const status = killed ? 'timeout' : (exitCode === 0 ? 'success' : 'failed');
       // P1-13 终态回写（含 node 版本）
-      db.prepare('UPDATE sandbox_runs SET status=?, exit_code=?, duration_ms=?, node_version=?, artifacts=?, stdout_excerpt=?, stderr_excerpt=? WHERE id=?')
-        .run(status, exitCode ?? -1, durationMs, process.versions.node, JSON.stringify(artifacts), stdout.slice(0, 2000), stderr.slice(0, 1000), runId);
+      dal.runq('UPDATE sandbox_runs SET status=?, exit_code=?, duration_ms=?, node_version=?, artifacts=?, stdout_excerpt=?, stderr_excerpt=? WHERE id=?', [status, exitCode ?? -1, durationMs, process.versions.node, JSON.stringify(artifacts), stdout.slice(0, 2000), stderr.slice(0, 1000), runId]);
       resolve({ status, exitCode, stdout, stderr, durationMs, artifacts, runId });
     });
   });
@@ -197,8 +197,8 @@ function runCommand(cmd, { timeoutMs = 10000, workDir, owner, agentId, sessionId
   if (!ALLOWED_CMDS.has(base)) {
     return { status: 'denied', stdout: '', stderr: `命令 "${base}" 不在白名单内（可执行：${[...ALLOWED_CMDS].slice(0, 12).join('、')}…）。危险或未分级命令一律拒绝。` };
   }
-  const runInfo = db.prepare(`INSERT INTO sandbox_runs (run_env, owner, agent_id, session_id, status, code_digest, created_at)
-    VALUES ('local-process', ?, ?, ?, 'running', ?, ?)`).run(owner || '', agentId || null, sessionId || null, digestOf(cmd), now());
+  const runInfo = dal.runq(`INSERT INTO sandbox_runs (run_env, owner, agent_id, session_id, status, code_digest, created_at)
+    VALUES ('local-process', ?, ?, ?, 'running', ?, ?)`, [owner || '', agentId || null, sessionId || null, digestOf(cmd), now()]);
   const runId = Number(runInfo.lastInsertRowid);
   return new Promise((resolve) => {
     const child = spawn(base, parts.slice(1), { shell: false, cwd: workDir || os.tmpdir(), stdio: ['ignore', 'pipe', 'pipe'], env: { PATH: process.env.PATH || '/usr/bin:/bin' } });
@@ -210,15 +210,14 @@ function runCommand(cmd, { timeoutMs = 10000, workDir, owner, agentId, sessionId
     const t0 = Date.now();
     child.on('error', e => {
       clearTimeout(killer);
-      db.prepare('UPDATE sandbox_runs SET status=?, stderr_excerpt=?, duration_ms=? WHERE id=?').run('failed', e.message, Date.now() - t0, runId);
+      dal.runq('UPDATE sandbox_runs SET status=?, stderr_excerpt=?, duration_ms=? WHERE id=?', ['failed', e.message, Date.now() - t0, runId]);
       resolve({ status: 'failed', stdout: '', stderr: e.message, runId });
     });
     child.on('close', (code) => {
       clearTimeout(killer);
       const stdout = out.join('').slice(0, OUT_LIMIT), stderr = err.join('').slice(0, OUT_LIMIT);
       const status = killed ? 'timeout' : (code === 0 ? 'success' : 'failed');
-      db.prepare('UPDATE sandbox_runs SET status=?, exit_code=?, duration_ms=?, stdout_excerpt=?, stderr_excerpt=? WHERE id=?')
-        .run(status, code ?? -1, Date.now() - t0, stdout.slice(0, 2000), stderr.slice(0, 1000), runId);
+      dal.runq('UPDATE sandbox_runs SET status=?, exit_code=?, duration_ms=?, stdout_excerpt=?, stderr_excerpt=? WHERE id=?', [status, code ?? -1, Date.now() - t0, stdout.slice(0, 2000), stderr.slice(0, 1000), runId]);
       resolve({ status, stdout, stderr, runId });
     });
   });

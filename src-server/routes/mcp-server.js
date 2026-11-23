@@ -6,6 +6,7 @@
  * 注意路径避让：客户端管理路由已占用 /api/mcp（routes/mcp.js），本端点用 /mcp 与 /api/mcp-server
  */
 const express = require('express');
+const dal = require('../lib/dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const crypto = require('crypto');
 const { db, now } = require('../db');
 const { auth, adminOnly } = require('../lib/auth');
@@ -31,14 +32,14 @@ async function runAgentAsTool(agent, input, inputVars) {
 }
 
 function listPublishedAgents() {
-  return db.prepare(`SELECT id,name,description,edit_mode,routing_mode,workflow FROM agents WHERE status='published' ORDER BY id`).all();
+  return dal.q(`SELECT id,name,description,edit_mode,routing_mode,workflow FROM agents WHERE status='published' ORDER BY id`);
 }
 
 // ================= MCP 协议端点（POST /mcp，Bearer 令牌） =================
 router.post('/', async (req, res) => {
   const token = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
   // SEC-02a：库中 token 列为 HMAC 哈希——按哈希比对
-  const tk = db.prepare('SELECT * FROM mcp_tokens WHERE token=? AND status=1').get(hashKey(token));
+  const tk = dal.getq('SELECT * FROM mcp_tokens WHERE token=? AND status=1', [hashKey(token)]);
   if (!tk) {
     return res.status(401).json({ jsonrpc: '2.0', id: (req.body || {}).id ?? null, error: { code: -32001, message: 'Unauthorized: invalid or disabled MCP token' } });
   }
@@ -46,7 +47,7 @@ router.post('/', async (req, res) => {
   const { id, method, params } = msg;
   // notification（无 id）：确认类通知一律 202 空响应（Streamable HTTP 规范）
   if (id === undefined || id === null) {
-    try { db.prepare('UPDATE mcp_tokens SET last_used_at=? WHERE id=?').run(now(), tk.id); } catch { }
+    try { dal.runq('UPDATE mcp_tokens SET last_used_at=? WHERE id=?', [now(), tk.id]); } catch { }
     return res.status(202).end();
   }
   const ok = result => res.json({ jsonrpc: '2.0', id, result });
@@ -88,7 +89,7 @@ router.post('/', async (req, res) => {
         if (tk.agent_id !== +m[1]) {
           return ok({ content: [{ type: 'text', text: `令牌无权访问该智能体（令牌已绑定作用域，仅可调用 agent_${tk.agent_id}）` }], isError: true });
         }
-        const agent = db.prepare(`SELECT * FROM agents WHERE id=? AND status='published'`).get(+m[1]);
+        const agent = dal.getq(`SELECT * FROM agents WHERE id=? AND status='published'`, [+m[1]]);
         if (!agent) return ok({ content: [{ type: 'text', text: `智能体不存在或未发布：${name}` }], isError: true });
         // P5.16：arguments 按参数 schema 展开——input（task 兼容别名）+ Start 节点变量直达（file 类型传文件 ID）
         const args = (params || {}).arguments || {};
@@ -101,7 +102,7 @@ router.post('/', async (req, res) => {
         }
         try {
           const text = await runAgentAsTool(agent, String(input), inputVars);
-          try { db.prepare('UPDATE mcp_tokens SET calls=calls+1, last_used_at=? WHERE id=?').run(now(), tk.id); } catch { }
+          try { dal.runq('UPDATE mcp_tokens SET calls=calls+1, last_used_at=? WHERE id=?', [now(), tk.id]); } catch { }
           return ok({ content: [{ type: 'text', text: text || '（智能体未返回内容）' }], isError: false });
         } catch (e) {
           return ok({ content: [{ type: 'text', text: `智能体执行失败：${e.message}` }], isError: true });
@@ -134,8 +135,8 @@ router.get('/info', auth, adminOnly, (req, res) => {
 
 // 令牌列表（脱敏展示：仅前缀掩码，不回传哈希；P2-2：附带 agent_id/agent_name 作用域信息）
 router.get('/tokens', auth, adminOnly, (req, res) => {
-  const rows = db.prepare(`SELECT t.id, t.name, t.agent_id, t.status, t.calls, t.last_used_at, t.created_at, t.token_prefix, a.name AS agent_name
-    FROM mcp_tokens t LEFT JOIN agents a ON a.id = t.agent_id ORDER BY t.id DESC`).all()
+  const rows = dal.q(`SELECT t.id, t.name, t.agent_id, t.status, t.calls, t.last_used_at, t.created_at, t.token_prefix, a.name AS agent_name
+    FROM mcp_tokens t LEFT JOIN agents a ON a.id = t.agent_id ORDER BY t.id DESC`)
     .map(t => ({ ...t, token: t.token_prefix || '' }));
   res.json({ code: 0, data: rows });
 });
@@ -148,24 +149,24 @@ router.post('/tokens', auth, adminOnly, (req, res) => {
   if (raw === undefined || raw === null || raw === '') return res.json({ code: 400, msg: '必须绑定一个已发布智能体（全域令牌已停用）' });
   const agentId = Number(raw);
   if (!Number.isInteger(agentId) || agentId <= 0) return res.json({ code: 400, msg: 'agent_id 参数非法（正整数）' });
-  const agent = db.prepare("SELECT id, name FROM agents WHERE id=? AND status='published'").get(agentId);
+  const agent = dal.getq("SELECT id, name FROM agents WHERE id=? AND status='published'", [agentId]);
   if (!agent) return res.json({ code: 400, msg: '绑定的智能体不存在或未发布' });
   const token = 'mcp_' + crypto.randomBytes(24).toString('hex');
-  db.prepare('INSERT INTO mcp_tokens (token,token_prefix,name,agent_id,status,created_at) VALUES (?,?,?,?,1,?)').run(hashKey(token), maskPrefix(token), name, agentId, now());
+  dal.runq('INSERT INTO mcp_tokens (token,token_prefix,name,agent_id,status,created_at) VALUES (?,?,?,?,1,?)', [hashKey(token), maskPrefix(token), name, agentId, now()]);
   res.json({ code: 0, data: { token, name, agent_id: agentId }, msg: '令牌已生成（已绑定智能体作用域，仅本次完整展示，请立即保存）' });
 });
 
 // 停用 / 启用
 router.patch('/tokens/:id', auth, adminOnly, (req, res) => {
-  const row = db.prepare('SELECT * FROM mcp_tokens WHERE id=?').get(+req.params.id);
+  const row = dal.getq('SELECT * FROM mcp_tokens WHERE id=?', [+req.params.id]);
   if (!row) return res.json({ code: 404, msg: '令牌不存在' });
-  db.prepare('UPDATE mcp_tokens SET status=? WHERE id=?').run(row.status ? 0 : 1, row.id);
+  dal.runq('UPDATE mcp_tokens SET status=? WHERE id=?', [row.status ? 0 : 1, row.id]);
   res.json({ code: 0, msg: row.status ? '已停用' : '已启用' });
 });
 
 // 删除令牌
 router.delete('/tokens/:id', auth, adminOnly, (req, res) => {
-  db.prepare('DELETE FROM mcp_tokens WHERE id=?').run(+req.params.id);
+  dal.runq('DELETE FROM mcp_tokens WHERE id=?', [+req.params.id]);
   res.json({ code: 0, msg: '已删除' });
 });
 

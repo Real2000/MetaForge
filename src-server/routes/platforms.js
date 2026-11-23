@@ -5,6 +5,7 @@
  * 落库为智能体（external_mode='chat'），对话经 /v3/chat 转发（Bot 需在扣子侧发布为 API 渠道）。
  */
 const express = require('express');
+const dal = require('../lib/dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const { db, now } = require('../db');
 const { auth, adminOnly } = require('../lib/auth');
 const dify = require('../lib/dify');
@@ -30,12 +31,12 @@ function resolveBuildUrl(type, endpoint, buildUrl) {
 }
 
 router.get('/', (req, res) => {
-  const rows = db.prepare('SELECT * FROM platforms ORDER BY id DESC').all();
+  const rows = dal.q('SELECT * FROM platforms ORDER BY id DESC');
   // 控制台密码不下发明文，只回传是否已配置；agent_count 为真同步落库的外部智能体数
   const safe = rows.map(p => {
     const { console_password, ...rest } = p;
     rest.console_pwd_set = console_password ? 1 : 0;
-    rest.agent_count = db.prepare("SELECT COUNT(*) c FROM agents WHERE source=? AND source_name=? AND external_app_id IS NOT NULL AND external_app_id!=''").get(p.type, p.name).c;
+    rest.agent_count = dal.getq("SELECT COUNT(*) c FROM agents WHERE source=? AND source_name=? AND external_app_id IS NOT NULL AND external_app_id!=''", [p.type, p.name]).c;
     return rest;
   });
   res.json({ code: 0, data: safe });
@@ -46,15 +47,14 @@ router.post('/', (req, res) => {
   if (!name?.trim() || !endpoint?.trim()) return res.json({ code: 400, msg: '请填写名称与服务地址' });
   const finalType = type || 'coze';
   const finalBuild = resolveBuildUrl(finalType, endpoint, build_url);
-  const info = db.prepare(`INSERT INTO platforms (name,type,endpoint,token,build_url,console_email,console_password,status,synced,created_at)
-    VALUES (?,?,?,?,?,?,?,1,0,datetime('now','localtime'))`)
-    .run(name.trim(), finalType, endpoint.trim(), token || '', finalBuild, console_email || '', console_password || '');
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)').run(req.user.username, '新建平台接入', name.trim(), req.ip, now());
+  const info = dal.runq(`INSERT INTO platforms (name,type,endpoint,token,build_url,console_email,console_password,status,synced,created_at)
+    VALUES (?,?,?,?,?,?,?,1,0,datetime('now','localtime'))`, [name.trim(), finalType, endpoint.trim(), token || '', finalBuild, console_email || '', console_password || '']);
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '新建平台接入', name.trim(), req.ip, now()]);
   res.json({ code: 0, data: { id: info.lastInsertRowid } });
 });
 
 router.put('/:id', (req, res) => {
-  const old = db.prepare('SELECT * FROM platforms WHERE id=?').get(req.params.id);
+  const old = dal.getq('SELECT * FROM platforms WHERE id=?', [req.params.id]);
   if (!old) return res.json({ code: 404, msg: '接入配置不存在' });
   const { name, type, endpoint, token, status, build_url, console_email, console_password } = req.body || {};
   const finalType = type || old.type;
@@ -62,21 +62,20 @@ router.put('/:id', (req, res) => {
   const finalBuild = resolveBuildUrl(finalType, finalEndpoint, build_url ?? old.build_url);
   const finalEmail = console_email !== undefined ? console_email : old.console_email;
   const finalPwd = console_password !== undefined ? (console_password === '' ? '' : console_password) : old.console_password;
-  db.prepare('UPDATE platforms SET name=?,type=?,endpoint=?,token=?,build_url=?,console_email=?,console_password=?,status=? WHERE id=?')
-    .run(name || old.name, finalType, finalEndpoint, token ?? old.token, finalBuild, finalEmail, finalPwd, status ?? old.status, old.id);
+  dal.runq('UPDATE platforms SET name=?,type=?,endpoint=?,token=?,build_url=?,console_email=?,console_password=?,status=? WHERE id=?', [name || old.name, finalType, finalEndpoint, token ?? old.token, finalBuild, finalEmail, finalPwd, status ?? old.status, old.id]);
   res.json({ code: 0, msg: '已保存' });
 });
 
 router.delete('/:id', (req, res) => {
-  const old = db.prepare('SELECT * FROM platforms WHERE id=?').get(req.params.id);
-  db.prepare('DELETE FROM platforms WHERE id=?').run(req.params.id);
-  if (old) db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)').run(req.user.username, '删除平台接入', old.name, req.ip, now());
+  const old = dal.getq('SELECT * FROM platforms WHERE id=?', [req.params.id]);
+  dal.runq('DELETE FROM platforms WHERE id=?', [req.params.id]);
+  if (old) dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '删除平台接入', old.name, req.ip, now()]);
   res.json({ code: 0, msg: '已删除' });
 });
 
 // 测试连接：Coze 用 PAT 调 /v1/workspaces 真实验证；其他类型校验地址连通性
 router.post('/:id/test', async (req, res) => {
-  const old = db.prepare('SELECT * FROM platforms WHERE id=?').get(req.params.id);
+  const old = dal.getq('SELECT * FROM platforms WHERE id=?', [req.params.id]);
   if (!old) return res.json({ code: 404, msg: '接入配置不存在' });
   if (old.type === 'coze') {
     if (!old.token?.startsWith('pat_')) {
@@ -103,7 +102,7 @@ router.post('/:id/test', async (req, res) => {
 
 // 前往外部平台搭建（校验地址 → 记录跳转日志 → 返回搭建页地址由前端 window.open 打开）
 router.post('/:id/jump', async (req, res) => {
-  const old = db.prepare('SELECT * FROM platforms WHERE id=?').get(req.params.id);
+  const old = dal.getq('SELECT * FROM platforms WHERE id=?', [req.params.id]);
   if (!old) return res.json({ code: 404, msg: '接入配置不存在' });
   const url = resolveBuildUrl(old.type, old.endpoint, old.build_url);
   if (!url) return res.json({ code: 400, msg: '未配置搭建页地址，请先在接入管理中填写' });
@@ -116,8 +115,7 @@ router.post('/:id/jump', async (req, res) => {
       msg: `「${old.name}」的搭建页地址 ${url} 是演示占位地址，不可访问。请点击「配置」填写真实地址（${old.type === 'dify' ? '官方中文站为 https://dify.ai/zh（自部署 Dify 填 http://你的域名/apps；海外云端版 cloud.dify.ai 需代理访问）' : '扣子官方为 https://www.coze.cn/space，私有化部署填自己的域名'}）`,
     });
   }
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(req.user.username, '前往外部平台搭建', `${old.name} → ${url}`, req.ip, now());
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '前往外部平台搭建', `${old.name} → ${url}`, req.ip, now()]);
   res.json({ code: 0, data: { url } });
 });
 
@@ -126,7 +124,7 @@ router.post('/:id/jump', async (req, res) => {
 // - Coze 且已配置 PAT → 真同步（遍历工作空间拉 Bot 清单 + 落库 + 清理历史占位记录）
 // - 其他情况保留占位同步
 router.post('/:id/sync', async (req, res) => {
-  const old = db.prepare('SELECT * FROM platforms WHERE id=?').get(req.params.id);
+  const old = dal.getq('SELECT * FROM platforms WHERE id=?', [req.params.id]);
   if (!old) return res.json({ code: 404, msg: '接入配置不存在' });
   const t = now();
 
@@ -140,7 +138,7 @@ router.post('/:id/sync', async (req, res) => {
       const CMP_MODES = ['completion'];
       let added = 0, updated = 0, skipped = 0;
       for (const app of apps) {
-        const exist = db.prepare('SELECT * FROM agents WHERE source=? AND external_app_id=?').get('dify', app.id);
+        const exist = dal.getq('SELECT * FROM agents WHERE source=? AND external_app_id=?', ['dify', app.id]);
         let serviceKey = '';
         let mode = '';
         if (CHAT_MODES.includes(app.mode)) {
@@ -156,26 +154,23 @@ router.post('/:id/sync', async (req, res) => {
         const desc = (app.description || '').trim() ||
           (mode === 'chat' ? 'Dify 对话型应用（经接入管理同步）' : mode === 'completion' ? 'Dify 文本生成应用（经接入管理同步）' : `Dify ${mode} 应用（暂不支持对话转发）`);
         if (exist) {
-          db.prepare(`UPDATE agents SET name=?,description=?,external_api_key=?,external_mode=?,status=?,source_name=?,updated_at=? WHERE id=?`)
-            .run(app.name, desc, serviceKey, mode, 'published', old.name, t, exist.id);
+          dal.runq(`UPDATE agents SET name=?,description=?,external_api_key=?,external_mode=?,status=?,source_name=?,updated_at=? WHERE id=?`, [app.name, desc, serviceKey, mode, 'published', old.name, t, exist.id]);
           updated++;
         } else {
-          db.prepare(`INSERT INTO agents (name,description,type,space_id,category,prompt,model,temperature,context_rounds,max_reply,opening,opening_questions,kb_id,status,source,source_name,external_app_id,external_api_key,external_mode,created_at,updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-            .run(app.name, desc, 'enterprise', db.prepare('SELECT id FROM spaces WHERE type=? AND owner=? LIMIT 1').get('personal', req.user.username)?.id || 0, '工作', `【外部 Dify 应用】${app.name}`, 'dify-app', 0.7, 10, 2048,
-              `您好，我是「${app.name}」（Dify 搭建），请问有什么可以帮您？`, '[]', null, 'published', 'dify', old.name, app.id, serviceKey, mode, t, t);
+          dal.runq(`INSERT INTO agents (name,description,type,space_id,category,prompt,model,temperature,context_rounds,max_reply,opening,opening_questions,kb_id,status,source,source_name,external_app_id,external_api_key,external_mode,created_at,updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, [app.name, desc, 'enterprise', dal.getq('SELECT id FROM spaces WHERE type=? AND owner=? LIMIT 1', ['personal', req.user.username])?.id || 0, '工作', `【外部 Dify 应用】${app.name}`, 'dify-app', 0.7, 10, 2048,
+              `您好，我是「${app.name}」（Dify 搭建），请问有什么可以帮您？`, '[]', null, 'published', 'dify', old.name, app.id, serviceKey, mode, t, t]);
           added++;
         }
       }
-      db.prepare('UPDATE platforms SET synced=synced+1, last_sync_at=? WHERE id=?').run(t, old.id);
-      db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-        .run(req.user.username, '同步平台智能体', `${old.name}：真同步完成（新增 ${added}、更新 ${updated}${skipped ? '、暂不支持对话 ' + skipped : ''}）`, req.ip, t);
+      dal.runq('UPDATE platforms SET synced=synced+1, last_sync_at=? WHERE id=?', [t, old.id]);
+      dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '同步平台智能体', `${old.name}：真同步完成（新增 ${added}、更新 ${updated}${skipped ? '、暂不支持对话 ' + skipped : ''}）`, req.ip, t]);
       return res.json({
         code: 0,
         data: { added, updated, skipped, total: apps.length, real: true, msg: `真实同步完成：共 ${apps.length} 个应用，新增 ${added}、更新 ${updated}${skipped ? `、${skipped} 个工作流类型仅同步展示` : ''}` },
       });
     } catch (e) {
-      db.prepare('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)').run('platform-sync', `Dify 真同步失败（${old.name}）：${e.message}`, t);
+      dal.runq('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)', ['platform-sync', `Dify 真同步失败（${old.name}）：${e.message}`, t]);
       return res.json({ code: 502, msg: 'Dify 真同步失败：' + e.message });
     }
   }
@@ -188,26 +183,23 @@ router.post('/:id/sync', async (req, res) => {
       for (const b of bots) {
         const botId = b.bot_id || b.bot_id_str || b.id;
         if (!botId) continue;
-        const exist = db.prepare('SELECT * FROM agents WHERE source=? AND external_app_id=?').get('coze', String(botId));
+        const exist = dal.getq('SELECT * FROM agents WHERE source=? AND external_app_id=?', ['coze', String(botId)]);
         const name = b.name || `Coze Bot ${botId}`;
         const desc = (b.description || '').trim() || `扣子智能体（空间：${b.workspace_name || b.workspace_id}，经接入管理同步）`;
         if (exist) {
-          db.prepare(`UPDATE agents SET name=?,description=?,external_mode=?,status=?,source_name=?,updated_at=? WHERE id=?`)
-            .run(name, desc, 'chat', 'published', old.name, t, exist.id);
+          dal.runq(`UPDATE agents SET name=?,description=?,external_mode=?,status=?,source_name=?,updated_at=? WHERE id=?`, [name, desc, 'chat', 'published', old.name, t, exist.id]);
           updated++;
         } else {
-          db.prepare(`INSERT INTO agents (name,description,type,space_id,category,prompt,model,temperature,context_rounds,max_reply,opening,opening_questions,kb_id,status,source,source_name,external_app_id,external_api_key,external_mode,created_at,updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-            .run(name, desc, 'enterprise', db.prepare('SELECT id FROM spaces WHERE type=? AND owner=? LIMIT 1').get('personal', req.user.username)?.id || 0, '工作', `【外部扣子智能体】${name}`, 'coze-bot', 0.7, 10, 2048,
-              `您好，我是「${name}」（扣子搭建），请问有什么可以帮您？`, '[]', null, 'published', 'coze', old.name, String(botId), old.token, 'chat', t, t);
+          dal.runq(`INSERT INTO agents (name,description,type,space_id,category,prompt,model,temperature,context_rounds,max_reply,opening,opening_questions,kb_id,status,source,source_name,external_app_id,external_api_key,external_mode,created_at,updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, [name, desc, 'enterprise', dal.getq('SELECT id FROM spaces WHERE type=? AND owner=? LIMIT 1', ['personal', req.user.username])?.id || 0, '工作', `【外部扣子智能体】${name}`, 'coze-bot', 0.7, 10, 2048,
+              `您好，我是「${name}」（扣子搭建），请问有什么可以帮您？`, '[]', null, 'published', 'coze', old.name, String(botId), old.token, 'chat', t, t]);
           added++;
         }
       }
       // 清理历史占位记录（无 external_app_id 的 Coze 智能体）
-      const cleaned = db.prepare(`DELETE FROM agents WHERE source='coze' AND (external_app_id IS NULL OR external_app_id='')`).run().changes;
-      db.prepare('UPDATE platforms SET synced=synced+1, last_sync_at=? WHERE id=?').run(t, old.id);
-      db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-        .run(req.user.username, '同步平台智能体', `${old.name}：Coze 真同步完成（空间 ${spaceInfo.length} 个、Bot ${bots.length} 个：新增 ${added}、更新 ${updated}${cleaned ? `、清理占位 ${cleaned}` : ''}）`, req.ip, t);
+      const cleaned = dal.runq(`DELETE FROM agents WHERE source='coze' AND (external_app_id IS NULL OR external_app_id='')`).changes;
+      dal.runq('UPDATE platforms SET synced=synced+1, last_sync_at=? WHERE id=?', [t, old.id]);
+      dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '同步平台智能体', `${old.name}：Coze 真同步完成（空间 ${spaceInfo.length} 个、Bot ${bots.length} 个：新增 ${added}、更新 ${updated}${cleaned ? `、清理占位 ${cleaned}` : ''}）`, req.ip, t]);
       let tip = '';
       if (!bots.length) {
         tip = '。当前工作空间内没有「智能体(Bot)」类型的资源——扣子新版「项目/AI 应用」暂不在开放 API 同步范围内，请在扣子以「智能体」类型新建后再同步；或确认 PAT 勾选了「团队空间管理(listBot)」权限';
@@ -217,15 +209,14 @@ router.post('/:id/sync', async (req, res) => {
         data: { added, updated, cleaned, total: bots.length, real: true, msg: `真实同步完成：${spaceInfo.length} 个工作空间共 ${bots.length} 个智能体，新增 ${added}、更新 ${updated}${cleaned ? `、清理占位记录 ${cleaned} 条` : ''}${tip}` },
       });
     } catch (e) {
-      db.prepare('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)').run('platform-sync', `Coze 真同步失败（${old.name}）：${e.message}`, t);
+      dal.runq('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)', ['platform-sync', `Coze 真同步失败（${old.name}）：${e.message}`, t]);
       return res.json({ code: 502, msg: 'Coze 真同步失败：' + e.message });
     }
   }
 
   // ---------- 占位同步（未配置凭据） ----------
-  db.prepare('UPDATE platforms SET synced=synced+1, last_sync_at=? WHERE id=?').run(t, old.id);
-  db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
-    .run(req.user.username, '同步平台智能体', `${old.name}：占位同步`, req.ip, t);
+  dal.runq('UPDATE platforms SET synced=synced+1, last_sync_at=? WHERE id=?', [t, old.id]);
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '同步平台智能体', `${old.name}：占位同步`, req.ip, t]);
   const hint = old.type === 'dify'
     ? '未配置控制台账号密码，执行了占位同步。请在编辑中填写 Dify 控制台邮箱与密码后重新同步'
     : '未配置扣子个人访问令牌（PAT），执行了占位同步。请到扣子「API 管理 → 个人访问令牌」创建 PAT（勾选团队空间管理/Bot 管理/对话权限），粘贴到配置的令牌输入框后重新同步';

@@ -12,6 +12,7 @@
  *                 → ④ 返回 { ok, agentId, text(去@), bind }；拒绝时 { ok:false, reply }（出站提示语）
  */
 const { db, now } = require('../db');
+const dal = require('./dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 
 // ---------------- @机器人识别 ----------------
 /** 各渠道 @ 机器人的特征剥离（返回 { hit, text }：hit=是否@了机器人，text=去除@后的输入）
@@ -36,57 +37,54 @@ function stripAtMention(msg) {
 function chatKey(channel, chatId) { return `${channel}:${chatId}`; }
 
 function findBind(channel, chatId) {
-  return db.prepare('SELECT * FROM channel_bound_chats WHERE chat_key=?').get(chatKey(channel, chatId));
+  return dal.getq('SELECT * FROM channel_bound_chats WHERE chat_key=?', [chatKey(channel, chatId)]);
 }
 
 /** 创建/更新绑定（chat_key 幂等 upsert） */
 function upsertBind({ channelId, chatId, chatName, agentId, bindMode, createdBy }) {
   const key = chatKey(
-    db.prepare('SELECT type FROM channels WHERE id=?').get(channelId)?.type || 'webhook',
+    dal.getq('SELECT type FROM channels WHERE id=?', [channelId])?.type || 'webhook',
     chatId,
   );
-  const old = db.prepare('SELECT * FROM channel_bound_chats WHERE chat_key=?').get(key);
+  const old = dal.getq('SELECT * FROM channel_bound_chats WHERE chat_key=?', [key]);
   if (old) {
-    db.prepare('UPDATE channel_bound_chats SET chat_name=?, agent_id=?, bind_mode=?, updated_at=? WHERE id=?')
-      .run(String(chatName || old.chat_name), agentId ?? old.agent_id, bindMode || old.bind_mode, now(), old.id);
-    return db.prepare('SELECT * FROM channel_bound_chats WHERE id=?').get(old.id);
+    dal.runq('UPDATE channel_bound_chats SET chat_name=?, agent_id=?, bind_mode=?, updated_at=? WHERE id=?', [String(chatName || old.chat_name), agentId ?? old.agent_id, bindMode || old.bind_mode, now(), old.id]);
+    return dal.getq('SELECT * FROM channel_bound_chats WHERE id=?', [old.id]);
   }
-  const info = db.prepare(`INSERT INTO channel_bound_chats (channel_id, chat_key, chat_name, agent_id, bind_mode, created_by, created_at, updated_at)
-    VALUES (?,?,?,?,?,?,?,?)`)
-    .run(channelId, key, String(chatName || ''), agentId ?? null, bindMode || 'all', String(createdBy || ''), now(), now());
-  return db.prepare('SELECT * FROM channel_bound_chats WHERE id=?').get(info.lastInsertRowid);
+  const info = dal.runq(`INSERT INTO channel_bound_chats (channel_id, chat_key, chat_name, agent_id, bind_mode, created_by, created_at, updated_at)
+    VALUES (?,?,?,?,?,?,?,?)`, [channelId, key, String(chatName || ''), agentId ?? null, bindMode || 'all', String(createdBy || ''), now(), now()]);
+  return dal.getq('SELECT * FROM channel_bound_chats WHERE id=?', [info.lastInsertRowid]);
 }
 
 function deleteBind(bindId) {
-  db.prepare('DELETE FROM chat_whitelist WHERE bind_id=?').run(bindId); // 级联
-  db.prepare('DELETE FROM channel_bound_chats WHERE id=?').run(bindId);
+  dal.runq('DELETE FROM chat_whitelist WHERE bind_id=?', [bindId]); // 级联
+  dal.runq('DELETE FROM channel_bound_chats WHERE id=?', [bindId]);
 }
 
 function listBinds(channelId) {
   const where = channelId ? 'WHERE b.channel_id=?' : '';
   const args = channelId ? [channelId] : [];
-  return db.prepare(`
+  return dal.q(`
     SELECT b.*, a.name AS agent_name, c.name AS channel_name, c.type AS channel_type,
       (SELECT COUNT(*) FROM chat_whitelist w WHERE w.bind_id=b.id) AS whitelist_count
     FROM channel_bound_chats b
     LEFT JOIN agents a ON a.id=b.agent_id
     LEFT JOIN channels c ON c.id=b.channel_id
-    ${where} ORDER BY b.id DESC`).all(...args);
+    ${where} ORDER BY b.id DESC`, [...args]);
 }
 
 // ---------------- 白名单 ----------------
 function addWhitelist(bindId, senderId, senderName) {
-  const bid = db.prepare('SELECT id FROM channel_bound_chats WHERE id=?').get(bindId);
+  const bid = dal.getq('SELECT id FROM channel_bound_chats WHERE id=?', [bindId]);
   if (!bid) throw new Error('绑定不存在');
-  db.prepare(`INSERT INTO chat_whitelist (bind_id, sender_id, sender_name, created_at) VALUES (?,?,?,?)
-    ON CONFLICT(bind_id, sender_id) DO UPDATE SET sender_name=excluded.sender_name`)
-    .run(bindId, String(senderId), String(senderName || ''), now());
+  dal.runq(`INSERT INTO chat_whitelist (bind_id, sender_id, sender_name, created_at) VALUES (?,?,?,?)
+    ON CONFLICT(bind_id, sender_id) DO UPDATE SET sender_name=excluded.sender_name`, [bindId, String(senderId), String(senderName || ''), now()]);
 }
 function removeWhitelist(bindId, senderId) {
-  db.prepare('DELETE FROM chat_whitelist WHERE bind_id=? AND sender_id=?').run(bindId, String(senderId));
+  dal.runq('DELETE FROM chat_whitelist WHERE bind_id=? AND sender_id=?', [bindId, String(senderId)]);
 }
 function listWhitelist(bindId) {
-  return db.prepare('SELECT * FROM chat_whitelist WHERE bind_id=? ORDER BY id').all(bindId);
+  return dal.q('SELECT * FROM chat_whitelist WHERE bind_id=? ORDER BY id', [bindId]);
 }
 
 // ---------------- 入站处理管线（P1-10 核心入口） ----------------
@@ -117,7 +115,7 @@ function inbound(msg) {
 
   // ③ 白名单校验（all=全员 / whitelist=名单内 / admin=频道创建者+平台管理员——无平台账号映射时按白名单空处理）
   if (bind.bind_mode === 'whitelist') {
-    const hit = db.prepare('SELECT id FROM chat_whitelist WHERE bind_id=? AND sender_id=?').get(bind.id, msg.sender.id);
+    const hit = dal.getq('SELECT id FROM chat_whitelist WHERE bind_id=? AND sender_id=?', [bind.id, msg.sender.id]);
     if (!hit) {
       return { ok: false, reply: `抱歉，您（${msg.sender.id}）不在本群机器人的使用白名单内，请联系管理员添加。` };
     }
