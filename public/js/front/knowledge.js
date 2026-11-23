@@ -9,11 +9,13 @@ import { openViewer } from '../viewer.js'; // P1-15 统一文档查看器（分�
 const PIPELINE_STEPS = [
   { key: 'parse', name: '文件解析', desc: '提取 PDF/DOCX/TXT 等文档的原始文本' },
   { key: 'ocr', name: 'OCR 增强', desc: '识别扫描版 PDF/图片中的文字（未配置 OCR 服务时自动跳过）' },
+  { key: 'vision-describe', name: '图片理解（VL）', desc: '图片型文件用多模态 VL 模型生成描述文本（需库配置 vision_model，与 OCR 互斥）' },
   { key: 'clean', name: '文本清洗', desc: '去除页眉页脚、多余空白与乱码字符' },
   { key: 'chunk', name: '智能切片', desc: '句边界切分+语义聚合：短段落合并至~chunkSize，标题/章节号为强边界' },
   { key: 'toc', name: '目录提取', desc: '生成章节层级目录，检索命中自动带同章节上下文' },
   { key: 'metadata', name: '元数据抽取', desc: '抽取部门/密级/文档类型元数据（用于检索权限过滤）' },
   { key: 'keywords', name: '关键词生成', desc: '为分块生成检索关键词与问法（需已配置模型）' },
+  { key: 'graphrag', name: '知识图谱抽取', desc: '后台抽取实体与关系三元组入库，检索时图谱通道助推相关分块（M4 AI-04；需已配置模型）' },
   { key: 'regression', name: '召回回归', desc: '库变更后自动重跑评测集（有评测集时生效）' },
 ];
 const PIPELINE_DEFAULT = PIPELINE_STEPS.map(s => s.key); // 默认管道（与后端默认一致）
@@ -430,6 +432,20 @@ export async function render(el) {
       </div>
       <div class="form-item"><label>${t('分隔符（正则）')}</label><input class="input" id="kb_chunk_sep" value="${esc(kb.chunk_separator || '\\n\\s*\\n')}" placeholder="${t('默认：\\n\\s*\\n')}"><div style="font-size:11px;color:var(--text-3)">${t('用于按段落切分，正则表达式格式，默认按空行分段。')}</div></div>
       <hr>
+      <div style="font-size:13px;font-weight:600;color:var(--text);margin:10px 0 6px">${t('重排配置')}<span style="font-weight:400;font-size:11px;color:var(--text-3)">${t('（M4 AI-09 库级覆盖：不填 = 跟随全局默认）')}</span></div>
+      <div class="form-item"><label>${t('重排开关')}</label>
+        <select class="input" id="kb_rerank_enabled">
+          <option value="" ${(kb.rerank_enabled == null) ? 'selected' : ''}>${t('跟随全局默认（开启）')}</option>
+          <option value="1" ${kb.rerank_enabled === 1 ? 'selected' : ''}>${t('强制开启')}</option>
+          <option value="0" ${kb.rerank_enabled === 0 ? 'selected' : ''}>${t('强制关闭（直接用 RRF 融合排名）')}</option>
+        </select>
+      </div>
+      <div class="form-item"><label>${t('重排模型')}</label><input class="input" id="kb_rerank_model" value="${esc(kb.rerank_model || '')}" placeholder="${t('默认（bge-reranker-v2-m3）')}"><div style="font-size:11px;color:var(--text-3)">${t('重排供应商须已配置该模型，否则自动降级回落 RRF')}</div></div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        <div class="form-item" style="flex:1;min-width:160px"><label>${t('重排取 Top-N')}</label><input class="input" id="kb_rerank_top_n" type="number" min="1" max="50" value="${kb.rerank_top_n != null ? kb.rerank_top_n : ''}" placeholder="${t('默认 5')}"></div>
+        <div class="form-item" style="flex:1;min-width:160px"><label>${t('重排分数阈值')}</label><input class="input" id="kb_rerank_threshold" type="number" min="0" max="1" step="0.05" value="${kb.rerank_threshold != null ? kb.rerank_threshold : ''}" placeholder="${t('不过滤（空）')}"><div style="font-size:11px;color:var(--text-3)">${t('低于该分数的片段不进入回答上下文')}</div></div>
+      </div>
+      <hr>
       <div style="font-size:13px;font-weight:600;color:var(--text);margin:10px 0 6px">${t('元数据')}</div>
       <div class="form-item"><label>${t('自动元数据')}</label>
         <div style="display:flex;align-items:center;gap:10px;padding:10px;border:1px solid var(--border);border-radius:8px">
@@ -532,6 +548,10 @@ export async function render(el) {
           if (!assertPipeSerializable()) return; // 全停用步骤：拦截并明示语义（[] 在后端=恢复默认）
           const chunkSize = Math.min(2000, Math.max(100, +sizeInput.value)) || 500;
           const chunkOverlap = Math.min(chunkSize - 1, Math.max(0, +mask.querySelector('#kb_chunk_overlap').value)) || 0;
+          // M4 AI-09：库级重排配置三态归一——空=跟随全局默认（存 NULL）；数值字段空串=回默认（存 NULL）
+          const rEnabled = mask.querySelector('#kb_rerank_enabled').value;
+          const rTopN = mask.querySelector('#kb_rerank_top_n').value.trim();
+          const rThreshold = mask.querySelector('#kb_rerank_threshold').value.trim();
           try {
             await api('/knowledge/' + kb.id, { method: 'PUT', body: {
               name: mask.querySelector('#kb_name').value,
@@ -542,6 +562,10 @@ export async function render(el) {
               chunk_separator: mask.querySelector('#kb_chunk_sep').value || '\\n\\s*\\n',
               auto_metadata: autoMetaSw.classList.contains('on') ? 1 : 0, // V1.2 #2：自动元数据开关
               pipeline: serializePipe(), // V2.3 #5：摄取管道（非法步骤名等 400 错误在下方 catch 透传 toast）
+              rerank_enabled: rEnabled === '' ? null : +rEnabled, // AI-09：null=回全局默认（三态）
+              rerank_model: mask.querySelector('#kb_rerank_model').value.trim(), // 空串=用全局默认模型
+              rerank_top_n: rTopN === '' ? null : Math.max(1, Math.min(50, +rTopN)), // 空=回默认 5
+              rerank_threshold: rThreshold === '' ? null : (+rThreshold || null), // 空=不过滤（历史基线）
             } });
             toast(t('已保存')); close(); loadKbs().then(() => { current = kbs.find(x => x.id === kb.id); renderKbList(); });
           } catch (e) { toast(e.message, 'err'); } // V2.3 #5：保存失败（含 pipeline 400 校验）不再静默，弹窗保留供修正
@@ -1005,6 +1029,16 @@ export async function render(el) {
     return `<span class="tag ${cls}">${(+score).toFixed(2)}</span>`;
   }
 
+  // AI-03（2026-11-23）：召回多指标胶囊——hit@K / 召回@K / MRR / NDCG（无数据显 '—'）
+  function metricsChips(m) {
+    if (!m || m.cases == null) return '<span style="color:var(--text-3)">—</span>';
+    const fmt = v => v == null ? '—' : (+v).toFixed(2);
+    return `<span class="tag blue" style="font-size:10px" title="${t('Top-K 内任一命中占比')}">hit@${m.k || 10} ${fmt(m.hit_at_k)}</span> `
+      + `<span class="tag blue" style="font-size:10px" title="${t('期望词在 Top-K 的覆盖率')}">召回@${m.k || 10} ${fmt(m.recall_at_k)}</span> `
+      + `<span class="tag blue" style="font-size:10px" title="${t('首个命中排名倒数均值')}">MRR ${fmt(m.mrr)}</span> `
+      + `<span class="tag blue" style="font-size:10px" title="${t('排序质量折损累计（含排名位置权重）')}">NDCG ${fmt(m.ndcg)}</span>`;
+  }
+
   // 评测集列表（名称/得分/条数/创建时间/重跑/删除；403 与加载失败优雅提示）
   async function renderEvals() {
     if (!current) {
@@ -1029,21 +1063,22 @@ export async function render(el) {
       </div>
       <div class="card">
         <div class="table-wrap"><table class="tbl">
-          <thead><tr><th>${t('名称')}</th><th>${t('得分')}</th><th>${t('条数')}</th><th>${t('创建时间')}</th><th>${t('操作')}</th></tr></thead>
+          <thead><tr><th>${t('名称')}</th><th>${t('得分')}</th><th>${t('多指标（Top-K 口径）')}</th><th>${t('条数')}</th><th>${t('创建时间')}</th><th>${t('操作')}</th></tr></thead>
           <tbody>${list.map(e => `
             <tr data-eval-row="${e.id}">
               <td><b>${esc(e.name)}</b></td>
               <td class="ev-score">${scoreBadge(e.score)}</td>
+              <td class="ev-metrics">${metricsChips(e.metrics)}</td>
               <td>${e.dataset_count}</td>
               <td style="color:var(--text-3)">${esc(e.created_at)}</td>
               <td>
                 <button class="btn link" data-rerun="${e.id}" data-name="${esc(e.name)}">${t('重跑')}</button>
                 <button class="btn link" style="color:var(--danger)" data-del-eval="${e.id}">${t('删除')}</button>
               </td>
-            </tr>`).join('') || `<tr><td colspan="5" class="empty">${t('暂无评测集——在「召回测试」页执行测试后点「💾 保存为评测集」，或等库变更后自动回归')}</td></tr>`}
+            </tr>`).join('') || `<tr><td colspan="6" class="empty">${t('暂无评测集——在「召回测试」页执行测试后点「💾 保存为评测集」，或等库变更后自动回归')}</td></tr>`}
           </tbody>
         </table></div>
-        <div class="hint" style="margin-top:10px">💡 ${t('知识库变更（重传文件/调整切片参数）后将自动回归评测并通知创建者；得分 = Top-1 命中条数 / 总条数（重跑跳过 Rerank 保证稳定）')}</div>
+        <div class="hint" style="margin-top:10px">💡 ${t('知识库变更（重传文件/调整切片参数）后将自动回归评测并通知创建者；得分 = Top-1 命中条数 / 总条数（重跑跳过 Rerank 保证稳定）；多指标列提供 hit@K / 召回@K / MRR / NDCG 的量化对比（M4 AI-03）')}</div>
       </div>
       <div id="ev_detail"></div>`;
     paneEvals.querySelector('#evBack').onclick = () => { current = null; switchTab('kb'); renderKbList(); };
@@ -1057,18 +1092,20 @@ export async function render(el) {
     });
   }
 
-  // 重跑单个评测集 → 展示新得分/旧得分/diff 徽章 + 逐条明细（query/是否命中/期望词），并原地刷新该行得分
+  // 重跑单个评测集 → 展示新得分/旧得分/diff 徽章 + 多指标聚合 + 逐条明细（query/是否命中/期望词/排名指标），并原地刷新该行
   async function rerunEvalUi(eid, evalName) {
     const btn = paneEvals.querySelector(`[data-rerun="${eid}"]`);
     if (btn) { btn.disabled = true; btn.textContent = `⏳ ${t('重跑中…')}`; }
     try {
       const j = await api(`/knowledge/${current.id}/evaluations/${eid}/rerun`, { method: 'POST' });
-      const { score, prev_score, diff, detail } = j.data;
+      const { score, prev_score, diff, metrics, detail } = j.data;
       const hitCount = (detail || []).filter(d => d.hit).length;
       const total = (detail || []).length;
-      // 原地刷新该行得分徽章（不整页重渲染，保留下方明细展示）
+      // 原地刷新该行得分徽章与多指标胶囊（不整页重渲染，保留下方明细展示）
       const scoreCell = paneEvals.querySelector(`[data-eval-row="${eid}"] .ev-score`);
       if (scoreCell) scoreCell.innerHTML = scoreBadge(score);
+      const metricsCell = paneEvals.querySelector(`[data-eval-row="${eid}"] .ev-metrics`);
+      if (metricsCell) metricsCell.innerHTML = metricsChips(metrics);
       paneEvals.querySelector('#ev_detail').innerHTML = `
         <div class="card">
           <h3>${t('重跑结果：')}${esc(evalName || '')} ${diffBadge(diff)}</h3>
@@ -1077,13 +1114,16 @@ export async function render(el) {
             <div class="stat-card"><div class="label">${t('旧得分')}</div><div class="num">${prev_score == null ? '—' : (+prev_score).toFixed(2)}</div><div class="sub">${t('重跑前最近一次')}</div></div>
             <div class="stat-card"><div class="label">${t('变化')}</div><div class="num" style="color:${diff === '持平' || diff === '首次' ? 'var(--text-3)' : String(diff).startsWith('+') ? 'var(--brand)' : 'var(--danger)'}">${esc(diff === '首次' ? t('首次') : diff === '持平' ? t('持平') : String(diff).replace(/^[+-]/, ''))}</div><div class="sub">${t('±0.02 内算持平')}</div></div>
           </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">${metricsChips(metrics)}<span class="hint" style="font-size:11px">${t('M4 AI-03：Top-K 多指标（K=10）——库变更前后同口径对比')}</span></div>
           <div style="margin-top:12px">${(detail || []).map(d => `
             <div style="border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin-bottom:8px">
               <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center">
                 <b style="font-size:13px">${d.hit ? '✅' : '❌'} ${esc(d.query)}</b>
-                <span>${d.hit ? `<span class="tag green">${t('命中')}</span>` : `<span class="tag red">${t('未命中')}</span>`}${d.top_file ? ` <span class="tag gray" style="font-size:10px">📄 ${esc(d.top_file)}</span>` : ''}</span>
+                <span>${d.hit ? `<span class="tag green">${t('命中')}</span>` : `<span class="tag red">${t('未命中')}</span>`}${d.top_file ? ` <span class="tag gray" style="font-size:10px">📄 ${esc(d.top_file)}</span>` : ''}
+                ${d.hit_k && !d.hit ? `<span class="tag orange" style="font-size:10px" title="${t('Top-1 未中但 Top-K 内命中，重排/融合改善后可提升')}">hit@${metrics && metrics.k || 10}</span>` : ''}</span>
               </div>
               <div style="margin-top:4px;font-size:12px;color:var(--text-3)">${t('期望词：')}${(d.expected || []).map(term => `<span class="tag blue" style="font-size:10px">${esc(term)}</span>`).join(' ') || '—'}</div>
+              <div style="margin-top:3px;font-size:11px;color:var(--text-3)">${t('排名')}${d.rank || '—'} · ${t('召回')}${d.recall != null ? (+d.recall).toFixed(2) : '—'} · MRR ${d.mrr != null ? (+d.mrr).toFixed(3) : '—'} · NDCG ${d.ndcg != null ? (+d.ndcg).toFixed(3) : '—'} · ${t('Top-K 命中')}${d.hit_k ? '✅' : '❌'}</div>
             </div>`).join('') || `<div class="empty-box"><div class="big">🈳</div>${t('无明细数据')}</div>`}
           </div>
         </div>`;

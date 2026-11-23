@@ -35,15 +35,19 @@ router.get('/config', (req, res) => {
 /** 可用套件：内置模板 + 既有评测集（evaluations；type='rag' 为 M4 AI-03 RAG 质量基线） */
 router.get('/suites', (req, res) => {
   const suites = evalSuite.SUITE_TEMPLATES.map(t => ({ ...t, builtin: true }));
-  const evals = db.prepare(`SELECT e.id, e.name, e.type, e.kb_id, e.agent_id, a.name AS agent_name
+  // AI-03（2026-11-23）：附带 score/created_at/metrics——RAG 基线历史可直接展示四指标聚合
+  const evals = db.prepare(`SELECT e.id, e.name, e.type, e.kb_id, e.agent_id, e.score, e.created_at, e.metrics, a.name AS agent_name
     FROM evaluations e LEFT JOIN agents a ON a.id=e.agent_id ORDER BY e.id DESC LIMIT 200`).all();
   for (const ev of evals) {
+    let metrics = null;
+    try { metrics = JSON.parse(ev.metrics || 'null'); } catch { metrics = null; }
     suites.push({
       name: ev.name,
       suite_type: ev.type === 'kb' ? 'kb' : ev.type === 'rag' ? 'rag' : 'agent',
       evaluation_id: ev.id,
       ref_id: ev.type === 'kb' || ev.type === 'rag' ? ev.kb_id : ev.agent_id, builtin: false,
       desc: ev.type === 'kb' ? '知识库评测集（召回回归）' : ev.type === 'rag' ? 'RAG 质量基线（检索→生成→RAGAS 四指标）' : `智能体测评集（${ev.agent_name || '智能体'}）`,
+      score: ev.score ?? null, created_at: ev.created_at, metrics,
     });
   }
   res.json({ code: 0, data: { suites } });

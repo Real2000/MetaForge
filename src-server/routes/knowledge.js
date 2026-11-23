@@ -486,11 +486,14 @@ router.get('/:id/evaluations', (req, res) => {
   const kb = db.prepare('SELECT * FROM kbs WHERE id=?').get(req.params.id);
   const deny = denyIfNotAllowed(kb, req.user);
   if (deny) return res.json(deny);
-  const rows = db.prepare(`SELECT id,name,score,created_at,dataset FROM evaluations WHERE kb_id=? AND type='kb' ORDER BY id DESC`).all(kb.id);
+  // AI-03（2026-11-23）：metrics 一并返回——列表页展示 hit@K/召回@K/MRR/NDCG 聚合（未评测/旧数据为 null）
+  const rows = db.prepare(`SELECT id,name,score,created_at,dataset,metrics FROM evaluations WHERE kb_id=? AND type='kb' ORDER BY id DESC`).all(kb.id);
   const data = rows.map(r => {
     let count = 0;
     try { const arr = JSON.parse(r.dataset || '[]'); if (Array.isArray(arr)) count = arr.length; } catch { count = 0; }
-    return { id: r.id, name: r.name, score: r.score ?? null, created_at: r.created_at, dataset_count: count };
+    let metrics = null;
+    try { metrics = JSON.parse(r.metrics || 'null'); } catch { metrics = null; }
+    return { id: r.id, name: r.name, score: r.score ?? null, created_at: r.created_at, dataset_count: count, metrics };
   });
   res.json({ code: 0, data });
 });

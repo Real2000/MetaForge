@@ -19,6 +19,19 @@ export async function render(box) {
     <div id="evMetrics">${t('加载中…')}</div>
   </div>
   <div class="card" style="padding:22px;margin-bottom:16px">
+    <h3 style="margin-bottom:4px">🎯 ${t('RAG 质量基线')} <span class="sub">${t('检索 → 生成 → RAGAS 四指标（上下文精确率 / 上下文召回率 / 答案相关性 / 答案忠实度）')}</span></h3>
+    <div style="font-size:12px;color:var(--text-3);margin-bottom:12px">${t('复用知识库评测集逐条走完整 RAG 链路并按四指标打分；同一评测集重跑即得库变更前后的量化对比（M4 AI-03）。答案侧指标需已配置模型供应商，未配置时仅产出检索侧指标。')}</div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      <select class="input" id="ragKb" style="width:220px"><option value="">${t('加载中…')}</option></select>
+      <select class="input" id="ragEval" style="width:220px"><option value="">${t('选择该库的评测集')}</option></select>
+      <input class="input" id="ragTopN" type="number" min="1" max="20" value="5" style="width:90px" title="${t('检索 Top-N（送检片段数）')}">
+      <button class="btn primary sm" id="ragRun">${t('运行 RAG 基线')}</button>
+    </div>
+    <div id="ragOut" style="margin-top:12px"></div>
+    <div style="margin-top:16px;font-size:13px;font-weight:600">🗂 ${t('历史 RAG 基线')}</div>
+    <div id="ragHistory" style="margin-top:8px">${t('加载中…')}</div>
+  </div>
+  <div class="card" style="padding:22px;margin-bottom:16px">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:8px">
       <h3>📈 ${t('多版本趋势')} <span class="sub">${t('同一套件按版本序列，标注回退点与显著性')}</span></h3>
       <div style="display:flex;gap:6px">
@@ -373,6 +386,90 @@ export async function render(box) {
     } catch (e) { el.innerHTML = `<span style="color:var(--danger,#dc2626)">${esc(e.message)}</span>`; }
   };
 
+  // ---------- M4 AI-03（2026-11-23）：RAG 质量基线（检索→生成→RAGAS 四指标；POST /api/eval/rag-baseline） ----------
+  const ragKbSel = box.querySelector('#ragKb');
+  const ragEvalSel = box.querySelector('#ragEval');
+  const ragScoreBadge = (v) => v == null ? '<span style="color:var(--text-3)">—</span>'
+    : `<b style="color:${+v >= 0.6 ? 'var(--ok,#16a34a)' : +v >= 0.3 ? 'var(--text-2)' : 'var(--danger,#dc2626)'}">${(+v).toFixed(2)}</b>`;
+
+  async function loadRagKbs() {
+    try {
+      const d = (await api('/knowledge')).data;
+      const kbs = Array.isArray(d) ? d : (d && (d.list || d.kbs)) || [];
+      ragKbSel.innerHTML = kbs.length
+        ? `<option value="">${t('选择知识库')}</option>` + kbs.map(k => `<option value="${k.id}">${esc(k.name)}</option>`).join('')
+        : `<option value="">${t('暂无知识库')}</option>`;
+      ragKbSel.onchange = loadRagEvals;
+    } catch (e) { ragKbSel.innerHTML = `<option value="">${esc(e.message)}</option>`; }
+  }
+
+  async function loadRagEvals() {
+    const kbId = ragKbSel.value;
+    if (!kbId) { ragEvalSel.innerHTML = `<option value="">${t('选择该库的评测集')}</option>`; return; }
+    ragEvalSel.innerHTML = `<option value="">${t('加载中…')}</option>`;
+    try {
+      const list = (await api(`/knowledge/${kbId}/evaluations`)).data || [];
+      ragEvalSel.innerHTML = list.length
+        ? list.map(e => `<option value="${e.id}">${esc(e.name)}（${e.dataset_count} ${t('条')}）</option>`).join('')
+        : `<option value="">${t('该库暂无评测集（先在知识库页「召回测试」保存）')}</option>`;
+    } catch (e) { ragEvalSel.innerHTML = `<option value="">${esc(e.message)}</option>`; }
+  }
+
+  const ragMetricCard = (label, v, sub) => `<div style="flex:1;min-width:140px;padding:14px;border:1px solid var(--line,#e5e7eb);border-radius:12px;background:var(--bg-2,#fafbfc)">
+    <div style="font-size:12px;color:var(--text-3)">${esc(label)}</div>
+    <div style="font-size:24px;font-weight:700;margin:4px 0;color:${v == null ? 'var(--text-3)' : +v >= 0.6 ? 'var(--ok,#16a34a)' : +v >= 0.3 ? 'var(--text-2)' : 'var(--danger,#dc2626)'}">${v == null ? '—' : (+v).toFixed(2)}</div>
+    <div style="font-size:11px;color:var(--text-3)">${esc(sub || '')}</div>
+  </div>`;
+
+  box.querySelector('#ragRun').onclick = async () => {
+    const kbId = +ragKbSel.value;
+    const evalId = +ragEvalSel.value;
+    if (!kbId) return toast(t('请选择知识库'), 'err');
+    if (!evalId) return toast(t('请选择该库的评测集'), 'err');
+    const btn = box.querySelector('#ragRun');
+    const out = box.querySelector('#ragOut');
+    btn.disabled = true; btn.textContent = `⏳ ${t('运行中…')}`;
+    out.innerHTML = `<span style="color:var(--text-3);font-size:13px">${t('逐条检索并生成回答中（用时取决于用例数与模型）…')}</span>`;
+    try {
+      const d = (await api('/eval/rag-baseline', { method: 'POST', body: { kb_id: kbId, evaluation_id: evalId, top_n: +box.querySelector('#ragTopN').value || 5 } })).data;
+      const m = d.metrics || {};
+      const four = [['context_precision', t('上下文精确率'), t('相关片段排序质量')], ['context_recall', t('上下文召回率'), t('所需信息覆盖度')], ['answer_relevancy', t('答案相关性'), t('回答对题程度')], ['faithfulness', t('答案忠实度'), t('事实被片段支撑比例')]];
+      out.innerHTML = `
+        <div style="font-size:13px;margin-bottom:8px"><b>${esc(d.name)}</b> · ${t('基线')} #${d.id} · ${d.cases} ${t('用例')}
+          ${m.evaluated_answers > 0 ? ` · ${m.evaluated_answers} ${t('可评答案')}` : ` · <span style="color:var(--danger,#dc2626)">${t('未配置模型供应商——答案侧四指标不可评（仅检索侧）')}</span>`}</div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">${four.map(([k, label, sub]) => ragMetricCard(label, m[k], sub)).join('')}</div>
+        <div style="margin-top:10px">${(d.detail || []).map(c => `
+          <div style="border:1px solid var(--line,#e5e7eb);border-radius:8px;padding:8px 10px;margin-bottom:8px;font-size:12px">
+            <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center">
+              <b>${esc(c.query)}</b>
+              ${c.retrieval ? `<span><span class="tag ${c.retrieval.top1 ? 'green' : c.retrieval.hitK ? 'orange' : 'red'}">${c.retrieval.top1 ? t('Top-1 命中') : c.retrieval.hitK ? t('Top-K 命中') : t('未命中')}</span> <span class="tag gray" style="font-size:10px">MRR ${(c.retrieval.mrr || 0).toFixed(2)} · NDCG ${(c.retrieval.ndcg || 0).toFixed(2)}</span></span>` : ''}
+            </div>
+            ${c.metrics ? `<div style="color:var(--text-3);margin-top:4px">${t('四指标')}：${four.map(([k, label]) => `${label} ${c.metrics[k] == null ? '—' : (+c.metrics[k]).toFixed(2)}`).join(' · ')} <span class="tag gray" style="font-size:10px">${c.mode === 'llm' ? t('LLM 裁判') : c.mode === 'heuristic' ? t('启发式') : ''}</span></div>` : (c.answer == null ? `<div style="color:var(--text-3);margin-top:4px">${t('未生成答案（无模型供应商）')}</div>` : '')}
+            ${c.error ? `<div style="color:var(--danger,#dc2626);margin-top:4px">⚠️ ${esc(c.error)}</div>` : ''}
+            ${c.answer ? `<div style="color:var(--text-3);margin-top:4px;background:var(--bg-2,#fafbfc);border-radius:6px;padding:6px 8px">💬 ${esc(String(c.answer).slice(0, 160))}${String(c.answer).length > 160 ? '…' : ''}</div>` : ''}
+          </div>`).join('')}
+        </div>`;
+      loadRagHistory();
+      toast(t('RAG 基线已生成（基线 #{id}）').replace('{id}', d.id));
+    } catch (e) {
+      out.innerHTML = `<span style="color:var(--danger,#dc2626);font-size:13px">${esc(e.message || t('运行失败'))}</span>`;
+    } finally { btn.disabled = false; btn.textContent = t('运行 RAG 基线'); }
+  };
+
+  async function loadRagHistory() {
+    const el = box.querySelector('#ragHistory');
+    try {
+      const rows = (((await api('/eval/suites')).data || {}).suites || []).filter(s => s.suite_type === 'rag');
+      if (!rows.length) { el.innerHTML = `<div style="color:var(--text-3);font-size:13px;text-align:center;padding:10px">${t('暂无 RAG 基线——上方运行一次即生成')}</div>`; return; }
+      const f = v => v == null ? '—' : (+v).toFixed(2);
+      el.innerHTML = `<div class="table-wrap"><table class="tbl">
+        <thead><tr><th>${t('名称')}</th><th>${t('综合分')}</th><th>${t('上下文精确率')}</th><th>${t('上下文召回率')}</th><th>${t('答案相关性')}</th><th>${t('答案忠实度')}</th><th>${t('可评答案')}</th><th>${t('时间')}</th></tr></thead>
+        <tbody>${rows.map(s => { const m = s.metrics || {};
+          return `<tr><td><b>${esc(s.name)}</b></td><td>${ragScoreBadge(s.score)}</td><td>${f(m.context_precision)}</td><td>${f(m.context_recall)}</td><td>${f(m.answer_relevancy)}</td><td>${f(m.faithfulness)}</td><td>${m.evaluated_answers ?? '—'}/${m.cases ?? '—'}</td><td style="color:var(--text-3)">${esc((s.created_at || '').slice(0, 16))}</td></tr>`; }).join('')}</tbody>
+      </table></div>`;
+    } catch (e) { el.innerHTML = `<span style="color:var(--danger,#dc2626);font-size:13px">${esc(e.message)}</span>`; }
+  }
+
   box.querySelector('#evTrendLoad').onclick = renderTrend;
   box.querySelector('#evTrendAxis').onchange = () => { if (box.querySelector('#evTrend svg')) renderTrend(); };
   box.querySelector('#evRunner').onclick = openRunner;
@@ -381,4 +478,6 @@ export async function render(box) {
   loadSuites();
   loadTrendSuites();
   loadList();
+  loadRagKbs();     // M4 AI-03：RAG 质量基线（知识库/评测集下拉 + 历史表）
+  loadRagHistory();
 }
