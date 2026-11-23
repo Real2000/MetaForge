@@ -52,7 +52,9 @@ const CONFIG_DEFS = [
   // ---- 队列（N7 / U2-1） ----
   { key: 'queue_driver', label: '任务队列驱动', group: 'system', type: 'string', env: 'QUEUE_DRIVER', default: 'memory', options: ['memory', 'redis'], desc: 'memory=进程内队列（默认，单进程）；redis=外置 BullMQ 队列（多进程/多节点横向扩展，需已装 bullmq/ioredis 并配好 redis_url）' },
   { key: 'redis_url', label: 'Redis 连接串', group: 'system', type: 'string', env: 'REDIS_URL', default: '', desc: 'redis 驱动使用的 Redis 连接串（如 redis://127.0.0.1:6379）；留空用默认地址' },
-  { key: 'deploy_mode', label: '部署模式', group: 'system', type: 'string', env: 'DEPLOY_MODE', default: 'single', options: ['single', 'cluster'], desc: 'single=单进程（默认）；cluster=多进程/多节点（启用选主租约锁，调度 tick 与内存队列仅 leader 执行）' },
+  { key: 'queue_strict', label: 'Redis 队列强依赖', group: 'system', type: 'string', env: 'AGENT_QUEUE_STRICT', default: '', options: ['', '1'], desc: 'MT-15：设为 1 时，指定 redis 驱动但依赖/连接不可用一律 fail-fast 抛错（不回退内存驱动）；生产/集群档已自动启用，设 AGENT_QUEUE_ALLOW_FALLBACK=1 可强制回退' },
+  { key: 'lock_driver', label: '分布式锁驱动', group: 'system', type: 'string', env: 'LOCK_DRIVER', default: 'auto', options: ['auto', 'db', 'redis'], desc: 'MT-15：auto=随队列驱动（redis 队列→redis 锁，否则→db 锁）；db=库内租约锁（仅同机多进程共享 SQLite 有效）；redis=跨机分布式锁（多节点唯一权威，需 ioredis）' },
+  { key: 'deploy_mode', label: '部署模式', group: 'system', type: 'string', env: 'DEPLOY_MODE', default: 'single', options: ['single', 'cluster'], desc: 'single=单进程（默认）；cluster=多进程/多节点（启用选主锁，调度 tick 与内存队列仅 leader 执行）' },
   // ---- 信创数据库（N7 / U2-1 / P4） ----
   { key: 'db_driver', label: '数据库驱动', group: 'system', type: 'string', env: 'AGENT_DB_DRIVER', default: 'sqlite', options: ['sqlite', 'dm', 'kingbase'], desc: 'sqlite=内置（默认）；dm=达梦 DM8（需 dmdb）；kingbase=人大金仓（需 pg）' },
   { key: 'sql_dialect', label: 'SQL 方言', group: 'system', type: 'string', env: 'SQL_DIALECT', default: 'sqlite', options: ['sqlite', 'dm', 'kingbase'], desc: 'SQL 方言适配目标；默认 sqlite 恒等转换，切信创库时同步设为 dm/kingbase' },

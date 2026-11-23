@@ -16,6 +16,7 @@
  */
 const os = require('os');
 const { db } = require('../db');
+const lockRedis = require('./lock-redis'); // MT-15：跨机分布式锁后端（Redis）
 
 const DEFAULT_TTL_MS = 90 * 1000; // 租约时长：调度 tick 每 30s 续租一次，90s 留 3 个周期容错
 const LOCK_NAME = 'cluster-leader'; // 统一的集群领导权锁名
@@ -88,8 +89,63 @@ function info(name) {
   return db.prepare('SELECT * FROM cluster_locks WHERE name=?').get(name) || null;
 }
 
+// ===================== MT-15：锁后端选择 + 异步统一 API（支持跨机） =====================
+// 后端（LOCK_DRIVER）：db=库内租约（默认，仅同机多进程共享 SQLite 有效）；
+//   redis=Redis 分布式锁（跨机多节点唯一权威）；auto=队列驱动为 redis 时用 redis，否则 db。
+// 既有同步 API（acquire/isLeader/renew/release）保持「DB 后端」语义不变（零回归）；
+// 需要跨机时改用异步 API（acquireAsync/isLeaderAsync/renewAsync/releaseAsync），由后端自动分派。
+
+/** 解析锁后端：LOCK_DRIVER(env) > 配置项 lock_driver > auto */
+function resolveLockDriver() {
+  let v = String(process.env.LOCK_DRIVER || '').toLowerCase();
+  if (!v) { try { const cfg = require('../config'); v = String((cfg.get && cfg.get('lock_driver')) || 'auto').toLowerCase(); } catch { v = 'auto'; } }
+  if (v === 'db' || v === 'redis') return v;
+  // auto：跟随队列驱动
+  let q = String(process.env.QUEUE_DRIVER || '').toLowerCase();
+  if (!q) { try { const cfg = require('../config'); q = String((cfg.get && cfg.get('queue_driver')) || 'memory').toLowerCase(); } catch { q = 'memory'; } }
+  return q === 'redis' ? 'redis' : 'db';
+}
+
+let _redisBackend = null;
+/** 取得（惰性创建）Redis 锁后端；依赖/连接不可用时抛可读错误（跨机档 fail-fast） */
+function redisBackend() {
+  if (_redisBackend) return _redisBackend;
+  _redisBackend = lockRedis.createBackend(lockRedis.defaultClient());
+  return _redisBackend;
+}
+
+/** 注入 Redis 客户端（测试用；传 null 复位）；会重建后端 */
+function _setRedisClient(c) { lockRedis._setClient(c); _redisBackend = null; }
+
+/** 当前锁后端名（db / redis；监控用） */
+function backend() { return resolveLockDriver(); }
+
+/** 异步申请/接管/续租（按后端分派；redis 后端支持跨机） */
+async function acquireAsync(name, ttlMs = DEFAULT_TTL_MS, owner = ownerId()) {
+  if (resolveLockDriver() === 'redis') return redisBackend().acquire(name, ttlMs, owner);
+  return acquire(name, ttlMs, owner);
+}
+/** 异步判断是否 leader（按后端分派） */
+async function isLeaderAsync(name, owner = ownerId()) {
+  if (resolveLockDriver() === 'redis') return redisBackend().isLeader(name, owner);
+  return isLeader(name, owner);
+}
+/** 异步续租 */
+async function renewAsync(name, ttlMs = DEFAULT_TTL_MS, owner = ownerId()) {
+  if (resolveLockDriver() === 'redis') return redisBackend().renew(name, ttlMs, owner);
+  return renew(name, ttlMs, owner);
+}
+/** 异步释放 */
+async function releaseAsync(name, owner = ownerId()) {
+  if (resolveLockDriver() === 'redis') return redisBackend().release(name, owner);
+  return release(name, owner);
+}
+
 module.exports = {
   acquire, isLeader, renew, release, info,
   isClusterMode, _resetClusterModeCache, ownerId,
   LOCK_NAME, DEFAULT_TTL_MS,
+  // MT-15：跨机锁
+  resolveLockDriver, backend, _setRedisClient,
+  acquireAsync, isLeaderAsync, renewAsync, releaseAsync,
 };

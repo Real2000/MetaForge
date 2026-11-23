@@ -28,6 +28,23 @@ function _resolveDriverName() {
   return String(name || 'memory').toLowerCase();
 }
 
+/**
+ * 是否「强依赖」模式（MT-15）：显式指定 redis 驱动且处于生产/集群档时，Redis 依赖缺失或连接失败
+ * 一律 **fail-fast 抛错**（不再静默回退内存驱动，避免「以为用了外置队列其实退回了进程内」的隐形降级）。
+ * 优先级：AGENT_QUEUE_ALLOW_FALLBACK=1（显式允许回退）> AGENT_QUEUE_STRICT=1 / 配置 queue_strict > 自动判定。
+ */
+function _strict() {
+  if (process.env.AGENT_QUEUE_ALLOW_FALLBACK === '1') return false;
+  if (process.env.AGENT_QUEUE_STRICT === '1') return true;
+  try { const cfg = require('../config'); if (cfg.get && cfg.get('queue_strict') === '1') return true; } catch { /* ignore */ }
+  if (_resolveDriverName() !== 'redis') return false;
+  // 显式指定 redis → 生产/集群档视为强依赖
+  if (process.env.NODE_ENV === 'production' || process.env.CLUSTER_MODE === '1') return true;
+  if ((parseInt(process.env.WEB_CONCURRENCY || '', 10) || 0) > 1) return true;
+  try { const cfg = require('../config'); if (cfg.get && cfg.get('deploy_mode') === 'cluster') return true; } catch { /* ignore */ }
+  return false;
+}
+
 /** 取得（或惰性创建）当前驱动实例 */
 function _getDriver() {
   if (_driver) return _driver;
@@ -41,6 +58,13 @@ function _getDriver() {
       _driver = rd.create(REGISTRY, { redisUrl: url || undefined });
       _driverName = 'redis';
     } catch (e) {
+      if (_strict()) {
+        // MT-15：强依赖模式下不回退，暴露致命错误（进程应据此启动失败，避免静默降级）
+        _driverErr = e;
+        _driverName = 'none';
+        throw new Error('[queue] 已配置 Redis 强依赖但驱动不可用（拒绝回退内存驱动）：' + e.message +
+          '。如确需回退，请设 AGENT_QUEUE_ALLOW_FALLBACK=1。');
+      }
       _driverErr = e;
       _driver = require('./memory-driver').create(REGISTRY);
       _driverName = 'memory(fallback)';
@@ -76,11 +100,22 @@ function drain() { const d = _getDriver(); return d.drain ? d.drain() : undefine
 
 /** 驱动运行信息（健康检查/监控用） */
 function driverInfo() {
-  _getDriver();
-  return { driver: _driverName, error: _driverErr ? _driverErr.message : null, registered: [...REGISTRY.keys()] };
+  let fatal = null;
+  try { _getDriver(); } catch (e) { fatal = e.message; }
+  return {
+    driver: _driverName || 'none',
+    requested: _resolveDriverName(),
+    strict: _strict(),
+    error: fatal || (_driverErr ? _driverErr.message : null),
+    registered: [...REGISTRY.keys()],
+  };
 }
+
+/** 复位驱动缓存（仅测试用；运行期驱动一经创建即固定） */
+function _resetDriver() { _driver = null; _driverErr = null; _driverName = ''; }
 
 module.exports = {
   register, enqueue, getJob, queueStats, cleanupHistory,
   startWorkers, stopWorkers, drain, driverInfo, REGISTRY,
+  _strict, _resolveDriverName, _resetDriver, // MT-15：供测试/监控
 };

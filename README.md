@@ -3010,4 +3010,29 @@ R5 远期生态首项。**先做 3D 资产生成与导出（新增资产类型 +
 - `npm run lint:sql`：通过（`lib/audit.js` 作为审计底层帧出口加入豁免名单，其余未超基线）。
 - 隔离生产档实例实测：`encryption.key` 落盘权限 0600、`keyInfo` 来源 `file`；生产档未验签回调 `POST /api/channel/card-callback` → **HTTP 401**（原因可检索）；运行期审计写入 `op_logs` 的 `created_at=2026-11-22T15:29:57Z`（UTC）、`scripts/verify-audit-chain.js` 校验链完整。
 
+## MT-15 运行时无状态化 + Redis 队列（跨机分布式锁 + 队列强依赖）（2026-11-23）
+
+**目标**：让应用可在多副本/多节点部署下安全横向扩展——Redis 队列设为部署强依赖（缺依赖 fail-fast，不再静默降级）、跨机分布式锁（补 SQLite 租约仅同机有效的短板）、调度与运维仅单 leader 执行（对应《开发计划表 v1.1》MT-15，归 M5 规模化，并行 M2 推进）。
+
+**队列强依赖化（lib/queue/index.js）**
+- 新增 `_strict()`：显式指定 `QUEUE_DRIVER=redis` 且处于生产/集群档（`NODE_ENV=production` / `CLUSTER_MODE=1` / `WEB_CONCURRENCY>1` / 配置 `deploy_mode=cluster`）即视为强依赖；依赖缺失或连接失败一律 **fail-fast 抛错**（`driver='none'`），杜绝「名义外置队列、实为进程内」的隐形降级。
+- 优先级：`AGENT_QUEUE_ALLOW_FALLBACK=1`（显式允许回退，最高）> `AGENT_QUEUE_STRICT=1` / 配置 `queue_strict` > 自动判定。`driverInfo()` 增 `requested/strict/error` 字段供健康检查/监控。
+
+**跨机分布式锁（新增 lib/lock-redis.js + 扩展 lib/cluster-lock.js）**
+- 新增 `lib/lock-redis.js`：基于 Redis 的分布式锁后端，语义与同机 DB 租约完全对齐——acquire（Lua 原子：键不存在/已过期/本持有者→写入或续期，否则让位）、release（Lua 比较后删除，避免误删他人锁）、isLeader/renew。依赖 ioredis 惰性加载；支持注入任意客户端便于单测。
+- `lib/cluster-lock.js` 增异步统一 API `acquireAsync/isLeaderAsync/renewAsync/releaseAsync`，按后端分派：`LOCK_DRIVER`（env）> 配置 `lock_driver` > `auto`（跟随队列驱动：redis 队列→redis 锁，否则→db 锁）；既有同步 API 保持 DB 后端语义不变（零回归）。
+
+**调度与停机（lib/scheduler.js、server.js）**
+- 调度 tick 改用 `acquireAsync` 取领导权（跨机 Redis 锁），运维定时任务 guard 读取每次 tick 刷新的 `schedLeader`；非 leader 让位。
+- 优雅停机改调 `releaseAsync` 异步释放（best-effort 不阻塞停机），使其他节点/重启实例立即接管。
+
+**配置与编排（lib/config.js、ecosystem.config.js）**
+- 新增配置项 `lock_driver`（auto/db/redis）、`queue_strict`（''/1）；`deploy_mode` 描述同步为「选主锁」。
+- `ecosystem.config.js` web 编排注入 `QUEUE_DRIVER/LOCK_DRIVER/REDIS_URL`（默认 memory/auto/空；跨机时设 redis 三件套）。
+
+**验证**
+- `npm test`：冒烟 **633/0 全绿**（+5 MT-15 用例：队列强依赖 fail-fast 与逃生阀、锁后端选择、异步锁 API 语义一致、Redis 锁算法注入客户端 NX 接管/让位/续期/比较删除、配置与编排就绪；另改造 1 处既有集群门控断言为 acquireAsync/releaseAsync）；双租户 E2E **26/0 全绿**。
+- `npm run lint:sql`：通过（110 文件 / 1656 处，未超基线）。
+- 已知限制：ioredis/bullmq 为可选依赖（默认未安装，惰性加载）；「双副本不重复消费 / 跨机仅一个 leader」需真实 Redis 环境联调，单测以注入假客户端验证锁算法正确性。
+
 > AI生成

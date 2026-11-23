@@ -104,9 +104,13 @@ async function runTask(task) {
 function startScheduler() {
   // U2-1：'cron-task' 已在模块顶层注册（见上），此处仅保留守卫以兼容旧调用
   if (!global.__cronTaskRegistered) global.__cronTaskRegistered = true;
+  // MT-15：集群/跨机领导权（异步统一 API，后端按 LOCK_DRIVER 分派：同机=DB 租约，跨机=Redis 锁）。
+  //   schedLeader 每次 tick 刷新，供 ops 守卫同步读取（ops 自身定时器不改为异步）。
+  let schedLeader = !CLUSTER;
   const tick = async () => {
-    // U2-1 / N7-P2：集群模式下，非 leader 进程让位（同时完成领导权续租）
-    if (CLUSTER && !clusterLock.acquire(LEADER_LOCK, LOCK_TTL)) {
+    // U2-1 / N7-P2 / MT-15：集群模式下，非 leader 进程让位（同时完成领导权续租）
+    schedLeader = CLUSTER ? await clusterLock.acquireAsync(LEADER_LOCK, LOCK_TTL) : true;
+    if (CLUSTER && !schedLeader) {
       if (!global.__schedStandbyLogged) { console.log('[scheduler] 非 leader 进程，调度让位（由 leader 执行 tick）'); global.__schedStandbyLogged = true; }
       return;
     }
@@ -131,8 +135,8 @@ function startScheduler() {
   tick();
   setInterval(tick, 30000);
   // P0 运维：每日备份 + 产物清理 + 日志归档（内置，无外部依赖）
-  // U2-1 / N7-P2：集群下仅 leader 执行运维定时任务（guard 在每次触发时复查领导权，避免重复备份/清理）
-  ops.startOps(() => !CLUSTER || clusterLock.isLeader(LEADER_LOCK));
+  // U2-1 / N7-P2 / MT-15：集群下仅 leader 执行运维定时任务（读取 schedLeader，含跨机 Redis 锁结果）
+  ops.startOps(() => schedLeader);
   console.log('[scheduler] 定时任务调度器已启动（30s 扫描）');
 }
 

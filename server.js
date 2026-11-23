@@ -289,8 +289,9 @@ const voiceStreamHandle = attachVoiceStream(server);
 // 悬挂的 SSE 长连接由 5 秒兜底强退处理，避免卡死重启流程
 function shutdown(signal) {
   console.log(`\n[server] 收到 ${signal}，优雅停机中（停止接新连接，等待请求收尾）…`);
-  // U2-1 / N7-P2：主动释放集群领导权，使其他进程/重启实例可立即接管调度（无需等待租约 TTL 过期）
-  try { require('./src-server/lib/cluster-lock').release(require('./src-server/lib/cluster-lock').LOCK_NAME); } catch { }
+  // U2-1 / N7-P2 / MT-15：主动释放集群领导权，使其他进程/重启实例可立即接管调度（无需等待租约 TTL 过期）。
+  // 异步 API 按后端分派（同机=DB 租约；跨机=Redis 锁），best-effort 不阻塞停机。
+  try { const cl = require('./src-server/lib/cluster-lock'); Promise.resolve(cl.releaseAsync(cl.LOCK_NAME)).catch(() => { }); } catch { }
   try { require('./src-server/lib/db-read').closeReadDb(); } catch { } // U2-1 / N7-P3：关闭只读副本连接
   try { canvasCollabHandle.close(); } catch { } // U1-7：先断 WS 协作长连接，防 server.close 等待它悬挂至 5s 强退
   try { voiceStreamHandle.close(); } catch { } // U0-2：再断 WS 语音长连接（同上）

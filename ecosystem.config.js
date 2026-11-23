@@ -36,9 +36,13 @@ module.exports = {
       env: {
         NODE_ENV: 'production',
         PORT: process.env.PORT || 3210,
-        WEB_CONCURRENCY: String(WEB_INSTANCES), // 令各 worker 识别集群模式 → 启用选主租约锁
+        WEB_CONCURRENCY: String(WEB_INSTANCES), // 令各 worker 识别集群模式 → 启用选主锁
         DEPLOY_MODE: 'cluster',
         AGENT_DATA_DIR: process.env.AGENT_DATA_DIR || path.join(__dirname, 'data'),
+        // MT-15：跨机部署时设 QUEUE_DRIVER=redis + REDIS_URL + LOCK_DRIVER=redis（redis 队列档为强依赖，缺依赖即启动失败）
+        QUEUE_DRIVER: process.env.QUEUE_DRIVER || 'memory',
+        LOCK_DRIVER: process.env.LOCK_DRIVER || 'auto',
+        REDIS_URL: process.env.REDIS_URL || '',
       },
       // 优雅停机：等待存量请求收尾
       kill_timeout: 8000,

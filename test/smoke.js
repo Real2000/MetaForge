@@ -8652,13 +8652,13 @@ print('PY_OK')
 
     await t('U2-1/N7-P2: 调度/运维/服务端集群门控与集群派生（源码断言）', () => {
       const sched = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'lib', 'scheduler.js'), 'utf8');
-      assert.ok(/clusterLock\.acquire\(LEADER_LOCK/.test(sched), '调度 tick 应经选主 acquire 门控');
+      assert.ok(/clusterLock\.acquireAsync\(LEADER_LOCK/.test(sched), '调度 tick 应经选主 acquireAsync 门控（MT-15 支持跨机）');
       assert.ok(/ops\.startOps\(\(\)\s*=>/.test(sched), '应给 ops 传 leader guard');
       const opsSrc = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'lib', 'ops.js'), 'utf8');
       assert.ok(/function startOps\(guard\)/.test(opsSrc), 'ops.startOps 应接受 guard 参数');
       const srv = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
       assert.ok(/WEB_CONCURRENCY/.test(srv) && /cluster\.fork/.test(srv), 'server.js 应支持 WEB_CONCURRENCY 集群派生');
-      assert.ok(/cluster-lock'\)\.release/.test(srv), '优雅停机应释放领导权');
+      assert.ok(/releaseAsync\(cl\.LOCK_NAME\)/.test(srv), '优雅停机应释放领导权（MT-15 异步后端分派）');
       // U2-1/N7-P2 修复：主进程 fork 前先完成一次数据库迁移（消除多 worker 并发迁移竞争）
       assert.ok(/require\('\.\/src-server\/db'\)/.test(srv), '集群主进程应预加载 db 完成迁移');
       // U2-1/N7-P2 修复：主进程收到终止信号后停止自动重启，并在 worker 全部退出后自行退出
@@ -8678,6 +8678,127 @@ print('PY_OK')
       assert.ok(Number(web.instances) >= 1, 'web instances 应 ≥1');
       const wk = eco.apps.find(a => a.name === 'agent-queue-worker');
       assert.strictEqual(wk.exec_mode, 'fork', 'worker 应为 fork 模式');
+    });
+
+    // ---------------- MT-15：Redis 强依赖 + 跨机分布式锁 + 无状态多副本 ----------------
+    await t('MT-15: 队列强依赖化——显式 redis 缺依赖时 fail-fast，逃生阀可强制回退', () => {
+      const q = require('../src-server/lib/queue');
+      const sQ = process.env.QUEUE_DRIVER, sS = process.env.AGENT_QUEUE_STRICT,
+        sF = process.env.AGENT_QUEUE_ALLOW_FALLBACK, sN = process.env.NODE_ENV;
+      try {
+        delete process.env.NODE_ENV;
+        process.env.QUEUE_DRIVER = 'redis'; process.env.AGENT_QUEUE_STRICT = '1';
+        delete process.env.AGENT_QUEUE_ALLOW_FALLBACK;
+        assert.strictEqual(q._strict(), true, '显式 strict 应生效');
+        q._resetDriver();
+        const info = q.driverInfo();
+        assert.strictEqual(info.driver, 'none', '严格模式依赖缺失时不得回退内存驱动');
+        assert.ok(/拒绝回退|强依赖/.test(info.error || ''), '应暴露可读致命错误：' + info.error);
+        // 逃生阀：显式允许回退
+        process.env.AGENT_QUEUE_ALLOW_FALLBACK = '1'; q._resetDriver();
+        const info2 = q.driverInfo();
+        assert.strictEqual(info2.strict, false, '逃生阀关闭严格模式');
+        assert.ok(/memory/.test(info2.driver), '允许回退时回落内存驱动：' + info2.driver);
+      } finally {
+        if (sQ === undefined) delete process.env.QUEUE_DRIVER; else process.env.QUEUE_DRIVER = sQ;
+        if (sS === undefined) delete process.env.AGENT_QUEUE_STRICT; else process.env.AGENT_QUEUE_STRICT = sS;
+        if (sF === undefined) delete process.env.AGENT_QUEUE_ALLOW_FALLBACK; else process.env.AGENT_QUEUE_ALLOW_FALLBACK = sF;
+        if (sN === undefined) delete process.env.NODE_ENV; else process.env.NODE_ENV = sN;
+        q._resetDriver();
+      }
+    });
+
+    await t('MT-15: 锁后端选择——auto 随队列驱动；显式 LOCK_DRIVER 覆盖', () => {
+      const lock = require('../src-server/lib/cluster-lock');
+      const sQ = process.env.QUEUE_DRIVER, sL = process.env.LOCK_DRIVER;
+      try {
+        delete process.env.LOCK_DRIVER; delete process.env.QUEUE_DRIVER;
+        assert.strictEqual(lock.backend(), 'db', '默认（内存队列）应为 db 锁');
+        process.env.QUEUE_DRIVER = 'redis';
+        assert.strictEqual(lock.backend(), 'redis', 'redis 队列应自动用 redis 锁（跨机）');
+        process.env.LOCK_DRIVER = 'db';
+        assert.strictEqual(lock.backend(), 'db', '显式 db 覆盖 auto');
+        process.env.LOCK_DRIVER = 'redis'; process.env.QUEUE_DRIVER = 'memory';
+        assert.strictEqual(lock.backend(), 'redis', '显式 redis 覆盖 auto');
+      } finally {
+        if (sQ === undefined) delete process.env.QUEUE_DRIVER; else process.env.QUEUE_DRIVER = sQ;
+        if (sL === undefined) delete process.env.LOCK_DRIVER; else process.env.LOCK_DRIVER = sL;
+      }
+    });
+
+    await t('MT-15: 异步锁统一 API（DB 后端）——acquireAsync/isLeaderAsync/releaseAsync 语义与同步一致', async () => {
+      const lock = require('../src-server/lib/cluster-lock');
+      const sL = process.env.LOCK_DRIVER;
+      try {
+        delete process.env.LOCK_DRIVER; // db 后端
+        process.env.CLUSTER_MODE = '1'; lock._resetClusterModeCache();
+        lock.release('UTA', 'A'); lock.release('UTA', 'B');
+        assert.strictEqual(await lock.acquireAsync('UTA', 60000, 'A'), true, 'A 首取成功');
+        assert.strictEqual(await lock.isLeaderAsync('UTA', 'A'), true, 'A 为 leader');
+        assert.strictEqual(await lock.renewAsync('UTA', 60000, 'A'), true, 'A 续租成功');
+        assert.strictEqual(await lock.releaseAsync('UTA', 'B'), false, '非持有者释放无效');
+        assert.strictEqual(await lock.releaseAsync('UTA', 'A'), true, 'A 释放成功');
+        assert.strictEqual(await lock.isLeaderAsync('UTA', 'A'), false, '释放后非 leader');
+      } finally {
+        if (sL === undefined) delete process.env.LOCK_DRIVER; else process.env.LOCK_DRIVER = sL;
+        delete process.env.CLUSTER_MODE; lock._resetClusterModeCache();
+        lock.release('UTA', 'A'); lock.release('UTA', 'B');
+      }
+    });
+
+    await t('MT-15: Redis 锁算法（注入假客户端）——NX 接管/让位/续期/比较删除', async () => {
+      const lockRedis = require('../src-server/lib/lock-redis');
+      // 假 Redis：按脚本特征区分 acquire（含 PEXPIRE）/ release（含 DEL）
+      const store = new Map();
+      const fake = {
+        async get(k) { return store.has(k) ? store.get(k) : null; },
+        async eval(script, _n, key, owner) {
+          if (/PEXPIRE/.test(script)) { // acquire
+            const cur = store.get(key);
+            if (cur === undefined) { store.set(key, owner); return 1; }
+            if (cur === owner) return 1;
+            return 0;
+          }
+          if (/DEL/.test(script)) { // release
+            if (store.get(key) === owner) { store.delete(key); return 1; }
+            return 0;
+          }
+          return 0;
+        },
+      };
+      const be = lockRedis.createBackend(fake);
+      assert.strictEqual(be.name, 'redis');
+      assert.strictEqual(await be.acquire('L', 60000, 'A'), true, 'A 首取（NX 写入）成功');
+      assert.strictEqual(await be.isLeader('L', 'A'), true, 'A 为锁主');
+      assert.strictEqual(await be.acquire('L', 60000, 'B'), false, 'B 在租约期内让位');
+      assert.strictEqual(await be.isLeader('L', 'B'), false, 'B 非锁主');
+      assert.strictEqual(await be.renew('L', 60000, 'A'), true, 'A 续期成功（本人存在）');
+      assert.strictEqual(await be.release('L', 'B'), false, '非持有者释放无效（比较删除）');
+      assert.strictEqual(await be.release('L', 'A'), true, 'A 释放成功');
+      assert.strictEqual(await be.isLeader('L', 'A'), false, '释放后非锁主');
+      // cluster-lock 经注入客户端走 redis 后端
+      const lock = require('../src-server/lib/cluster-lock');
+      const sL = process.env.LOCK_DRIVER;
+      try {
+        lock._setRedisClient(fake);
+        process.env.LOCK_DRIVER = 'redis';
+        assert.strictEqual(lock.backend(), 'redis');
+        assert.strictEqual(await lock.acquireAsync('UTB', 60000, 'X'), true, 'cluster-lock 走 redis 后端接管成功');
+        assert.strictEqual(await lock.isLeaderAsync('UTB', 'X'), true, 'cluster-lock 走 redis 后端识别锁主');
+        assert.strictEqual(await lock.releaseAsync('UTB', 'X'), true, 'cluster-lock 走 redis 后端释放成功');
+      } finally {
+        if (sL === undefined) delete process.env.LOCK_DRIVER; else process.env.LOCK_DRIVER = sL;
+        lock._setRedisClient(null);
+      }
+    });
+
+    await t('MT-15: 配置项与部署编排就绪（lock_driver/queue_strict/ecosystem）', () => {
+      const cfg = require('../src-server/lib/config');
+      assert.strictEqual(cfg.get('lock_driver'), 'auto', 'lock_driver 默认 auto');
+      assert.strictEqual(cfg.get('queue_strict'), '', 'queue_strict 默认空');
+      const eco = require(path.join(__dirname, '..', 'ecosystem.config.js'));
+      const web = eco.apps.find(a => a.name === 'agent-web');
+      assert.ok('LOCK_DRIVER' in web.env && 'REDIS_URL' in web.env, 'web 编排应含 LOCK_DRIVER/REDIS_URL');
     });
 
     // ---------------- U2-1 / N7-P3 读写分离 DAL 与 litestream ----------------
