@@ -94,11 +94,16 @@ app.use((req, res, next) => {
 // 凭据/机器协议/webhook 端点豁免（见 lib/response.js）。置于全部路由之前。
 app.use(require('./src-server/lib/response').contract());
 
+// BE-B5（2026-11-23）：内部 API 版本化——规范前缀 /api/v1/*，旧 /api/* 作为过渡期别名（双挂载）。
+// 旧前缀响应注入弃用告警头并记录告警；挂载统一经 mountApi（见 lib/api-version.js）。
+const apiVersion = require('./src-server/lib/api-version');
+app.use(apiVersion.deprecationNotice());
+
 // U0-6 A2A Agent Card 公开发现端点（必须在任何鉴权中间件之前注册）
 const { publicRouter, authRouter, adminRouter } = require('./src-server/routes/a2a');
-app.use(publicRouter); // /.well-known/agent-card.json 公开访问
-app.use('/api/a2a/admin', adminRouter); // U2-7 Phase 3：密钥管理（平台管理员）
-app.use('/api/a2a', authRouter); // /api/a2a/* 需认证
+app.use(publicRouter); // /.well-known/agent-card.json + /api/a2a/oauth/token 公开访问（机器协议，保持原路径）
+apiVersion.mountApi(app, 'a2a/admin', adminRouter); // U2-7 Phase 3：密钥管理（平台管理员）
+apiVersion.mountApi(app, 'a2a', authRouter); // /api[/v1]/a2a/* 需认证
 const PORT = process.env.PORT || 3210;
 
 // MT-13：捕获原始报文（req.rawBody）供支付回调 HMAC 验签逐字节比对（防重排/篡改）
@@ -130,103 +135,106 @@ app.use(expressStatic(path.join(__dirname, 'public'), staticOptions));
 const { tenantContext } = require('./src-server/lib/auth');
 app.use(tenantContext);
 
-// API 路由
-app.use('/api/auth', require('./src-server/routes/auth'));
-app.use('/api/auth/sso', require('./src-server/routes/sso'));
+// API 路由（BE-B5：统一经 mountApi 双挂载 /api/v1/* 与 /api/*）
+apiVersion.mountApi(app, 'auth', require('./src-server/routes/auth'));
+apiVersion.mountApi(app, 'auth/sso', require('./src-server/routes/sso'));
 
-app.use('/api/agents', require('./src-server/routes/agents'));
-app.use('/api/memories', require('./src-server/routes/memories')); // P1-5 记忆管理（查看/搜索/合并/删除/导出，adminOnly）
-app.use('/api/channel', require('./src-server/routes/channel')); // P1-7 渠道适配层（统一入站模型 + 出站发送封装）
-app.use('/api/sandbox', require('./src-server/routes/sandbox')); // P1-11~13 沙箱执行子线（运行记录/远程主机/执行测试）
-app.use('/api/chat', require('./src-server/routes/chat'));
-app.use('/api/knowledge', require('./src-server/routes/knowledge'));
-app.use('/api/tasks', require('./src-server/routes/tasks'));
-app.use('/api/providers', require('./src-server/routes/providers'));
-app.use('/api/platforms', require('./src-server/routes/platforms'));
-app.use('/api/security', require('./src-server/routes/security'));
-app.use('/api/monitor', require('./src-server/routes/logs'));
-app.use('/api/stats', require('./src-server/routes/stats'));
+apiVersion.mountApi(app, 'agents', require('./src-server/routes/agents'));
+apiVersion.mountApi(app, 'memories', require('./src-server/routes/memories')); // P1-5 记忆管理（查看/搜索/合并/删除/导出，adminOnly）
+apiVersion.mountApi(app, 'channel', require('./src-server/routes/channel')); // P1-7 渠道适配层（统一入站模型 + 出站发送封装）
+apiVersion.mountApi(app, 'sandbox', require('./src-server/routes/sandbox')); // P1-11~13 沙箱执行子线（运行记录/远程主机/执行测试）
+apiVersion.mountApi(app, 'chat', require('./src-server/routes/chat'));
+apiVersion.mountApi(app, 'knowledge', require('./src-server/routes/knowledge'));
+apiVersion.mountApi(app, 'tasks', require('./src-server/routes/tasks'));
+apiVersion.mountApi(app, 'providers', require('./src-server/routes/providers'));
+apiVersion.mountApi(app, 'platforms', require('./src-server/routes/platforms'));
+apiVersion.mountApi(app, 'security', require('./src-server/routes/security'));
+apiVersion.mountApi(app, 'monitor', require('./src-server/routes/logs'));
+apiVersion.mountApi(app, 'stats', require('./src-server/routes/stats'));
 // API 发布（OpenAI 兼容，密钥自鉴权）与分享链接（免登录）
 app.use('/openapi', require('./src-server/routes/openapi'));
-app.use('/api/share', require('./src-server/routes/share'));
-app.use('/api/departments', require('./src-server/routes/departments')); // P0 组织部门树
+apiVersion.mountApi(app, 'share', require('./src-server/routes/share'));
+apiVersion.mountApi(app, 'departments', require('./src-server/routes/departments')); // P0 组织部门树
 // V1.3 #4 2026-10-30 钉钉集成回调（mock 阶段：验签/解密/幂等/组织同步；服务器对服务器推送无登录态，安全靠验签，路由内故意不挂 auth）
-app.use('/api/dingtalk', require('./src-server/routes/dingtalk'));
+apiVersion.mountApi(app, 'dingtalk', require('./src-server/routes/dingtalk'));
 // P5.14 文件一等变量：工作流文件上传/下载（画布 file 变量 + 聊天附件共用）
-app.use('/api/files', require('./src-server/routes/files'));
-app.use('/api/doc', require('./src-server/routes/doc')); // P1-15/16 文档预览（受控原文流 + 权限校验）
+apiVersion.mountApi(app, 'files', require('./src-server/routes/files'));
+apiVersion.mountApi(app, 'doc', require('./src-server/routes/doc')); // P1-15/16 文档预览（受控原文流 + 权限校验）
 // P2-16 工具注册表统一化（内置工具 + MCP + 子智能体同表登记）
-app.use('/api/tools', require('./src-server/routes/tools'));
+apiVersion.mountApi(app, 'tools', require('./src-server/routes/tools'));
 // MCP 服务管理与行业模板库（P2）
-app.use('/api/mcp', require('./src-server/routes/mcp'));
-app.use('/api/templates', require('./src-server/routes/templates'));
-app.use('/api/wf-templates', require('./src-server/routes/wf-templates')); // P5.17 工作流模板库
+apiVersion.mountApi(app, 'mcp', require('./src-server/routes/mcp'));
+apiVersion.mountApi(app, 'templates', require('./src-server/routes/templates'));
+apiVersion.mountApi(app, 'wf-templates', require('./src-server/routes/wf-templates')); // P5.17 工作流模板库
 // 通知中心（铃铛消息：发布上架广播 / 系统公告）
-app.use('/api/notify', require('./src-server/routes/notify'));
+apiVersion.mountApi(app, 'notify', require('./src-server/routes/notify'));
 // 用量报表与配额管理（P2）
-app.use('/api/quota', require('./src-server/routes/quota'));
-app.use('/api/billing', require('./src-server/routes/billing')); // D2-2 计费用量感知闭环（预检/预留/结算/对账）
+apiVersion.mountApi(app, 'quota', require('./src-server/routes/quota'));
+apiVersion.mountApi(app, 'billing', require('./src-server/routes/billing')); // D2-2 计费用量感知闭环（预检/预留/结算/对账）
 // 用户自有模型源（P3）：自带 Key 接入个人 OpenAI 兼容服务，仅本人可见可用
-app.use('/api/usermodels', require('./src-server/routes/usermodels'));
-app.use('/api/tool-keys', require('./src-server/routes/tool-keys')); // P3-2：用户级工具 API Key（weather/translate 等，加密落盘掩码回显）
+apiVersion.mountApi(app, 'usermodels', require('./src-server/routes/usermodels'));
+apiVersion.mountApi(app, 'tool-keys', require('./src-server/routes/tool-keys')); // P3-2：用户级工具 API Key（weather/translate 等，加密落盘掩码回显）
 // 技能资产（P3）：提示词+工具组合资产化，对话中 @技能名 调用
-app.use('/api/skillassets', require('./src-server/routes/skillassets'));
+apiVersion.mountApi(app, 'skillassets', require('./src-server/routes/skillassets'));
 // V2.2 #7 技能/模版市场：工作流模版/技能资产/MCP 工具/异构应用四区聚合 + 收藏 + 一键克隆
-app.use('/api/skills-market', require('./src-server/routes/skills-market'));
+apiVersion.mountApi(app, 'skills-market', require('./src-server/routes/skills-market'));
 // V2.3 Y7 版本/License 管理端点：GET 版本快照（登录可看，普通用户脱敏）+ POST 热重载（仅管理员，写 op_logs 审计）
-app.use('/api/edition', require('./src-server/routes/edition'));
+apiVersion.mountApi(app, 'edition', require('./src-server/routes/edition'));
 // 用户管理：管理员对用户的增删改查/角色管理/重置密码/启停
-app.use('/api/users', require('./src-server/routes/users'));
+apiVersion.mountApi(app, 'users', require('./src-server/routes/users'));
 // MT-10 租户开通闭环（2026-11-22）：平台超管开通/停用租户（建租户 + 派生首个管理员）
-app.use('/api/tenants', require('./src-server/routes/tenants'));
+apiVersion.mountApi(app, 'tenants', require('./src-server/routes/tenants'));
 // MT-09 平台超管跨租户运维台（2026-11-22）：跨租户只读统计 / 带审计 impersonation / 审计查询
-app.use('/api/platform-admin', require('./src-server/routes/platform-admin'));
+apiVersion.mountApi(app, 'platform-admin', require('./src-server/routes/platform-admin'));
 // MT-13 支付/订阅闭环（2026-11-22）：下单/回调验签(免登录)/订单/钱包/退款/对账
-app.use('/api/payment', require('./src-server/routes/payment'));
+apiVersion.mountApi(app, 'payment', require('./src-server/routes/payment'));
 // 意见反馈（帮助体系）：全站反馈通道 + 管理员闭环处理（站内信回告提交者）
-app.use('/api/feedback', require('./src-server/routes/feedback'));
+apiVersion.mountApi(app, 'feedback', require('./src-server/routes/feedback'));
 // P5.27 本地桥（桌面操控客户端服务）：设备配对 + 任务队列（轮询模式，桥端 device_token 鉴权）
-app.use('/api/localbridge', require('./src-server/routes/localbridge').router);
+apiVersion.mountApi(app, 'localbridge', require('./src-server/routes/localbridge').router);
 // 商业化（2026-10-20）：套餐定价/企业线索/账单发票/客户成功洞察（plans 与 lead 免登录）
-app.use('/api/biz', require('./src-server/routes/biz'));
+apiVersion.mountApi(app, 'biz', require('./src-server/routes/biz'));
 // U2-3 插件运行时管理（安装/卸载/启用/沙箱试运行）
-app.use('/api/plugins', require('./src-server/routes/plugins'));
+apiVersion.mountApi(app, 'plugins', require('./src-server/routes/plugins'));
 // P5.5 通用密钥管理（画布 {{env.XXX}} 占位符数据源；仅管理员）
-app.use('/api/secrets', require('./src-server/routes/secrets'));
+apiVersion.mountApi(app, 'secrets', require('./src-server/routes/secrets'));
 // P2-1~3 协作房间+任务分解+人机协同（2026-11-13）
-app.use('/api/collab', require('./src-server/routes/collab'));
+apiVersion.mountApi(app, 'collab', require('./src-server/routes/collab'));
 // P2-4~8 专家目录+子智能体库+插件+市场Hub对接（2026-11-13）
-app.use('/api/catalog', require('./src-server/routes/catalog'));
+apiVersion.mountApi(app, 'catalog', require('./src-server/routes/catalog'));
 // U2-5 市场商品管理（智能体发行为市场可购买商品）
-app.use('/api/market', require('./src-server/routes/market-products'));
+apiVersion.mountApi(app, 'market', require('./src-server/routes/market-products'));
 // U2-5 Phase 2 市场订单管理（购买/订阅/支付回调）
-app.use('/api/market/orders', require('./src-server/routes/market-orders'));
+apiVersion.mountApi(app, 'market/orders', require('./src-server/routes/market-orders'));
 // P1-20 配置中心（统一配置管理，格式检查 + 脱敏回显 + 审计日志）
-app.use('/api/config', require('./src-server/routes/config'));
+apiVersion.mountApi(app, 'config', require('./src-server/routes/config'));
 // U1-1 内建数据库（用户自定义表CRUD + 行数据管理）
-app.use('/api/database', require('./src-server/routes/database'));
+apiVersion.mountApi(app, 'database', require('./src-server/routes/database'));
 // P1-21 API 文档站（自动生成 OpenAPI 规范 + Redoc 渲染页面）
-app.use('/api/api-docs', require('./src-server/routes/api-docs'));
+apiVersion.mountApi(app, 'api-docs', require('./src-server/routes/api-docs'));
 // P2-20 语音供应商管理（2026-11-13）
-app.use('/api/voice-providers', require('./src-server/routes/voice-providers'));
+apiVersion.mountApi(app, 'voice-providers', require('./src-server/routes/voice-providers'));
 // P2-18 浏览器自动化（2026-11-13）
-app.use('/api/browser', require('./src-server/routes/browser'));
+apiVersion.mountApi(app, 'browser', require('./src-server/routes/browser'));
 // D1-3 创作资产 V1（2026-11-20）：项目/素材库/分镜三件套
-app.use('/api/creation', require('./src-server/routes/creation'));
+apiVersion.mountApi(app, 'creation', require('./src-server/routes/creation'));
 // D3-1 3D 与数字人 V1（2026-11-21）：3D 资产生成/导出 + 数字人合规评估
-app.use('/api/model3d', require('./src-server/routes/model3d'));
+apiVersion.mountApi(app, 'model3d', require('./src-server/routes/model3d'));
 // D3-2 经验自进化 V1（2026-11-21）：专家×任务类型可靠度聚合 + 编排优选 + 自进化验收指标
-app.use('/api/experience', require('./src-server/routes/experience'));
+apiVersion.mountApi(app, 'experience', require('./src-server/routes/experience'));
 // D3-4 评测体系 V1（2026-11-21）：发布基线（成功率/步数/干预率）+ SWE-bench-lite 接入
-app.use('/api/eval', require('./src-server/routes/eval'));
+apiVersion.mountApi(app, 'eval', require('./src-server/routes/eval'));
 // D2-1 代码索引与仓库语义检索（2026-11-21）：只读检索 + 补丁 propose/apply/rollback
-app.use('/api/code', require('./src-server/routes/code'));
-// P3 MCP Server（2026-10-22 ⑤）：已发布智能体暴露为 MCP 工具（Streamable HTTP + Bearer 令牌；管理端 /api/mcp-server）
+apiVersion.mountApi(app, 'code', require('./src-server/routes/code'));
+// P3 MCP Server（2026-10-22 ⑤）：已发布智能体暴露为 MCP 工具（Streamable HTTP + Bearer 令牌；管理端 /api[/v1]/mcp-server）
+// 注：/mcp 为对外 MCP 协议入口（非 /api 内部契约），保持原路径单挂载。
 app.use('/mcp', require('./src-server/routes/mcp-server'));
-app.use('/api/mcp-server', require('./src-server/routes/mcp-server'));
+apiVersion.mountApi(app, 'mcp-server', require('./src-server/routes/mcp-server'));
 
-// 健康检查
-app.get('/api/health', (req, res) => res.json({ code: 0, data: { ok: true, ts: Date.now() } }));
+// 健康检查（BE-B5：新旧前缀双挂载）
+const healthHandler = (req, res) => res.json({ code: 0, data: { ok: true, ts: Date.now() } });
+app.get(apiVersion.API_PREFIX + '/health', healthHandler);
+app.get(apiVersion.LEGACY_PREFIX + '/health', healthHandler);
 
 // 分享页面（/share/:token → share.html，前端自解析 token）
 // V3.1 #12 嵌入代码（2026-11-03）：按 token 对应智能体的 embed_domains 白名单动态下发 CSP

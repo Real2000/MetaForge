@@ -224,8 +224,10 @@ function auditTenantBypass(req, user, tenantId) {
 
 /** 租户上下文中间件：必须置于全部业务路由之前 */
 const TENANT_PUBLIC_PREFIXES = ['/api/auth', '/api/health', '/api/edition', '/api/a2a', '/.well-known', '/api/config/public', '/api/payment/callback'];
+// BE-B5：双挂载下 /api/v1/* 折叠回 /api/* 后再判定，两类前缀行为一致。
+const { stripVersion } = require('./api-version');
 function isTenantPublicPath(reqPath) {
-  const p = String(reqPath || '');
+  const p = stripVersion(String(reqPath || ''));
   return TENANT_PUBLIC_PREFIXES.some(pre => p === pre || p.startsWith(pre + '/'));
 }
 function tenantContext(req, res, next) {

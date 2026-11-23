@@ -3035,4 +3035,29 @@ R5 远期生态首项。**先做 3D 资产生成与导出（新增资产类型 +
 - `npm run lint:sql`：通过（110 文件 / 1656 处，未超基线）。
 - 已知限制：ioredis/bullmq 为可选依赖（默认未安装，惰性加载）；「双副本不重复消费 / 跨机仅一个 leader」需真实 Redis 环境联调，单测以注入假客户端验证锁算法正确性。
 
+## BE-B5 内部 API 版本化（/api/v1 规范前缀 + /api 过渡期别名）（2026-11-23）
+
+**目标**：内部 REST API 引入版本前缀 `/api/v1/*`（规范入口）；过渡期与旧 `/api/*` **双挂载**（旧前缀为弃用别名，注入弃用告警头并记录告警，明确迁移期后下线）；OpenAPI 规范只列 v1（对应《开发计划表 v1.1》BE-B5，归 M5 规模化，依赖 BE-B1/BE-B4）。
+
+**版本前缀与双挂载（新增 lib/api-version.js）**
+- 单一来源常量 `API_PREFIX='/api/v1'` / `LEGACY_PREFIX='/api'`；`mountApi(app, sub, router)` 把同一 router 同时挂到规范前缀与旧前缀，避免逐条重复注册。
+- `isLegacyApiPath()`（旧前缀判定，排除 v1）/ `isCanonicalApiPath()` / `stripVersion()`（`/api/v1/*` 折叠回 `/api/*`）。
+- `deprecationNotice()` 中间件：对旧 `/api/*` 响应注入 RFC 8594 风格弃用头 `Deprecation: true`、`Link: </api/v1/…>; rel="successor-version"`、`Warning: 299`，并按「方法+路径」节流记录告警；`/api/v1/*` 不注入。
+
+**server.js**
+- 全部内部 API 挂载（57 处）改经 `mountApi` 双挂载（含 `auth/sso`、`a2a/admin`、`market/orders` 等多层子路径、`api-docs`、`mcp-server`、`health`）；`/openapi`（对外开放契约）与 `/mcp`（MCP 协议入口）保持原路径单挂载；弃用告警中间件紧随响应契约中间件装配。
+
+**既有 `/api` 前缀判定逻辑折叠版本（行为一致）**
+- `lib/response.js`：响应契约豁免（`/api/auth`、`/api/dingtalk`、`/api/a2a`、渠道回调三端点）判定先 `stripVersion`——新旧前缀豁免行为一致（登录失败仍 HTTP 200 + code 401）。
+- `lib/auth.js`：租户公开路径 `isTenantPublicPath` 同样折叠版本前缀（登录/健康/版本/a2a 等在多租户档下不因 v1 前缀被误判为需租户上下文）。
+
+**OpenAPI 只列 v1（lib/api-doc.js）**
+- `tagFor`/`descFor` 折叠版本前缀后再取标签/描述（`/api/v1/agents` → tag `agents`）。
+- `buildGlobalOpenApi` 过滤旧 `/api/*` 别名路由——规范仅列 `/api/v1/*` 与非 `/api` 对外开放契约（`/openapi/*`、`/mcp`）。
+
+**验证**
+- `npm test`：冒烟 **637/0 全绿**（+4 BE-B5 用例：前缀判定与归一化、弃用告警头注入/不注入、server.js 全量双挂载且无遗留旧式挂载、既有判定逻辑折叠版本；另适配 BE-B4 一处断言为 v1）；双租户 E2E **26/0 全绿**。
+- `npm run lint:sql`：通过（110 文件 / 1656 处，未超基线）。
+- 隔离实例实测：`/api/health` 与 `/api/v1/health` 均 200（旧前缀带 `Deprecation` 头、v1 无）；受保护端点新旧前缀均 401（BE-B1 契约）；豁免端点新旧前缀登录失败均 HTTP 200 + code 401；`/api/v1/api-docs/openapi.json` 与 `/openapi/openapi.json` 均含 425 条 v1 路径、旧 `/api/*` 别名残留 0 条。
+
 > AI生成

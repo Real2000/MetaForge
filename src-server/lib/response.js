@@ -23,11 +23,15 @@ const EXEMPT_PREFIXES = ['/api/auth', '/api/dingtalk', '/api/a2a'];
 // 豁免精确路径（含其子路径）
 const EXEMPT_EXACT = ['/api/channel/event', '/api/channel/card-callback', '/api/channel/inbound'];
 
+// BE-B5：双挂载下请求路径可能是 /api/* 或 /api/v1/*，折叠版本前缀后再判定，两类前缀行为一致。
+const { stripVersion } = require('./api-version');
+
 /** 判断某完整请求路径是否豁免状态码修正 */
 function isExempt(path) {
   if (!path) return false;
-  if (EXEMPT_EXACT.some(p => path === p || path.startsWith(p + '/'))) return true;
-  return EXEMPT_PREFIXES.some(p => path === p || path.startsWith(p + '/'));
+  const p0 = stripVersion(path);
+  if (EXEMPT_EXACT.some(p => p0 === p || p0.startsWith(p + '/'))) return true;
+  return EXEMPT_PREFIXES.some(p => p0 === p || p0.startsWith(p + '/'));
 }
 
 /** 业务码 → HTTP 状态码：4xx/5xx 原样；其余（异常/落成功区间的错误码）回落 400 */

@@ -6885,7 +6885,7 @@ print('PY_OK')
         assert.ok(spec.paths['/openapi/v1/chat/completions'] && spec.paths['/openapi/v1/chat/completions'].post, '规范应含 chat/completions POST 定义');
         assert.ok(spec.paths['/openapi/v1/models'] && spec.paths['/openapi/v1/models'].get, '规范应含 models GET 定义');
         assert.ok(Object.keys(spec.paths).length > 100, 'BE-B4：自动采集应覆盖全部已注册路由（>100）');
-        assert.ok(spec.paths['/api/agents'], 'BE-B4：应含 /api/agents');
+        assert.ok(spec.paths['/api/v1/agents'], 'BE-B5：规范只列 v1，应含 /api/v1/agents');
         assert.strictEqual(spec['x-sdk'].name, 'agent-platform-sdk', '规范应含 SDK 元数据');
         assert.ok(spec.components.securitySchemes.apiKeyAuth, '规范应含 apiKeyAuth 安全方案');
         // BE-B4：两个规范入口同源（/openapi/openapi.json 与 /api/api-docs/openapi.json）
@@ -10579,16 +10579,21 @@ print('PY_OK')
     const app = express();
     const r = express.Router();
     r.get('/:id', (q, s) => s.end());
-    app.use('/api/agents', r);
+    app.use('/api/v1/agents', r);
+    // BE-B5：旧 /api/* 别名应被过滤，不出现在规范中
+    const legacy = express.Router();
+    legacy.get('/x', (q, s) => s.end());
+    app.use('/api/legacy', legacy);
     const spec = buildGlobalOpenApi(app);
     assert.strictEqual(spec.openapi, '3.1.0', '应为 OpenAPI 3.1');
     assert.ok(spec.info.version, 'info.version 来自版本单一来源');
     assert.ok(spec.components.securitySchemes.cookieAuth, '应含 cookieAuth');
-    const op = spec.paths['/api/agents/{id}'].get;
+    const op = spec.paths['/api/v1/agents/{id}'].get;
     assert.ok(op, '路径参数应转为 {id}');
     assert.deepStrictEqual(op.parameters[0], { name: 'id', in: 'path', required: true, schema: { type: 'string' } }, 'path 参数应被提取');
     assert.ok(op.responses['200'] && op.responses['400'] && op.responses['401'], '应含标准错误码');
-    assert.ok(op.tags && op.tags.includes('agents'), 'tag 取 /api 第二段');
+    assert.ok(op.tags && op.tags.includes('agents'), 'tag 折叠 v1 前缀后取 /api 第二段');
+    assert.ok(!spec.paths['/api/legacy/x'], 'BE-B5：旧 /api/* 别名不应出现在规范中');
     // 开放端点富定义叠加
     assert.ok(spec.paths['/openapi/v1/chat/completions'].post.requestBody, '开放端点应叠加手写富定义');
   });
@@ -10602,6 +10607,58 @@ print('PY_OK')
       assert.ok(/require\(['"][^'"]*lib\/version['"]\)/.test(src), f + ' 应从 lib/version 读取版本');
       assert.ok(!/['"]p5\.\d+['"]/.test(src), f + ' 不应再硬编码 p5.xx 版本');
     }
+  });
+
+  // BE-B5：内部 API 版本化——/api/v1 规范前缀 + /api 过渡期别名（双挂载）+ 弃用告警 + OpenAPI 只列 v1
+  await t('BE-B5：api-version 前缀判定与归一化（v1/旧前缀/其它）', () => {
+    const av = require('../src-server/lib/api-version');
+    assert.strictEqual(av.API_PREFIX, '/api/v1');
+    assert.strictEqual(av.LEGACY_PREFIX, '/api');
+    assert.strictEqual(av.isLegacyApiPath('/api/agents'), true, '旧前缀为 legacy');
+    assert.strictEqual(av.isLegacyApiPath('/api/v1/agents'), false, 'v1 非 legacy');
+    assert.strictEqual(av.isCanonicalApiPath('/api/v1/agents'), true, 'v1 为规范前缀');
+    assert.strictEqual(av.isLegacyApiPath('/openapi/v1/models'), false, '非 /api 不受影响');
+    assert.strictEqual(av.isLegacyApiPath('/share/abc'), false, '页面/静态路径不受影响');
+    assert.strictEqual(av.stripVersion('/api/v1/agents/1'), '/api/agents/1', 'v1 折叠回 /api');
+    assert.strictEqual(av.stripVersion('/api/agents/1'), '/api/agents/1', '旧前缀保持不变');
+    assert.strictEqual(av.stripVersion('/openapi/x'), '/openapi/x', '非 /api 不变');
+  });
+
+  await t('BE-B5：弃用告警中间件——旧前缀注入 Deprecation/Link/Warning，v1 不注入', () => {
+    const av = require('../src-server/lib/api-version');
+    const mw = av.deprecationNotice(() => {});
+    const mkRes = () => ({ headers: {}, setHeader(k, v) { this.headers[k] = v; } });
+    let nexted = 0;
+    const resLegacy = mkRes();
+    mw({ method: 'GET', originalUrl: '/api/agents?x=1' }, resLegacy, () => nexted++);
+    assert.strictEqual(resLegacy.headers['Deprecation'], 'true', '旧前缀应标 Deprecation');
+    assert.ok(/successor-version/.test(resLegacy.headers['Link'] || ''), 'Link 应指向 v1 后继版本');
+    assert.ok(/Deprecated/.test(resLegacy.headers['Warning'] || ''), 'Warning 应提示弃用');
+    const resV1 = mkRes();
+    mw({ method: 'GET', originalUrl: '/api/v1/agents' }, resV1, () => nexted++);
+    assert.strictEqual(resV1.headers['Deprecation'], undefined, 'v1 不应标 Deprecation');
+    assert.strictEqual(nexted, 2, '中间件应放行');
+  });
+
+  await t('BE-B5：server.js 内部 API 全部双挂载，无遗留旧式 app.use(\'/api/…\')', () => {
+    const srv = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
+    assert.ok(/require\(['"][^'"]*lib\/api-version['"]\)/.test(srv), 'server.js 应引入 api-version');
+    assert.ok(/deprecationNotice\(\)/.test(srv), 'server.js 应装配弃用告警中间件');
+    assert.ok(/mountApi\(app, 'agents'/.test(srv), '应经 mountApi 挂载 agents');
+    assert.ok(/mountApi\(app, 'auth\/sso'/.test(srv), '应经 mountApi 挂载多层子路径');
+    assert.strictEqual((srv.match(/app\.use\('\/api\//g) || []).length, 0, '不应再有旧式 app.use(\'/api/…) 挂载');
+    assert.ok(/app\.use\('\/openapi'/.test(srv), '/openapi 保持原路径单挂载');
+    assert.ok(/app\.use\('\/mcp'/.test(srv), '/mcp 保持原路径单挂载');
+  });
+
+  await t('BE-B5：既有 /api 前缀判定逻辑折叠版本（响应契约豁免/租户公开路径）', () => {
+    const { isExempt } = require('../src-server/lib/response');
+    assert.strictEqual(isExempt('/api/auth/login'), true, '旧前缀登录豁免');
+    assert.strictEqual(isExempt('/api/v1/auth/login'), true, 'v1 前缀登录豁免（折叠后一致）');
+    assert.strictEqual(isExempt('/api/agents'), false, '业务端点不豁免');
+    assert.strictEqual(isExempt('/api/v1/channel/card-callback'), true, 'v1 渠道回调豁免');
+    assert.ok(/stripVersion/.test(fs.readFileSync(path.join(__dirname, '..', 'src-server', 'lib', 'auth.js'), 'utf8')), 'auth.js 租户公开路径判定应折叠版本前缀');
+    assert.ok(/stripVersion/.test(fs.readFileSync(path.join(__dirname, '..', 'src-server', 'lib', 'response.js'), 'utf8')), 'response.js 豁免判定应折叠版本前缀');
   });
 
   try { db.close(); } catch { }

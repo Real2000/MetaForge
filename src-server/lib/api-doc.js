@@ -9,6 +9,8 @@
  */
 const { getNodeOutputs } = require('./workflow-schema');
 const { OPENAPI_VERSION, API_VERSION } = require('./version');
+// BE-B5：路线标签/描述判定折叠版本前缀；全局规范只列 v1（过滤旧 /api 别名）。
+const { stripVersion, isLegacyApiPath } = require('./api-version');
 
 /** OpenAPI 类型映射：画布变量类型 → { type, format, hint } */
 const TYPE_MAP_OPENAPI = {
@@ -271,9 +273,9 @@ function buildApiDoc(agent, host) {
  * /openapi/* 叠加手写的富定义（请求体、示例、细分错误码）。
  * ================================================================ */
 
-/** 路由前缀 → 分组标签（tag）：/api|/openapi 取第二段，其余取首段 */
+/** 路由前缀 → 分组标签（tag）：/api|/openapi 取第二段，其余取首段（BE-B5：折叠 /api/v1 版本前缀） */
 function tagFor(p) {
-  const segs = String(p).replace(/^\//, '').split('/');
+  const segs = String(stripVersion(p)).replace(/^\//, '').split('/');
   if ((segs[0] === 'api' || segs[0] === 'openapi') && segs[1]) return segs[1];
   return segs[0] || 'root';
 }
@@ -319,11 +321,12 @@ const ROUTE_DESC = {
   '/api/a2a': 'A2A 智能体互操作（Agent-to-Agent）',
 };
 
-/** 取某完整路径最长匹配前缀的描述 */
+/** 取某完整路径最长匹配前缀的描述（BE-B5：折叠 /api/v1 版本前缀） */
 function descFor(p) {
+  const p0 = stripVersion(p);
   let best = '';
   for (const k of Object.keys(ROUTE_DESC)) {
-    if ((p === k || p.startsWith(k + '/')) && k.length > best.length) best = k;
+    if ((p0 === k || p0.startsWith(k + '/')) && k.length > best.length) best = k;
   }
   return best ? ROUTE_DESC[best] : '';
 }
@@ -496,6 +499,8 @@ function buildGlobalOpenApi(app, opts = {}) {
   const routes = collectRoutes(app);
   const paths = {};
   for (const r of routes) {
+    // BE-B5：规范只列 v1——跳过旧 /api/* 双挂载别名（保留 /api/v1/* 与非 /api 对外开放契约）。
+    if (isLegacyApiPath(r.path)) continue;
     const op = toOapiPath(r.path);
     if (!paths[op]) paths[op] = {};
     if (!paths[op][r.method]) paths[op][r.method] = operationFor(r);
