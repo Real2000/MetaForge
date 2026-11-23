@@ -24,6 +24,11 @@ function available() {
   return !!_bullmq;
 }
 
+/** 测试助手（下划线约定：生产代码不得调用）——清空依赖探测缓存。
+ *  背景：bullmq 已入 package.json（MT-15 队列强依赖化），依赖树同步后真实环境必然可用；
+ *  「缺依赖降级」路径的测试须以 Module._load 桩模拟缺失，并借此助手清缓存后重新探测。 */
+function __resetDeps() { _bullmq = null; _bullmqErr = null; }
+
 /** 依赖缺失时的可读错误信息 */
 function missingDepsError() {
   return new Error('Redis 队列驱动需要依赖 bullmq 与 ioredis，请先安装：npm i bullmq ioredis（或改用 QUEUE_DRIVER=memory）');
@@ -118,4 +123,4 @@ function create(registry, opts = {}) {
   return { name: 'redis', redisUrl, enqueue, getJob, queueStats, cleanupHistory, startWorkers, stopWorkers };
 }
 
-module.exports = { create, available, missingDepsError };
+module.exports = { create, available, missingDepsError, __resetDeps };

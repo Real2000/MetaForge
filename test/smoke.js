@@ -8555,19 +8555,36 @@ print('PY_OK')
       assert.strictEqual(q.getJob(jobId), undefined, '过期历史任务应被清理');
     });
 
-    await t('U2-1/N7-P1: redis 驱动缺依赖 —— available=false 且 create 抛可读错误', () => {
+    await t('U2-1/N7-P1: redis 驱动缺依赖 —— available=false 且 create 抛可读错误（Module._load 桩确定性模拟）', () => {
+      // 背景：bullmq 已入 package.json（依赖树同步后真实环境必然可用），「缺依赖」路径须用 require 桩确定性模拟——
+      // 不再依赖 node_modules 的偶然缺失状态（2026-11-23 sqlite-vec 安装同步依赖树后曾致本用例误红）
+      const Module = require('module');
+      const origLoad = Module._load;
       const rd = require('../src-server/lib/queue/redis-driver');
-      assert.strictEqual(rd.available(), false, '未安装 bullmq 时 available 应为 false');
-      assert.throws(() => rd.create(new Map()), /bullmq/, 'create 应抛含 bullmq 的可读错误');
+      Module._load = function (request, ...rest) {
+        if (request === 'bullmq') throw new Error("Cannot find module 'bullmq'");
+        return origLoad.call(this, request, ...rest);
+      };
+      rd.__resetDeps();
+      try {
+        assert.strictEqual(rd.available(), false, '模拟 bullmq 缺失时 available 应为 false');
+        assert.throws(() => rd.create(new Map()), /bullmq/, 'create 应抛含 bullmq 的可读错误');
+      } finally {
+        Module._load = origLoad;
+        rd.__resetDeps(); // 恢复真实探测（bullmq 实际已安装）
+        assert.strictEqual(rd.available(), true, '桩移除后应恢复可用（依赖已安装的真实状态）');
+      }
     });
 
-    await t('U2-1/N7-P1: QUEUE_DRIVER=redis 但缺依赖 → 回退内存驱动并记录降级原因（子进程隔离验证）', () => {
+    await t('U2-1/N7-P1: QUEUE_DRIVER=redis 但缺依赖 → 回退内存驱动并记录降级原因（子进程隔离 + require 桩）', () => {
       const { execFileSync } = require('child_process');
       const tmpDir = path.join(__dirname, '..', '.temp', 'n7-subproc-' + Date.now());
       fs.mkdirSync(tmpDir, { recursive: true });
       try {
         const root = path.join(__dirname, '..');
-        const script = `process.env.AGENT_DATA_DIR=${JSON.stringify(tmpDir)};process.env.QUEUE_DRIVER='redis';const q=require(${JSON.stringify(path.join(root, 'src-server', 'lib', 'queue'))});process.stdout.write('__N7JSON__'+JSON.stringify(q.driverInfo())+'__N7JSON__');`;
+        // 子进程内同样以 Module._load 桩拦截 bullmq（确定性模拟缺依赖，不依赖 node_modules 状态）
+        const script = `const Module=require('module');const _orig=Module._load;Module._load=function(r,...a){if(r==='bullmq')throw new Error("Cannot find module 'bullmq'");return _orig.apply(this,[r,...a])};` +
+          `process.env.AGENT_DATA_DIR=${JSON.stringify(tmpDir)};process.env.QUEUE_DRIVER='redis';const q=require(${JSON.stringify(path.join(root, 'src-server', 'lib', 'queue'))});process.stdout.write('__N7JSON__'+JSON.stringify(q.driverInfo())+'__N7JSON__');`;
         const out = execFileSync(process.execPath, ['-e', script], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
         const m = out.match(/__N7JSON__(.*?)__N7JSON__/s);
         assert.ok(m, '应取得子进程驱动信息');
@@ -8681,15 +8698,24 @@ print('PY_OK')
     });
 
     // ---------------- MT-15：Redis 强依赖 + 跨机分布式锁 + 无状态多副本 ----------------
-    await t('MT-15: 队列强依赖化——显式 redis 缺依赖时 fail-fast，逃生阀可强制回退', () => {
+    await t('MT-15: 队列强依赖化——显式 redis 缺依赖时 fail-fast，逃生阀可强制回退（Module._load 桩）', () => {
       const q = require('../src-server/lib/queue');
+      const rd = require('../src-server/lib/queue/redis-driver');
+      const Module = require('module');
+      const origLoad = Module._load;
       const sQ = process.env.QUEUE_DRIVER, sS = process.env.AGENT_QUEUE_STRICT,
         sF = process.env.AGENT_QUEUE_ALLOW_FALLBACK, sN = process.env.NODE_ENV;
       try {
+        // 桩拦截 bullmq 模拟缺依赖（真实环境依赖已安装，须确定性模拟；探测缓存随 __resetDeps 重建）
+        Module._load = function (request, ...rest) {
+          if (request === 'bullmq') throw new Error("Cannot find module 'bullmq'");
+          return origLoad.call(this, request, ...rest);
+        };
         delete process.env.NODE_ENV;
         process.env.QUEUE_DRIVER = 'redis'; process.env.AGENT_QUEUE_STRICT = '1';
         delete process.env.AGENT_QUEUE_ALLOW_FALLBACK;
         assert.strictEqual(q._strict(), true, '显式 strict 应生效');
+        rd.__resetDeps();
         q._resetDriver();
         const info = q.driverInfo();
         assert.strictEqual(info.driver, 'none', '严格模式依赖缺失时不得回退内存驱动');
@@ -8700,6 +8726,8 @@ print('PY_OK')
         assert.strictEqual(info2.strict, false, '逃生阀关闭严格模式');
         assert.ok(/memory/.test(info2.driver), '允许回退时回落内存驱动：' + info2.driver);
       } finally {
+        Module._load = origLoad;
+        rd.__resetDeps(); // 恢复真实探测
         if (sQ === undefined) delete process.env.QUEUE_DRIVER; else process.env.QUEUE_DRIVER = sQ;
         if (sS === undefined) delete process.env.AGENT_QUEUE_STRICT; else process.env.AGENT_QUEUE_STRICT = sS;
         if (sF === undefined) delete process.env.AGENT_QUEUE_ALLOW_FALLBACK; else process.env.AGENT_QUEUE_ALLOW_FALLBACK = sF;
@@ -11086,6 +11114,100 @@ print('PY_OK')
     // 反例：空用例集
     const bad = await rm.runRagBaseline({ kbId: kbid, cases: [] });
     assert.strictEqual(bad.ok, false, '空用例应被拒绝');
+  });
+
+  // ==================== AI-02 收尾（D-4 拍板 SQLite-vec）向量索引 2026-11-23 ====================
+  console.log('【AI-02 收尾】SQLite-vec 向量索引（覆盖度闸/双写回填/KNN 融合/失效联动/降级链）');
+
+  await t('AI-02：vector-index 原语——upsert(BigInt rowid)/knn 排序/count/remove/drop 幂等', () => {
+    const vi = require('../src-server/lib/vector-index');
+    assert.strictEqual(vi.available(), true, 'sqlite-vec 扩展应可加载（预编译二进制随依赖安装）');
+    const kbId = 987654; // 测试专用库号（不建真实库，仅验证索引原语）
+    vi.drop(kbId);
+    const vecA = new Float32Array(vi.BGE_DIM); vecA[0] = 1;
+    const vecB = new Float32Array(vi.BGE_DIM); vecB[1] = 1;
+    assert.strictEqual(vi.count(kbId), 0, '空索引 count=0');
+    vi.upsert(kbId, [{ id: 101, vec: vecA }, { id: 102, vec: vecB }]);
+    assert.strictEqual(vi.count(kbId), 2, '应写入 2 条（BigInt rowid 绑定）');
+    const hits = vi.knn(kbId, vecA, 2);
+    assert.strictEqual(hits.length, 2);
+    assert.strictEqual(hits[0].rowid, 101, '最近邻应为 101（同向向量）');
+    assert.ok(hits[0].distance <= hits[1].distance, 'KNN 应按距离升序');
+    // upsert 幂等：同 id 重写不新增行
+    vi.upsert(kbId, [{ id: 101, vec: vecB }]);
+    assert.strictEqual(vi.count(kbId), 2, '同 id 重写不应新增');
+    vi.remove(kbId, [102]); // 移除同向并列行，消除距离并列的断言不确定性
+    assert.strictEqual(vi.knn(kbId, vecB, 1)[0].rowid, 101, '重写后 101 应匹配 vecB');
+    vi.remove(kbId, [101]);
+    assert.strictEqual(vi.count(kbId), 0, 'remove 后表应清空（102 已在并列消解时移除）');
+    vi.drop(kbId);
+    assert.strictEqual(vi.count(kbId), 0, 'drop 后 count=0（ensureTable 幂等重建空表）');
+  });
+
+  await t('AI-02：检索 ANN 快路径端到端——首查覆盖度回填双写、KNN 融合命中、次查零回填、失效联动重建、禁用回落全扫', async () => {
+    const r = require('../src-server/lib/retriever');
+    const vi = require('../src-server/lib/vector-index');
+    db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('AI02向量索引测试库','',1,'vecu',datetime('now','localtime'))`).run();
+    const kbid = db.prepare(`SELECT id FROM kbs WHERE name='AI02向量索引测试库'`).get().id;
+    const fin = db.prepare(`INSERT INTO kb_files (kb_id,name,size,status,chunk_count,created_at) VALUES (?,?,100,'success',2,datetime('now','localtime'))`).run(kbid, '向量测试文档.txt');
+    const fid = Number(fin.lastInsertRowid);
+    const c1 = db.prepare(`INSERT INTO kb_chunks (file_id,kb_id,content) VALUES (?,?,?)`).run(fid, kbid, '考勤管理制度：员工上下班均须打卡，不得代打卡。');
+    db.prepare(`INSERT INTO kb_chunks (file_id,kb_id,content) VALUES (?,?,?)`).run(fid, kbid, '报销管理制度：差旅费用须按时提交，逾期不予报销。');
+    const origFetch = global.fetch;
+    const origAllow = process.env.AGENT_FETCH_ALLOW_PRIVATE;
+    process.env.AGENT_FETCH_ALLOW_PRIVATE = '1'; // mock fetch 不真正出网，SSRF 守卫放行内网 mock 地址
+    db.prepare(`INSERT INTO providers (name,base_url,api_key,models,configured,is_default,remark,created_at) VALUES ('bge嵌入测试供应商','http://gw.test/v1','sk-x',?,1,0,'',datetime('now','localtime'))`).run(JSON.stringify(['bge-m3']));
+    // mock /embeddings：文本含「考勤」→ 单位向量 e0，否则 e1（正交，判别确定性）
+    const vecOf = (axis) => { const v = new Array(vi.BGE_DIM).fill(0); v[axis] = 1; return v; };
+    global.fetch = async (url, opt) => {
+      const body = JSON.parse((opt && opt.body) || '{}');
+      const input = body.input || [];
+      return { ok: true, json: async () => ({ data: input.map(t => ({ embedding: String(t).includes('考勤') ? vecOf(0) : vecOf(1) })) }) };
+    };
+    r.__expireCircuitBreakers();
+    try {
+      // ① 首查：覆盖度 0/2 → 回填双写（kb_chunks 无缓存全走网关）→ KNN 融合
+      const trace1 = {};
+      const hits1 = await r.retrieve('考勤制度怎么样', kbid, 5, 0, { rerankEnabled: false, trace: trace1 });
+      assert.ok(trace1.ann && trace1.ann.engine === 'sqlite-vec', '应走 ANN 路径：' + JSON.stringify(trace1.ann));
+      assert.strictEqual(trace1.ann.coverage, '2/2', '覆盖度应补齐至 2/2');
+      assert.ok(trace1.ann.backfilled >= 2, '首查应回填 2 条（双写）：' + JSON.stringify(trace1.ann));
+      assert.ok(hits1.length >= 1 && String(hits1[0].content).includes('考勤'), 'Top-1 应为考勤分块');
+      assert.strictEqual(trace1.engine, 'B3', '引擎标签应为 B3');
+      const emb = db.prepare('SELECT embedding FROM kb_chunks WHERE id=?').get(Number(c1.lastInsertRowid));
+      assert.ok(emb && emb.embedding, 'kb_chunks.embedding 应已写 B3 缓存（双写之一）');
+      assert.strictEqual(vi.count(kbid), 2, '影子表应有 2 条（双写之二）');
+      // ② 次查：覆盖度完整 → 纯 KNN 快路径，零回填零网关批量
+      const trace2 = {};
+      await r.retrieve('考勤制度怎么样', kbid, 5, 0, { rerankEnabled: false, trace: trace2 });
+      assert.strictEqual(trace2.ann.backfilled, 0, '覆盖度完整后应零回填');
+      assert.strictEqual(trace2.ann.coverage, '2/2');
+      // ③ 失效联动：remove 后覆盖度闸自动重建
+      vi.remove(kbid, [Number(c1.lastInsertRowid)]);
+      assert.strictEqual(vi.count(kbid), 1, '失效后影子表剩 1 条');
+      const trace3 = {};
+      const hits3 = await r.retrieve('考勤制度怎么样', kbid, 5, 0, { rerankEnabled: false, trace: trace3 });
+      assert.ok(trace3.ann.backfilled >= 1, '覆盖度缺失应触发回填重建');
+      assert.ok(hits3.length >= 1 && String(hits3[0].content).includes('考勤'), '重建后命中不变');
+      // ④ 全局禁用 → 回落全扫（无 ann trace，命中一致——降级链 0 阻断）
+      const origAvail = vi.__force(false);
+      try {
+        const trace4 = {};
+        const hits4 = await r.retrieve('考勤制度怎么样', kbid, 5, 0, { rerankEnabled: false, trace: trace4 });
+        assert.strictEqual(trace4.ann, undefined, '禁用后不应有 ann trace（回落全表扫描）');
+        assert.ok(hits4.length >= 1 && String(hits4[0].content).includes('考勤'), '全扫路径命中应一致（B3 缓存已就绪）');
+        assert.strictEqual(trace4.engine, 'B3', '全 B3 缓存路径引擎标签应为 B3（AI-02 收尾修正历史误标）');
+      } finally { vi.__force(origAvail); }
+    } finally {
+      vi.drop(kbid);
+      db.prepare('DELETE FROM kb_chunks WHERE kb_id=?').run(kbid);
+      db.prepare('DELETE FROM kb_files WHERE kb_id=?').run(kbid);
+      db.prepare('DELETE FROM kbs WHERE id=?').run(kbid);
+      db.prepare('DELETE FROM providers WHERE name=?').run('bge嵌入测试供应商');
+      global.fetch = origFetch;
+      if (origAllow === undefined) delete process.env.AGENT_FETCH_ALLOW_PRIVATE; else process.env.AGENT_FETCH_ALLOW_PRIVATE = origAllow;
+      r.__expireCircuitBreakers();
+    }
   });
 
   try { db.close(); } catch { }

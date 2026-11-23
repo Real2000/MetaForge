@@ -30,6 +30,7 @@ const {
 } = require('../lib/ingestion-pipeline'); // V2.3 #5 2026-10-31：摄取管道（上传链路自此管道化）
 const { filterBySpace, reqTenantOpt } = require('../lib/space-utils'); // V2.4 #9 收尾 2026-11-02；MT-05 2026-11-22：接租户边界
 const { parsePagination } = require('../lib/pagination'); // P1-3 2026-11-04：分页参数容错统一解析
+const vectorIndex = require('../lib/vector-index'); // AI-02 收尾：sqlite-vec 影子表失效联动（编辑/合并/删除/库删）
 
 const router = express.Router();
 router.use(auth);
@@ -167,6 +168,7 @@ router.delete('/:id', (req, res) => {
   db.prepare('DELETE FROM kb_chunks WHERE kb_id=?').run(req.params.id);
   db.prepare('DELETE FROM kb_files WHERE kb_id=?').run(req.params.id);
   db.prepare('DELETE FROM kbs WHERE id=?').run(req.params.id);
+  if (old) vectorIndex.drop(old.id); // AI-02 收尾：库删 → 影子表一并清除（幂等，防索引残留孤儿向量）
   if (old) db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)').run(req.user.username, '删除知识库', old.name, req.ip, now());
   res.json({ code: 0, msg: '已删除' });
 });
@@ -290,6 +292,11 @@ router.delete('/files/:fileId', (req, res) => {
   if (deny) return res.json(deny);
   db.prepare('DELETE FROM kb_chunks WHERE file_id=?').run(req.params.fileId);
   db.prepare('DELETE FROM kb_files WHERE id=?').run(req.params.fileId);
+  if (f) {
+    // AI-02 收尾：文件删 → 其分块的影子表向量同步失效（覆盖度闸下次检索不再命中已删内容）
+    const ids = db.prepare('SELECT id FROM kb_chunks WHERE file_id=?').all(req.params.fileId).map(r => r.id);
+    vectorIndex.remove(f.kb_id, ids);
+  }
   res.json({ code: 0, msg: '已删除' });
 });
 
@@ -367,6 +374,7 @@ router.put('/chunks/:chunkId', (req, res) => {
   } else {
     db.prepare('UPDATE kb_chunks SET content=?, embedding=NULL WHERE id=?').run(String(content || ''), c.id);
   }
+  vectorIndex.remove(c.kb_id, [c.id]); // AI-02 收尾：内容变更 → 影子表向量同步失效（下次检索回填新内容向量）
   // 更新文件 chunk_count（不做严格同步，简单 +1 即可）
   res.json({ code: 0, msg: '分块已更新' });
 });
@@ -379,6 +387,7 @@ router.delete('/chunks/:chunkId', (req, res) => {
   const deny = denyIfNotAllowed(kb, req.user);
   if (deny) return res.json(deny);
   db.prepare('DELETE FROM kb_chunks WHERE id=?').run(c.id);
+  vectorIndex.remove(c.kb_id, [c.id]); // AI-02 收尾：分块删 → 影子表同步失效
   res.json({ code: 0, msg: '已删除' });
 });
 
@@ -396,6 +405,7 @@ router.post('/chunks/merge', (req, res) => {
   // AI-02：合并后目标分块内容变更→同步失效其向量缓存（下次检索重算）；源分块行删除即携带其向量一并清除
   db.prepare('UPDATE kb_chunks SET content=?, embedding=NULL WHERE id=?').run((source.content + '\n' + target.content).trim(), target.id);
   db.prepare('DELETE FROM kb_chunks WHERE id=?').run(source.id);
+  vectorIndex.remove(source.kb_id, [target.id, source.id]); // AI-02 收尾：目标重算 + 源删除，两侧向量同步失效
   res.json({ code: 0, msg: '已合并' });
 });
 

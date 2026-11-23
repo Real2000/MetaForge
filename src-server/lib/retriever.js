@@ -21,6 +21,10 @@
  *          改写失败静默回落原 query（0 阻断）。
  *   AI-02：向量通路正确性——删除 LanceDB ANN 死分支（不可达 + 256/1024 维陷阱）；cosine 维度不符 fail-loud
  *          （原静默返回 0 会丢召回）；embedding 存储由 JSON 文本改为 float32 BLOB（解析 590ms→16ms@N=1万）。
+ *   AI-02 收尾（2026-11-23，D-4 拍板 SQLite-vec）：sqlite-vec vec0 影子表 KNN 快路径（lib/vector-index.js）。
+ *          仅当 扩展可用 + 库域限定 + 网关可出查询向量 + 覆盖度完整 时启用；KNN 命中行回查精确余弦，
+ *          融合口径与全扫严格一致；否则全量回落既有全表扫描（行为不变，0 阻断）。ANN 路径的主 SELECT
+ *          不携带 embedding BLOB（省 O(N) 传输——实测 10 万分块现状全扫 p95 ≈1.9s，KNN 路径 ~200ms）。
  */
 const { db } = require('../db');
 const { assertPublicHttpUrl } = require('./ssrf-guard'); // SEC-05：向量/重排网关出站前的 SSRF 校验
@@ -344,8 +348,11 @@ async function retrieve(query, kbId = null, topN = 5, threshold = 0.01, opts = {
   // 修复后非有限数（'abc'/null 之外的 NaN 场景）回落默认 0.5，语义与缺省一致
   const _w = Number(opts.vecWeight ?? 0.5);
   const vecWeight = Number.isFinite(_w) ? Math.min(1, Math.max(0, _w)) : 0.5;
+  // AI-02 收尾：ANN 候选判定（扩展可用 + 库域限定 + 未显式关闭）——成立时主 SELECT 不取 embedding BLOB
+  //（KNN 在库内算距离，向量不出库；这是 10 万分块下性能收益的本体）；opts.ann=false 可强制全扫（调试/对照）
+  const annCandidate = kbId != null && opts.ann !== false && require('./vector-index').available();
   const rows = db.prepare(`
-    SELECT c.id, c.content, c.kb_id, c.file_id, c.parent_id, c.chapter_id, c.embedding, c.keywords, c.metadata, f.name AS file, k.name AS kb,
+    SELECT c.id, c.content, c.kb_id, c.file_id, c.parent_id, c.chapter_id, ${annCandidate ? '' : 'c.embedding,'} c.keywords, c.metadata, f.name AS file, k.name AS kb,
       k.rerank_enabled AS kb_rerank_enabled, k.rerank_model AS kb_rerank_model, k.rerank_top_n AS kb_rerank_top_n, k.rerank_threshold AS kb_rerank_threshold
     FROM kb_chunks c
     LEFT JOIN kb_files f ON f.id = c.file_id
@@ -353,6 +360,7 @@ async function retrieve(query, kbId = null, topN = 5, threshold = 0.01, opts = {
     WHERE (? IS NULL OR c.kb_id = ?) AND (k.enabled IS NULL OR k.enabled = 1)
   `).all(kbId, kbId);
   if (!rows.length) return [];
+  const kbChunkTotal = rows.length; // AI-02 收尾：本库分块总数（覆盖度闸分母；须在元数据过滤 splice 前捕获）
   // AI-09：库级重排配置（从本行携带的 kbs 列构建，免额外查询；kbId 为空时不应用库级配置）
   const kbc = kbId != null ? normalizeKbRerankConfig({
     rerank_enabled: rows[0].kb_rerank_enabled,
@@ -435,6 +443,49 @@ async function retrieve(query, kbId = null, topN = 5, threshold = 0.01, opts = {
 
   // 通道 2：向量（双引擎选择）
   const upd = db.prepare('UPDATE kb_chunks SET embedding=? WHERE id=?');
+
+  // ===== AI-02 收尾（D-4：SQLite-vec）ANN 快路径 =====
+  // 仅当 覆盖度完整（影子表行数=库分块数，缺失行先回填双写）时走 KNN；KNN 命中行回查 kb_chunks.embedding
+  // 算精确余弦，使 RRF 向量通道口径与全扫严格一致（非近似 ANN，验收「命中率≥98%」天然 100%）。
+  // 任何一步不成立（扩展/网关/索引/覆盖度）→ 落到下方既有全表扫描，行为不变（0 阻断）。
+  if (annCandidate) {
+    const qEmb = await bgeEmbed([query]);
+    if (qEmb && Array.isArray(qEmb[0]) && qEmb[0].length === BGE_DIM) {
+      try {
+        const vi = require('./vector-index');
+        const qv = new Float32Array(qEmb[0]);
+        // 覆盖度闸：缺失行优先复用 B3 缓存、无缓存批量走网关，双写（kb_chunks.embedding + 影子表）；
+        // 网关中途失败保留已写部分，下次检索续传（闸门兜底，不会 KNN 到空洞）
+        let backfilled = 0;
+        if (vi.count(kbId) < kbChunkTotal) backfilled = await backfillVecIndex(kbId);
+        const indexed = vi.count(kbId);
+        const knnHits = vi.knn(kbId, qv, vi.ANN_K);
+        if (knnHits.length) {
+          const embMap = fetchEmbeddings(knnHits.map(h => h.rowid));
+          const idToIdx = new Map(rows.map((r, i) => [Number(r.id), i]));
+          const vecScores = new Array(rows.length).fill(0);
+          let scored = 0;
+          for (const h of knnHits) {
+            const idx = idToIdx.get(h.rowid);
+            const v = embMap.get(h.rowid);
+            if (idx == null || !v) continue; // 元数据过滤掉的行/向量不可读 → 不参与向量通道（fail-closed）
+            vecScores[idx] = cosine(qv, v);
+            scored++;
+          }
+          if (_trace) {
+            _trace.engine = 'B3';
+            _trace.ann = { engine: 'sqlite-vec', k: vi.ANN_K, hits: scored, coverage: `${indexed}/${kbChunkTotal}`, backfilled };
+          }
+          return rerankAndSlice(query, finish(rows, bm25, vecScores, 'B3', RERANK_CANDIDATES, threshold, vecWeight, qTerms, graphRank), topN, rerankOpts, kbId);
+        }
+        if (_trace) _trace.ann = { engine: 'sqlite-vec', hits: 0, coverage: `${indexed}/${kbChunkTotal}`, degraded: true, reason: 'empty_index' };
+      } catch (e) {
+        if (_trace) _trace.ann = { engine: 'sqlite-vec', degraded: true, reason: String(e && e.message).slice(0, 120) };
+      }
+    }
+    // ANN 未走通（网关查询向量不可用/索引空/异常）→ 主 SELECT 未携带 BLOB，补齐后回落全扫（与旧行为一致）
+    await loadEmbeddings(rows);
+  }
   const parsed = rows.map(r => parseVec(r.embedding));
 
   // AI-02：删除 LanceDB ANN 死分支（原 vector-store.js）。
@@ -447,19 +498,28 @@ async function retrieve(query, kbId = null, topN = 5, threshold = 0.01, opts = {
   if (parsed.every(p => p.engine === 'B3')) {
     // 全部已有 bge 缓存，查询向量走网关（失败则整体降级本地重算）
     const q = await bgeEmbed([query]);
-    if (q) { if (_trace) _trace.engine = engine; return rerankAndSlice(query, finish(rows, bm25, parsed.map(p => p.v), new Float32Array(q[0]), engine, RERANK_CANDIDATES, threshold, vecWeight, qTerms, graphRank), topN, rerankOpts, kbId); }
+    if (q) {
+      engine = 'B3'; // 全 B3 缓存 + 网关查询向量成功——真实引擎是 bge-m3（历史代码误标 H，随 AI-02 收尾修正）
+      const qv0 = new Float32Array(q[0]);
+      const vecScores = parsed.map(p => cosine(qv0, p.v));
+      if (_trace) _trace.engine = engine;
+      return rerankAndSlice(query, finish(rows, bm25, vecScores, engine, RERANK_CANDIDATES, threshold, vecWeight, qTerms, graphRank), topN, rerankOpts, kbId);
+    }
   }
   const missIdx = rows.map((_, i) => i).filter(i => parsed[i].engine !== 'B3');
   if (missIdx.length) {
     const got = await bgeEmbed([query, ...missIdx.map(i => rows[i].content)]);
     if (got && got.length === missIdx.length + 1) {
       // 批量落库 bge 向量缓存
+      engine = 'B3'; // 网关补齐成功——本次检索全程 bge-m3（历史代码误标 H，随 AI-02 收尾修正）
       missIdx.forEach((idx, k) => {
         try { upd.run(encodeVec(got[k + 1], 'B3'), rows[idx].id); } catch { }
         parsed[idx] = { v: new Float32Array(got[k + 1]), engine: 'B3' };
       });
       if (_trace) _trace.engine = engine;
-      return rerankAndSlice(query, finish(rows, bm25, parsed.map(p => p.v), new Float32Array(got[0]), engine, RERANK_CANDIDATES, threshold, vecWeight, qTerms, graphRank), topN, rerankOpts, kbId);
+      const qv0 = new Float32Array(got[0]);
+      const vecScores = parsed.map(p => p.v ? cosine(qv0, p.v) : 0);
+      return rerankAndSlice(query, finish(rows, bm25, vecScores, engine, RERANK_CANDIDATES, threshold, vecWeight, qTerms, graphRank), topN, rerankOpts, kbId);
     }
   }
 
@@ -473,7 +533,73 @@ async function retrieve(query, kbId = null, topN = 5, threshold = 0.01, opts = {
     return v;
   });
   if (_trace) _trace.engine = engine;
-  return rerankAndSlice(query, finish(rows, bm25, vecs, qVec, engine, RERANK_CANDIDATES, threshold, vecWeight, qTerms, graphRank), topN, rerankOpts, kbId);
+  const vecScores = vecs.map(v => cosine(qVec, v));
+  return rerankAndSlice(query, finish(rows, bm25, vecScores, engine, RERANK_CANDIDATES, threshold, vecWeight, qTerms, graphRank), topN, rerankOpts, kbId);
+}
+
+/* ---------------- AI-02 收尾（D-4：SQLite-vec）辅助：BLOB 按需加载 / 回填 ---------------- */
+
+/** 批量回填 rows[].embedding（ANN 路径的主 SELECT 不携带 BLOB；仅 ANN 未走通回落全扫时发生）。
+ *  IN 分片 ≤500（SQLite 变量上限保守值）；未命中行的 embedding 保持 undefined（parseVec 归一为无缓存）。 */
+function loadEmbeddings(rows) {
+  const byId = new Map();
+  for (let i = 0; i < rows.length; i += 500) {
+    const part = rows.slice(i, i + 500);
+    const ph = part.map(() => '?').join(',');
+    for (const r of db.prepare(`SELECT id, embedding FROM kb_chunks WHERE id IN (${ph})`).all(...part.map(x => x.id))) {
+      byId.set(Number(r.id), r.embedding);
+    }
+  }
+  for (const r of rows) {
+    const e = byId.get(Number(r.id));
+    if (e !== undefined) r.embedding = e;
+  }
+}
+
+/** 取回指定分块 id 的 B3 向量（KNN 命中行算精确余弦用）；仅收 B3 且维度相符的（防脏数据入融合） */
+function fetchEmbeddings(ids) {
+  const out = new Map();
+  for (let i = 0; i < ids.length; i += 500) {
+    const part = ids.slice(i, i + 500);
+    const ph = part.map(() => '?').join(',');
+    for (const r of db.prepare(`SELECT id, embedding FROM kb_chunks WHERE id IN (${ph})`).all(...part)) {
+      const p = parseVec(r.embedding);
+      if (p.engine === 'B3' && p.v && p.v.length === BGE_DIM) out.set(Number(r.id), p.v);
+    }
+  }
+  return out;
+}
+
+/** 影子表覆盖度回填：缺失行优先复用 kb_chunks.embedding 已有 B3 缓存（向量值一致，避免重复网关调用
+ *  与模型版本漂移），无缓存的批量走网关（batch 64，双写缓存+索引）。网关中途失败保留已写部分——
+ *  覆盖度闸保证下次检索续传，KNN 永不命中空洞。返回累计写入条数。 */
+async function backfillVecIndex(kbId) {
+  const vi = require('./vector-index');
+  const missing = db.prepare(`SELECT id, content, embedding FROM kb_chunks WHERE kb_id=? AND id NOT IN (SELECT rowid FROM ${vi.tableFor(kbId)}) ORDER BY id`).all(kbId);
+  if (!missing.length) return 0;
+  const cached = [];
+  const need = [];
+  for (const r of missing) {
+    const p = parseVec(r.embedding);
+    if (p.engine === 'B3' && p.v && p.v.length === BGE_DIM) cached.push({ id: r.id, vec: p.v });
+    else need.push(r);
+  }
+  let n = vi.upsert(kbId, cached);
+  const upd = db.prepare('UPDATE kb_chunks SET embedding=? WHERE id=?');
+  for (let i = 0; i < need.length; i += 64) {
+    const batch = need.slice(i, i + 64);
+    const got = await bgeEmbed(batch.map(r => r.content));
+    if (!got || got.length !== batch.length) break; // 网关失败：保留已写部分（覆盖度闸下次续传）
+    const items = [];
+    batch.forEach((r, k) => {
+      const v = new Float32Array(got[k]);
+      if (v.length !== BGE_DIM) return; // 维度异常不入索引（防脏数据）
+      try { upd.run(encodeVec(v, 'B3'), r.id); } catch { }
+      items.push({ id: r.id, vec: v });
+    });
+    n += vi.upsert(kbId, items);
+  }
+  return n;
 }
 
 /** Rerank 重排（优先）→ 如果不可用/被关闭/失败，退回 RRF 排名前 topN 条。opts.rerankEnabled=false 跳过重排，opts.rerankModel 指定模型
@@ -570,10 +696,13 @@ function attachChapterContext(results) {
   return results;
 }
 
-/** 加权 RRF 融合 + 排序输出（两种引擎共用）。vecWeight 为向量通道权重（0~1）；qTerms 用于计算每条结果的命中词
+/** 加权 RRF 融合 + 排序输出（两种引擎共用）。
+ *  vecScores（AI-02 收尾改造）：调用方预计算的余弦分数数组——全扫路径为逐行 cosine(qVec, v)；
+ *  ANN 路径仅 KNN 命中行有值（其余 0，不参与向量通道，与「vec>0.05 门槛」语义自洽）。
+ *  vecWeight 为向量通道权重（0~1）；qTerms 用于计算每条结果的命中词。
  *  graphRank（AI-04）：图谱通道命中的行索引数组（按图谱关联度排序）——固定权重 GRAPH_W 参与融合，命中标记 r.graph。 */
-function finish(rows, bm25, vecs, qVec, engine, topN, threshold, vecWeight = 0.5, qTerms = [], graphRank = null) {
-  const vec = vecs.map(v => cosine(qVec, v));
+function finish(rows, bm25, vecScores, engine, topN, threshold, vecWeight = 0.5, qTerms = [], graphRank = null) {
+  const vec = vecScores;
   const K = 60;
   const wV = Math.min(1, Math.max(0, vecWeight)); // 向量通道权重（0=纯关键词，1=纯向量）
   const wB = 1 - wV;
