@@ -262,6 +262,23 @@ function sha256(s) { return crypto.createHash('sha256').update(s).digest('hex');
  * 排除 _migrations（台账）与 schema_anchor（锚点自身），避免自指。任一对象 DDL 变化 → hash 变化。
  */
 function computeSchemaFingerprint() {
+  // MT-7（2026-11-23）PG 桥：sqlite_master 为 SQLite 专有（方言层登记差异）——非 sqlite 方言下
+  // 结构指纹改用 information_schema（表 → 列名/类型/可空/默认值 归一化哈希；索引/触发器不在此
+  // 指纹域——列级增删改已覆盖迁移语义的漂移检测需求，与 db-driver 探测 API 的登记替代一致）。
+  // 锚点为「单库内」自比较（boot 间指纹一致即无漂移），跨方言域（sqlite↔PG）指纹不可比，无影响。
+  if (PROBE_DIALECT !== 'sqlite') {
+    const rows = db.prepare(`SELECT table_name, column_name, data_type, is_nullable, column_default
+      FROM information_schema.columns
+      WHERE table_schema='public' AND table_name NOT IN ('_migrations','schema_anchor')
+      ORDER BY table_name, column_name`).all();
+    const byTable = {};
+    for (const r of rows) (byTable[r.table_name] = byTable[r.table_name] || [])
+      .push(`${r.column_name}|${r.data_type}|${r.is_nullable}|${r.column_default || ''}`);
+    const perObject = {};
+    for (const k of Object.keys(byTable)) perObject[`table:${k}`] = sha256(byTable[k].join('\n'));
+    const hash = sha256(Object.keys(perObject).sort().map(k => k + '=' + perObject[k]).join('\n'));
+    return { hash, perObject, objectCount: Object.keys(perObject).length };
+  }
   const rows = db.prepare("SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' AND sql IS NOT NULL AND name NOT IN ('_migrations','schema_anchor')").all();
   const perObject = {};
   for (const r of rows) perObject[`${r.type}:${r.name}`] = sha256(normalizeDdl(r.sql));
@@ -678,7 +695,21 @@ const ALL_MIGRATIONS = [
   // secrets 唯一键由全局 name 改为 (name, tenant_id)：同一密钥名可在不同租户各自定义；存量键归平台全局（0）。
   { id: 116, name: 'secrets 租户隔离：唯一键改 (name,tenant_id)（MT-12）', up: (ctx) => {
     if (!ctx.tableExists('secrets')) return;
-    const ddl = ctx.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='secrets'").pluck().get() || '';
+    // MT-7（2026-11-23）PG 桥兼容：sqlite_master/PRAGMA 为 SQLite 专有（方言层登记差异），
+    // PG 系下查询即报错——try/catch 探测后走目录视图分支：唯一约束存在性查 information_schema，
+    // 缺失时以唯一索引补齐（等价约束语义；重建表搬运法是 SQLite 无 ALTER 约束能力的专用路径，PG 不需要）。
+    // sqlite 分支（ddl 非空）逐字节保持原路径——生产零回归。
+    let ddl = '';
+    try {
+      ddl = ctx.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='secrets'").pluck().get() || '';
+    } catch { /* PG/kingbase：无 sqlite_master——走下方目录视图分支 */ }
+    if (!ddl) {
+      const hasU = ctx.db.prepare("SELECT 1 FROM information_schema.table_constraints WHERE table_name='secrets' AND constraint_type='UNIQUE'").get();
+      if (hasU) return; // 全新建表 DDL 已含 UNIQUE(name,tenant_id)（db.js 现行定义），幂等跳过
+      ctx.db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_secrets_name_tenant ON secrets(name, tenant_id)');
+      console.log('[migrate] secrets 已补唯一索引 (name,tenant_id)（PG 模式：目录视图核验，索引兜底等价约束）');
+      return;
+    }
     if (/UNIQUE\s*\(\s*name\s*,\s*tenant_id\s*\)/i.test(ddl)) return; // 已重建，幂等跳过
     const cols = ctx.db.prepare('PRAGMA table_info(secrets)').all().map(c => c.name);
     const hasTenant = cols.includes('tenant_id');

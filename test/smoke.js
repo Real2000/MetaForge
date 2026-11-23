@@ -795,6 +795,126 @@ function t(name, fn) {
     });
   }
 
+  // ==================== MT-7（2026-11-23）PG 同步桥 PoC：契约级单测（无 PG 环境文本级） ====================
+  console.log('【MT-7】PG 同步桥 PoC（占位符转换 / RLS 策略 / 桥契约 / 接线守卫）');
+  {
+    await t('MT-7：pg-bridge 占位符转换——?→$n 词法感知（字符串/注释/转义引号不误转）', () => {
+      const { convertPlaceholders } = require('../src-server/lib/pg-bridge');
+      // 基本转换 + 顺序编号
+      assert.deepStrictEqual(convertPlaceholders('SELECT * FROM t WHERE a=? AND b=?'),
+        { sql: 'SELECT * FROM t WHERE a=$1 AND b=$2', n: 2 }, '占位符应顺序转 $1..$n');
+      // 字符串字面量内 ? 不是占位符（LIKE '%?%' 语义保持）
+      const r1 = convertPlaceholders("SELECT * FROM t WHERE c LIKE '%?%' AND d=?");
+      assert.strictEqual(r1.sql.includes("'%?%'"), true, '字符串内 ? 不应转换：' + r1.sql);
+      assert.strictEqual(r1.n, 1, '仅字符串外的 ? 计数');
+      // 注释内 ? 不转换
+      const r2 = convertPlaceholders('SELECT ? -- 何处 ? 呢\n FROM t');
+      assert.strictEqual(r2.n, 1, '注释内 ? 不计数：' + r2.sql);
+      assert.ok(r2.sql.includes('-- 何处 ? 呢'), '注释文本应保持原样');
+      // 转义引号（'' → 双写）不提前终止字符串扫描
+      const r3 = convertPlaceholders("SELECT 'it''s ?' AS s, ? FROM t");
+      assert.strictEqual(r3.n, 1, '转义引号后的 ? 仍在字符串内不计数：' + r3.sql);
+      // 数字编号连续性
+      assert.deepStrictEqual(convertPlaceholders('UPDATE t SET x=? WHERE id=?'), { sql: 'UPDATE t SET x=$1 WHERE id=$2', n: 2 });
+    });
+    await t('MT-7：pg-bridge 桥契约——连接串/驱动缺失 fail-fast 可读错误（不裸崩）', () => {
+      const { createPgBridge } = require('../src-server/lib/pg-bridge');
+      // 无连接串：明确报缺 PG_CONN/DATABASE_URL（部署自查友好）
+      assert.throws(() => createPgBridge(), /缺少 PG 连接串/, '无连接串应报可读错误');
+      // 有连接串但 pg 驱动未安装：报安装指引并提示回退 sqlite。
+      // 本机自 MT-7 真机验证起已装 pg——劫持 Module._resolveFilename 确定性模拟「未装」，
+      // 不依赖宿主环境安装状态（无论装没装都必须给可读指引，不裸崩）
+      const Module = require('module');
+      const origResolve = Module._resolveFilename;
+      Module._resolveFilename = function (request, ...rest) {
+        if (request === 'pg') {
+          const e = new Error("Cannot find module 'pg'");
+          e.code = 'MODULE_NOT_FOUND';
+          throw e;
+        }
+        return origResolve.call(this, request, ...rest);
+      };
+      try {
+        assert.throws(() => createPgBridge({ connString: 'postgres://u:p@localhost:5432/db' }),
+          /未安装 pg 驱动[\s\S]*AGENT_DB_DRIVER=sqlite/, '未装驱动应报指引（惰性 require 约定，同 db-driver）');
+      } finally {
+        Module._resolveFilename = origResolve; // 恢复解析器——劫持仅限本断言内
+      }
+    });
+    await t('MT-7：RLS 策略 SQL——ENABLE+FORCE（owner 不旁路）+ POLICY 双向 + 会话变量回退', () => {
+      const { rlsPolicySql, DEFAULT_RLS_TABLES } = require('../src-server/lib/pg-rls');
+      const sql = rlsPolicySql('agents');
+      assert.ok(/ALTER TABLE agents ENABLE ROW LEVEL SECURITY/.test(sql), '应启用 RLS');
+      assert.ok(/ALTER TABLE agents FORCE ROW LEVEL SECURITY/.test(sql), '应 FORCE（owner 也受控——DB 层强制隔离的验收语义）');
+      assert.ok(/USING \(tenant_id = [\s\S]*current_setting\('app\.tenant_id', true\)/.test(sql), '读策略应基于会话变量');
+      assert.ok(/WITH CHECK \(tenant_id =/.test(sql), '写策略应校验租户归属（防跨租户写入）');
+      assert.ok(/COALESCE\(NULLIF\(current_setting\('app\.tenant_id', true\), ''\), '0'\)/.test(sql),
+        '未设会话变量应回退 0（平台基线租户——单租户部署行为与现状一致）');
+      assert.ok(/DROP POLICY IF EXISTS/.test(sql), '策略应幂等（重复执行安全）');
+      // 括号配平（PG 解析器硬校验）——MT-7 PoC 首跑踩坑：WITH CHECK 曾多一个右括号致
+      // syntax error at or near ")"，且该错被 db.js 的非致命 catch 吞掉（策略数 0、静默不隔离）。
+      // 文本断言无法覆盖此类缺陷，配平校验锚定回归。
+      const open = (sql.match(/\(/g) || []).length;
+      const close = (sql.match(/\)/g) || []).length;
+      assert.strictEqual(open, close, `RLS 策略 SQL 括号应配平（open=${open}, close=${close}）`);
+      assert.deepStrictEqual(DEFAULT_RLS_TABLES, ['agents', 'kbs', 'sessions', 'messages', 'tasks'],
+        'PoC 核心资源表清单（迁移 #122 已补齐 tenant_id）');
+    });
+    await t('MT-7：方言 BLOB→BYTEA + instr()→strpos()（kingbase）——迁移 #130 列定义与 api_key 加密迁移在 PG 侧可执行', () => {
+      const { translate } = require('../src-server/lib/sql-dialect');
+      const alterSql = 'ALTER TABLE agent_memories ADD COLUMN embedding BLOB DEFAULT NULL';
+      assert.strictEqual(translate(alterSql, 'kingbase').sql,
+        'ALTER TABLE agent_memories ADD COLUMN embedding BYTEA DEFAULT NULL',
+        'kingbase/PG 系应把 BLOB 翻译为 BYTEA（PG 无 BLOB 类型，原文直发即 syntax error——PoC 首跑 #130 踩坑）');
+      assert.strictEqual(translate(alterSql, 'sqlite').sql, alterSql, 'sqlite 方言恒等翻译（零回归）');
+      assert.strictEqual(translate(alterSql, 'dm').sql, alterSql, 'dm 自有 BLOB 类型，不应改写');
+      // instr() → strpos()：api_key 加密迁移的明文探测（WHERE instr(api_key,'.')=0）——PG 无 instr，
+      // 原文直发即报错、迁移兜底降级为不加密（密钥明文落库，PoC 二跑踩坑）
+      const probeSql = "SELECT id, api_key FROM providers WHERE api_key!='' AND instr(api_key,'.')=0";
+      assert.strictEqual(translate(probeSql, 'kingbase').sql,
+        "SELECT id, api_key FROM providers WHERE api_key!='' AND strpos(api_key,'.')=0",
+        'kingbase/PG 系应把 instr() 翻译为 strpos()（语义一致：1 起始位置，未命中 0）');
+      assert.strictEqual(translate(probeSql, 'dm').sql, probeSql, 'dm 自有 INSTR 函数，不应改写');
+    });
+    await t('MT-7：worker 同步握手协议——Atomics 唤醒 + 事务租约 + lastval 契约（静态守卫）', () => {
+      const fs2 = require('fs');
+      const workerSrc = fs2.readFileSync(path.join(__dirname, '..', 'src-server', 'lib', 'pg-bridge-worker.js'), 'utf8');
+      // Atomics.notify 是主线程 Atomics.wait 的唯一同步唤醒路径（postMessage 事件在阻塞期不可达）
+      assert.ok(/Atomics\.store\(stateArr, 0, 1\)/.test(workerSrc) && /Atomics\.notify\(stateArr, 0\)/.test(workerSrc),
+        'worker 完成后应 notify 唤醒（同步桥的正确性根基）');
+      // 事务亲和：BEGIN 租约 / COMMIT|ROLLBACK 归还（多语句跨连接会使事务失效）
+      assert.ok(/txConn = await pool\.connect\(\)/.test(workerSrc), 'BEGIN 应租约专用连接');
+      assert.ok(/c\.release\(\)/.test(workerSrc), '事务结束应归还租约连接');
+      // lastInsertRowid 契约（dal.insert/路由创建链依赖）：同连接补查 lastval()
+      assert.ok(/SELECT lastval\(\) AS v/.test(workerSrc), 'run 应补查 lastval 实现 lastInsertRowid');
+      // RLS 注入：SET LOCAL 事务级（连接归池不残留）
+      assert.ok(/set_config\('app\.tenant_id'/.test(workerSrc), '应注入会话变量（RLS 强制隔离）');
+      const bridgeSrc = fs2.readFileSync(path.join(__dirname, '..', 'src-server', 'lib', 'pg-bridge.js'), 'utf8');
+      assert.ok(/Atomics\.wait\(state, 0, 0, CALL_TIMEOUT_MS\)/.test(bridgeSrc), '主线程应同步等待（带超时防死锁）');
+      assert.ok(!/rows\[0\] \|\| null/.test(bridgeSrc), 'get 契约：无行返回 undefined（better-sqlite3 语义）');
+      // setTenantContext 入参窄化守卫（PoC 二跑踩坑）：曾误写 Number(tenantId)（闭包初值 null →
+      // Number(null)=0），一切租户上下文静默归 0、RLS 隔离形同虚设——静态锚定防复发
+      assert.ok(/setTenantContext\(tid\)\s*\{\s*tenantId = tid == null \? null : Number\(tid\)/.test(bridgeSrc),
+        'setTenantContext 应窄化入参 tid（Number(tenantId) 会使所有租户上下文静默变 0）');
+      // worker 不得阻止进程退出（PoC 首跑踩坑）：一次性脚本（node -e / CLI）主逻辑完成后因 worker
+      // 存活而永不退出，表现为子进程挂死、execFileSync 逐级超时——unref 后进程存活只取决于主线程句柄
+      assert.ok(/worker\.unref\(\)/.test(bridgeSrc), 'worker 应 unref（不阻止进程自然退出）');
+    });
+    await t('MT-7：db.js 接线守卫——AGENT_DB_DRIVER 分支 + sqlite 缺省路径 + 探测方言化收敛', () => {
+      const fs2 = require('fs');
+      const dbSrc = fs2.readFileSync(path.join(__dirname, '..', 'src-server', 'db.js'), 'utf8');
+      assert.ok(/AGENT_DB_DRIVER\s*\|\|\s*'sqlite'/.test(dbSrc), '缺省驱动应为 sqlite（生产零回归）');
+      assert.ok(/DB_DRIVER === 'pg'/.test(dbSrc) && /createPgBridge/.test(dbSrc), 'pg 分支应走同步桥');
+      assert.ok(/DB_DIALECT = process\.env\.DB_DIALECT \|\| 'kingbase'/.test(dbSrc),
+        'PG 模式应绑定 kingbase（PG 系）方言——DDL/探测分支随 DB_DIALECT 生效');
+      // 探测方言化（PG 启动必需）：46 处散点已收敛 probeColumns/probeTableExists
+      assert.ok(dbSrc.includes('function probeColumns(') && dbSrc.includes('function probeTableExists('),
+        '启动期探测辅助应存在（方言分支）');
+      const pragmaCount = (dbSrc.match(/db\.prepare\('PRAGMA table_info/g) || []).length;
+      assert.strictEqual(pragmaCount, 0, '业务散点应全部收敛（0 处直连 PRAGMA；probeColumns 内部为模板串形态不在此计数）：' + pragmaCount);
+    });
+  }
+
   // ================ P3 扩展工具（2026-10-22）：Text2SQL / 图表 / Word / MCP Server / 分类器路由 ================
   console.log('【N】P3 扩展工具（Text2SQL / 图表 / Word / MCP Server / 分类器路由）');
   const extra = require('../src-server/lib/tools-extra');
@@ -3029,7 +3149,14 @@ function t(name, fn) {
           const r1 = await fetch(base + '/api/monitor/op-logs?size=1', { headers: { Authorization: 'Bearer ' + tokA3 } });
           const rid1 = r1.headers.get('x-request-id');
           assert.ok(/^[0-9a-f]{12}$/.test(rid1 || ''), '响应头应携带 12 位 hex X-Request-Id：' + rid1);
-          const a1 = db.prepare('SELECT * FROM access_logs WHERE request_id=?').get(rid1);
+          // 落行为 finish 回调 fire-and-forget（尽力而为语义）——fetch resolve（响应头到手）先于
+          // 服务器 res finish 的落库完成存在天然竞态（Docker/负载等时序抖动会翻转窗口，曾致 flaky），
+          // 断言前短轮询等待（上限 2s），保持「骨架行必须落」的验收强度不变
+          let a1 = null;
+          for (let i = 0; i < 40 && !a1; i++) {
+            a1 = db.prepare('SELECT * FROM access_logs WHERE request_id=?').get(rid1);
+            if (!a1) await new Promise(r2 => setTimeout(r2, 50));
+          }
           assert.ok(a1, 'access_logs 应落骨架行');
           assert.strictEqual(a1.method, 'GET', 'access_logs 应记录方法');
           assert.strictEqual(a1.status, 200, 'access_logs 应记录状态码');

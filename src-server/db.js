@@ -10,11 +10,24 @@ const Database = require('better-sqlite3');
 const DATA_DIR = process.env.AGENT_DATA_DIR || path.join(__dirname, '..', 'data');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
-const db = new Database(path.join(DATA_DIR, 'platform.db'));
-// U2-1 / N7-P2：集群多进程共用同一 SQLite 库，并发写（启动迁移/写入）时等待锁释放而非立即 SQLITE_BUSY 崩溃。
-// 单进程下无锁竞争，此设置无任何行为影响。
-db.pragma('busy_timeout = 5000');
-db.pragma('journal_mode = WAL');
+// ================== MT-7（2026-11-23）数据层可插拔：PG 同步桥接线 ==================
+// AGENT_DB_DRIVER=pg 时走 PostgreSQL 同步桥（业务层 1585+ 处同步调用零改动——BE-C1 收敛 +
+// BE-C2 方言闭环的可插拔兑现）；缺省 sqlite 路径与现状逐字节一致（生产零回归）。
+// DB_DIALECT 在此先于 PROBE_DIALECT / DDL 出口读取前设定：PG 用 kingbase（PG 系）方言翻译。
+const DB_DRIVER = (process.env.AGENT_DB_DRIVER || 'sqlite').toLowerCase();
+let db;
+if (DB_DRIVER === 'pg') {
+  process.env.DB_DIALECT = process.env.DB_DIALECT || 'kingbase';
+  const { createPgBridge } = require('./lib/pg-bridge');
+  db = createPgBridge();
+  console.log('[db] PostgreSQL 同步桥模式（MT-7 PoC）：RLS 见 lib/pg-rls.js，连接串 PG_CONN/DATABASE_URL');
+} else {
+  db = new Database(path.join(DATA_DIR, 'platform.db'));
+  // U2-1 / N7-P2：集群多进程共用同一 SQLite 库，并发写（启动迁移/写入）时等待锁释放而非立即 SQLITE_BUSY 崩溃。
+  // 单进程下无锁竞争，此设置无任何行为影响。
+  db.pragma('busy_timeout = 5000');
+  db.pragma('journal_mode = WAL');
+}
 
 // U2-1 / N7-P2：集群多进程并发执行内联迁移「先查列→再 ALTER」时，两进程可能同时判定列不存在，
 // 后到达者会抛 "duplicate column name"（列已被另一进程添加）。此处集中吞掉该幂等错误，
@@ -42,6 +55,29 @@ db.pragma('journal_mode = WAL');
       throw e;
     }
   };
+}
+
+// ================== MT-7（2026-11-23）启动期探测方言化 ==================
+// 背景：本文件 43 处内联迁移探测「PRAGMA table_info(X).all().map(c => c.name)」+ 2 处表存在性
+// 探测（sqlite_master）为 SQLite 专有。AGENT_DB_DRIVER=pg（同步桥模式）下 PRAGMA/sqlite_master
+// 不可用——统一收敛到这两个辅助函数（方言分支）：
+//   · sqlite：与原语句逐字节等价（零行为差异），PG 模式启动由此成为可能
+//   · pg/kingbase：走 information_schema 标准目录视图（与 migrate.js 方言探测同源语义）
+const PROBE_DIALECT = process.env.DB_DIALECT || 'sqlite';
+function probeColumns(table) {
+  if (PROBE_DIALECT === 'sqlite') {
+    return db.prepare(`PRAGMA table_info(${table})`).all().map(c => c.name);
+  }
+  return db.prepare('SELECT column_name AS name FROM information_schema.columns WHERE lower(table_name)=lower(?)').all(table).map(c => c.name);
+}
+// 注意（2026-11-23 实测踩坑）：本函数体的 sqlite 分支与「散点探测原形态」同形——批量替换脚本
+// 曾把它一并替换成自调用（无限递归致 SEC-02a/加密迁移块爆栈被 catch 吞掉、明文 Key 未哈希化 →
+// 对外 API 全 401）。此处必须保持直查 sqlite_master，勿做任何「模式化替换」。
+function probeTableExists(table) {
+  if (PROBE_DIALECT === 'sqlite') {
+    return !!db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?").get(table);
+  }
+  return !!db.prepare('SELECT 1 FROM information_schema.tables WHERE lower(table_name)=lower(?)').get(table);
 }
 
 // 2026-10-28 向量库升级：LanceDB 嵌入式向量数据库（零部署，磁盘持久化）
@@ -279,7 +315,7 @@ CREATE TABLE IF NOT EXISTS messages (
 // rating：0 未评 / 1 👍 / -1 👎（消息级好坏反馈）
 // solved：0 未评 / 1 已解决 / 2 未解决（「这个回答解决你的问题了吗」二选一调研）
 {
-  const msgCols = db.prepare('PRAGMA table_info(messages)').all().map(c => c.name);
+  const msgCols = probeColumns('messages');
   if (!msgCols.includes('rating')) {
     db.exec('ALTER TABLE messages ADD COLUMN rating INTEGER DEFAULT 0');
     console.log('[db] messages 表已迁移：新增 rating 字段');
@@ -293,12 +329,12 @@ CREATE TABLE IF NOT EXISTS messages (
 // messages.branch：消息分支归属（main=当前活跃线；回放归档线 br-{ts} 只读保留，防误删上下文）
 // sessions.active_branch：会话当前查看/写入的分支（v1 恒 main，预留切换能力）
 {
-  const msgCols = db.prepare('PRAGMA table_info(messages)').all().map(c => c.name);
+  const msgCols = probeColumns('messages');
   if (!msgCols.includes('branch')) {
     db.exec("ALTER TABLE messages ADD COLUMN branch TEXT DEFAULT 'main'");
     console.log('[db] messages 表已迁移：新增 branch 字段（P1-6 分支回放）');
   }
-  const sessCols = db.prepare('PRAGMA table_info(sessions)').all().map(c => c.name);
+  const sessCols = probeColumns('sessions');
   if (!sessCols.includes('active_branch')) {
     db.exec("ALTER TABLE sessions ADD COLUMN active_branch TEXT DEFAULT 'main'");
     console.log('[db] sessions 表已迁移：新增 active_branch 字段（P1-6 分支回放）');
@@ -444,7 +480,7 @@ CREATE TABLE IF NOT EXISTS evaluations (
 // ---------------- 存量库迁移（幂等） ----------------
 // users 表补充配额字段（2026-10-20 P2：用户级 Token 配额，0=不限制）
 {
-  const userCols = db.prepare('PRAGMA table_info(users)').all().map(c => c.name);
+  const userCols = probeColumns('users');
   if (!userCols.includes('quota_total')) {
     db.exec('ALTER TABLE users ADD COLUMN quota_total INTEGER DEFAULT 0');
     db.exec('ALTER TABLE users ADD COLUMN quota_used INTEGER DEFAULT 0');
@@ -463,7 +499,7 @@ CREATE TABLE IF NOT EXISTS evaluations (
 }
 // agents 表补充 owner（2026-10-20 P2：分享页/openapi 消耗记账归属到智能体发布者）
 {
-  const agentCols2 = db.prepare('PRAGMA table_info(agents)').all().map(c => c.name);
+  const agentCols2 = probeColumns('agents');
   if (!agentCols2.includes('owner')) {
     db.exec("ALTER TABLE agents ADD COLUMN owner TEXT DEFAULT ''");
     console.log('[db] agents 表已迁移：新增 owner 字段');
@@ -473,7 +509,7 @@ CREATE TABLE IF NOT EXISTS evaluations (
 }
 // users 表补充 must_change_pwd（2026-10-20 P0 弱口令治理：标记需强制改密的账号）
 {
-  const userCols = db.prepare('PRAGMA table_info(users)').all().map(c => c.name);
+  const userCols = probeColumns('users');
   if (!userCols.includes('must_change_pwd')) {
     db.exec('ALTER TABLE users ADD COLUMN must_change_pwd INTEGER DEFAULT 0');
     console.log('[db] users 表已迁移：新增 must_change_pwd 字段');
@@ -517,7 +553,7 @@ CREATE TABLE IF NOT EXISTS evaluations (
 // users 表补充 onboarded（2026-10-20 帮助体系：新手引导完成标记，0=未看过 3 步引导）
 // 与 quota_alert_level（用量预警已提醒档位：0=未提醒 1=已提醒80% 2=已提醒90%，防重复站内信）
 {
-  const userCols2 = db.prepare('PRAGMA table_info(users)').all().map(c => c.name);
+  const userCols2 = probeColumns('users');
   if (!userCols2.includes('onboarded')) {
     db.exec('ALTER TABLE users ADD COLUMN onboarded INTEGER DEFAULT 0');
     console.log('[db] users 表已迁移：新增 onboarded 字段');
@@ -530,7 +566,7 @@ CREATE TABLE IF NOT EXISTS evaluations (
 // users 补充 plan（2026-10-20 商业化）：套餐档位 free/pro/enterprise，默认 free；
 // 套餐额度与权益定义见 lib/plans.js（静态配置，不入库）
 {
-  const userCols3 = db.prepare('PRAGMA table_info(users)').all().map(c => c.name);
+  const userCols3 = probeColumns('users');
   if (!userCols3.includes('plan')) {
     db.exec("ALTER TABLE users ADD COLUMN plan TEXT DEFAULT 'free'");
     console.log('[db] users 表已迁移：新增 plan 字段');
@@ -578,7 +614,7 @@ db.exec(`CREATE TABLE IF NOT EXISTS invoices (
   created_at TEXT
 );`);
 // platforms 表补充 build_url（外部平台搭建页地址）
-const platCols = db.prepare('PRAGMA table_info(platforms)').all().map(c => c.name);
+const platCols = probeColumns('platforms');
 if (!platCols.includes('build_url')) {
   db.exec(`ALTER TABLE platforms ADD COLUMN build_url TEXT DEFAULT ''`);
   // 按类型补默认搭建页地址
@@ -597,7 +633,7 @@ if (!platCols.includes('console_email')) {
   console.log('[db] platforms 表已迁移：新增 console_email / console_password 字段');
 }
 // agents 表补充外部应用映射与分享字段
-const agentCols = db.prepare('PRAGMA table_info(agents)').all().map(c => c.name);
+const agentCols = probeColumns('agents');
 if (!agentCols.includes('external_app_id')) {
   db.exec(`ALTER TABLE agents ADD COLUMN external_app_id TEXT DEFAULT ''`);
   db.exec(`ALTER TABLE agents ADD COLUMN external_api_key TEXT DEFAULT ''`);
@@ -610,7 +646,7 @@ if (!agentCols.includes('share_token')) {
   console.log('[db] agents 表已迁移：新增 share_token / share_enabled 字段');
 }
 // sessions 表补充外部平台会话 ID（Dify conversation_id，多轮对话必需）
-const sessCols = db.prepare('PRAGMA table_info(sessions)').all().map(c => c.name);
+const sessCols = probeColumns('sessions');
 if (!sessCols.includes('ext_conversation_id')) {
   db.exec(`ALTER TABLE sessions ADD COLUMN ext_conversation_id TEXT DEFAULT ''`);
   console.log('[db] sessions 表已迁移：新增 ext_conversation_id 字段');
@@ -632,7 +668,7 @@ db.exec(`CREATE TABLE IF NOT EXISTS agent_api_keys (
 );`);
 // SEC-02a（2026-11-22）：API Key 改哈希存储——新增 key_prefix（列表展示掩码；key 列自本版起存 HMAC 哈希而非明文）
 {
-  const akCols = db.prepare('PRAGMA table_info(agent_api_keys)').all().map(c => c.name);
+  const akCols = probeColumns('agent_api_keys');
   if (!akCols.includes('key_prefix')) {
     db.exec("ALTER TABLE agent_api_keys ADD COLUMN key_prefix TEXT DEFAULT ''");
     console.log('[db] agent_api_keys 表已迁移：新增 key_prefix 字段（SEC-02a 哈希存储）');
@@ -640,7 +676,7 @@ db.exec(`CREATE TABLE IF NOT EXISTS agent_api_keys (
 }
 // BE-B3（M2 批次3，2026-11-22）：对外 API 每 Key 日/月调用配额（0 = 不限，向后兼容）
 {
-  const akCols = db.prepare('PRAGMA table_info(agent_api_keys)').all().map(c => c.name);
+  const akCols = probeColumns('agent_api_keys');
   if (!akCols.includes('quota_daily')) {
     db.exec('ALTER TABLE agent_api_keys ADD COLUMN quota_daily INTEGER DEFAULT 0');
     console.log('[db] agent_api_keys 表已迁移：新增 quota_daily 字段（BE-B3 日配额）');
@@ -769,7 +805,7 @@ db.exec(`CREATE TABLE IF NOT EXISTS agent_reviews (
 );`);
 db.exec(`CREATE INDEX IF NOT EXISTS idx_agent_reviews_agent ON agent_reviews(agent_id, id DESC);`);
 {
-  const aCols = db.prepare('PRAGMA table_info(agents)').all().map(c => c.name);
+  const aCols = probeColumns('agents');
   if (!aCols.includes('review_comment')) {
     db.exec(`ALTER TABLE agents ADD COLUMN review_comment TEXT DEFAULT ''`);
     console.log('[db] agents 表已迁移：新增 review_comment 字段（V3.1 #12 审核流——最新驳回意见，前台展示用）');
@@ -877,12 +913,12 @@ db.exec(`CREATE TABLE IF NOT EXISTS agent_memories (
   }
 };
 // kb_chunks 表补充 embedding（本地向量缓存，JSON 数组，懒计算）
-const chunkCols = db.prepare('PRAGMA table_info(kb_chunks)').all().map(c => c.name);
+const chunkCols = probeColumns('kb_chunks');
 if (!chunkCols.includes('embedding')) {
   db.exec(`ALTER TABLE kb_chunks ADD COLUMN embedding TEXT DEFAULT ''`);
   console.log('[db] kb_chunks 表已迁移：新增 embedding 字段');
 }
-const kbCols = db.prepare('PRAGMA table_info(kbs)').all().map(c => c.name);
+const kbCols = probeColumns('kbs');
 if (!kbCols.includes('chunk_size')) {
   db.exec(`ALTER TABLE kbs ADD COLUMN chunk_size INTEGER DEFAULT 500`);
   console.log('[db] kbs 表已迁移：新增 chunk_size 字段');
@@ -897,13 +933,13 @@ if (!kbCols.includes('chunk_separator')) {
 }
 // V2.4 #9 租户化（2026-10-31）：kbs 表增加 space_id 列——空间归属，0=无空间（默认），写入时关联对应的 space 表记录。
 // 本列是占位迁移，V2.4 正式开工时做存量回填+创建写入口。幂等（列已存在则跳过）。
-const kbColsV24 = db.prepare('PRAGMA table_info(kbs)').all().map(c => c.name);
+const kbColsV24 = probeColumns('kbs');
 if (!kbColsV24.includes('space_id')) {
   db.exec(`ALTER TABLE kbs ADD COLUMN space_id INTEGER DEFAULT 0`);
   console.log('[db] kbs 表已迁移：新增 space_id 字段（V2.4 #9 租户化占位）');
 }
 // kb_chunks 表增加 parent_id（父子切片：父 = ~1000 字上下文，子 = ~200 字精准召回）
-const chunkCols2 = db.prepare('PRAGMA table_info(kb_chunks)').all().map(c => c.name);
+const chunkCols2 = probeColumns('kb_chunks');
 if (!chunkCols2.includes('parent_id')) {
   db.exec(`ALTER TABLE kb_chunks ADD COLUMN parent_id INTEGER DEFAULT NULL`);
   console.log('[db] kb_chunks 表已迁移：新增 parent_id 字段（父子切片）');
@@ -914,7 +950,7 @@ if (!chunkCols2.includes('keywords')) {
   console.log('[db] kb_chunks 表已迁移：新增 keywords 字段（自动关键词/问法）');
 }
 // kbs 表增加 toc（TOC 目录结构：JSON [{title, level, startChunkId, chapterId}...]），切片后按章节标记分块归属
-const kbCols4 = db.prepare('PRAGMA table_info(kbs)').all().map(c => c.name);
+const kbCols4 = probeColumns('kbs');
 if (!kbCols4.includes('toc')) {
   db.exec(`ALTER TABLE kbs ADD COLUMN toc TEXT DEFAULT '[]'`);
   console.log('[db] kbs 表已迁移：新增 toc 字段（TOC 目录结构）');
@@ -925,7 +961,7 @@ if (!chunkCols2.includes('chapter_id')) {
   console.log('[db] kb_chunks 表已迁移：新增 chapter_id 字段（章节归属）');
 }
 // kb_files 表增加解析日志相关字段（2026-10-29：解析日志与状态可视化）
-const fileCols = db.prepare('PRAGMA table_info(kb_files)').all().map(c => c.name);
+const fileCols = probeColumns('kb_files');
 if (!fileCols.includes('source')) {
   db.exec(`ALTER TABLE kb_files ADD COLUMN source TEXT DEFAULT 'upload'`);
   console.log('[db] kb_files 表已迁移：新增 source 字段（来源标识）');
@@ -969,12 +1005,12 @@ if (!kbCols4.includes('pipeline')) {
 // kbs.vision_model TEXT —— 该知识库选用的多模态视觉理解模型名（空=不启用 vision 描述）
 {
   try {
-    const chunkCols3 = db.prepare('PRAGMA table_info(kb_chunks)').all().map(c => c.name);
+    const chunkCols3 = probeColumns('kb_chunks');
     if (!chunkCols3.includes('image_descs')) {
       db.exec(`ALTER TABLE kb_chunks ADD COLUMN image_descs TEXT DEFAULT ''`);
       console.log('[db] kb_chunks 表已迁移：新增 image_descs 字段（U1-9 图片描述文本）');
     }
-    const kbCols5 = db.prepare('PRAGMA table_info(kbs)').all().map(c => c.name);
+    const kbCols5 = probeColumns('kbs');
     if (!kbCols5.includes('vision_model')) {
       db.exec(`ALTER TABLE kbs ADD COLUMN vision_model TEXT DEFAULT ''`);
       console.log('[db] kbs 表已迁移：新增 vision_model 字段（U1-9 视觉理解模型）');
@@ -1011,7 +1047,7 @@ db.exec(`CREATE TABLE IF NOT EXISTS market_favorites (
 // ---------------- V1.3（2026-10-30）：#6 评测集 + #4 钉钉 mock ----------------
 // evaluations 加 kb_id/type：知识库级召回评测集与智能体级评测同表共存（type='agent'|'kb'，默认 'agent' 兼容存量）
 // 存量行 type 归一为 'agent'（agent_id 非 NULL）/查询侧补 type 过滤防两类数据互相污染
-const evalCols = db.prepare('PRAGMA table_info(evaluations)').all().map(c => c.name);
+const evalCols = probeColumns('evaluations');
 if (!evalCols.includes('kb_id')) {
   db.exec(`ALTER TABLE evaluations ADD COLUMN kb_id INTEGER DEFAULT NULL`);
   console.log('[db] evaluations 表已迁移：新增 kb_id 字段（知识库级评测集）');
@@ -1061,7 +1097,7 @@ db.exec(`CREATE TABLE IF NOT EXISTS chat_traces (
   created_at TEXT
 );`);
 // chat_traces 表补充 suggestions（用户问题建议，JSON 数组，异步生成后回填）
-const traceCols = db.prepare('PRAGMA table_info(chat_traces)').all().map(c => c.name);
+const traceCols = probeColumns('chat_traces');
 if (!traceCols.includes('suggestions')) {
   db.exec(`ALTER TABLE chat_traces ADD COLUMN suggestions TEXT DEFAULT '[]'`);
   console.log('[db] chat_traces 表已迁移：新增 suggestions 字段');
@@ -1099,7 +1135,7 @@ db.exec(`CREATE TABLE IF NOT EXISTS workflow_runs (
 db.exec(`CREATE INDEX IF NOT EXISTS idx_wf_runs_agent ON workflow_runs(agent_id, id DESC);`);
 // P5.8 差异化能力 #9：workflow_runs 支持 parent_run_id（子智能体节点调用关联父 run，画布下钻调试）
 {
-  const wfRunCols = db.prepare('PRAGMA table_info(workflow_runs)').all().map(c => c.name);
+  const wfRunCols = probeColumns('workflow_runs');
   if (!wfRunCols.includes('parent_run_id')) {
     db.exec('ALTER TABLE workflow_runs ADD COLUMN parent_run_id INTEGER DEFAULT NULL');
     console.log('[db] workflow_runs 表已迁移：新增 parent_run_id 字段（子智能体下钻）');
@@ -1109,7 +1145,7 @@ db.exec(`CREATE INDEX IF NOT EXISTS idx_wf_runs_agent ON workflow_runs(agent_id,
 // U1-3 工作流断点恢复（2026-11-13）：workflow_runs.node_checkpoint 存每个节点完成后的中间结果/logs。
 // 执行中断后从最后检查点续跑（runGraph 的 skipSet 模式），恢复行为落审计日志
 {
-  const wfRunCols = db.prepare('PRAGMA table_info(workflow_runs)').all().map(c => c.name);
+  const wfRunCols = probeColumns('workflow_runs');
   if (!wfRunCols.includes('node_checkpoint')) {
     db.exec('ALTER TABLE workflow_runs ADD COLUMN node_checkpoint TEXT DEFAULT NULL');
     console.log('[db] workflow_runs 表已迁移：新增 node_checkpoint 字段（U1-3 工作流断点恢复）');
@@ -1189,7 +1225,7 @@ db.exec(`CREATE TABLE IF NOT EXISTS shots (
 db.exec(`CREATE INDEX IF NOT EXISTS idx_shots_project ON shots(project_id, seq);`);
 // P5.8 差异化能力 #11：tasks 表支持 Webhook 触发（exec_type='webhook' + webhook_token 路由鉴权）
 {
-  const taskCols = db.prepare('PRAGMA table_info(tasks)').all().map(c => c.name);
+  const taskCols = probeColumns('tasks');
   if (!taskCols.includes('webhook_token')) {
     db.exec('ALTER TABLE tasks ADD COLUMN webhook_token TEXT DEFAULT \'\''); // SQL 值用单引号（双引号在 SQLite 是标识符引用）
     console.log('[db] tasks 表已迁移：新增 webhook_token 字段（Webhook 触发）');
@@ -1197,7 +1233,7 @@ db.exec(`CREATE INDEX IF NOT EXISTS idx_shots_project ON shots(project_id, seq);
 }
 // P5.31 对话内一键创建定时任务：tasks 归属列（username；'' = 历史管理员创建的存量任务，仅管理员可见可管）
 {
-  const taskCols = db.prepare('PRAGMA table_info(tasks)').all().map(c => c.name);
+  const taskCols = probeColumns('tasks');
   if (!taskCols.includes('username')) {
     db.exec('ALTER TABLE tasks ADD COLUMN username TEXT DEFAULT \'\'');
     console.log('[db] tasks 表已迁移：新增 username 归属字段（对话内创建定时任务）');
@@ -1206,7 +1242,7 @@ db.exec(`CREATE INDEX IF NOT EXISTS idx_shots_project ON shots(project_id, seq);
 }
 // P5.32 MCP 细粒度风险分级：服务级信任开关（trusted=1 才允许按工具注解/启发式降级；默认 0 = 整类 high）
 {
-  const mcpCols = db.prepare('PRAGMA table_info(mcp_servers)').all().map(c => c.name);
+  const mcpCols = probeColumns('mcp_servers');
   if (!mcpCols.includes('trusted')) {
     db.exec('ALTER TABLE mcp_servers ADD COLUMN trusted INTEGER DEFAULT 0');
     console.log('[db] mcp_servers 表已迁移：新增 trusted 信任字段（工具风险分级白名单）');
@@ -1229,7 +1265,7 @@ db.exec(`CREATE INDEX IF NOT EXISTS idx_shots_project ON shots(project_id, seq);
 // P5.34（审查 Y4 完整方案）：agents 稳定标识列——系统资源（内置智能体）与用户资产解耦，
 // 按 system_key 查找/种子不再受 agents.name 无唯一约束的影响（用户自建同名智能体无法劫持）
 {
-  const agentCols = db.prepare('PRAGMA table_info(agents)').all().map(c => c.name);
+  const agentCols = probeColumns('agents');
   if (!agentCols.includes('system_key')) {
     db.exec("ALTER TABLE agents ADD COLUMN system_key TEXT DEFAULT ''");
     console.log('[db] agents 表已迁移：新增 system_key 系统标识字段');
@@ -1537,7 +1573,7 @@ db.exec(`CREATE TABLE IF NOT EXISTS feedbacks (
 // ---------------- P3 扩展迁移（2026-10-22）----------------
 // ⑦ 分类器路由：agents.routing_mode（function 默认 function calling 编排 / classifier 分类器直达子智能体）
 {
-  const cols = db.prepare('PRAGMA table_info(agents)').all().map(c => c.name);
+  const cols = probeColumns('agents');
   if (!cols.includes('routing_mode')) db.exec(`ALTER TABLE agents ADD COLUMN routing_mode TEXT DEFAULT 'function'`);
 }
 // ⑤ MCP Server：独立访问令牌（把已发布智能体暴露为 MCP 工具，Bearer 鉴权 + 调用计数）
@@ -1554,7 +1590,7 @@ db.exec(`CREATE TABLE IF NOT EXISTS mcp_tokens (
 // 此前任一有效令牌可调用全部已发布智能体，一把泄露令牌 = 全平台智能体访问；
 // 与 openapi.js 的 agent_api_keys 作用域校验（同日修复）对齐，堵齐两条对外链路。
 {
-  const mcpCols = db.prepare('PRAGMA table_info(mcp_tokens)').all().map(c => c.name);
+  const mcpCols = probeColumns('mcp_tokens');
   if (!mcpCols.includes('agent_id')) {
     db.exec('ALTER TABLE mcp_tokens ADD COLUMN agent_id INTEGER DEFAULT NULL');
     console.log('[db] mcp_tokens 表已迁移：新增 agent_id 字段（P2-2 令牌作用域）');
@@ -1569,7 +1605,7 @@ db.exec(`CREATE TABLE IF NOT EXISTS mcp_tokens (
 // ---------------- P4 扩展迁移（2026-10-22）----------------
 // 模型类型标注：providers.model_types 存 {模型名: chat/image/video/tts/embedding} 映射（后台展示与按类型校验；前台实时分类）
 {
-  const cols = db.prepare('PRAGMA table_info(providers)').all().map(c => c.name);
+  const cols = probeColumns('providers');
   if (!cols.includes('model_types')) db.exec(`ALTER TABLE providers ADD COLUMN model_types TEXT DEFAULT '{}'`);
 }
 
@@ -1580,6 +1616,11 @@ db.exec(`CREATE TABLE IF NOT EXISTS mcp_tokens (
 {
   const SYS_TASK_AGENT = '定时任务执行助手';
   const SYS_TASK_KEY = 'system_task_runner';
+  // MT-7（2026-11-23 PG 桥）：本种子行归属 tenant_id=1（agents.tenant_id 列默认值）。FORCE RLS 生效后的
+  // 二次启动中，无租户上下文的 SELECT 只见 tenant-0 行（种子行不可见→误判不存在→重插→WITH CHECK 违约→
+  // 启动即崩，PoC 二跑踩坑）。种子块内显式声明租户上下文；sqlite 无此方法，条件调用保持零回归。
+  const hasTenantCtx = typeof db.setTenantContext === 'function';
+  if (hasTenantCtx) db.setTenantContext(1);
   const exists = db.prepare('SELECT id FROM agents WHERE system_key=?').get(SYS_TASK_KEY);
   if (!exists) {
     db.prepare(`INSERT INTO agents
@@ -1594,6 +1635,7 @@ db.exec(`CREATE TABLE IF NOT EXISTS mcp_tokens (
         'published', 'self', '系统内置', SYS_TASK_KEY, now(), now());
     console.log('[db] 已种子系统智能体「' + SYS_TASK_AGENT + '」（system_key=' + SYS_TASK_KEY + '）');
   }
+  if (hasTenantCtx) db.setTenantContext(null); // 恢复无上下文基线（后续启动逻辑不受种子上下文残留影响）
 }
 
 // ---------------- 种子数据（仅首次） ----------------
@@ -1989,7 +2031,7 @@ module.exports = { db, dbRead, hashPwd, hashPwdAsync, verifyPwd, now, daysAgo, t
     for (const r of rows) { const enc = encrypt(r.api_key); if (enc !== r.api_key) { db.prepare('UPDATE providers SET api_key=? WHERE id=?').run(enc, r.id); n++; } }
     // 用户级 key 表（表存在性防御：老库无对应表时跳过该段；明文判定 = 无 '.' 分隔符）
     for (const t of ['usermodels', 'user_providers', 'user_tool_keys']) {
-      if (!db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?").get(t)) continue;
+      if (!probeTableExists(t)) continue;
       const urows = db.prepare(`SELECT id, api_key FROM ${t} WHERE api_key!='' AND instr(api_key,'.')=0`).all();
       for (const r of urows) { const enc = encrypt(r.api_key); if (enc !== r.api_key) { db.prepare(`UPDATE ${t} SET api_key=? WHERE id=?`).run(enc, r.id); m++; } }
     }
@@ -2010,7 +2052,7 @@ module.exports = { db, dbRead, hashPwd, hashPwdAsync, verifyPwd, now, daysAgo, t
     ];
     let cnt = 0;
     for (const { table, col, pfx } of tasks) {
-      if (!db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?").get(table)) continue;
+      if (!probeTableExists(table)) continue;
       const rows = db.prepare(`SELECT id, ${col} AS v FROM ${table} WHERE ${col} IS NOT NULL AND ${col} != ''`).all();
       for (const r of rows) {
         if (looksHashed(r.v)) continue; // 已是哈希
@@ -2051,7 +2093,7 @@ db.exec(`CREATE TABLE IF NOT EXISTS localbridge_tasks (
 // ================== U2-4 Phase 2 端侧指令闭环：localbridge_tasks 加 channel_msg_id ==================
 {
   try {
-    const lbtCols = db.prepare('PRAGMA table_info(localbridge_tasks)').all().map(c => c.name);
+    const lbtCols = probeColumns('localbridge_tasks');
     if (!lbtCols.includes('channel_msg_id')) {
       db.exec('ALTER TABLE localbridge_tasks ADD COLUMN channel_msg_id INTEGER DEFAULT NULL');
       db.exec('CREATE INDEX IF NOT EXISTS idx_lbt_channel_msg ON localbridge_tasks(channel_msg_id);');
@@ -2064,7 +2106,7 @@ db.exec(`CREATE TABLE IF NOT EXISTS localbridge_tasks (
 // 服务端高危 op 总闸（键鼠/clipboard_write/file_write）；与桥端开关构成双层。默认关闭。
 {
   try {
-    const devCols = db.prepare('PRAGMA table_info(localbridge_devices)').all().map(c => c.name);
+    const devCols = probeColumns('localbridge_devices');
     if (!devCols.includes('allow_high_risk')) {
       db.exec('ALTER TABLE localbridge_devices ADD COLUMN allow_high_risk INTEGER DEFAULT 0');
       console.log('[db] localbridge_devices 表已迁移：新增 allow_high_risk 字段（N6/U2-4）');
@@ -2077,7 +2119,7 @@ db.exec(`CREATE TABLE IF NOT EXISTS localbridge_tasks (
 // localbridge_backups：写操作（file_write/file_patch）自动备份台账 + 回滚状态，供「事后改动清单/一键回滚」。
 {
   try {
-    const devCols = db.prepare('PRAGMA table_info(localbridge_devices)').all().map(c => c.name);
+    const devCols = probeColumns('localbridge_devices');
     if (!devCols.includes('permission_tier')) {
       db.exec("ALTER TABLE localbridge_devices ADD COLUMN permission_tier TEXT DEFAULT 'standard'");
       console.log('[db] localbridge_devices 表已迁移：新增 permission_tier 字段（D1-1）');
@@ -2150,7 +2192,7 @@ db.exec('CREATE INDEX IF NOT EXISTS idx_bc_device ON bridge_crashes(device_id);'
 
 // ---------------- P1-4 分层记忆v1：agent_memories 增加 type/confidence/source/summary 字段（2026-11-11）----------------
 {
-  const cols = db.prepare('PRAGMA table_info(agent_memories)').all().map(r => r.name);
+  const cols = probeColumns('agent_memories');
   if (!cols.includes('type')) db.exec("ALTER TABLE agent_memories ADD COLUMN type TEXT DEFAULT 'fact'");
   if (!cols.includes('confidence')) db.exec("ALTER TABLE agent_memories ADD COLUMN confidence REAL DEFAULT 1.0");
   if (!cols.includes('source')) db.exec("ALTER TABLE agent_memories ADD COLUMN source TEXT DEFAULT 'chat'");
@@ -2618,7 +2660,7 @@ db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_mc_unique ON model_capabilities(m
 // auth_config: JSON（aksk 存 {access_key,secret_key}；oauth 存 {client_id,client_secret,token_url}；custom 存 {headers:{}}）
 // status: 连接状态 1=正常 0=异常（连通测试结果）
 {
-  const pCols = db.prepare('PRAGMA table_info(providers)').all().map(c => c.name);
+  const pCols = probeColumns('providers');
   if (!pCols.includes('auth_type')) {
     db.exec("ALTER TABLE providers ADD COLUMN auth_type TEXT DEFAULT 'bearer'");
     db.exec("ALTER TABLE providers ADD COLUMN auth_config TEXT DEFAULT '{}'");
@@ -2653,12 +2695,12 @@ console.log('[db] 创建 model_capabilities/usage_records 表 + providers 扩充
 // departments 扩列：monthly_budget（月度预算元，0=不设预算不告警）、budget_alert_level（已提醒档位 0/1/2，仿 users.quota_alert_level 防轰炸）
 {
   try {
-    const pvCols = db.prepare('PRAGMA table_info(providers)').all().map(c => c.name);
+    const pvCols = probeColumns('providers');
     if (!pvCols.includes('model_price')) {
       db.exec("ALTER TABLE providers ADD COLUMN model_price TEXT DEFAULT '{}'");
       console.log('[db] providers 表已迁移：新增 model_price 字段（U1-6 模型单价表）');
     }
-    const urCols = db.prepare('PRAGMA table_info(usage_records)').all().map(c => c.name);
+    const urCols = probeColumns('usage_records');
     if (!urCols.includes('prompt_tokens')) db.exec('ALTER TABLE usage_records ADD COLUMN prompt_tokens INTEGER DEFAULT 0');
     if (!urCols.includes('completion_tokens')) db.exec('ALTER TABLE usage_records ADD COLUMN completion_tokens INTEGER DEFAULT 0');
     if (!urCols.includes('dept_id')) {
@@ -2666,7 +2708,7 @@ console.log('[db] 创建 model_capabilities/usage_records 表 + providers 扩充
       console.log('[db] usage_records 表已迁移：新增 prompt_tokens/completion_tokens/dept_id 字段（U1-6 精细计费）');
     }
     db.exec('CREATE INDEX IF NOT EXISTS idx_ur_dept ON usage_records(dept_id);');
-    const dpCols = db.prepare('PRAGMA table_info(departments)').all().map(c => c.name);
+    const dpCols = probeColumns('departments');
     if (!dpCols.includes('monthly_budget')) {
       db.exec('ALTER TABLE departments ADD COLUMN monthly_budget REAL DEFAULT 0');
       db.exec('ALTER TABLE departments ADD COLUMN budget_alert_level INTEGER DEFAULT 0');
@@ -2680,7 +2722,7 @@ console.log('[db] 创建 model_capabilities/usage_records 表 + providers 扩充
 // 房间成员模型（collab_room_members）复用既有结构，在线状态由 WS 内存态承载不入库
 {
   try {
-    const crCols = db.prepare('PRAGMA table_info(collab_rooms)').all().map(c => c.name);
+    const crCols = probeColumns('collab_rooms');
     if (!crCols.includes('agent_id')) {
       db.exec('ALTER TABLE collab_rooms ADD COLUMN agent_id INTEGER DEFAULT NULL');
       db.exec('CREATE INDEX IF NOT EXISTS idx_cr_agent ON collab_rooms(agent_id);');
@@ -2746,7 +2788,7 @@ db.exec('CREATE INDEX IF NOT EXISTS idx_es_kb ON external_sources(kb_id);');
 // ================== U2-7 external_sources 扩展列 ==================
 {
   try {
-    const esCols = db.prepare('PRAGMA table_info(external_sources)').all().map(c => c.name);
+    const esCols = probeColumns('external_sources');
     if (!esCols.includes('auth_type')) {
       db.exec("ALTER TABLE external_sources ADD COLUMN auth_type TEXT DEFAULT 'none'");
       db.exec("ALTER TABLE external_sources ADD COLUMN auth_config TEXT DEFAULT ''");
@@ -3047,4 +3089,17 @@ try {
   }
 } catch (e) {
   console.error('[migrate] 迁移框架初始化失败（非致命）：', e.message);
+}
+
+// ================== MT-7（2026-11-23）RLS 应用：PG 模式下核心表启用行级安全 ==================
+// 时机在全部建表/迁移完成之后（策略应用对象是已存在的表）。幂等（POLICY IF NOT EXISTS 语义，
+// 见 lib/pg-rls.js）；sqlite 模式零执行零影响。
+if (DB_DRIVER === 'pg') {
+  try {
+    const { applyRls } = require('./lib/pg-rls');
+    const applied = applyRls(db);
+    console.log(`[db][MT-7] RLS 策略已应用：${applied.join(', ')}（FORCE 行级隔离，会话变量 app.tenant_id）`);
+  } catch (e) {
+    console.error('[db][MT-7] RLS 策略应用失败（非致命，检查表是否含 tenant_id 列）：', e.message);
+  }
 }

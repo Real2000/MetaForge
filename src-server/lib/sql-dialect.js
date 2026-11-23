@@ -114,6 +114,13 @@ const DIALECTS = {
       { re: /\bINTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT\b/gi, to: 'SERIAL PRIMARY KEY' },
       // 单独的整型自增列（无 PRIMARY KEY 紧跟）
       { re: /\bINTEGER\s+AUTOINCREMENT\b/gi, to: 'SERIAL' },
+      // BLOB（SQLite 任意长度二进制）→ PG 系 BYTEA（迁移 #130 列定义 def='BLOB DEFAULT NULL' 经此翻译；
+      // PG 无 BLOB 类型，原文直发即 syntax error——MT-7 PoC 首跑踩坑。dm 自有 BLOB 类型故不入 COMMON_RULES）
+      { re: /\bBLOB\b/g, to: 'BYTEA' },
+      // instr(X, Y) → PG 系 strpos(X, Y)：语义一致（Y 在 X 中的 1 起始位置，未命中为 0）——
+      // api_key 加密迁移的明文探测 WHERE instr(api_key,'.')=0 经此翻译（PG 无 instr，原文直发
+      // 即报错、迁移兜底降级为不加密——MT-7 PoC 二跑踩坑。dm 自有 INSTR，保持原文）
+      { re: /\binstr\s*\(/gi, to: 'strpos(' },
       ...COMMON_RULES,
     ],
     unsupported: [

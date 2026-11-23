@@ -35,6 +35,9 @@ const ALLOWLIST = new Set([
   'src-server/lib/vector-index.js', 'src-server/lib/retriever.js', 'src-server/lib/graphrag.js',
   'src-server/lib/memory-recall.js', 'src-server/lib/rag-metrics.js', 'src-server/lib/ingestion-pipeline.js',
   'src-server/lib/workflow.js', 'src-server/lib/access-log.js',
+  // MT-7（2026-11-23）补录：pg-rls 为 RLS 策略执行器（PG 原生 DDL 的框架层出口，
+  // 与 migrate 同性质——策略应用发生在建表完成后，非业务 CRUD 收敛范围）
+  'src-server/lib/pg-rls.js',
 ]);
 
 function walk(dir, out = []) {
