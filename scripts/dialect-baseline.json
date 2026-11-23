@@ -1,0 +1,11 @@
+{
+  "_comment": "BE-C2 方言闭环审计登记表（lint:dialect）。alternatives 键为「方言::构造签名」，值为验收认可的替代方案说明——计划表 BE-C2 验收原文「warning 清单为 0 或有替代」。--update 可自动追加新签名（补说明后生效）。",
+  "alternatives": {
+    "dm::PRAGMA": "PRAGMA 仅 SQLite 专有。两类替代：(a) 探测类（PRAGMA table_info 等 47 处，集中于 db.js 启动内联迁移探测）——db.js 仅在 sqlite 驱动路径运行（better-sqlite3 直连），dm/kingbase 部署时由 db-driver.createDriver 替换连接（MT-7 PoC），列探测走 migrate.js 方言分支（PROBE_DIALECT）的 information_schema.columns，已实现等价路径；(b) 设置类（busy_timeout/journal_mode）——信创库由驱动连接参数承担（db-driver.connect opts）。",
+    "kingbase::PRAGMA": "同 dm::PRAGMA——探测类走 migrate.js 方言分支 information_schema；设置类由驱动连接参数承担（MT-7 接线后生效）。",
+    "dm::INSERT OR IGNORE": "达梦不支持 ON CONFLICT DO NOTHING（kingbase 已自动改写）。7 处业务 upsert 均有唯一约束：替代为 MERGE INTO（WHEN NOT MATCHED THEN INSERT）或应用层先查后写。信创部署时按 scripts/dialect-baseline 的 MERGE 模板逐处改写（7 处清单见审计 --update 样本位）。",
+    "dm::ON CONFLICT upsert": "达梦不支持 PG 系 ON CONFLICT upsert（kingbase 原生兼容零告警）。3 处业务已标准化为 ON CONFLICT 写法（secrets/_config/model_capabilities，SQLite/kingbase 双原生）；dm 部署时按 MERGE INTO 模板替换：MERGE INTO t USING (SELECT ? AS col...) src ON (t.k = src.k) WHEN MATCHED THEN UPDATE SET ... WHEN NOT MATCHED THEN INSERT ...（占位符需按 MERGE 语义重排，故不做机械翻译——sql-dialect 设计原则：语义复杂改写不臆造）。",
+    "dm::sqlite_master 系统表": "系统目录查询替代：information_schema.tables / information_schema.columns（migrate.js hasColumn/tableExists 方言分支已实现）。db.js 散点探测仅 sqlite 启动路径执行（better-sqlite3 直连），dm/kingbase 由 db-driver 替换连接后走方言分支。",
+    "kingbase::sqlite_master 系统表": "同 dm::sqlite_master 系统表——information_schema 替代（migrate.js 方言分支已实现），散点探测仅 sqlite 启动路径执行。"
+  }
+}

@@ -8,7 +8,17 @@
  * 设计原则：
  *   - 默认 sqlite 方言恒等返回，回归行为不变；
  *   - 逐构造覆盖、可单测；未知/未映射的 SQLite 专有构造显式产出 warning（不静默）；
- *   - 仅做「可机械改写」的映射；语义复杂的改写（如 UPDATE ... LIMIT）不臆造，转 warning。
+ *   - 仅做「可机械改写」的映射；语义复杂的改写（如 UPDATE ... LIMIT、ON CONFLICT→MERGE）不臆造，
+ *     转 warning 并由 scripts/lint-dialect.js 审计登记替代方案（BE-C2 验收：warning 清单为 0 或有替代）。
+ *
+ * BE-C2（2026-11-23）方言闭环增强：
+ *   - translate() 返回结构新增 downgrades：与 warnings 分离的「已确认降级路径」清单
+ *     （warnings=需人工确认的未映射项；downgrades=方言侧已有替代实现的降级，如 FTS5 虚表跳过）；
+ *   - FTS5 / vec0 虚表 DDL：非 sqlite 方言下建表语句注释化跳过（检索降级路径：BM25 内存通道 /
+ *     向量库全扫，见 retriever.bm25Scores 方言判定），登记 downgrade 而非 warning；
+ *   - dm 补单列自增规则（INTEGER AUTOINCREMENT → INT IDENTITY(1,1)，此前仅覆盖 PK 紧跟形态）；
+ *   - dm unsupported 补 ON CONFLICT upsert（达梦不支持，替代：MERGE INTO 模板/先查后写，见登记表）；
+ *   - sqlite_master/sqlite_sequence 系统表查询登记（替代：information_schema / db-driver 方言探测 API）。
  */
 'use strict';
 
@@ -76,6 +86,8 @@ const DIALECTS = {
     rules: [
       // INTEGER PRIMARY KEY AUTOINCREMENT → INT IDENTITY(1,1) PRIMARY KEY
       { re: /\bINTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT\b/gi, to: 'INT IDENTITY(1,1) PRIMARY KEY' },
+      // BE-C2（2026-11-23）补单列自增形态（无 PK 紧跟）：此前该形态落入 AUTOINCREMENT 残留告警
+      { re: /\bINTEGER\s+AUTOINCREMENT\b/gi, to: 'INT IDENTITY(1,1)' },
       // 搜索型 LIKE 的大小写：DM 默认区分，保留原样
       ...COMMON_RULES,
     ],
@@ -85,6 +97,11 @@ const DIALECTS = {
       { name: 'randomblob()', re: /\brandomblob\s*\(/i },
       { name: 'AUTOINCREMENT', re: /\bAUTOINCREMENT\b/i },
       { name: 'PRAGMA', re: /\bPRAGMA\b/i },
+      // BE-C2（2026-11-23）：达梦不支持 ON CONFLICT upsert（PG 9.5+ 语法）——不臆造 MERGE 机械改写
+      //（占位符重排/命名风险高且无 dm 环境验证）；替代方案登记于 scripts/dialect-baseline.json：
+      // MERGE INTO 模板或应用层先查后写
+      { name: 'ON CONFLICT upsert', re: /\bON\s+CONFLICT\b/i },
+      { name: 'sqlite_master 系统表', re: /\bsqlite_master\b|\bsqlite_sequence\b/i },
     ],
   },
 
@@ -105,6 +122,8 @@ const DIALECTS = {
       { name: 'randomblob()', re: /\brandomblob\s*\(/i },
       { name: 'AUTOINCREMENT', re: /\bAUTOINCREMENT\b/i },
       { name: 'PRAGMA', re: /\bPRAGMA\b/i },
+      // ON CONFLICT upsert：PG 系原生兼容，不告警（smoke 单测锚定该语义）
+      { name: 'sqlite_master 系统表', re: /\bsqlite_master\b|\bsqlite_sequence\b/i },
     ],
   },
 };
@@ -125,14 +144,36 @@ function getDialect(name) {
  * 翻译 SQL 到目标方言。
  * @param {string} sql SQL 文本（SQLite 语法）
  * @param {string} [dialectName='sqlite']
- * @returns {{sql:string, warnings:string[], dialect:string}}
+ * @returns {{sql:string, warnings:string[], downgrades:Array<{kind:string,table?:string,note:string}>, dialect:string}}
+ *   - warnings：需人工确认的未映射构造（审计门禁要求「为 0 或登记替代」）
+ *   - downgrades：已确认降级路径的构造（如 FTS5 虚表跳过——检索层有内存通道/全扫兜底，
+ *     见 retriever.bm25Scores 的方言判定与 vector-index.available() 探测），不构成阻塞
  */
 function translate(sql, dialectName = 'sqlite') {
   const d = getDialect(dialectName);
   let out = String(sql == null ? '' : sql);
   const warnings = [];
+  const downgrades = [];
 
-  if (d.name === 'sqlite') return { sql: out, warnings, dialect: d.name };
+  if (d.name === 'sqlite') return { sql: out, warnings, downgrades, dialect: d.name };
+
+  // --- BE-C2（2026-11-23）FTS5 / vec0 虚表 DDL：方言侧跳过建表（注释化）+ 降级登记 ---
+  // 全文索引与 ANN 向量索引均为 SQLite 专有（vec0 为 sqlite-vec 扩展）。非 sqlite 方言下：
+  //   - kb_chunks_fts（FTS5 全文）→ 检索降级为 BM25 内存通道（retriever.bm25Scores 方言判定）
+  //   - vec_kb_*（vec0 影子表）→ ANN 不可用 → 检索走全扫（vector-index.available() 已有降级路径）
+  out = out.replace(
+    /CREATE\s+VIRTUAL\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([\w".]+)\s+USING\s+(fts5|vec0)\b[^;]*;?/gi,
+    (whole, table, kind) => {
+      downgrades.push({
+        kind: `virtual-table:${kind}`,
+        table: String(table).replace(/"/g, ''),
+        note: kind === 'fts5'
+          ? `${d.label} 不支持 FTS5 全文索引，建表跳过——BM25 降级为内存通道（retriever.bm25Scores 方言判定）`
+          : `${d.label} 不支持 vec0 向量虚表，建表跳过——ANN 降级为全扫（vector-index.available() 探测兜底）`,
+      });
+      return `-- [dialect-skip:${kind}] ${table}：${d.label} 专有索引降级（见 downgrades 登记）`;
+    }
+  );
 
   // --- 复合语句：INSERT OR IGNORE / INSERT OR REPLACE 的语义等价改写 ---
   if (/\bINSERT\s+OR\s+IGNORE\b/i.test(out)) {
@@ -146,9 +187,9 @@ function translate(sql, dialectName = 'sqlite') {
   if (/\bINSERT\s+OR\s+REPLACE\b/i.test(out)) {
     out = out.replace(/\bINSERT\s+OR\s+REPLACE\b/gi, 'INSERT');
     if (d.name === 'kingbase') {
-      warnings.push('INSERT OR REPLACE：金仓需 ON CONFLICT (...) DO UPDATE SET ...，缺少冲突目标，未自动改写');
+      warnings.push('INSERT OR REPLACE：金仓需 ON CONFLICT (...) DO UPDATE SET ...，缺少冲突目标，未自动改写（建议业务侧改为标准 ON CONFLICT 写法，本方言即原生兼容）');
     } else {
-      warnings.push('INSERT OR REPLACE：达梦需改写为 MERGE，未自动改写');
+      warnings.push('INSERT OR REPLACE：达梦需改写为 MERGE，未自动改写（建议业务侧改为标准 ON CONFLICT 写法，由 MERGE 模板登记替代）');
     }
   }
 
@@ -163,7 +204,7 @@ function translate(sql, dialectName = 'sqlite') {
     if (p.re.test(out)) warnings.push(`未映射的 SQLite 专有构造：${p.name}（请人工确认 ${d.label} 等价写法）`);
   }
 
-  return { sql: out, warnings, dialect: d.name };
+  return { sql: out, warnings, downgrades, dialect: d.name };
 }
 
 /** 在语句末尾（分号之前）追加子句 */

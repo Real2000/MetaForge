@@ -133,7 +133,10 @@ function set(key, value) {
   }
 
   // 写入数据库
-  dal.runq('INSERT OR REPLACE INTO _config (key, value, updated_at) VALUES (?, ?, ?)', [key, String(coerced), now()]);
+  // BE-C2（2026-11-23）：INSERT OR REPLACE → 标准 ON CONFLICT upsert（key 为 PK 冲突目标；
+  // 三方言统一：SQLite/kingbase 原生，dm 走登记替代——id/首建时间稳定）
+  dal.runq(`INSERT INTO _config (key, value, updated_at) VALUES (?, ?, ?)
+    ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`, [key, String(coerced), now()]);
   // 刷新缓存
   configMap.set(key, coerced);
   return coerced;

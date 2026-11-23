@@ -270,9 +270,13 @@ function parseVec(s) {
   } catch { return { v: null, engine: null }; }
 }
 
-/** BM25 通道打分（U0-3：FTS5 可选。useFts=true 时走 SQL MATCH，缺省运行时扫描维持既有测试行为） */
+/** BM25 通道打分（U0-3：FTS5 可选。useFts=true 时走 SQL MATCH，缺省运行时扫描维持既有测试行为）
+ *  BE-C2（2026-11-23）FTS5 降级：非 SQLite 方言（DB_DIALECT=dm/kingbase）显式走内存通道——
+ *  FTS5 为 SQLite 专有虚表（translate 层已对建表 DDL 注释化跳过），此前降级依赖 sqlite_master
+ *  探测失败的 catch 兜底，现改为显式方言判定（降级路径可审计、不依赖异常行为）。 */
 function bm25Scores(rows, qTerms, opts) {
-  if (opts && opts.useFts) {
+  const dialect = process.env.DB_DIALECT || 'sqlite';
+  if (opts && opts.useFts && dialect === 'sqlite') {
     try {
       const hasFts = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='kb_chunks_fts'").get();
       if (hasFts) return bm25ScoresFts5(rows, qTerms);

@@ -38,13 +38,23 @@ const { db } = require('../db');
 
 /* ---------- 工具函数 ---------- */
 
-/** 检查表中是否存在某列（缓存列信息避免反复 PRAGMA） */
+/** BE-C2（2026-11-23）：探测 API 方言化——SQLite 走 PRAGMA/sqlite_master（现状），
+ * dm/kingbase 走 information_schema（信创库标准目录视图）。SQLite 分支与既有行为逐字节一致
+ * （含 columnCache 语义）；information_schema 分支为 MT-7 驱动接线后生效的等价实现。 */
+const PROBE_DIALECT = process.env.DB_DIALECT || 'sqlite';
+
+/** 检查表中是否存在某列（缓存列信息避免反复探测） */
 const columnCache = new Map();
 function hasColumn(table, column) {
   const key = `${table}.${column}`;
   if (columnCache.has(key)) return columnCache.get(key);
   let cols;
-  try { cols = db.prepare(`PRAGMA table_info(${table})`).all().map(c => c.name); } catch { cols = []; }
+  if (PROBE_DIALECT === 'sqlite') {
+    try { cols = db.prepare(`PRAGMA table_info(${table})`).all().map(c => c.name); } catch { cols = []; }
+  } else {
+    // dm/kingbase：标准目录视图（表名参数化，与 PRAGMA 的防注入边界等价——information_schema 不接受标识符插值）
+    try { cols = db.prepare('SELECT column_name AS name FROM information_schema.columns WHERE lower(table_name)=lower(?)').all(table).map(c => c.name); } catch { cols = []; }
+  }
   const exists = cols.includes(column);
   columnCache.set(key, exists);
   return exists;
@@ -52,8 +62,14 @@ function hasColumn(table, column) {
 
 /** 检查表是否存在 */
 function tableExists(table) {
+  if (PROBE_DIALECT === 'sqlite') {
+    try {
+      const r = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?").get(table);
+      return !!r;
+    } catch { return false; }
+  }
   try {
-    const r = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?").get(table);
+    const r = db.prepare('SELECT 1 FROM information_schema.tables WHERE lower(table_name)=lower(?)').get(table);
     return !!r;
   } catch { return false; }
 }
@@ -76,10 +92,13 @@ function addColumn(table, column, def) {
 /** 快捷删列（BE-E1 down 用，幂等）：列存在则 ALTER TABLE DROP COLUMN（需 SQLite ≥ 3.35），返回 true 表示已执行 */
 function dropColumn(table, column) {
   if (!hasColumn(table, column)) return false;
-  const ver = String(db.prepare('select sqlite_version()').pluck().get());
-  const [major, minor] = ver.split('.').map(Number);
-  if (major < 3 || (major === 3 && minor < 35)) {
-    throw new Error(`当前 SQLite ${ver} 不支持 DROP COLUMN（需 ≥ 3.35），无法回滚 ${table}.${column}`);
+  if (PROBE_DIALECT === 'sqlite') {
+    // 版本门槛仅 SQLite 需要（ALTER DROP COLUMN 自 3.35 支持）；dm/kingbase 原生支持，直接执行
+    const ver = String(db.prepare('select sqlite_version()').pluck().get());
+    const [major, minor] = ver.split('.').map(Number);
+    if (major < 3 || (major === 3 && minor < 35)) {
+      throw new Error(`当前 SQLite ${ver} 不支持 DROP COLUMN（需 ≥ 3.35），无法回滚 ${table}.${column}`);
+    }
   }
   db.exec(`ALTER TABLE ${table} DROP COLUMN ${column}`);
   columnCache.set(`${table}.${column}`, false);

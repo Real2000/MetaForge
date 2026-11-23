@@ -19,9 +19,23 @@ db.pragma('journal_mode = WAL');
 // U2-1 / N7-P2：集群多进程并发执行内联迁移「先查列→再 ALTER」时，两进程可能同时判定列不存在，
 // 后到达者会抛 "duplicate column name"（列已被另一进程添加）。此处集中吞掉该幂等错误，
 // 使迁移在并发启动（WEB_CONCURRENCY / PM2 多实例）下收敛一致，且不掩盖其他 SQL 错误。
+// BE-C2（2026-11-23）方言闭环：全部建表/DDL 语句经方言层出口——db.exec 包装点统一注入
+// translate（sqlite 方言恒等翻译，本文件启动路径零行为差异零开销；dm/kingbase 方言下 DDL
+// 由 translate 改写：AUTOINCREMENT→IDENTITY/SERIAL、FTS5/vec0 虚表注释化跳过等）。
+// 注：db.js 仍以 better-sqlite3 打开连接（驱动接线属 MT-7 PoC 范围）；本出口保证「建表 SQL
+// 全部经方言层生成」——MT-7 切换 db 实例来源后，方言翻译即随 DB_DIALECT 生效。
 {
   const _rawExec = db.exec.bind(db);
+  const { translate: _translateDdl } = require('./lib/sql-dialect');
+  const _DDL_DIALECT = process.env.DB_DIALECT || 'sqlite';
   db.exec = (sql) => {
+    if (_DDL_DIALECT !== 'sqlite') {
+      // 非 sqlite 方言：翻译 DDL 并显式播报降级/告警（部署信创库时建表行为可观测，不静默）
+      const t = _translateDdl(String(sql), _DDL_DIALECT);
+      t.downgrades.forEach(x => console.log(`[dialect:${_DDL_DIALECT}] DDL 降级：${x.note}`));
+      t.warnings.forEach(w => console.warn(`[dialect:${_DDL_DIALECT}] DDL 翻译告警：${w}`));
+      sql = t.sql;
+    }
     try { return _rawExec(sql); }
     catch (e) {
       if (e && /duplicate column name/i.test(String(e.message || ''))) return undefined;
@@ -1937,7 +1951,11 @@ module.exports = { db, dbRead, hashPwd, hashPwdAsync, verifyPwd, now, daysAgo, t
       console.error('[db][SEC-10] 生成文件加密密钥失败（回退 secrets 表）：' + e.message);
       try {
         const key = crypto.randomBytes(32).toString('hex');
-        db.prepare('INSERT OR REPLACE INTO secrets (name,value,remark,created_at,updated_at) VALUES (?,?,?,?,?)')
+        // BE-C2（2026-11-23）：INSERT OR REPLACE → 标准 ON CONFLICT upsert（三方言统一：SQLite 3.24+/kingbase
+        // 原生支持；dm 由 scripts/dialect-baseline.json 登记 MERGE 替代）。语义改善：id 稳定（REPLACE 删旧插新会
+        // 重排自增 id）、created_at 保留首建值（仅更新 value/remark/时间）
+        db.prepare(`INSERT INTO secrets (name,value,remark,created_at,updated_at) VALUES (?,?,?,?,?)
+          ON CONFLICT(name, tenant_id) DO UPDATE SET value=excluded.value, remark=excluded.remark, updated_at=excluded.updated_at`)
           .run('ENCRYPTION_KEY', key, 'AES-256-GCM 加密密钥（文件不可用回退）', now(), now());
         cu.resetKeyCache();
         info = cu.keyInfo();

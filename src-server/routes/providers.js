@@ -254,8 +254,12 @@ router.post('/capabilities', adminOnly, (req, res) => {
   const allowed = ['text', 'vision', 'audio', 'embedding', 'rerank', 'image_gen', 'video_gen', 'tool_call', 'streaming'];
   if (!allowed.includes(capability)) return res.json({ code: 400, msg: `capability 必须为以下之一：${allowed.join(', ')}` });
   try {
-    const info = dal.runq(`INSERT OR REPLACE INTO model_capabilities (model_name,provider_name,capability,priority,enabled,created_at)
-      VALUES (?,?,?,?,?,datetime('now','localtime'))`, [model_name, provider_name || '', capability, priority || 0, enabled !== undefined ? (enabled ? 1 : 0) : 1]);
+    // BE-C2（2026-11-23）：INSERT OR REPLACE → 标准 ON CONFLICT upsert（唯一索引 idx_mc_unique 三列为
+    // 冲突目标；SQLite/kingbase 原生，dm 走登记替代。语义改善：id 稳定 + created_at 保留首建值）
+    const info = dal.runq(`INSERT INTO model_capabilities (model_name,provider_name,capability,priority,enabled,created_at)
+      VALUES (?,?,?,?,?,datetime('now','localtime'))
+      ON CONFLICT(model_name, provider_name, capability) DO UPDATE SET priority=excluded.priority, enabled=excluded.enabled`,
+      [model_name, provider_name || '', capability, priority || 0, enabled !== undefined ? (enabled ? 1 : 0) : 1]);
     res.json({ code: 0, data: { id: Number(info.lastInsertRowid) } });
   } catch (e) {
     res.json({ code: 500, msg: e.message });

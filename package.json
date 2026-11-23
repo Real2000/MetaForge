@@ -34,6 +34,8 @@
     "lint:sql:update": "node scripts/lint-bare-prepare.js --update",
     "lint:schema": "node scripts/lint-inline-schema.js",
     "lint:schema:update": "node scripts/lint-inline-schema.js --update-baseline",
+    "lint:dialect": "node scripts/lint-dialect.js",
+    "lint:dialect:update": "node scripts/lint-dialect.js --update",
     "migrate": "node scripts/migrate.js",
     "dialect:audit": "node scripts/dialect-audit.js",
     "package": "node scripts/package.js",

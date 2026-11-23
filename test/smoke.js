@@ -701,6 +701,100 @@ function t(name, fn) {
     assert.ok(warn.warnings.length > 0, '未映射构造应产出告警');
   });
 
+  // 【BE-C2 收尾（2026-11-23）】方言闭环：downgrades 机制 / 新构造映射 / upsert 标准化 / 审计门禁
+  console.log('【BE-C2】SQL 方言闭环收尾（downgrades / ON CONFLICT / 审计门禁）');
+  {
+    const { translate } = require('../src-server/lib/sql-dialect');
+    await t('BE-C2：downgrades 机制——FTS5/vec0 虚表非 sqlite 方言跳过建表 + 登记降级路径', () => {
+      const ftsDdl = "CREATE VIRTUAL TABLE IF NOT EXISTS kb_chunks_fts USING fts5(\n    content,\n    tokenize='unicode61'\n  );";
+      const vecDdl = 'CREATE VIRTUAL TABLE IF NOT EXISTS vec_kb_1 USING vec0(embedding float[1024]);';
+      // sqlite 方言：恒等 + 零 downgrades
+      const s = translate(ftsDdl, 'sqlite');
+      assert.strictEqual(s.sql, ftsDdl, 'sqlite 方言 FTS5 建表应恒等（零回归）');
+      assert.deepStrictEqual(s.downgrades, [], 'sqlite 方言不应产生降级');
+      // dm/kingbase：建表注释化跳过 + downgrades 登记（检索降级路径：BM25 内存通道 / ANN 全扫）
+      for (const d of ['dm', 'kingbase']) {
+        const t1 = translate(ftsDdl, d);
+        assert.ok(/\[dialect-skip:fts5\]/.test(t1.sql), `${d} FTS5 建表应注释化跳过：` + t1.sql.slice(0, 80));
+        assert.ok(t1.downgrades.some(x => x.kind === 'virtual-table:fts5'), `${d} 应登记 FTS5 降级`);
+        assert.strictEqual(t1.warnings.length, 0, `${d} FTS5 属已确认降级，不应产出 warning（降级≠未映射）`);
+        const t2 = translate(vecDdl, d);
+        assert.ok(/\[dialect-skip:vec0\]/.test(t2.sql), `${d} vec0 建表应注释化跳过`);
+        assert.ok(t2.downgrades.some(x => x.kind === 'virtual-table:vec0'), `${d} 应登记 vec0 降级`);
+      }
+    });
+    await t('BE-C2：dm 单列自增补映射 + ON CONFLICT 双方言语义锚定', () => {
+      // dm 此前仅覆盖 PK 紧跟形态，单列 INTEGER AUTOINCREMENT 落入残留告警——补映射后零告警
+      const dmCol = translate('CREATE TABLE t (id INTEGER AUTOINCREMENT, n TEXT)', 'dm');
+      assert.ok(/INT IDENTITY\(1,1\)/.test(dmCol.sql), 'dm 单列自增→IDENTITY：' + dmCol.sql);
+      assert.ok(!dmCol.warnings.some(w => /AUTOINCREMENT/.test(w)), '单列自增不应再产 AUTOINCREMENT 残留告警');
+      // ON CONFLICT upsert：kingbase（PG 系）原生兼容零告警；dm 不支持 → warning（替代：MERGE 模板，登记表承载）
+      const upsert = 'INSERT INTO t (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v';
+      const kb = translate(upsert, 'kingbase');
+      assert.strictEqual(kb.warnings.length, 0, 'kingbase 应原生兼容 ON CONFLICT（不产告警）');
+      assert.strictEqual(kb.sql, upsert, 'kingbase 翻译应保持原样（原生语法）');
+      const dm = translate(upsert, 'dm');
+      assert.ok(dm.warnings.some(w => /ON CONFLICT upsert/.test(w)), 'dm 不支持 ON CONFLICT 应产出告警（登记 MERGE 替代）');
+      // sqlite_master 系统表：非 sqlite 方言登记（替代：information_schema / migrate 方言探测分支）
+      for (const d of ['dm', 'kingbase']) {
+        const sm = translate("SELECT name FROM sqlite_master WHERE type='table' AND name=?", d);
+        assert.ok(sm.warnings.some(w => /sqlite_master/.test(w)), `${d} sqlite_master 查询应登记告警`);
+      }
+      assert.strictEqual(translate("SELECT name FROM sqlite_master WHERE type='table'", 'sqlite').warnings.length, 0, 'sqlite 方言系统表查询零告警');
+    });
+    await t('BE-C2：业务 upsert 标准化行为回归——ON CONFLICT 写法在 SQLite 下语义等价且 id 稳定', () => {
+      const { db } = require('../src-server/db');
+      // secrets（UNIQUE(name, tenant_id)）：同键写两次 → 单行 + id 稳定 + 首建 created_at 保留（REPLACE 会重排 id/重置时间）
+      db.prepare(`INSERT INTO secrets (name,value,remark,created_at,updated_at) VALUES (?,?,?,?,?)
+        ON CONFLICT(name, tenant_id) DO UPDATE SET value=excluded.value, remark=excluded.remark, updated_at=excluded.updated_at`)
+        .run('be2-test-key', 'v1', 'r1', '2020-01-01 00:00:00', '2020-01-01 00:00:00');
+      db.prepare(`INSERT INTO secrets (name,value,remark,created_at,updated_at) VALUES (?,?,?,?,?)
+        ON CONFLICT(name, tenant_id) DO UPDATE SET value=excluded.value, remark=excluded.remark, updated_at=excluded.updated_at`)
+        .run('be2-test-key', 'v2', 'r2', '2099-01-01 00:00:00', '2099-01-01 00:00:00');
+      const rows = db.prepare("SELECT * FROM secrets WHERE name='be2-test-key'").all();
+      assert.strictEqual(rows.length, 1, '同键两次 upsert 应保持单行（ON CONFLICT 语义）');
+      assert.strictEqual(rows[0].value, 'v2', '第二次写入应更新 value');
+      assert.strictEqual(rows[0].remark, 'r2', '第二次写入应更新 remark');
+      assert.strictEqual(rows[0].created_at, '2020-01-01 00:00:00', 'created_at 应保留首建值（语义改善：REPLACE 会重置）');
+      // model_capabilities（UNIQUE(model_name,provider_name,capability)）：同三元组二次注册 → 单行 + priority 更新
+      const mc = `INSERT INTO model_capabilities (model_name,provider_name,capability,priority,enabled,created_at)
+        VALUES (?,?,?,?,?,datetime('now','localtime'))
+        ON CONFLICT(model_name, provider_name, capability) DO UPDATE SET priority=excluded.priority, enabled=excluded.enabled`;
+      db.prepare(mc).run('be2-model', 'p1', 'text', 1, 1);
+      db.prepare(mc).run('be2-model', 'p1', 'text', 9, 0);
+      const mcRows = db.prepare("SELECT * FROM model_capabilities WHERE model_name='be2-model'").all();
+      assert.strictEqual(mcRows.length, 1, '同唯一键二次注册应保持单行');
+      assert.strictEqual(mcRows[0].priority, 9, 'priority 应更新为最新值');
+      assert.strictEqual(mcRows[0].enabled, 0, 'enabled 应更新为最新值');
+      // _config（key PK）：config.set 真实链路两次同 key → 单行（upsert 语义）
+      // 注：config.set 有 CONFIG_DEFS 白名单（防御式设计，未定义 key 拒写）——用已定义项测试，结束后恢复原值
+      const config = require('../src-server/lib/config');
+      const cfgKey = 'upload_ttl_days';
+      const cfgOrig = config.get(cfgKey);
+      try {
+        config.set(cfgKey, 11);
+        config.set(cfgKey, 22);
+        const cfg = db.prepare('SELECT * FROM _config WHERE key=?').get(cfgKey);
+        assert.ok(cfg && String(cfg.value) === '22', 'set 两次同 key 应 upsert 为最新值：' + JSON.stringify(cfg));
+        assert.strictEqual(db.prepare('SELECT COUNT(*) c FROM _config WHERE key=?').get(cfgKey).c, 1, '同 key 应保持单行');
+      } finally {
+        config.set(cfgKey, cfgOrig);
+        db.prepare('DELETE FROM secrets WHERE name=?').run('be2-test-key');
+        db.prepare('DELETE FROM model_capabilities WHERE model_name=?').run('be2-model');
+      }
+    });
+    await t('BE-C2：方言闭环审计门禁——lint:dialect 未登记 warning = 0（验收锚点）', async () => {
+      // 验收原文「warning 清单为 0 或有替代」的机器化锚点：审计工具 exit 0 = 全部 warning 已登记替代
+      const { execFileSync } = require('child_process');
+      const out = execFileSync('node', [path.join(__dirname, '..', 'scripts', 'lint-dialect.js')], {
+        encoding: 'utf8', timeout: 60000,
+      });
+      assert.ok(/方言审计门禁通过/.test(out), '审计工具应通过门禁：' + out.slice(-200));
+      assert.ok(/未登记 warning = 0/.test(out), '未登记 warning 应为 0（已登记项均有替代）');
+      assert.ok(/downgrades（已确认降级，非阻塞）/.test(out), '降级清单应单独报告（FTS5/vec0 跳过登记）');
+    });
+  }
+
   // ================ P3 扩展工具（2026-10-22）：Text2SQL / 图表 / Word / MCP Server / 分类器路由 ================
   console.log('【N】P3 扩展工具（Text2SQL / 图表 / Word / MCP Server / 分类器路由）');
   const extra = require('../src-server/lib/tools-extra');
