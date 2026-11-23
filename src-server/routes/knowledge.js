@@ -345,12 +345,14 @@ router.put('/chunks/:chunkId', (req, res) => {
   if (deny) return res.json(deny);
   const { content, metadata } = req.body || {};
   if (content == null) return res.json({ code: 400, msg: '请提供内容' });
+  // AI-02：内容变更→同步失效向量缓存（embedding 置空，下次检索按新内容重算）——
+  // 否则编辑后仍用旧嵌入，向量通道命中错误结果（“删除同步清向量”同源正确性）
   if (metadata !== undefined) {
     const clean = sanitizeMetadata(metadata);
     const metaSql = Object.keys(clean).length ? JSON.stringify(clean) : null;
-    db.prepare('UPDATE kb_chunks SET content=?, metadata=? WHERE id=?').run(String(content || ''), metaSql, c.id);
+    db.prepare('UPDATE kb_chunks SET content=?, metadata=?, embedding=NULL WHERE id=?').run(String(content || ''), metaSql, c.id);
   } else {
-    db.prepare('UPDATE kb_chunks SET content=? WHERE id=?').run(String(content || ''), c.id);
+    db.prepare('UPDATE kb_chunks SET content=?, embedding=NULL WHERE id=?').run(String(content || ''), c.id);
   }
   // 更新文件 chunk_count（不做严格同步，简单 +1 即可）
   res.json({ code: 0, msg: '分块已更新' });
@@ -378,7 +380,8 @@ router.post('/chunks/merge', (req, res) => {
   const kb = db.prepare('SELECT * FROM kbs WHERE id=?').get(source.kb_id);
   const deny = denyIfNotAllowed(kb, req.user);
   if (deny) return res.json(deny);
-  db.prepare('UPDATE kb_chunks SET content=? WHERE id=?').run((source.content + '\n' + target.content).trim(), target.id);
+  // AI-02：合并后目标分块内容变更→同步失效其向量缓存（下次检索重算）；源分块行删除即携带其向量一并清除
+  db.prepare('UPDATE kb_chunks SET content=?, embedding=NULL WHERE id=?').run((source.content + '\n' + target.content).trim(), target.id);
   db.prepare('DELETE FROM kb_chunks WHERE id=?').run(source.id);
   res.json({ code: 0, msg: '已合并' });
 });

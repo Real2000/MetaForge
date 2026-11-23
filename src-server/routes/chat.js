@@ -987,6 +987,11 @@ router.post('/stream', async (req, res) => {
     // 附件文本化注入（截断 24000 字/文件防超长请求触发供应商 400 流式 bug）
     const attachText = (attachRows.length && !attachVarMap) ? '\n\n' + attachRows.map(r => { const txt = fileToText(fileToRich(r)); return txt.length > 24000 ? txt.slice(0, 24000) + '\n…（文件过长已截断）' : txt; }).join('\n\n') : '';
 
+    // 3. 组装 messages 用的历史轮数（AI-01：提前到检索之前，供多轮指代消解改写查询使用）
+    const history = agent?.context_rounds
+      ? db.prepare('SELECT role, content FROM (SELECT * FROM messages WHERE session_id=? ORDER BY id DESC LIMIT ?) ORDER BY id').all(session_id, agent.context_rounds * 2)
+      : db.prepare('SELECT role, content FROM (SELECT * FROM messages WHERE session_id=? ORDER BY id DESC LIMIT 20) ORDER BY id').all(session_id);
+
     // 2. 知识库检索（混合检索：BM25 + 向量，RRF 融合；@技能标记已移除，检索更准）
     let kbContext = [];
     let kbHits = [];
@@ -994,15 +999,11 @@ router.post('/stream', async (req, res) => {
       // V1.2 #2 2026-10-30：元数据过滤联动——resolveKbFilter 解析 agent.kb_metadata_filter
       // （$user.dept 占位符按请求用户部门替换）；有过滤且无命中即无上下文（fail-closed 设计语义，不兑底放开）。
       // threshold 0.01 为原 3 参调用的默认值，显式写出保语义不变
-      kbHits = await retrieve(chatInput.trim() || input, agent.kb_id, 5, 0.01, { metadataFilter: resolveKbFilter(agent, req.user) || undefined });
+      // AI-01：传入 history → 检索前多轮指代消解改写（改写失败静默回落原 query，绝不阻断）
+      kbHits = await retrieve(chatInput.trim() || input, agent.kb_id, 5, 0.01, { metadataFilter: resolveKbFilter(agent, req.user) || undefined, history, username: req.user?.username, tenantId: req.user?.tenant_id });
       kbContext = kbHits.map(h => h.content);
       if (kbHits.length) send('kb', { hits: kbHits });
     }
-
-    // 3. 组装 messages（含历史轮数）
-    const history = agent?.context_rounds
-      ? db.prepare('SELECT role, content FROM (SELECT * FROM messages WHERE session_id=? ORDER BY id DESC LIMIT ?) ORDER BY id').all(session_id, agent.context_rounds * 2)
-      : db.prepare('SELECT role, content FROM (SELECT * FROM messages WHERE session_id=? ORDER BY id DESC LIMIT 20) ORDER BY id').all(session_id);
 
     // 3b. SinguX 式记忆与变量注入（借鉴「变量/长期记忆」）：
     //  - 变量：提示词中可用 {{USER_NAME}}/{{AGENT_NAME}} 等系统变量占位符，自定义变量清单注入说明；

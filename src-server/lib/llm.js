@@ -445,7 +445,11 @@ function chat(messages, opts = {}) {
  *  请求拖死 90s+）限时抛 TimeoutError 走故障转移，不再无限等待。
  *  仅此非流式入口注入；流式对话（chat.js）不经 chatOnce，长回答不受影响。 */
 async function chatOnce(messages, opts = {}) {
-  const hardTimeoutMs = Number(process.env.LLM_TIMEOUT_MS) || 120000;
+  // 优先级：显式 opts.hardTimeoutMs（有限正数，如查询改写 8s）> 环境变量 LLM_TIMEOUT_MS > 默认 120s。
+  // 现有调用方不传该值 → 行为与旧版完全一致（AI-01 引入，供 query-rewrite 限时，避免改写拖慢检索）
+  const hardTimeoutMs = (Number.isFinite(+opts.hardTimeoutMs) && +opts.hardTimeoutMs > 0)
+    ? +opts.hardTimeoutMs
+    : (Number(process.env.LLM_TIMEOUT_MS) || 120000);
   const gen = chat(messages, { ...opts, hardTimeoutMs });
   let out = null;
   while (true) {

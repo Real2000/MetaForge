@@ -11,6 +11,12 @@
  *    过滤的每个键都满足 meta[key] === 过滤值，或 meta[key] 为数组且包含该值；无元数据/缺键的行被
  *    滤除（fail-closed，防误授权）；不传或空对象时行为与无过滤完全一致（黄金基线护栏红线）
  * 返回 [{content, file, kb, kb_id, score(融合), bm25, vec, engine, channels, hit_terms, rerank_score}]
+ *
+ * M3 · RAG 数据平面重建（2026-11-23）：
+ *   AI-01：retrieve() 收 opts.history——携带对话历史时先经 lib/query-rewrite 改写查询（多轮指代消解），
+ *          改写失败静默回落原 query（0 阻断）。
+ *   AI-02：向量通路正确性——删除 LanceDB ANN 死分支（不可达 + 256/1024 维陷阱）；cosine 维度不符 fail-loud
+ *          （原静默返回 0 会丢召回）；embedding 存储由 JSON 文本改为 float32 BLOB（解析 590ms→16ms@N=1万）。
  */
 const { db } = require('../db');
 const { assertPublicHttpUrl } = require('./ssrf-guard'); // SEC-05：向量/重排网关出站前的 SSRF 校验
@@ -177,18 +183,54 @@ function embed(text) {
   return v;
 }
 
+// AI-02：cosine 维度不符 fail-loud（原实现静默 return 0 → 引擎混用被当成「无相似度」，静默丢召回、极难定位）。
+// 正常通路内查询向量与全部分块向量同引擎（见 retrieve 的分支保证），此处为通路一致性断言。
 function cosine(a, b) {
-  const n = Math.min(a.length, b.length);
-  if (a.length !== b.length) return 0; // 维度不一致（引擎不同）视为无相似度
+  if (!a || !b || a.length !== b.length) {
+    throw new Error(`向量维度不一致：查询 ${a && a.length} 维 vs 分块 ${b && b.length} 维（嵌入引擎混用，向量通路错误）`);
+  }
   let s = 0;
-  for (let i = 0; i < n; i++) s += a[i] * b[i];
+  for (let i = 0; i < a.length; i++) s += a[i] * b[i];
   return s;
+}
+
+/* AI-02：向量存储格式 —— float32 BLOB（新）+ JSON 文本（旧，兼容读）
+ * BLOB 布局：首字节 engine tag（1=B3 / 1024 维，2=H / 256 维）+ 小端 Float32 序列。
+ * 动机：JSON 文本解析在 N=1万 时全表扫描 ~590ms；改 float32 BLOB 后 ~16ms（实测）。 */
+const ENGINE_TAG = { B3: 1, H: 2 };
+const TAG_ENGINE = { 1: 'B3', 2: 'H' };
+
+/** 向量 → BLOB（engine: 'B3' | 'H'） */
+function encodeVec(vec, engine) {
+  const arr = vec instanceof Float32Array ? vec : Float32Array.from(vec || []);
+  const buf = Buffer.allocUnsafe(1 + arr.length * 4);
+  buf[0] = ENGINE_TAG[engine] || 0;
+  for (let i = 0; i < arr.length; i++) buf.writeFloatLE(arr[i], 1 + i * 4);
+  return buf;
+}
+
+/** BLOB → {v, engine}；非法长度/未知 tag → null（fail-closed） */
+function decodeVec(buf) {
+  if (!Buffer.isBuffer(buf) && !(buf instanceof Uint8Array)) return null;
+  if (buf.length < 5) return null;
+  const engine = TAG_ENGINE[buf[0]];
+  if (!engine) return null;
+  const dim = engine === 'B3' ? BGE_DIM : DIM;
+  if (buf.length !== 1 + dim * 4) return null;
+  const v = new Float32Array(dim);
+  for (let i = 0; i < dim; i++) v[i] = buf.readFloatLE(1 + i * 4);
+  return { v, engine };
 }
 
 function parseVec(s) {
   if (!s) return { v: null, engine: null };
+  // AI-02：先按 BLOB（新格式）解码；字符串为旧 JSON 文本格式，保持兼容读（存量分块懒迁移，下次写入即转 BLOB）
+  if (Buffer.isBuffer(s) || s instanceof Uint8Array) {
+    return decodeVec(s) || { v: null, engine: null };
+  }
+  if (typeof s !== 'string') return { v: null, engine: null };
   try {
-    // 缓存格式："B3:[...]"（bge-m3 1024 维）或 "H:[...]"（本地哈希 256 维）；裸 JSON 视为旧版本地哈希
+    // 旧缓存格式："B3:[...]"（bge-m3 1024 维）或 "H:[...]"（本地哈希 256 维）；裸 JSON 视为旧版本地哈希
     let engine = 'H', raw = s;
     if (s.startsWith('B3:')) { engine = 'B3'; raw = s.slice(3); }
     else if (s.startsWith('H:')) { engine = 'H'; raw = s.slice(2); }
@@ -259,6 +301,17 @@ function bm25ScoresMemory(rows, qTerms) {
  * 调用方全部 await retrieve(...)（原同步调用点已同步改造）。
  */
 async function retrieve(query, kbId = null, topN = 5, threshold = 0.01, opts = {}) {
+  // AI-01：多轮查询改写 / 指代消解——携带对话历史时先改写查询再用其检索
+  // （无历史 / 已关闭 / 模型不可用 / 超时 / 任何异常 → rewriteQuery 均回落原 query，绝不阻断检索）
+  if (Array.isArray(opts.history) && opts.history.length && opts.rewrite !== false) {
+    try {
+      const { rewriteQuery } = require('./query-rewrite');
+      const rq = await rewriteQuery(query, opts.history, {
+        username: opts.username, tenantId: opts.tenantId, model: opts.rewriteModel,
+      });
+      if (rq) query = rq;
+    } catch { /* 改写失败不影响检索 */ }
+  }
   // P2 里程碑补测修复（2026-11-05）：vector_weight 非法值鲁棒性——原实现 Number('abc')=NaN 后
   // Math.min/max 对 NaN 透传 → wV/wB 全 NaN → RRF 全 NaN → score>=threshold 恒 false → 静默 0 命中；
   // 修复后非有限数（'abc'/null 之外的 NaN 场景）回落默认 0.5，语义与缺省一致
@@ -320,33 +373,10 @@ async function retrieve(query, kbId = null, topN = 5, threshold = 0.01, opts = {
   const upd = db.prepare('UPDATE kb_chunks SET embedding=? WHERE id=?');
   const parsed = rows.map(r => parseVec(r.embedding));
 
-  // 优先 LanceDB ANN 搜索（2026-10-28 P3 向量库升级）
-  let annResult = null;
-  try {
-    const { annSearch, initDB } = require('./vector-store');
-    if (await initDB()) {
-      annResult = await annSearch(embed(query), RERANK_CANDIDATES);
-    }
-  } catch { /* ANN 不可用 → 回退全表扫描 */ }
-
-  if (annResult && annResult.length) {
-    const annRows = [];
-    const idxMap = new Map(annResult.map(r => [r.id, r]));
-    for (let i = 0; i < rows.length; i++) {
-      if (idxMap.has(rows[i].id)) annRows.push({ ...rows[i], score: idxMap.get(rows[i].id).score });
-    }
-    if (annRows.length) {
-      const annBm25 = bm25Scores(annRows, qTerms);
-      const annParsed = annRows.map(r => parseVec(r.embedding));
-      if (annParsed.some(p => p.engine === 'B3')) {
-        const q = await bgeEmbed([query]);
-        if (q) return rerankAndSlice(query, finish(annRows, annBm25, annParsed.map(p => p.v), new Float32Array(q[0]), 'B3', RERANK_CANDIDATES, threshold, vecWeight, qTerms), topN, opts, kbId);
-      }
-      return rerankAndSlice(query, finish(annRows, annBm25, annParsed.map(p => p.v), embed(query), 'H', RERANK_CANDIDATES, threshold, vecWeight, qTerms), topN, opts, kbId);
-    }
-  }
-
-  // 回退：全表扫描（LanceDB 不可用或无命中时）
+  // AI-02：删除 LanceDB ANN 死分支（原 vector-store.js）。
+  // 取证：upsertVectors 全后端零调用 → annSearch 恒返回 null（表从未写入）；且该分支传入的 embed(query)
+  // 是 256 维本地哈希向量，与 bge-m3 1024 维缓存维度天然不符——既不可达又埋维度陷阱。
+  // 向量通路统一走下方全表扫描 + 引擎一致性重算（查询与全部分块同引擎，杜绝混维）。
 
   // 优先 bge-m3：任一分块缺 B3 缓存 → 批量补齐（查询向量同引擎）
   let engine = 'H'; // P2-1 mocks: 默认本地哈希引擎，避免bgeEmbed不可用时的路径断裂（bgeProviders 无embedding模型时自动降级）
@@ -361,7 +391,7 @@ async function retrieve(query, kbId = null, topN = 5, threshold = 0.01, opts = {
     if (got && got.length === missIdx.length + 1) {
       // 批量落库 bge 向量缓存
       missIdx.forEach((idx, k) => {
-        try { upd.run('B3:' + JSON.stringify(got[k + 1]), rows[idx].id); } catch { }
+        try { upd.run(encodeVec(got[k + 1], 'B3'), rows[idx].id); } catch { }
         parsed[idx] = { v: new Float32Array(got[k + 1]), engine: 'B3' };
       });
       return rerankAndSlice(query, finish(rows, bm25, parsed.map(p => p.v), new Float32Array(got[0]), engine, RERANK_CANDIDATES, threshold, vecWeight, qTerms), topN, opts, kbId);
@@ -374,7 +404,7 @@ async function retrieve(query, kbId = null, topN = 5, threshold = 0.01, opts = {
   const vecs = rows.map((r, i) => {
     if (parsed[i].engine === 'H') return parsed[i].v;
     const v = embed(r.content);
-    try { upd.run('H:' + JSON.stringify([...v]), r.id); } catch { }
+    try { upd.run(encodeVec(v, 'H'), r.id); } catch { }
     return v;
   });
   return rerankAndSlice(query, finish(rows, bm25, vecs, qVec, engine, RERANK_CANDIDATES, threshold, vecWeight, qTerms), topN, opts, kbId);
@@ -496,4 +526,4 @@ function finish(rows, bm25, vecs, qVec, engine, topN, threshold, vecWeight = 0.5
 // __expireCircuitBreakers 测试助手（下划线约定：生产代码不得调用）：bgeDownUntil/rerankDownUntil 为模块级
 // 熔断状态，且 bgeEmbed 在无供应商环境下每次调用也会设置 30s 熔断（for 循环空转后落熔断行）——
 // 跨用例泄漏会导致后续 mock 供应商用例被短路，单测前需主动过期重置
-module.exports = { retrieve, embed, bgeEmbed, bgeRerank, rerankProviders, rerankModels, parseVec, rerankAndSlice, __expireCircuitBreakers: () => { bgeDownUntil = 0; rerankDownUntil = 0; } };
+module.exports = { retrieve, embed, bgeEmbed, bgeRerank, rerankProviders, rerankModels, parseVec, encodeVec, decodeVec, rerankAndSlice, __expireCircuitBreakers: () => { bgeDownUntil = 0; rerankDownUntil = 0; } };

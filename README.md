@@ -3060,4 +3060,25 @@ R5 远期生态首项。**先做 3D 资产生成与导出（新增资产类型 +
 - `npm run lint:sql`：通过（110 文件 / 1656 处，未超基线）。
 - 隔离实例实测：`/api/health` 与 `/api/v1/health` 均 200（旧前缀带 `Deprecation` 头、v1 无）；受保护端点新旧前缀均 401（BE-B1 契约）；豁免端点新旧前缀登录失败均 HTTP 200 + code 401；`/api/v1/api-docs/openapi.json` 与 `/openapi/openapi.json` 均含 425 条 v1 路径、旧 `/api/*` 别名残留 0 条。
 
+## M3 · RAG 数据平面重建（AI-01 多轮查询改写 + AI-02 向量通路正确性）（2026-11-23）
+
+**目标**：对标 Dify 第一战役——补齐 RAG 数据平面两大短板：多轮对话检索的指代消解，与向量通路的隐性错误（死分支 / 混维 / 慢格式）。M3 为 P0 项（AI-01 多轮查询改写、AI-02 向量库接通或替换）。
+
+**AI-01 多轮查询改写 / 指代消解（新增 lib/query-rewrite.js）**
+- 检索前用 LLM 将「最新问题 + 最近 N 轮历史（默认 4 轮）」压缩为一条自包含、可独立检索的查询，消解「它/这个/上述/该方案」等指代与省略主语。
+- 接入：`retriever.retrieve()` 收 `opts.history`（统一出口）；`routes/chat.js` 主链路把历史查询提前到检索之前并传入 → 检索用改写后查询。
+- 0 阻断：无历史 / 开关关闭（`AGENT_QUERY_REWRITE=0` 或配置 `query_rewrite=0`）/ 模型不可用（`chatOnce` 返回 mock）/ 超时 / 任何异常 → 一律回落原 query。
+- 限时：`chatOnce` 支持显式 `hardTimeoutMs`（改写用 8s），不拖慢检索；既有调用方不传该值 → 行为与旧版完全一致。
+- 缓存：按 (query + 最近历史) 指纹做 10min 进程内 TTL 缓存，同轮多入口共享一次改写。
+
+**AI-02 向量通路正确性**
+- 删除 LanceDB ANN 死分支（原 `lib/vector-store.js`，106 行 + 依赖 `vectordb`）：取证 `upsertVectors` 全后端零调用 → `annSearch` 恒返回 null（表从未写入）；且该分支用 256 维本地哈希向量对 1024 维 bge-m3 缓存 → 既不可达又埋混维陷阱。向量通路统一走全表扫描 + 引擎一致性重算。
+- `cosine` 维度不符由「静默 `return 0`（丢召回、极难定位）」改为 fail-loud 抛错（通路一致性断言）。
+- 向量存储由 JSON 文本改 **float32 BLOB**（首字节 engine tag + 小端 Float32）：N=1万 全表解析 ~590ms → ~16ms；旧 JSON 文本保持兼容读（懒迁移，下次写入即转 BLOB）。
+- 分块编辑 / 合并同步失效向量缓存（`embedding=NULL`，下次检索按新内容重算）——修「编辑后仍用旧嵌入致向量通道命中错误结果」。
+
+**验证**
+- `npm test`：冒烟 **645/0 全绿**（+8 M3 用例：改写 0 阻断/清洗/缓存/历史规范化、BLOB 往返与 fail-closed、`parseVec` 兼容读、落库格式护栏、编辑失效护栏、端到端 BLOB 回读）；双租户 E2E **26/0 全绿**。
+- `npm run lint:sql`：通过（110 文件 / 1656 处，未超基线）。
+
 > AI生成

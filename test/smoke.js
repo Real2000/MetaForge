@@ -10661,6 +10661,114 @@ print('PY_OK')
     assert.ok(/stripVersion/.test(fs.readFileSync(path.join(__dirname, '..', 'src-server', 'lib', 'response.js'), 'utf8')), 'response.js 豁免判定应折叠版本前缀');
   });
 
+  // ===== M3 · RAG 数据平面重建（2026-11-23）AI-01 多轮查询改写 / AI-02 向量通路正确性 =====
+  await t('AI-01：query-rewrite 无历史/关闭/异常/空返回 → 一律回落原 query（0 阻断）', async () => {
+    const qr = require('../src-server/lib/query-rewrite');
+    const raw = '它怎么配置？';
+    const H = [{ role: 'user', content: '介绍一下部署方案' }];
+    qr.__clearCache(); qr.__setImpl(async () => '应当被忽略');
+    assert.strictEqual(await qr.rewriteQuery(raw, []), raw, '无历史应原样返回');
+    assert.strictEqual(await qr.rewriteQuery(raw, null), raw, 'history=null 应原样返回');
+    assert.strictEqual(await qr.rewriteQuery('', H), '', '空 query 应原样返回');
+    qr.__clearCache();
+    assert.strictEqual(await qr.rewriteQuery(raw, H, { enabled: false }), raw, '显式关闭应原样返回');
+    qr.__clearCache(); qr.__setImpl(async () => { throw new Error('boom'); });
+    assert.strictEqual(await qr.rewriteQuery(raw, H), raw, '改写异常应回落原 query');
+    qr.__clearCache(); qr.__setImpl(async () => '   ');
+    assert.strictEqual(await qr.rewriteQuery(raw, H), raw, '空/空白返回应回落原 query');
+    qr.__setImpl(null); qr.__clearCache();
+  });
+
+  await t('AI-01：query-rewrite 有历史时改写 + 清洗（去围栏/前缀）+ 缓存去重', async () => {
+    const qr = require('../src-server/lib/query-rewrite');
+    const raw = '它怎么配置？';
+    const H = [{ role: 'user', content: '帮我看看 metaforge 的向量库' }, { role: 'assistant', content: '好的' }];
+    let calls = 0;
+    qr.__clearCache();
+    qr.__setImpl(async () => { calls++; return '```\n改写后的问题：MetaForge 向量库如何配置？\n```'; });
+    const out = await qr.rewriteQuery(raw, H);
+    assert.strictEqual(out, 'MetaForge 向量库如何配置？', '应剥离代码围栏与「改写后的问题：」前缀并取首行：' + out);
+    const out2 = await qr.rewriteQuery(raw, H);
+    assert.strictEqual(out2, out, '二次调用应命中缓存返回一致');
+    assert.strictEqual(calls, 1, '同 (query+history) 指纹应只调用一次改写实现（缓存去重）');
+    qr.__setImpl(null); qr.__clearCache();
+  });
+
+  await t('AI-01：normalizeHistory 过滤非法轮次并按 maxTurns 截取最近轮', () => {
+    const qr = require('../src-server/lib/query-rewrite');
+    const nh = qr.normalizeHistory([
+      { role: 'user', content: 'u1' }, { role: 'system', content: 'x' },
+      { role: 'assistant', content: 'a1' }, { role: 'user', content: '   ' },
+      { role: 'user', content: 'u2' }, { role: 'assistant', content: 'a2' },
+      { role: 'user', content: 'u3' },
+    ], 1);
+    assert.deepStrictEqual(nh.map(m => m.content), ['a2', 'u3'], 'maxTurns=1 应仅取最近一轮（system/空白被过滤）：' + JSON.stringify(nh));
+    assert.deepStrictEqual(qr.normalizeHistory(null), [], 'null → 空数组');
+  });
+
+  await t('AI-02：encodeVec/decodeVec float32 BLOB 往返（B3 1024 维 / H 256 维）+ fail-closed', () => {
+    const r = require('../src-server/lib/retriever');
+    const b3 = Float32Array.from({ length: 1024 }, (_, i) => Math.sin(i) * 0.5);
+    const bufB3 = r.encodeVec(b3, 'B3');
+    assert.ok(Buffer.isBuffer(bufB3) && bufB3.length === 1 + 1024 * 4, 'B3 BLOB 长度应为 1+1024*4');
+    const dB3 = r.decodeVec(bufB3);
+    assert.strictEqual(dB3.engine, 'B3');
+    assert.strictEqual(dB3.v.length, 1024);
+    assert.ok(Math.abs(dB3.v[500] - b3[500]) < 1e-6, 'B3 往返数值应一致');
+    const h = Float32Array.from({ length: 256 }, (_, i) => (i % 7) / 7);
+    const dH = r.decodeVec(r.encodeVec(h, 'H'));
+    assert.strictEqual(dH.engine, 'H');
+    assert.strictEqual(dH.v.length, 256);
+    assert.ok(Math.abs(dH.v[200] - h[200]) < 1e-6, 'H 往返数值应一致');
+    assert.strictEqual(r.decodeVec(Buffer.alloc(3)), null, '过短应 null');
+    assert.strictEqual(r.decodeVec(Buffer.alloc(1 + 1024 * 4)), null, '未知 engine tag(0) 应 null');
+    const badLen = Buffer.alloc(1 + 100 * 4); badLen[0] = 1;
+    assert.strictEqual(r.decodeVec(badLen), null, 'tag=B3 但长度不符应 null');
+    assert.strictEqual(r.decodeVec('not-a-buffer'), null, '非 buffer 应 null');
+  });
+
+  await t('AI-02：parseVec 兼容读——新 BLOB 优先、旧 JSON 文本（B3:/H:/裸 JSON）仍可解析', () => {
+    const r = require('../src-server/lib/retriever');
+    const b3 = Float32Array.from({ length: 1024 }, (_, i) => (i === 3 ? 1 : 0));
+    const p1 = r.parseVec(r.encodeVec(b3, 'B3'));
+    assert.strictEqual(p1.engine, 'B3'); assert.strictEqual(p1.v.length, 1024); assert.strictEqual(p1.v[3], 1);
+    const p2 = r.parseVec('B3:' + JSON.stringify([...b3]));
+    assert.strictEqual(p2.engine, 'B3'); assert.strictEqual(p2.v[3], 1, '旧 B3: JSON 文本应兼容');
+    const h = Array(256).fill(0); h[9] = 1;
+    const p3 = r.parseVec('H:' + JSON.stringify(h));
+    assert.strictEqual(p3.engine, 'H'); assert.strictEqual(p3.v[9], 1);
+    const p4 = r.parseVec(JSON.stringify(h));
+    assert.strictEqual(p4.engine, 'H'); assert.strictEqual(p4.v[9], 1, '裸 JSON 应视为旧本地哈希');
+    assert.deepStrictEqual(r.parseVec(null), { v: null, engine: null });
+    assert.deepStrictEqual(r.parseVec(Buffer.alloc(3)), { v: null, engine: null }, '非法 BLOB 应 fail-closed');
+  });
+
+  await t('AI-02：向量落库改 float32 BLOB，不再写 JSON 文本；retriever 不再引用已删 vector-store', () => {
+    const src = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'lib', 'retriever.js'), 'utf8');
+    assert.ok(/upd\.run\(encodeVec\(got\[k \+ 1\], 'B3'\)/.test(src), 'B3 缓存应写 encodeVec BLOB');
+    assert.ok(/upd\.run\(encodeVec\(v, 'H'\)/.test(src), 'H 缓存应写 encodeVec BLOB');
+    assert.ok(!/'B3:' \+ JSON\.stringify/.test(src), '不应再写 B3: JSON 文本');
+    assert.ok(!/require\(['"][^'"]*vector-store['"]\)/.test(src), 'retriever 不应再引用已删除的 vector-store');
+  });
+
+  await t('AI-02：分块编辑/合并同步失效向量缓存——embedding 置空（源码护栏）', () => {
+    const src = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'routes', 'knowledge.js'), 'utf8');
+    assert.ok(/SET content=\?, metadata=\?, embedding=NULL/.test(src), '编辑（带元数据）应同步置空向量');
+    assert.ok(/SET content=\?, embedding=NULL/.test(src), '编辑/合并应同步置空向量');
+  });
+
+  await t('AI-02：检索写回的向量为 BLOB 且可被 parseVec 回读（端到端）', async () => {
+    const r = require('../src-server/lib/retriever');
+    const kbid = globalThis.__goldenKbId;
+    assert.ok(kbid, '依赖既有黄金基线库');
+    await r.retrieve('迟到早退怎么处理', kbid, 3, 0, { rerankEnabled: false });
+    const row = db.prepare(`SELECT embedding FROM kb_chunks WHERE kb_id=? AND embedding IS NOT NULL LIMIT 1`).get(kbid);
+    assert.ok(row, '检索后应有分块写入向量缓存');
+    assert.ok(Buffer.isBuffer(row.embedding), '缓存应为 BLOB（新格式）');
+    const dec = r.parseVec(row.embedding);
+    assert.ok(dec.v && (dec.engine === 'H' || dec.engine === 'B3'), 'BLOB 应可回读为向量');
+  });
+
   try { db.close(); } catch { }
   fs.rmSync(process.env.AGENT_DATA_DIR, { recursive: true, force: true });
   console.log('\n———————————————');
