@@ -965,6 +965,28 @@ if (!kbCols4.includes('pipeline')) {
     }
   } catch (e) { console.error('[db] U1-9 图片理解迁移失败（不阻塞启动）：', e.message); }
 }
+// ================== M4 AI-09 重排阈值门控 + 库级配置（2026-11-23）==================
+// kbs.rerank_enabled  INTEGER —— 该库是否启用重排（NULL=沿用全局默认 true；0=强制关；1=强制开）
+// kbs.rerank_model    TEXT    —— 该库指定重排模型（''=用全局默认 bge-reranker-v2-m3）
+// kbs.rerank_top_n    INTEGER —— 该库精排输出条数（NULL=用全局默认 5）
+// kbs.rerank_threshold REAL   —— 该库重排分数阈值（NULL=不过滤，保持历史基线行为；数值时低于阈值的片段不进 context）
+// chat_traces.retrieval_trace TEXT —— 单次检索全链路诊断（AI-09 落 trace；AI-13 面板数据源）：
+//   JSON { rewrite, candidates, rerank:{requested,applied,degraded,model,threshold,candidates,passed}, engine, top }
+{
+  try {
+    const kbRerankCols = db.prepare('PRAGMA table_info(kbs)').all().map(c => c.name);
+    const addKb = (col, ddl) => { if (!kbRerankCols.includes(col)) { db.exec(`ALTER TABLE kbs ADD COLUMN ${ddl}`); console.log(`[db] kbs 表已迁移：新增 ${col} 字段（AI-09 重排库级配置）`); } };
+    addKb('rerank_enabled', 'rerank_enabled INTEGER DEFAULT NULL');
+    addKb('rerank_model', "rerank_model TEXT DEFAULT ''");
+    addKb('rerank_top_n', 'rerank_top_n INTEGER DEFAULT NULL');
+    addKb('rerank_threshold', 'rerank_threshold REAL DEFAULT NULL');
+    const traceCols = db.prepare('PRAGMA table_info(chat_traces)').all().map(c => c.name);
+    if (!traceCols.includes('retrieval_trace')) {
+      db.exec(`ALTER TABLE chat_traces ADD COLUMN retrieval_trace TEXT DEFAULT '[]'`);
+      console.log('[db] chat_traces 表已迁移：新增 retrieval_trace 字段（AI-09 检索诊断）');
+    }
+  } catch (e) { console.error('[db] M4 AI-09 重排库级配置迁移失败（不阻塞启动）：', e.message); }
+}
 // agents.kb_metadata_filter：挂知识库时声明的检索过滤（JSON 对象，AND 语义；值支持 "$user.dept" 占位符，
 // chat 时解析为请求用户部门文本名；NULL=不过滤）。例：{"level":"公开","dept":"$user.dept"}
 const agentCols2 = db.prepare('PRAGMA table_info(agents)').all().map(c => c.name);

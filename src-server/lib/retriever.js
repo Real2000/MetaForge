@@ -8,6 +8,8 @@
  * 4. Rerank（2026-10-28 P2 重排升级）：RRF 粗召回 Top 30 → cross-encoder 重排取 Top 5，模型可选、可关闭
  * 5. 可视化（2026-10-29）：每条结果带 channels（bm25/vec/both 命中通道）与 hit_terms（命中查询词，前端高亮用）
  * 6. 元数据过滤（V1.2 #2 2026-10-30）：opts.metadataFilter（JSON 对象，AND 语义）——分块行通过当且仅当
+ * 7. 重排阈值门控 + 库级配置（M4 AI-09 2026-11-23）：kbs 可配 rerank_enabled/rerank_model/rerank_top_n/
+ *    rerank_threshold（库级覆盖传入 opts）；重排分数低于阈值的片段不进 context；降级/生效写 opts.trace
  *    过滤的每个键都满足 meta[key] === 过滤值，或 meta[key] 为数组且包含该值；无元数据/缺键的行被
  *    滤除（fail-closed，防误授权）；不传或空对象时行为与无过滤完全一致（黄金基线护栏红线）
  * 返回 [{content, file, kb, kb_id, score(融合), bm25, vec, engine, channels, hit_terms, rerank_score}]
@@ -84,7 +86,7 @@ function rerankProviders() {
 
 /** 调网关 rerank 接口，返回按相关性降序排列的索引数组。失败返回 null（跳过重排，回落 RRF 结果）。model 可指定重排模型（默认 bge-reranker-v2-m3） */
 let rerankDownUntil = 0;
-async function bgeRerank(query, candidates, model) {
+async function bgeRerank(query, candidates, model, retTop) {
   if (Date.now() < rerankDownUntil) return null;
   if (!candidates || !candidates.length) return null;
   const ps = rerankProviders();
@@ -100,7 +102,7 @@ async function bgeRerank(query, candidates, model) {
           model: model || RERANK_MODEL,
           query,
           documents: candidates.map(c => c.content),
-          top_n: Math.min(candidates.length, RERANK_TOP_N),
+          top_n: Math.min(candidates.length, retTop || RERANK_TOP_N),
         }),
         signal: AbortSignal.timeout(RERANK_TIMEOUT),
       });
@@ -136,6 +138,23 @@ function rerankModels() {
     } catch { }
   }
   return out;
+}
+
+/**
+ * AI-09：归一库级重排配置（纯函数，无数据库访问——配置随检索查询行的 kbs 列一同带回，避免新增裸查）。
+ * 返回 { enabled|null, model, topN|null, threshold|null }；入参空返回 null（回落全局默认）。
+ * 归一：rerank_top_n 限 [1,50] 整数；rerank_threshold 仅接受有限数（NULL/非法 → null=不过滤）。
+ */
+function normalizeKbRerankConfig(kb) {
+  if (!kb) return null;
+  const tn = Number(kb.rerank_top_n);
+  const th = Number(kb.rerank_threshold);
+  return {
+    enabled: kb.rerank_enabled == null ? null : !!kb.rerank_enabled,
+    model: kb.rerank_model || '',
+    topN: (kb.rerank_top_n == null || !Number.isFinite(tn)) ? null : Math.max(1, Math.min(50, Math.floor(tn))),
+    threshold: (kb.rerank_threshold == null || !Number.isFinite(th)) ? null : th,
+  };
 }
 
 function tokenize(s) {
@@ -301,9 +320,12 @@ function bm25ScoresMemory(rows, qTerms) {
  * 调用方全部 await retrieve(...)（原同步调用点已同步改造）。
  */
 async function retrieve(query, kbId = null, topN = 5, threshold = 0.01, opts = {}) {
+  // AI-09/AI-13：检索诊断载体（调用方传 opts.trace 对象时回填；用于 chat_traces.retrieval_trace 落库）
+  const _trace = (opts.trace && typeof opts.trace === 'object') ? opts.trace : null;
   // AI-01：多轮查询改写 / 指代消解——携带对话历史时先改写查询再用其检索
   // （无历史 / 已关闭 / 模型不可用 / 超时 / 任何异常 → rewriteQuery 均回落原 query，绝不阻断检索）
   if (Array.isArray(opts.history) && opts.history.length && opts.rewrite !== false) {
+    const _origQ = query;
     try {
       const { rewriteQuery } = require('./query-rewrite');
       const rq = await rewriteQuery(query, opts.history, {
@@ -311,6 +333,7 @@ async function retrieve(query, kbId = null, topN = 5, threshold = 0.01, opts = {
       });
       if (rq) query = rq;
     } catch { /* 改写失败不影响检索 */ }
+    if (_trace) _trace.rewrite = { original: _origQ, rewritten: query, applied: query !== _origQ };
   }
   // P2 里程碑补测修复（2026-11-05）：vector_weight 非法值鲁棒性——原实现 Number('abc')=NaN 后
   // Math.min/max 对 NaN 透传 → wV/wB 全 NaN → RRF 全 NaN → score>=threshold 恒 false → 静默 0 命中；
@@ -318,13 +341,29 @@ async function retrieve(query, kbId = null, topN = 5, threshold = 0.01, opts = {
   const _w = Number(opts.vecWeight ?? 0.5);
   const vecWeight = Number.isFinite(_w) ? Math.min(1, Math.max(0, _w)) : 0.5;
   const rows = db.prepare(`
-    SELECT c.id, c.content, c.kb_id, c.file_id, c.parent_id, c.chapter_id, c.embedding, c.keywords, c.metadata, f.name AS file, k.name AS kb
+    SELECT c.id, c.content, c.kb_id, c.file_id, c.parent_id, c.chapter_id, c.embedding, c.keywords, c.metadata, f.name AS file, k.name AS kb,
+      k.rerank_enabled AS kb_rerank_enabled, k.rerank_model AS kb_rerank_model, k.rerank_top_n AS kb_rerank_top_n, k.rerank_threshold AS kb_rerank_threshold
     FROM kb_chunks c
     LEFT JOIN kb_files f ON f.id = c.file_id
     LEFT JOIN kbs k ON k.id = c.kb_id
     WHERE (? IS NULL OR c.kb_id = ?) AND (k.enabled IS NULL OR k.enabled = 1)
   `).all(kbId, kbId);
   if (!rows.length) return [];
+  // AI-09：库级重排配置（从本行携带的 kbs 列构建，免额外查询；kbId 为空时不应用库级配置）
+  const kbc = kbId != null ? normalizeKbRerankConfig({
+    rerank_enabled: rows[0].kb_rerank_enabled,
+    rerank_model: rows[0].kb_rerank_model,
+    rerank_top_n: rows[0].kb_rerank_top_n,
+    rerank_threshold: rows[0].kb_rerank_threshold,
+  }) : null;
+  const rerankOpts = {
+    ...opts,
+    rerankEnabled: (kbc && kbc.enabled != null) ? kbc.enabled : opts.rerankEnabled,
+    rerankModel: (kbc && kbc.model) ? kbc.model : opts.rerankModel,
+    rerankTopN: (kbc && kbc.topN != null) ? kbc.topN : opts.rerankTopN,
+    rerankThreshold: (kbc && kbc.threshold != null) ? kbc.threshold : opts.rerankThreshold,
+    trace: _trace,
+  };
   // V1.2 #2 2026-10-30：元数据过滤（AND 语义）——rows 取回后、任何打分/通道计算前逐行判定，覆盖全部分支
   // （annRows 从 rows 派生，先在此过滤即可）。fail-closed：无元数据/缺键/值不匹配的行直接滤除（防误授权）。
   // 无 metadataFilter 或空过滤对象时全部通过——与无过滤行为完全一致（黄金基线护栏红线，勿动语义）。
@@ -383,7 +422,7 @@ async function retrieve(query, kbId = null, topN = 5, threshold = 0.01, opts = {
   if (parsed.every(p => p.engine === 'B3')) {
     // 全部已有 bge 缓存，查询向量走网关（失败则整体降级本地重算）
     const q = await bgeEmbed([query]);
-    if (q) return rerankAndSlice(query, finish(rows, bm25, parsed.map(p => p.v), new Float32Array(q[0]), engine, RERANK_CANDIDATES, threshold, vecWeight, qTerms), topN, opts, kbId);
+    if (q) { if (_trace) _trace.engine = engine; return rerankAndSlice(query, finish(rows, bm25, parsed.map(p => p.v), new Float32Array(q[0]), engine, RERANK_CANDIDATES, threshold, vecWeight, qTerms), topN, rerankOpts, kbId); }
   }
   const missIdx = rows.map((_, i) => i).filter(i => parsed[i].engine !== 'B3');
   if (missIdx.length) {
@@ -394,7 +433,8 @@ async function retrieve(query, kbId = null, topN = 5, threshold = 0.01, opts = {
         try { upd.run(encodeVec(got[k + 1], 'B3'), rows[idx].id); } catch { }
         parsed[idx] = { v: new Float32Array(got[k + 1]), engine: 'B3' };
       });
-      return rerankAndSlice(query, finish(rows, bm25, parsed.map(p => p.v), new Float32Array(got[0]), engine, RERANK_CANDIDATES, threshold, vecWeight, qTerms), topN, opts, kbId);
+      if (_trace) _trace.engine = engine;
+      return rerankAndSlice(query, finish(rows, bm25, parsed.map(p => p.v), new Float32Array(got[0]), engine, RERANK_CANDIDATES, threshold, vecWeight, qTerms), topN, rerankOpts, kbId);
     }
   }
 
@@ -407,26 +447,50 @@ async function retrieve(query, kbId = null, topN = 5, threshold = 0.01, opts = {
     try { upd.run(encodeVec(v, 'H'), r.id); } catch { }
     return v;
   });
-  return rerankAndSlice(query, finish(rows, bm25, vecs, qVec, engine, RERANK_CANDIDATES, threshold, vecWeight, qTerms), topN, opts, kbId);
+  if (_trace) _trace.engine = engine;
+  return rerankAndSlice(query, finish(rows, bm25, vecs, qVec, engine, RERANK_CANDIDATES, threshold, vecWeight, qTerms), topN, rerankOpts, kbId);
 }
 
-/** Rerank 重排（优先）→ 如果不可用/被关闭/失败，退回 RRF 排名前 topN 条。opts.rerankEnabled=false 跳过重排，opts.rerankModel 指定模型 */
+/** Rerank 重排（优先）→ 如果不可用/被关闭/失败，退回 RRF 排名前 topN 条。opts.rerankEnabled=false 跳过重排，opts.rerankModel 指定模型
+ *  AI-09（2026-11-23）：opts.rerankTopN 覆盖输出条数；opts.rerankThreshold 数值时按重排分数门控（低于阈值的片段不进 context）；
+ *  opts.trace（对象）时回写诊断 { requested, applied, degraded, reason, model, threshold, candidates, passed }——降级可观测。
+ */
 async function rerankAndSlice(query, rrfResults, topN, opts = {}, kbId = null) {
   if (!rrfResults || !rrfResults.length) return [];
-  if (opts.rerankEnabled === false) return attachChapterContext(attachParentContext(rrfResults.slice(0, topN)));
+  const trace = (opts.trace && typeof opts.trace === 'object') ? opts.trace : null;
+  const setTrace = (obj) => { if (trace) trace.rerank = obj; };
+  const wantTopN = (Number.isFinite(+opts.rerankTopN) && +opts.rerankTopN > 0) ? Math.floor(+opts.rerankTopN) : topN;
+  const threshold = Number.isFinite(+opts.rerankThreshold) ? +opts.rerankThreshold : null;
+  const modelName = opts.rerankModel || RERANK_MODEL;
+  // 重排关闭：直接 RRF 排序（trace 标注 disabled，便于排查「为何无重排效果」）
+  if (opts.rerankEnabled === false) {
+    setTrace({ requested: false, applied: false, degraded: false, reason: 'disabled', model: modelName });
+    return attachChapterContext(attachParentContext(rrfResults.slice(0, wantTopN)));
+  }
   try {
-    const ranked = await bgeRerank(query, rrfResults, opts.rerankModel);
+    // 设阈值时多取候选（RERANK_CANDIDATES）以便门控后仍能凑满 wantTopN；否则只取 wantTopN（与历史行为一致）
+    const retTop = threshold != null ? Math.max(wantTopN, RERANK_CANDIDATES) : wantTopN;
+    const ranked = await bgeRerank(query, rrfResults, opts.rerankModel, retTop);
     if (ranked && ranked.length) {
       // 按 rerank 索引重排
       const resultMap = new Map();
       rrfResults.forEach((r, i) => resultMap.set(i, r));
-      return injectWatermark(attachChapterContext(attachParentContext(ranked
+      let mapped = ranked
         .map(r => ({ ...resultMap.get(r.index), rerank_score: r.score }))
-        .filter(Boolean)
-        .slice(0, topN))), kbId);
+        .filter(Boolean);
+      const candidates = mapped.length;
+      if (threshold != null) mapped = mapped.filter(r => (r.rerank_score || 0) >= threshold); // 门控：低相关片段剔除
+      const passed = mapped.length;
+      setTrace({ requested: true, applied: true, degraded: false, model: modelName, threshold, candidates, passed });
+      return injectWatermark(attachChapterContext(attachParentContext(mapped.slice(0, wantTopN))), kbId);
     }
-  } catch { /* fallthrough: 退回 RRF 排序 */ }
-  return injectWatermark(attachChapterContext(attachParentContext(rrfResults.slice(0, topN))), kbId);
+    // ranked 为 null（无重排供应商/熔断/返回异常）→ 降级回落 RRF
+    setTrace({ requested: true, applied: false, degraded: true, reason: 'unavailable', model: modelName, threshold });
+  } catch {
+    setTrace({ requested: true, applied: false, degraded: true, reason: 'error', model: modelName, threshold });
+  }
+  // 降级路径回落 RRF（阈值仅作用于重排生效路径——重排不可用时不误清空结果集）
+  return injectWatermark(attachChapterContext(attachParentContext(rrfResults.slice(0, wantTopN))), kbId);
 }
 
 /** 父分片上下文增强：对命中子分片的结果，查找其父分片（parent_id）并将其内容合并到 content 前 */
@@ -526,4 +590,4 @@ function finish(rows, bm25, vecs, qVec, engine, topN, threshold, vecWeight = 0.5
 // __expireCircuitBreakers 测试助手（下划线约定：生产代码不得调用）：bgeDownUntil/rerankDownUntil 为模块级
 // 熔断状态，且 bgeEmbed 在无供应商环境下每次调用也会设置 30s 熔断（for 循环空转后落熔断行）——
 // 跨用例泄漏会导致后续 mock 供应商用例被短路，单测前需主动过期重置
-module.exports = { retrieve, embed, bgeEmbed, bgeRerank, rerankProviders, rerankModels, parseVec, encodeVec, decodeVec, rerankAndSlice, __expireCircuitBreakers: () => { bgeDownUntil = 0; rerankDownUntil = 0; } };
+module.exports = { retrieve, embed, bgeEmbed, bgeRerank, rerankProviders, rerankModels, normalizeKbRerankConfig, parseVec, encodeVec, decodeVec, rerankAndSlice, __expireCircuitBreakers: () => { bgeDownUntil = 0; rerankDownUntil = 0; } };

@@ -988,19 +988,20 @@ router.post('/stream', async (req, res) => {
     const attachText = (attachRows.length && !attachVarMap) ? '\n\n' + attachRows.map(r => { const txt = fileToText(fileToRich(r)); return txt.length > 24000 ? txt.slice(0, 24000) + '\n…（文件过长已截断）' : txt; }).join('\n\n') : '';
 
     // 3. 组装 messages 用的历史轮数（AI-01：提前到检索之前，供多轮指代消解改写查询使用）
-    const history = agent?.context_rounds
+    let history = agent?.context_rounds
       ? db.prepare('SELECT role, content FROM (SELECT * FROM messages WHERE session_id=? ORDER BY id DESC LIMIT ?) ORDER BY id').all(session_id, agent.context_rounds * 2)
       : db.prepare('SELECT role, content FROM (SELECT * FROM messages WHERE session_id=? ORDER BY id DESC LIMIT 20) ORDER BY id').all(session_id);
 
     // 2. 知识库检索（混合检索：BM25 + 向量，RRF 融合；@技能标记已移除，检索更准）
     let kbContext = [];
     let kbHits = [];
+    const retrievalTrace = {}; // AI-09/AI-13：检索诊断（改写/重排/引擎），随 chat_traces.retrieval_trace 落库
     if (agent && agent.kb_id) {
       // V1.2 #2 2026-10-30：元数据过滤联动——resolveKbFilter 解析 agent.kb_metadata_filter
       // （$user.dept 占位符按请求用户部门替换）；有过滤且无命中即无上下文（fail-closed 设计语义，不兑底放开）。
       // threshold 0.01 为原 3 参调用的默认值，显式写出保语义不变
       // AI-01：传入 history → 检索前多轮指代消解改写（改写失败静默回落原 query，绝不阻断）
-      kbHits = await retrieve(chatInput.trim() || input, agent.kb_id, 5, 0.01, { metadataFilter: resolveKbFilter(agent, req.user) || undefined, history, username: req.user?.username, tenantId: req.user?.tenant_id });
+      kbHits = await retrieve(chatInput.trim() || input, agent.kb_id, 5, 0.01, { metadataFilter: resolveKbFilter(agent, req.user) || undefined, history, username: req.user?.username, tenantId: req.user?.tenant_id, trace: retrievalTrace });
       kbContext = kbHits.map(h => h.content);
       if (kbHits.length) send('kb', { hits: kbHits });
     }
@@ -1057,6 +1058,14 @@ router.post('/stream', async (req, res) => {
       system += `\n\n以下是知识库检索到的相关内容（带来源编号），请优先依据这些内容回答：\n${kbContext.map((c, i) => `[${i + 1}] ${c}`).join('\n')}`;
       system += `\n\n【引用规范】回答中引用了某条资料时，必须在对应句子末尾标注来源编号，格式如 [1] 或 [2]；多条来源可并列如 [1][3]。知识库没有的内容请如实说明，不要编造。`;
     }
+    // AI-06：长对话上下文压缩——超 token 预算时折叠早期轮次为摘要、保留最近 N 轮原文（context_rounds 为上限）；
+    // 任何异常静默回落原 history，绝不阻断对话（与 AI-01 改写同哲学）
+    try {
+      const cr = await require('../lib/context-manager').compressHistory(history, {
+        contextRounds: agent?.context_rounds, username: req.user?.username, tenantId: req.user?.tenant_id, trace: retrievalTrace.context,
+      });
+      if (cr.compressed) { history = cr.messages; send('notice', { msg: `🗜️ 会话较长，已压缩较早的 ${cr.summarizedTurns} 条历史为摘要（保留最近轮次原文）` }); }
+    } catch { /* 压缩失败不影响对话 */ }
     const messages = [{ role: 'system', content: system }, ...history, { role: 'user', content: (chatInput.trim() || '（用户通过 @ 调用了技能/专家，请按其设定开始服务）') + attachText }]; // P5.14：附件文本化注入（表单/普通链路）
 
     db.prepare('INSERT INTO messages (session_id,role,content,tokens,created_at) VALUES (?,?,?,?,?)')
@@ -1474,10 +1483,10 @@ router.post('/stream', async (req, res) => {
     db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')
       .run(req.user.username, '对话调用', `与 ${agent ? '「' + agent.name + '」' : '首页助手'} 对话（${tokens} tokens${stopped ? '，用户停止生成' : ''}${usedSkills.length ? '，@技能 ' + usedSkills.map(s => s.name).join('/') : ''}${toolTrace.length ? '，工具×' + toolTrace.length : ''}${genMeta?.provider ? '，@' + genMeta.provider + '/' + (genMeta.model || model || '') : ''}）`, req.ip, now());
     // 全链路追踪落库（model+provider 记录实际路由到的供应商，多供应商路由后可追溯）
-    db.prepare('INSERT INTO chat_traces (session_id,message_id,agent_id,model,mode,latency_ms,tokens,prompt_chars,kb_hits,tool_calls,blocked,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
+    db.prepare('INSERT INTO chat_traces (session_id,message_id,agent_id,model,mode,latency_ms,tokens,prompt_chars,kb_hits,tool_calls,blocked,retrieval_trace,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)')
       .run(session_id, msgInfo.lastInsertRowid, agent?.id || null, genMeta?.model || model || agent?.model || '', 'real', Date.now() - tStart, tokens, promptChars,
-        JSON.stringify(kbHits.map(h => ({ file: h.file, kb: h.kb, score: h.score, bm25: h.bm25, vec: h.vec, excerpt: h.content.slice(0, 120) }))),
-        JSON.stringify(toolTrace), blockedNote, now());
+        JSON.stringify(kbHits.map(h => ({ file: h.file, kb: h.kb, score: h.score, bm25: h.bm25, vec: h.vec, rerank_score: h.rerank_score, excerpt: h.content.slice(0, 120) }))),
+        JSON.stringify(toolTrace), blockedNote, JSON.stringify(retrievalTrace), now());
 
     send('done', { content: outMasked, tokens, model: genMeta?.model, provider: genMeta?.provider, mid: Number(msgInfo.lastInsertRowid) });
 

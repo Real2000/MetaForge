@@ -10769,6 +10769,81 @@ print('PY_OK')
     assert.ok(dec.v && (dec.engine === 'H' || dec.engine === 'B3'), 'BLOB 应可回读为向量');
   });
 
+  // ==================== M4 AI-09 重排阈值门控 + 库级配置（2026-11-23） ====================
+  await t('AI-09：kbs 重排库级列 + chat_traces.retrieval_trace 已迁移', () => {
+    const kbCols = db.prepare('PRAGMA table_info(kbs)').all().map(c => c.name);
+    for (const c of ['rerank_enabled', 'rerank_model', 'rerank_top_n', 'rerank_threshold']) {
+      assert.ok(kbCols.includes(c), `kbs 应有 ${c} 列`);
+    }
+    const traceCols = db.prepare('PRAGMA table_info(chat_traces)').all().map(c => c.name);
+    assert.ok(traceCols.includes('retrieval_trace'), 'chat_traces 应有 retrieval_trace 列');
+  });
+
+  await t('AI-09：normalizeKbRerankConfig 归一（enabled 三态 / topN 限幅 / threshold 非法落 null）', () => {
+    const { normalizeKbRerankConfig } = require('../src-server/lib/retriever');
+    db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('重排配置测试库','',1,'httpu1',datetime('now','localtime'))`).run();
+    const kbid = db.prepare(`SELECT id FROM kbs WHERE name='重排配置测试库'`).get().id;
+    // 未配置：全 null/空（回落全局默认）
+    const c0 = normalizeKbRerankConfig(db.prepare('SELECT * FROM kbs WHERE id=?').get(kbid));
+    assert.deepStrictEqual(c0, { enabled: null, model: '', topN: null, threshold: null });
+    // 配置：enabled=1，topN 越界 999 → 限幅 50；threshold 非法 'abc' → null
+    db.prepare('UPDATE kbs SET rerank_enabled=1, rerank_model=?, rerank_top_n=?, rerank_threshold=? WHERE id=?')
+      .run('bge-reranker-v2-m3', 999, 'abc', kbid);
+    const c1 = normalizeKbRerankConfig(db.prepare('SELECT * FROM kbs WHERE id=?').get(kbid));
+    assert.strictEqual(c1.enabled, true);
+    assert.strictEqual(c1.model, 'bge-reranker-v2-m3');
+    assert.strictEqual(c1.topN, 50, 'topN 应限幅到 50');
+    assert.strictEqual(c1.threshold, null, 'threshold 非法应落 null');
+    // enabled=0 → false
+    db.prepare('UPDATE kbs SET rerank_enabled=0, rerank_threshold=? WHERE id=?').run('0.35', kbid);
+    const c2 = normalizeKbRerankConfig(db.prepare('SELECT * FROM kbs WHERE id=?').get(kbid));
+    assert.strictEqual(c2.enabled, false);
+    assert.strictEqual(c2.threshold, 0.35);
+    assert.strictEqual(normalizeKbRerankConfig(null), null, '空入参应 null');
+    db.prepare('DELETE FROM kbs WHERE id=?').run(kbid);
+  });
+
+  await t('AI-09：重排阈值门控生效——低分片段不进 context，trace 回写；库级关闭则降级标记', async () => {
+    const r = require('../src-server/lib/retriever');
+    const kbid = globalThis.__goldenKbId;
+    assert.ok(kbid, '依赖既有黄金基线库');
+    const origFetch = global.fetch;
+    const origAllow = process.env.AGENT_FETCH_ALLOW_PRIVATE;
+    process.env.AGENT_FETCH_ALLOW_PRIVATE = '1'; // 测试放行内网（SSRF 守卫早返回），mock fetch 不真正出网
+    r.__expireCircuitBreakers();
+    db.prepare(`INSERT INTO providers (name,base_url,api_key,models,configured,is_default,remark,created_at) VALUES ('rerank测试供应商','http://gw.test/v1','sk-x',?,1,0,'',datetime('now','localtime'))`).run(JSON.stringify(['bge-reranker-v2-m3']));
+    // mock：按文档顺序返回递减分数（第 i 条 = 0.9 - i*0.1）
+    global.fetch = async (url, opt) => {
+      const body = JSON.parse((opt && opt.body) || '{}');
+      const results = (body.documents || []).map((_, i) => ({ index: i, relevance_score: +(0.9 - i * 0.1).toFixed(2) }));
+      return { ok: true, json: async () => ({ results }) };
+    };
+    try {
+      // 库级阈值 0.5：仅保留 >=0.5 的（第 0~4 条中 0.9~0.5）
+      db.prepare('UPDATE kbs SET rerank_enabled=NULL, rerank_threshold=?, rerank_top_n=NULL WHERE id=?').run(0.5, kbid);
+      const trace = {};
+      const hits = await r.retrieve('迟到早退怎么处理', kbid, 5, 0, { rerankEnabled: true, trace });
+      assert.ok(hits.length > 0, '应有通过阈值的命中');
+      assert.ok(hits.every(h => (h.rerank_score || 0) >= 0.5), '低于阈值的片段应被剔除：' + JSON.stringify(hits.map(h => h.rerank_score)));
+      assert.ok(trace.rerank && trace.rerank.applied === true && trace.rerank.degraded === false, 'trace 应记录重排生效');
+      assert.strictEqual(trace.rerank.threshold, 0.5, 'trace 应回写阈值');
+      assert.ok(trace.engine, 'trace 应记录所用引擎');
+      // 库级关闭重排 → 不走重排，降级标记 reason=disabled
+      db.prepare('UPDATE kbs SET rerank_enabled=0 WHERE id=?').run(kbid);
+      const trace2 = {};
+      const hits2 = await r.retrieve('迟到早退怎么处理', kbid, 5, 0, { trace: trace2 });
+      assert.ok(hits2.every(h => h.rerank_score == null), '库级关闭重排时不应有 rerank_score');
+      assert.strictEqual(trace2.rerank.requested, false);
+      assert.strictEqual(trace2.rerank.reason, 'disabled');
+    } finally {
+      db.prepare('DELETE FROM providers WHERE name=?').run('rerank测试供应商');
+      db.prepare('UPDATE kbs SET rerank_enabled=NULL, rerank_model=\'\', rerank_top_n=NULL, rerank_threshold=NULL WHERE id=?').run(kbid);
+      global.fetch = origFetch;
+      if (origAllow === undefined) delete process.env.AGENT_FETCH_ALLOW_PRIVATE; else process.env.AGENT_FETCH_ALLOW_PRIVATE = origAllow;
+      r.__expireCircuitBreakers();
+    }
+  });
+
   try { db.close(); } catch { }
   fs.rmSync(process.env.AGENT_DATA_DIR, { recursive: true, force: true });
   console.log('\n———————————————');
