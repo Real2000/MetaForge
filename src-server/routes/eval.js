@@ -206,4 +206,128 @@ router.post('/rag-baseline', adminOnly, async (req, res) => {
   res.json({ code: 0, data: { id: out.id, name: out.name, cases: out.cases, metrics: out.metrics, score: out.score, detail: out.detail } });
 });
 
+// ==================== AI-12 提示词多版本效果对比（2026-11-23） ====================
+// 复用 agent_prompt_versions（保存即快照）+ 既有 agent 评测跑分口径（chatOnce + 期望关键词命中比例）：
+// 同一评测集（type='agent'）对 N 个提示词版本「离线跑分」——system prompt 临时替换为版本快照
+//（不落 agents 表，零侵入），产出成功率/质量指标对比报告；先离线对比，不强制流量灰度（计划表口径）。
+const { chatOnce } = require('../lib/llm');
+const { canView } = require('../lib/agent-access');
+
+/** 归属防线：智能体可见性 + 评测集归属（须为该智能体的 type='agent' 评测集） */
+function evalAgentGuard(req, res, agentId, evalId) {
+  const agent = dal.getq('SELECT * FROM agents WHERE id=?', [agentId]);
+  if (!agent) { res.json({ code: 404, msg: '智能体不存在' }); return null; }
+  if (!canView(agent, req.user)) { res.json({ code: 403, msg: '无权查看该智能体' }); return null; }
+  const ev = dal.getq(`SELECT * FROM evaluations WHERE id=? AND agent_id=?`, [evalId, agentId]);
+  if (!ev) { res.json({ code: 404, msg: '评测集不存在或不属于该智能体' }); return null; }
+  return { agent, ev };
+}
+
+// 版本列表（对比入口数据源：含当前在线 prompt 作对照行 version=0）
+router.get('/prompt-versions/:agentId', async (req, res) => {
+  const agent = dal.getq('SELECT * FROM agents WHERE id=?', [req.params.agentId]);
+  if (!agent) return res.json({ code: 404, msg: '智能体不存在' });
+  if (!canView(agent, req.user)) return res.json({ code: 403, msg: '无权查看该智能体' });
+  const rows = dal.q(`SELECT id, version, prompt, user_prompt, edited_by, note, created_at
+    FROM agent_prompt_versions WHERE agent_id=? ORDER BY version DESC LIMIT 50`, [req.params.agentId]);
+  res.json({ code: 0, data: {
+    current: { version: 0, prompt: agent.prompt || '', note: '当前在线版本（未保存为快照）', created_at: agent.updated_at || '' },
+    versions: rows,
+  } });
+});
+
+// 离线对比跑分：同一评测集 × N 个提示词版本 → 对比报告（落库 prompt_compare_reports）
+router.post('/prompt-compare', async (req, res) => {
+  const { agent_id, evaluation_id, version_ids } = req.body || {};
+  const g = evalAgentGuard(req, res, Number(agent_id), Number(evaluation_id));
+  if (!g) return;
+  const { agent, ev } = g;
+  if ((ev.type || 'agent') !== 'agent') return res.json({ code: 400, msg: '仅支持智能体类型评测集（type=agent）' });
+  let items = [];
+  try { items = JSON.parse(ev.dataset || '[]'); } catch { items = []; }
+  if (!Array.isArray(items) || !items.length) return res.json({ code: 400, msg: '该评测集 dataset 为空或损坏' });
+  items = items.slice(0, 20); // 与既有评测 runner 同一截断口径（防超长跑分阻塞）
+  // 参评版本：显式 version_ids（去重截 8 个）或默认「当前在线 + 最近 3 个快照」
+  // 语义统一（2026-11-23 修正）：任何对比报告都含「当前在线版本」对照基线（version=0）——
+  // 用户最核心的对比场景是「历史版本 vs 现在线上」，显式指定 version_ids 时同样并入基线
+  // （首轮测试实锤：指定单版本曾因参评数 1 触发「至少两版本」400，与「+当前在线共 2 参评」验收意图相悖）
+  let versions;
+  const currentRow = () => ({ version: 0, prompt: agent.prompt || '', user_prompt: '', note: '当前在线版本', edited_by: '', created_at: '' });
+  if (Array.isArray(version_ids) && version_ids.length) {
+    const ids = [...new Set(version_ids.map(Number).filter(Number.isFinite))].slice(0, 8);
+    const picked = dal.q(`SELECT version, prompt, user_prompt, note, edited_by, created_at FROM agent_prompt_versions WHERE agent_id=? AND version IN (${ids.map(() => '?').join(',')}) ORDER BY version DESC`, [agent.id, ...ids]);
+    if (!picked.length) return res.json({ code: 404, msg: '指定的提示词版本不存在' });
+    versions = [currentRow(), ...picked];
+  } else {
+    versions = [currentRow()]
+      .concat(dal.q(`SELECT version, prompt, user_prompt, note, edited_by, created_at FROM agent_prompt_versions WHERE agent_id=? ORDER BY version DESC LIMIT 3`, [agent.id]));
+  }
+  if (versions.length < 2) return res.json({ code: 400, msg: '至少需要两个版本才能对比（当前在线 + 至少一个快照）' });
+  // 逐版本离线跑分（system prompt = 版本快照；与 V1.3 评测 runner 同口径：关键词命中比例）
+  const scored = [];
+  for (const v of versions) {
+    const cases = [];
+    let total = 0;
+    for (const it of items) {
+      const r = await chatOnce([
+        { role: 'system', content: String(v.prompt || '你是智能助手。') },
+        { role: 'user', content: String(it.q || '') },
+      ], { model: agent.model, temperature: 0.2, agentName: agent.name });
+      const got = (r.full || '').slice(0, 500);
+      const keys = String(it.expect || '').split(/[，,、\s]+/).filter(Boolean);
+      const hit = keys.filter(k => got.includes(k)).length;
+      const score = keys.length ? hit / keys.length : 1;
+      total += score;
+      cases.push({ q: it.q, expect: it.expect, got, score: +score.toFixed(2), hit: keys.length ? hit : 1, keys: keys.length });
+    }
+    const fullHit = cases.filter(c => c.score >= 1).length; // 成功率口径：期望关键词全命中的条数占比
+    scored.push({
+      version: v.version, note: v.note || '', edited_by: v.edited_by || '', created_at: v.created_at || '',
+      prompt_head: String(v.prompt || '').slice(0, 120),
+      score: Math.round((total / cases.length) * 100),          // 质量指标：综合得分（命中比例均值）
+      success_rate: Math.round((fullHit / cases.length) * 100),  // 成功率：全命中条目占比
+      cases,
+    });
+  }
+  scored.sort((a, b) => b.score - a.score);
+  const report = {
+    agent_id: agent.id, agent_name: agent.name, evaluation_id: ev.id, evaluation_name: ev.name,
+    case_count: items.length, winner: scored[0].version, generated_at: new Date().toISOString(),
+    versions: scored,
+  };
+  const info = dal.runq(`INSERT INTO prompt_compare_reports (agent_id, evaluation_id, report, created_at) VALUES (?,?,?,datetime('now','localtime'))`,
+    [agent.id, ev.id, JSON.stringify(report)]);
+  dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)',
+    [req.user.username, '提示词版本对比', `${agent.name} × ${ev.name}：${scored.length} 版本，最优 v${scored[0].version}（${scored[0].score} 分）`, req.ip, require('../db').now()]);
+  res.json({ code: 0, data: { id: info.lastInsertRowid, report } });
+});
+
+// 对比报告导出（验收：报告可导出，含成功率/质量指标）——json 全量 / csv 逐版本汇总
+router.get('/prompt-compare/:id/export', (req, res) => {
+  const row = dal.getq('SELECT * FROM prompt_compare_reports WHERE id=?', [req.params.id]);
+  if (!row) return res.json({ code: 404, msg: '对比报告不存在' });
+  let report = {};
+  try { report = JSON.parse(row.report || '{}'); } catch { report = {}; }
+  if ((req.query.format || 'json') === 'csv') {
+    // Excel 兼容 CSV：BOM 头 + 逐版本汇总行 + 逐条明细（成功率/综合得分并列，便于筛选排序）
+    const escCell = v => `"${String(v == null ? '' : v).replace(/"/g, '""')}"`;
+    const lines = [[
+      '版本', '备注', '操作者', '快照时间', '综合得分(质量指标)', '成功率(%)', '用例数',
+    ].map(escCell).join(',')];
+    for (const v of report.versions || []) {
+      lines.push([`v${v.version}`, v.note, v.edited_by, v.created_at, v.score, v.success_rate, (v.cases || []).length].map(escCell).join(','));
+    }
+    lines.push('');
+    lines.push(['用例序号', '查询', '期望关键词', '版本', '得分', '回答摘录'].map(escCell).join(','));
+    (report.versions || []).forEach(v => (v.cases || []).forEach((c, i) => {
+      lines.push([i + 1, c.q, c.expect, `v${v.version}`, c.score, c.got].map(escCell).join(','));
+    }));
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="prompt-compare-${req.params.id}.csv"`);
+    return res.send('\ufeff' + lines.join('\r\n'));
+  }
+  res.setHeader('Content-Disposition', `attachment; filename="prompt-compare-${req.params.id}.json"`);
+  res.json({ code: 0, exported_at: require('../db').now(), report });
+});
+
 module.exports = router;

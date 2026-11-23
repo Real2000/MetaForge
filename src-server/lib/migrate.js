@@ -823,6 +823,18 @@ const ALL_MIGRATIONS = [
   // === AI-14（2026-11-23）查询感知元数据过滤：库级开关（默认关） ===
   // 开启后 LLM 从查询推断过滤条件（值域约束 fail-closed：域外键值丢弃；与静态声明交集、静态优先）。
   { id: 138, name: 'kbs.infer_metadata_filter - 库级查询感知过滤开关（AI-14，默认关）', table: 'kbs', column: 'infer_metadata_filter', def: 'INTEGER DEFAULT 0' },
+  // === AI-11（2026-11-23）多模态向量检索：分块模态标记 ===
+  // 'text'（默认，存量行自动归一）/ 'image'（图片文件经 VL 描述分块化的行）——文搜图命中可标识来源（🖼️），
+  // 图搜图端点可限定检索域；图片内容以 VL 描述文本嵌入（多模态嵌入模型就位前的务实路径，见 retriever 注释）。
+  { id: 139, name: 'kb_chunks.modality - 分块模态标记（AI-11，text/image）', table: 'kb_chunks', column: 'modality', def: "TEXT DEFAULT 'text'" },
+  // === AI-12（2026-11-23）提示词多版本效果对比：对比报告存档（离线跑分结果，导出端点数据源） ===
+  { id: 140, name: 'prompt_compare_reports 提示词版本对比报告表（AI-12）', table: 'prompt_compare_reports', createSql: `CREATE TABLE IF NOT EXISTS prompt_compare_reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id INTEGER NOT NULL,
+    evaluation_id INTEGER,
+    report TEXT DEFAULT '{}',
+    created_at TEXT
+  )` },
 ];
 
 module.exports = {

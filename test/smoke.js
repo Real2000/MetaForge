@@ -2968,6 +2968,93 @@ function t(name, fn) {
           assert.strictEqual(hc, 0, '健康检查不应落 access_logs（探针减噪）');
           db.prepare(`DELETE FROM agent_api_keys WHERE name='BE-F1链路Key'`).run();
         });
+        // ===== AI-12 提示词多版本效果对比（2026-11-23）端到端 =====
+        await t('HTTP：AI-12——版本列表 + 同评测集多版本离线跑分 + 报告落库 + CSV/JSON 导出', async () => {
+          const tokA4 = sign({ uid: db.prepare(`SELECT id FROM users WHERE username='httpadmin'`).get().id, exp: Date.now() + 3600000 });
+          db.prepare(`INSERT INTO spaces (name,type,owner,members,created_at,tenant_id) VALUES ('AI12空间','enterprise','httpadmin','[]',datetime('now','localtime'),1)`).run();
+          const sp12 = db.prepare(`SELECT id FROM spaces WHERE name='AI12空间'`).get().id;
+          db.prepare(`INSERT INTO agents (name,type,space_id,owner,status,visibility,prompt,model,created_at) VALUES ('AI12对比智能体','other',?,'httpadmin','published','public','你是年假助手，回答须简洁准确。','mock-model',datetime('now','localtime'))`).run(sp12);
+          const ag12 = db.prepare(`SELECT id FROM agents WHERE name='AI12对比智能体'`).get().id;
+          db.prepare(`INSERT INTO agent_prompt_versions (agent_id,version,prompt,user_prompt,edited_by,note,created_at) VALUES (?,1,'你是年假助手 v1，回答详细。','','httpadmin','提示词修改',datetime('now','localtime'))`).run(ag12);
+          db.prepare(`INSERT INTO agent_prompt_versions (agent_id,version,prompt,user_prompt,edited_by,note,created_at) VALUES (?,2,'你是年假助手 v2，回答简洁准确。','','httpadmin','提示词修改',datetime('now','localtime'))`).run(ag12);
+          // 评测集：expect 取自 q 本身——mock 模式回显用户问题，命中比例确定性 100%（跑分通路验证）
+          const ds12 = JSON.stringify([{ q: '平台支持年假查询吗', expect: '年假,查询' }]);
+          db.prepare(`INSERT INTO evaluations (name,agent_id,rule_prompt,dataset,status,score,result,type,kb_id,created_at) VALUES ('AI12对比集',?,'',?,'done',0,'[]','agent',NULL,datetime('now','localtime'))`).run(ag12, ds12);
+          const ev12 = db.prepare(`SELECT id FROM evaluations WHERE name='AI12对比集' AND agent_id=?`).get(ag12).id;
+          try {
+            // ① 版本列表（当前在线 + 快照）
+            const vl = await jfetch(`/api/eval/prompt-versions/${ag12}`, {}, tokA4);
+            assert.ok(vl.j && vl.j.code === 0 && vl.j.data.versions.length === 2, '版本列表应含 2 个快照');
+            assert.ok(vl.j.data.current.prompt.includes('简洁准确'), '当前在线版本应作对照行');
+            // ② 离线对比（默认：当前在线 + 最近 3 快照 = 3 参评）
+            const cmp = await jfetch('/api/eval/prompt-compare', { method: 'POST', body: JSON.stringify({ agent_id: ag12, evaluation_id: ev12 }) }, tokA4);
+            assert.ok(cmp.j && cmp.j.code === 0, '对比跑分应成功：' + JSON.stringify(cmp.j || {}).slice(0, 120));
+            const R = cmp.j.data.report;
+            assert.strictEqual(R.versions.length, 3, '默认应参评 3 个版本（当前在线 + 2 快照）');
+            for (const v of R.versions) {
+              assert.ok(Number.isFinite(v.score), '版本应有综合得分（质量指标）');
+              assert.ok(Number.isFinite(v.success_rate), '版本应有成功率');
+              assert.ok(Array.isArray(v.cases) && v.cases.length === 1, '每版本应携带逐条明细');
+              assert.ok(v.cases[0].got.includes('年假查询'), 'mock 回显语义下回答应含查询原文（跑分通路实锤）');
+            }
+            assert.ok(R.winner != null && R.case_count === 1, '报告应含最优版本与用例数');
+            const rid = cmp.j.data.id;
+            assert.ok(db.prepare('SELECT id FROM prompt_compare_reports WHERE id=?').get(rid), '对比报告应落库 prompt_compare_reports');
+            // ③ CSV 导出（验收：报告可导出，含成功率/质量指标）
+            // BOM 断言用原始字节：fetch .text() 的 UTF-8 解码按 WHATWG 规范会剥离 BOM，
+            // 对解码后文本断 \ufEFF 永远不成立（首轮实测踩坑）——改为直接校验响应体前缀字节 EF BB BF
+            const csv = await fetch(base + `/api/eval/prompt-compare/${rid}/export?format=csv`, { headers: { Authorization: 'Bearer ' + tokA4 } });
+            const csvBuf = new Uint8Array(await csv.arrayBuffer());
+            const csvText = Buffer.from(csvBuf).toString('utf8');
+            assert.ok(csv.status === 200, 'CSV 导出应 200');
+            assert.ok(csvText.includes('综合得分') && csvText.includes('成功率'), 'CSV 应含质量指标/成功率列头');
+            assert.ok(csvBuf[0] === 0xEF && csvBuf[1] === 0xBB && csvBuf[2] === 0xBF, 'CSV 响应体应带 BOM 字节头 EF BB BF（Excel 兼容）');
+            // ④ JSON 导出
+            const js = await fetch(base + `/api/eval/prompt-compare/${rid}/export`, { headers: { Authorization: 'Bearer ' + tokA4 } });
+            const jsj = await js.json();
+            assert.ok(jsj.report && jsj.report.versions.length === 3, 'JSON 导出应含完整报告');
+            // ⑤ 指定版本对比（version_ids=[2] → 与当前在线共 2 参评）
+            const cmp2 = await jfetch('/api/eval/prompt-compare', { method: 'POST', body: JSON.stringify({ agent_id: ag12, evaluation_id: ev12, version_ids: [2] }) }, tokA4);
+            assert.strictEqual(cmp2.j.data.report.versions.length, 2, '指定 version_ids 应仅参评所选版本 + 当前在线');
+          } finally {
+            db.prepare(`DELETE FROM prompt_compare_reports WHERE agent_id=?`).run(ag12);
+            db.prepare(`DELETE FROM evaluations WHERE id=?`).run(ev12);
+            db.prepare(`DELETE FROM agent_prompt_versions WHERE agent_id=?`).run(ag12);
+            db.prepare(`DELETE FROM agents WHERE id=?`).run(ag12);
+            db.prepare(`DELETE FROM spaces WHERE id=?`).run(sp12);
+          }
+        });
+        // ===== AI-11 图搜图（2026-11-23）端到端 =====
+        // 桩不可用说明：HTTP 块的服务器跑在子进程——主进程改 llm 模块属性对子进程无效（首轮实测踩坑）。
+        // 改用 mock 模式确定性通路：无已配置供应商 → chatOnce 走 mockAnswer → 回显 user 消息 text 片段
+        // （visionDescribe 的 user 消息 text=「请描述这张图片：」，多模态数组兼容由 mockAnswer 修复）。
+        await t('HTTP：AI-11 图搜图——VL mock 通路 → image 分块优先 + modality 透传 + 无视觉模型 400', async () => {
+          const tokA5 = sign({ uid: db.prepare(`SELECT id FROM users WHERE username='httpadmin'`).get().id, exp: Date.now() + 3600000 });
+          db.prepare(`INSERT INTO kbs (name,description,enabled,owner,vision_model,created_at) VALUES ('AI11图搜图库','',1,'httpadmin','mock-vl-model',datetime('now','localtime'))`).run();
+          const kb11 = db.prepare(`SELECT id FROM kbs WHERE name='AI11图搜图库'`).get().id;
+          db.prepare(`INSERT INTO kb_files (kb_id,name,size,status,chunk_count,created_at) VALUES (?,'年假流程图.png',100,'success',3,datetime('now','localtime'))`).run(kb11);
+          const f11 = db.prepare('SELECT id FROM kb_files WHERE kb_id=? ORDER BY id DESC').get(kb11).id;
+          // image 块 = 摄取管道 visionUsed 时的 VL 描述分块（模拟）；内容与 mock 回显 query 重叠（「图片/描述」词项）
+          db.prepare(`INSERT INTO kb_chunks (file_id,kb_id,content,modality) VALUES (?,?,?,'image')`).run(f11, kb11, '流程图：员工年假申请步骤，入职满一年五天。图片描述演示块一。');
+          db.prepare(`INSERT INTO kb_chunks (file_id,kb_id,content,modality) VALUES (?,?,?,'image')`).run(f11, kb11, '流程图：报销流程三十天内提交发票。图片描述演示块二。');
+          db.prepare(`INSERT INTO kb_chunks (file_id,kb_id,content,modality) VALUES (?,?,?,'text')`).run(f11, kb11, '年假制度文本：入职满一年带薪年假五天。');
+          try {
+            const r = await jfetch('/api/knowledge/image-search', { method: 'POST', body: JSON.stringify({ kb_id: kb11, image_base64: 'aGk=' }) }, tokA5);
+            assert.ok(r.j && r.j.code === 0, '图搜图应成功（mock VL 通路）：' + JSON.stringify(r.j || {}).slice(0, 140));
+            assert.ok((r.j.data.query || '').includes('请描述这张图片'), 'query 应为 VL 描述文本（mock 回显 user 消息 text，多模态兼容实锤）：' + (r.j.data.query || '').slice(0, 60));
+            assert.ok(r.j.data.image_hits >= 1, '应命中 image 分块（找相似图片语义）：' + JSON.stringify({ image_hits: r.j.data.image_hits, count: r.j.data.count }));
+            assert.strictEqual(r.j.data.hits[0].modality, 'image', 'image 分块应排在最前（图搜图优先返回图片）');
+            assert.ok(r.j.data.hits.some(h => h.content.includes('五天')), '应命中年假流程图块（描述语义对齐）');
+            // 无视觉模型的库 400（fail-closed：不静默走文本检索，明确提示配置）
+            db.prepare('UPDATE kbs SET vision_model=NULL WHERE id=?').run(kb11);
+            const r3 = await jfetch('/api/knowledge/image-search', { method: 'POST', body: JSON.stringify({ kb_id: kb11, image_base64: 'aGk=' }) }, tokA5);
+            assert.strictEqual(r3.j.code, 400, '未配置 vision_model 应 400（fail-closed 明确提示）');
+          } finally {
+            db.prepare('DELETE FROM kb_chunks WHERE kb_id=?').run(kb11);
+            db.prepare('DELETE FROM kb_files WHERE kb_id=?').run(kb11);
+            db.prepare('DELETE FROM kbs WHERE id=?').run(kb11);
+          }
+        });
         // ===== P1-3 分页参数容错（2026-11-04）：lib 统一解析 + 三接口回归（notify 原必 500 实锤点） =====
         await t('P1-3：parsePagination 六态容错（缺省/正常/abc/负数/超大/小数）', () => {
           const { parsePagination } = require('../src-server/lib/pagination');
@@ -4820,7 +4907,9 @@ function t(name, fn) {
           const lv0 = await jfetch(`/api/agents/${llmopsAid}/prompt-versions`, {}, tok1);
           const v1 = (lv0.j.data || []).find(v => v.version === 1);
           assert.ok(v1, '应存在 v1 版本可回滚：' + JSON.stringify(lv0.j.data).slice(0, 200));
-          const rb = await jfetch(`/api/agents/${llmopsAid}/prompt-versions/${v1.id}/rollback`, { method: 'POST' }, tok1);
+          // 契约修正（2026-11-23）：rollback 的 :vid 参数语义是 version 号（端点 WHERE agent_id=? AND version=?），
+          // 原测试误传自增 id——首轮 AI-12 用例直接 INSERT prompt_versions 推进全局自增序列后 id≠version 暴露 404
+          const rb = await jfetch(`/api/agents/${llmopsAid}/prompt-versions/${v1.version}/rollback`, { method: 'POST' }, tok1);
           assert.ok(rb.j && rb.j.code === 0, 'owner rollback 应成功：' + JSON.stringify(rb.j).slice(0, 140));
           assert.strictEqual(rb.j.msg, '已回滚到 v1', 'msg 契约：已回滚到 vN');
           // V2.3 审查加固（回滚端点返回的是新版本号 v3——审计链要求，回滚是独立操作，始终产生新版本记录以便追溯）
@@ -4839,7 +4928,7 @@ function t(name, fn) {
           const lvOwn = await jfetch(`/api/agents/${llmopsAid}/prompt-versions`, {}, tok1);
           const anyV = (lvOwn.j.data || [])[0];
           assert.ok(anyV, 'owner 应能取到版本列表');
-          const rb = await jfetch(`/api/agents/${llmopsAid}/prompt-versions/${anyV.id}/rollback`, { method: 'POST' }, tok2);
+          const rb = await jfetch(`/api/agents/${llmopsAid}/prompt-versions/${anyV.version}/rollback`, { method: 'POST' }, tok2);
           assert.ok(rb.j && rb.j.code === 403, '第三人回滚应 403：' + JSON.stringify(rb.j).slice(0, 120));
           const d = await jfetch(`/api/agents/${llmopsAid}/detail`, {}, tok1);
           assert.strictEqual(d.j.data.prompt, '你是银行客服助手 v1', '403 回滚不得改动 prompt');
@@ -11792,6 +11881,58 @@ print('PY_OK')
         db.prepare('DELETE FROM kb_files WHERE kb_id=?').run(kbId);
         db.prepare('DELETE FROM kbs WHERE id=?').run(kbId);
       }
+    });
+  }
+
+  // ==================== AI-11/AI-12 收尾（2026-11-23）====================
+  console.log('【AI-11/AI-12】迁移 #139/#140 结构断言 + 文搜图 modality 透传');
+  {
+    const { db } = require('../src-server/db');
+    const r = require('../src-server/lib/retriever');
+    await t('AI-11：迁移 #139/#140——kb_chunks.modality 列（DEFAULT text）+ prompt_compare_reports 表结构', () => {
+      const mod = db.prepare('PRAGMA table_info(kb_chunks)').all().find(c => c.name === 'modality');
+      assert.ok(mod, 'kb_chunks 应有 modality 列（迁移 #139，图搜图/文搜图模态标识基础）');
+      assert.ok(/'text'/.test(mod.dflt_value || ''), "modality 默认值应为 'text'（存量行自动归一文本，零迁移风险）");
+      const pcCols = db.prepare('PRAGMA table_info(prompt_compare_reports)').all().map(c => c.name);
+      for (const col of ['id', 'agent_id', 'evaluation_id', 'report', 'created_at']) {
+        assert.ok(pcCols.includes(col), `prompt_compare_reports 应有 ${col} 列（迁移 #140，AI-12 对比报告存档）`);
+      }
+    });
+    await t('AI-11：文搜图——retrieve 命中 image 分块透传 modality=image + text 分块缺省归一', async () => {
+      db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('AI-11 modality 测试库','',1,'httpu1',datetime('now','localtime'))`).run();
+      const kbId = db.prepare(`SELECT id FROM kbs WHERE name='AI-11 modality 测试库'`).get().id;
+      db.prepare(`INSERT INTO kb_files (kb_id,name,size,status,chunk_count,created_at) VALUES (?,'架构图.png',2048,'success',2,datetime('now','localtime'))`).run(kbId);
+      const fid = db.prepare('SELECT id FROM kb_files WHERE kb_id=? ORDER BY id DESC').get(kbId).id;
+      // image 块：摄取管道 visionUsed 时落 modality='image'（图片 VL 描述分块化）
+      db.prepare('INSERT INTO kb_chunks (file_id,kb_id,content,modality) VALUES (?,?,?,?)').run(fid, kbId, '系统架构图：包含接入层、服务层、数据层三层设计，服务层内置智能体编排', 'image');
+      // text 块：modality 缺省 → DEFAULT 'text'（存量/普通分块归一路径）
+      db.prepare('INSERT INTO kb_chunks (file_id,kb_id,content) VALUES (?,?,?)').run(fid, kbId, '会议纪要：本季度重点完成多租户改造。');
+      try {
+        const hits = await r.retrieve('架构图 三层设计', kbId, 5, 0.01, { rerankEnabled: false });
+        assert.ok(hits.length >= 1, '文搜图应命中图片 VL 描述分块（描述即文本，混合检索天然可达）');
+        const imgHit = hits.find(h => h.content.includes('架构图'));
+        assert.ok(imgHit, '应命中含「架构图」的描述分块');
+        assert.strictEqual(imgHit.modality, 'image', '命中图片块应透传 modality=image（前端可标识 🖼️ 来源）');
+        assert.ok(hits.every(h => h.modality === 'image' || h.modality === 'text'), '命中块 modality 应归一为 image/text');
+        const t2 = await r.retrieve('会议纪要 多租户', kbId, 5, 0.01, { rerankEnabled: false });
+        assert.ok(t2.length >= 1, '文本块应可命中');
+        assert.ok(t2.every(h => h.modality === 'text'), '文本块命中应 modality=text（DEFAULT 归一 + 命中对象回填）');
+      } finally {
+        db.prepare('DELETE FROM kb_chunks WHERE kb_id=?').run(kbId);
+        db.prepare('DELETE FROM kb_files WHERE kb_id=?').run(kbId);
+        db.prepare('DELETE FROM kbs WHERE id=?').run(kbId);
+      }
+    });
+    await t('AI-11：visionDescribe 契约——参数缺失 fail-closed + mock 模式多模态兼容（HTTP 502 分支数据源）', async () => {
+      const { visionDescribe } = require('../src-server/lib/llm');
+      // 参数缺失：buf/modelName 必填 → ok:false（image-search 端点据此 502 明确不静默——跨进程桩不可达，契约在此单测覆盖）
+      assert.strictEqual((await visionDescribe(null, 'm')).ok, false, '缺 buf 应 fail-closed 返回 ok:false');
+      assert.strictEqual((await visionDescribe(Buffer.from('x'), '')).ok, false, '缺 modelName 应 fail-closed 返回 ok:false');
+      // mock 模式（测试环境无已配置供应商 → chatOnce 走 mockAnswer）：多模态数组 content 不再 TypeError，
+      // 回显 user 消息 text 片段（mockAnswer 数组兼容修复的进程内实锤）
+      const vd = await visionDescribe(Buffer.from('x'), 'mock-vl-model');
+      assert.strictEqual(vd.ok, true, 'mock 模式应成功返回描述文本：' + JSON.stringify(vd).slice(0, 120));
+      assert.ok((vd.text || '').includes('请描述这张图片'), '描述文本应回显多模态 user 消息的 text 片段（数组兼容实锤）：' + (vd.text || '').slice(0, 60));
     });
   }
 

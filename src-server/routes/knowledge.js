@@ -427,7 +427,7 @@ router.post('/recall-test', async (req, res) => {
   // V1.1 读侧收口（V1.2 #2 2026-10-30 补齐）：召回测试可检索他人库内容，同样属读越权——
   // 与 logs/files 同模式先查 kb 校验归属；未指定库（全库检索）无归属可校验，仅管理员放行（fail-closed）
   if (kbId) {
-    const kb = db.prepare('SELECT * FROM kbs WHERE id=?').get(kbId);
+  const kb = dal.getq('SELECT * FROM kbs WHERE id=?', [kbId]);
     const deny = denyIfNotAllowed(kb, req.user);
     if (deny) return res.json(deny);
   } else if (req.user.role !== 'admin') {
@@ -451,6 +451,34 @@ router.post('/recall-test', async (req, res) => {
   // 检查最终结果中是否有 rerank_score 来判断重排是否实际生效
   const rerankApplied = hits.some(h => h.rerank_score !== undefined && h.rerank_score !== null);
   res.json({ code: 0, data: { query, hits, count: hits.length, mode, rerankApplied, vecWeight } });
+});
+
+// ---------- AI-11（2026-11-23）图搜图：上传图片 → VL 描述 → 以描述检索图片分块 ----------
+// 务实路径（多模态嵌入模型就位前）：图片语义经 VL 模型归一为描述文本（与图片分块的入库路径对称——
+// 图片分块 content 即 VL 描述），文本检索天然对齐；命中优先返回 modality='image'（找相似图片），
+// 文本块作为次级参考随行返回。需库配置 vision_model（与摄取管道同一模型语义）。
+router.post('/image-search', async (req, res) => {
+  const { kb_id, image_base64, top_n } = req.body || {};
+  const kbId = Number(kb_id);
+  if (!Number.isInteger(kbId) || kbId <= 0) return res.json({ code: 400, msg: '请提供 kb_id（知识库）' });
+  const kb = db.prepare('SELECT * FROM kbs WHERE id=?').get(kbId);
+  const deny = denyIfNotAllowed(kb, req.user);
+  if (deny) return res.json(deny);
+  const b64 = String(image_base64 || '').replace(/^data:image\/[a-z]+;base64,/, '').trim();
+  if (!b64) return res.json({ code: 400, msg: '请提供图片（image_base64）' });
+  if (!kb.vision_model) return res.json({ code: 400, msg: '该知识库未配置视觉模型（vision_model）——图搜图需与摄取管道同一 VL 模型' });
+  let buf;
+  try { buf = Buffer.from(b64, 'base64'); } catch { return res.json({ code: 400, msg: '图片 base64 解码失败' }); }
+  if (!buf.length || buf.length > 8 * 1024 * 1024) return res.json({ code: 400, msg: '图片为空或超过 8MB' });
+  const { visionDescribe } = require('../lib/llm');
+  const vd = await visionDescribe(buf, kb.vision_model, '用一段简洁中文描述这张图片的主要内容（供相似图片检索，60 字内）。');
+  if (!vd.ok || !vd.text) return res.json({ code: 502, msg: '视觉模型描述失败：' + (vd.msg || '未知') });
+  const topN = Math.max(1, Math.min(Number(top_n) || 5, 20));
+  const hits = await retrieve(vd.text, kbId, topN * 2, 0.01, { rerankEnabled: false }); // 取双倍候选，排序时 image 优先后截 topN
+  // 图片块优先（找相似图片语义），文本块次级随行；稳定排序保留相关性内部序
+  const sorted = [...hits].sort((a, b) => (b.modality === 'image' ? 1 : 0) - (a.modality === 'image' ? 1 : 0));
+  const out = sorted.slice(0, topN);
+  res.json({ code: 0, data: { query: vd.text, hits: out, count: out.length, image_hits: out.filter(h => h.modality === 'image').length } });
 });
 
 // ---------- V1.3 #6 2026-10-30：知识库级召回评测集（保存/列表/重跑 diff/删除，全端点归属校验） ----------

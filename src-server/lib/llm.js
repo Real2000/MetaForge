@@ -281,7 +281,13 @@ async function* callReal(provider, messages, opts = {}) {
 /** 模拟回复：确定性规则生成，按小块流式吐出 */
 function mockAnswer(messages, opts = {}) {
   const userMsg = [...messages].reverse().find(m => m.role === 'user');
-  const q = (userMsg?.content || '').trim();
+  // AI-11（2026-11-23）多模态兼容：user 消息 content 可能为数组（[{type:'text'},{type:'image_url'}]，
+  // 见 visionDescribe）——拼接其中 text 片段；原 (content||'').trim() 对数组抛 TypeError，
+  // 是图搜图/图片理解在演示模式下的实测崩溃点（防御式：任何未来多模态消息走 mock 不再崩）
+  const raw = userMsg?.content;
+  const q = (Array.isArray(raw)
+    ? raw.filter(p => p && p.type === 'text').map(p => p.text || '').join(' ')
+    : String(raw ?? '')).trim();
   const kbCtx = opts.kbContext || [];
   const agentName = opts.agentName || '';
 

@@ -416,7 +416,7 @@ async function retrieve(query, kbId = null, topN = 5, threshold = 0.01, opts = {
   //（KNN 在库内算距离，向量不出库；这是 10 万分块下性能收益的本体）；opts.ann=false 可强制全扫（调试/对照）
   const annCandidate = kbId != null && opts.ann !== false && require('./vector-index').available();
   const rows = db.prepare(`
-    SELECT c.id, c.content, c.kb_id, c.file_id, c.parent_id, c.chapter_id, ${annCandidate ? '' : 'c.embedding,'} c.keywords, c.metadata, f.name AS file, k.name AS kb,
+    SELECT c.id, c.content, c.kb_id, c.file_id, c.parent_id, c.chapter_id, ${annCandidate ? '' : 'c.embedding,'} c.keywords, c.metadata, c.modality, f.name AS file, k.name AS kb,
       k.rerank_enabled AS kb_rerank_enabled, k.rerank_model AS kb_rerank_model, k.rerank_top_n AS kb_rerank_top_n, k.rerank_threshold AS kb_rerank_threshold
     FROM kb_chunks c
     LEFT JOIN kb_files f ON f.id = c.file_id
@@ -861,6 +861,7 @@ function finish(rows, bm25, vecScores, engine, topN, threshold, vecWeight = 0.5,
   const out = rows.map((r, i) => ({
     id: r.id, parent_id: r.parent_id ?? null, chapter_id: r.chapter_id ?? null, // P1/P0-TOC 修复：携带分块ID与归属，供上下文挂载
     content: r.content, file: r.file, kb: r.kb, kb_id: r.kb_id,
+    modality: r.modality || 'text', // AI-11：分块模态（image=图片 VL 描述块；前端可标识 🖼️ 来源）
     metadata: r.metadata ?? null, // V1.2 审查加固 2026-10-30：携带分块元数据（召回结果前端徽章/调用方判定用；原 JSON 字符串）
     score: Math.round(rrf[i] * 10000) / 10000,
     bm25: Math.round(bm25[i] * 1000) / 1000,

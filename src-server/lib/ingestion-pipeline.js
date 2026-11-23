@@ -386,20 +386,23 @@ function persistSuccess(ctx) {
 
   // 先插父分片，再插子分片
   if (ctx.hasParentSlice && ctx.parentChunks.length) {
-    const insParent = db.prepare('INSERT INTO kb_chunks (file_id,kb_id,content,parent_id) VALUES (?,?,?,?)');
+    const insParent = db.prepare('INSERT INTO kb_chunks (file_id,kb_id,content,parent_id,modality) VALUES (?,?,?,?,?)');
     ctx.parentChunks.forEach(pc => {
       const result = review(pc, 'kb_import');
       if (result.blocked) { blockedChunks.push('父分片：' + result.reason); return; }
-      insParent.run(ctx.fileId, kb.id, result.cleaned || pc, null);
+      insParent.run(ctx.fileId, kb.id, result.cleaned || pc, null, ctx.visionUsed ? 'image' : 'text');
     });
   }
-  const ins = db.prepare('INSERT INTO kb_chunks (file_id,kb_id,content,parent_id,chapter_id) VALUES (?,?,?,?,?)');
+  // AI-11（2026-11-23）：图片文件（visionUsed）分块标 modality='image'——文搜图命中可标识来源，
+  // 图搜图可限定检索域；文本文件保持 'text'（列默认，存量行自动归一）
+  const ins = db.prepare('INSERT INTO kb_chunks (file_id,kb_id,content,parent_id,chapter_id,modality) VALUES (?,?,?,?,?,?)');
   const parentStartIdx = ctx.hasParentSlice ? ctx.parentChunks.length : 0;
+  const chunkModality = ctx.visionUsed ? 'image' : 'text';
   chunks.forEach((c, i) => {
     const result = review(c, 'kb_import');
     if (result.blocked) { blockedChunks.push(`分块 #${i + 1}：${result.reason}`); return; }
     const parentId = ctx.hasParentSlice && ctx.childToParent[i] >= 0 ? (parentStartIdx + ctx.childToParent[i] + 1) : null;
-    ins.run(ctx.fileId, kb.id, result.cleaned || c, parentId, ctx.chapterIds ? ctx.chapterIds[i] : null);
+    ins.run(ctx.fileId, kb.id, result.cleaned || c, parentId, ctx.chapterIds ? ctx.chapterIds[i] : null, chunkModality);
   });
 
   // 有审核拦截的分块 → 记录但不中断已通过的分块写入（不影响已合法内容入库）
