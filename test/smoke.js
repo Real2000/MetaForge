@@ -10844,6 +10844,250 @@ print('PY_OK')
     }
   });
 
+  // ==================== M4 检索质量战役：AI-04 GraphRAG / AI-05 记忆召回 / AI-07 忠实度 / AI-03 多指标（2026-11-23） ====================
+  console.log('【M4】检索可信度与质量（GraphRAG 接通 / 记忆语义召回 / 忠实度校验 / RAGAS 多指标）');
+
+  // ---- AI-04：GraphRAG 接入默认管道 + 检索融合 ----
+  await t('AI-04：graphrag 已入默认管道（keywords 后）且为 post 步骤（fire-and-forget，不阻塞上传）', () => {
+    const ip = require('../src-server/lib/ingestion-pipeline');
+    assert.ok(ip.VALID_STEP('graphrag'), 'graphrag 应在步骤白名单');
+    const idx = ip.DEFAULT_PIPELINE.indexOf('graphrag');
+    assert.ok(idx > ip.DEFAULT_PIPELINE.indexOf('keywords'), 'graphrag 应排在 keywords 之后');
+    assert.ok(idx < ip.DEFAULT_PIPELINE.indexOf('regression'), 'graphrag 应在 regression 之前（计划口径：keywords 后加）');
+    assert.strictEqual(ip.PIPELINE_STEPS.graphrag.post, true, 'graphrag 应为 post 后处理步骤');
+  });
+
+  await t('AI-04：buildGraphForFile 无供应商静默跳过；DI 注入抽取器后 entities/entity_relations 非空（验收：上传后图谱表非空）', async () => {
+    const g = require('../src-server/lib/graphrag');
+    db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('AI04图谱测试库','',1,'graphu',datetime('now','localtime'))`).run();
+    const kbid = db.prepare(`SELECT id FROM kbs WHERE name='AI04图谱测试库'`).get().id;
+    const fin = db.prepare(`INSERT INTO kb_files (kb_id,name,size,status,chunk_count,created_at) VALUES (?,?,100,'success',2,datetime('now','localtime'))`).run(kbid, '图谱测试文档.txt');
+    const fid = Number(fin.lastInsertRowid);
+    const c1 = db.prepare(`INSERT INTO kb_chunks (file_id,kb_id,content) VALUES (?,?,?)`).run(fid, kbid, '张伟负责华东区的销售工作，华东区隶属于公司销售体系。');
+    db.prepare(`INSERT INTO kb_chunks (file_id,kb_id,content) VALUES (?,?,?)`).run(fid, kbid, '李娜担任人力资源总监，负责招聘与培训。');
+    // 无供应商（测试库无 providers）→ 静默跳过，不炸
+    const skip = await g.buildGraphForFile(fid, kbid);
+    assert.strictEqual(skip.skipped, 'no_provider', '无供应商应 skipped=no_provider：' + JSON.stringify(skip));
+    // DI 注入确定性抽取器（force 跳过供应商检查）→ 实体/三元组全量落库
+    const r1 = await g.buildGraphForFile(fid, kbid, {
+      force: true,
+      extractEntities: async (chunks) => [
+        { name: '张伟', type: '人物', description: '销售' }, { name: '华东区', type: '地点', description: '区域' },
+        { name: '李娜', type: '人物', description: 'HR' }, { name: '人力资源部', type: '组织', description: '部门' },
+      ],
+      extractTriples: async (text) => String(text).includes('张伟')
+        ? [{ subject: '张伟', predicate: '负责', object: '华东区' }]
+        : [{ subject: '李娜', predicate: '担任', object: '人力资源部' }],
+    });
+    assert.strictEqual(r1.entities, 4, '应新增 4 个实体（幂等键 name+type）：' + JSON.stringify(r1));
+    assert.strictEqual(r1.relations, 2, '应写入 2 条关系（两个分块各 1）：' + JSON.stringify(r1));
+    const entCount = db.prepare('SELECT COUNT(*) c FROM entities').get().c;
+    const relCount = db.prepare('SELECT COUNT(*) c FROM entity_relations').get().c;
+    assert.ok(entCount >= 4 && relCount >= 2, `图谱表应非空：entities=${entCount} relations=${relCount}`);
+    // 幂等：重复构建不新增实体（persistEntities 同名+同类型合并 kb_ids）
+    const r2 = await g.buildGraphForFile(fid, kbid, {
+      force: true,
+      extractEntities: async () => [{ name: '张伟', type: '人物', description: '销售' }],
+      extractTriples: async () => [],
+    });
+    assert.strictEqual(r2.entities, 0, '重复抽取同实体应 0 新增（幂等）');
+    globalThis.__ai04KbId = kbid; // 供检索融合用例复用
+    globalThis.__ai04ChunkId = Number(c1.lastInsertRowid);
+  });
+
+  await t('AI-04：检索图谱通道融合——实体关联查询命中支撑分块（channels=graph 标记 + trace.graph 可观测）', async () => {
+    const r = require('../src-server/lib/retriever');
+    const kbid = globalThis.__ai04KbId;
+    assert.ok(kbid, '依赖图谱测试库');
+    const trace = {};
+    const hits = await r.retrieve('张伟负责什么工作', kbid, 5, 0, { rerankEnabled: false, trace });
+    assert.ok(hits.length >= 1, '应能命中张伟分块');
+    const zh = hits.find(h => String(h.content || '').includes('张伟'));
+    assert.ok(zh, '张伟分块应进 Top-N（BM25 已可命中，图谱通道叠加助推）');
+    assert.ok(trace.graph && trace.graph.chunks >= 1, 'trace.graph 应记录图谱通道命中：' + JSON.stringify(trace.graph));
+    assert.ok(zh.graph === true, '图谱命中的分块应带 graph 标记');
+    // 关闭图谱通道（opts.graph=false）→ trace 无 graph 字段、无 graph 标记（对照语义）
+    const trace2 = {};
+    const hits2 = await r.retrieve('张伟负责什么工作', kbid, 5, 0, { rerankEnabled: false, graph: false, trace: trace2 });
+    assert.strictEqual(trace2.graph, undefined, 'graph=false 应跳过图谱通道');
+    assert.ok(hits2.every(h => h.graph == null), '关闭通道时不应有 graph 标记');
+  });
+
+  // ---- AI-05：记忆语义召回 + 同义合并 ----
+  await t('AI-05：agent_memories 迁移——embedding/last_used_at 列已就绪', () => {
+    const cols = db.prepare('PRAGMA table_info(agent_memories)').all().map(c => c.name);
+    assert.ok(cols.includes('embedding'), '应有 embedding 列：' + cols.join(','));
+    assert.ok(cols.includes('last_used_at'), '应有 last_used_at 列');
+  });
+
+  await t('AI-05：recallMemories 语义排序 Top-K——相关记忆排前、无关不挤占注入位、last_used_at 回写', async () => {
+    const mr = require('../src-server/lib/memory-recall');
+    db.prepare('INSERT INTO agents (name,prompt,owner,created_at) VALUES (\'AI05记忆测试智能体\',\'测试\',\'memu\',datetime(\'now\',\'localtime\'))').run();
+    const aid = db.prepare(`SELECT id FROM agents WHERE name='AI05记忆测试智能体'`).get().id;
+    const ins = db.prepare('INSERT INTO agent_memories (agent_id,username,fact,type,confidence,source,created_at) VALUES (?,?,?,?,?,?,?)');
+    ins.run(aid, 'memu', '用户是银行客户经理，负责信贷业务', 'fact', 1.0, 'chat', '2026-11-20 10:00:00');
+    ins.run(aid, 'memu', '用户偏好简洁的回复风格', 'preference', 1.0, 'chat', '2026-11-20 10:00:00');
+    ins.run(aid, 'memu', '用户养了一只橘猫', 'fact', 1.0, 'chat', '2026-11-01 10:00:00');
+    const trace = {};
+    const rows = await mr.recallMemories(aid, 'memu', '帮我写一份信贷风险审查报告', { topK: 2, trace });
+    assert.strictEqual(rows.length, 2, 'Top-K=2 应只回 2 条（原行为全量 LIMIT 20）');
+    assert.ok(String(rows[0].fact).includes('信贷') || String(rows[0].fact).includes('银行'), '相关记忆应排第一：' + rows[0].fact);
+    assert.ok(trace.memory && trace.memory.engine === 'H' && trace.memory.injected === 2, 'trace 应记录引擎与注入数：' + JSON.stringify(trace.memory));
+    const used = db.prepare('SELECT last_used_at FROM agent_memories WHERE agent_id=? AND fact LIKE ?').get(aid, '%信贷%');
+    assert.ok(used && used.last_used_at, '命中记忆应回写 last_used_at');
+    // 向量懒缓存：召回后 embedding 列应已写入（本地哈希 BLOB）
+    const cached = db.prepare('SELECT embedding FROM agent_memories WHERE agent_id=? AND fact LIKE ?').get(aid, '%橘猫%');
+    assert.ok(cached && cached.embedding, '召回侧应懒写入向量缓存（BLOB）');
+    globalThis.__ai05AgentId = aid;
+  });
+
+  await t('AI-05：recordMemories 同义合并——近义重复更新既有行而非新增；互为子串去重保持', async () => {
+    const mr = require('../src-server/lib/memory-recall');
+    const aid = globalThis.__ai05AgentId;
+    assert.ok(aid, '依赖记忆测试智能体');
+    // ① 互为子串去重（改造前语义保留）
+    const s1 = await mr.recordMemories({ agentId: aid, username: 'memu', facts: ['用户是银行客户经理，负责信贷业务'] });
+    assert.strictEqual(s1.inserted, 0, '与既有记忆互为子串应 0 新增：' + JSON.stringify(s1));
+    // ② 同义合并：措辞微调（近义）→ 本地哈希 cosine > 0.92 → 更新既有行
+    const before = db.prepare('SELECT COUNT(*) c FROM agent_memories WHERE agent_id=? AND username=?').get(aid, 'memu').c;
+    const s2 = await mr.recordMemories({ agentId: aid, username: 'memu', facts: ['用户是银行客户经理，负责信贷审批业务'] });
+    const after = db.prepare('SELECT COUNT(*) c FROM agent_memories WHERE agent_id=? AND username=?').get(aid, 'memu').c;
+    assert.strictEqual(after, before, '近义重复应合并不新增：' + before + ' → ' + after + '，' + JSON.stringify(s2));
+    const merged = db.prepare('SELECT fact, embedding FROM agent_memories WHERE agent_id=? AND username=? AND fact LIKE ?').get(aid, 'memu', '%信贷审批%');
+    assert.ok(merged, '合并后应保留新措辞：' + (merged && merged.fact));
+    assert.ok(merged && merged.embedding, '合并行应带新向量缓存');
+    // ③ 全新事实 → 正常新增且带向量
+    const s3 = await mr.recordMemories({ agentId: aid, username: 'memu', facts: ['用户所在分行在杭州'] });
+    assert.strictEqual(s3.inserted, 1, '全新事实应正常新增');
+    const row3 = db.prepare('SELECT embedding FROM agent_memories WHERE agent_id=? AND username=? AND fact=?').get(aid, 'memu', '用户所在分行在杭州');
+    assert.ok(row3 && row3.embedding, '新增记忆应随写向量缓存');
+  });
+
+  await t('AI-05：衰减函数口径——新记忆满权重、90 天半衰、长期下限 0.2', () => {
+    const mr = require('../src-server/lib/memory-recall');
+    assert.strictEqual(mr.decayFactor(null), 1, '无时间基点不惩罚');
+    assert.ok(Math.abs(mr.decayFactor(new Date().toLocaleString('sv-SE')) - 1) < 0.01, '刚创建应 ~1');
+    const half = mr.decayFactor(new Date(Date.now() - 90 * 86400000).toLocaleString('sv-SE'));
+    assert.ok(Math.abs(half - 0.5) < 0.05, '90 天应 ~0.5（半衰期），实得 ' + half);
+    const old = mr.decayFactor(new Date(Date.now() - 900 * 86400000).toLocaleString('sv-SE'));
+    assert.strictEqual(old, 0.2, '超长期应钳制下限 0.2（偏好类记忆不失效只降权）');
+  });
+
+  // ---- AI-07：答案忠实度 / 引用校验 ----
+  await t('AI-07：引用编号解析与分句（纯函数口径）', () => {
+    const f = require('../src-server/lib/faithfulness');
+    assert.deepStrictEqual(f.parseCitations('答案如[1]，多引用[2][3]与越界[99]'), [1, 2, 3, 99], '应去重保序提取全部编号');
+    const s = f.splitSentences('这是第一句完整内容。[1] 第二句较短。好的。\n第三句完整且足够长度！');
+    assert.ok(s.length >= 2, '短碎片（<6 字实义）应被过滤，实质句保留：' + JSON.stringify(s));
+    assert.ok(s[0].includes('这是第一句完整内容'), '首句应保留：' + s[0]);
+    assert.ok(!s.some(x => x.includes('第二句较短') || x.includes('好的')), '短碎片不应送检');
+  });
+
+  await t('AI-07：词面校验（无供应商 lexical 模式）——支撑回答 pass / 越界引用 low / 幻觉断言 low', async () => {
+    const f = require('../src-server/lib/faithfulness');
+    const hits = [{ content: '公司规定员工迟到需填写补卡单，由部门主管审批。' }, { content: '报销须在费用发生后 30 天内提交。' }];
+    // ① 有据回答（引用 + 内容来自片段）→ pass
+    const ok = await f.checkFaithfulness({ answer: '员工迟到需要填写补卡单并由部门主管审批。[1]', hits });
+    assert.strictEqual(ok.verdict, 'pass', '有据回答应 pass：' + JSON.stringify(ok && ok.summary));
+    assert.strictEqual(ok.mode, 'lexical', '无供应商应为词面模式');
+    assert.strictEqual(ok.score, 1, '全支撑应为 1');
+    // ② 引用越界（[9] 但命中集仅 2 条）→ low_confidence + invalidCitations
+    const bad = await f.checkFaithfulness({ answer: '员工迟到需要填写补卡单并由部门主管审批。[9]', hits });
+    assert.ok(bad.lowConfidence, '越界引用应低置信');
+    assert.deepStrictEqual(bad.invalidCitations, [9], '应检出越界编号 9');
+    // ③ 幻觉断言（命中集中不存在的事实）→ 词面覆盖不足 → low_confidence
+    const hal = await f.checkFaithfulness({ answer: '所有迟到员工一律罚款五百元并通报批评。[1]', hits });
+    assert.ok(hal.lowConfidence && hal.unsupported.length >= 1, '幻觉断言应判不支撑：' + JSON.stringify(hal && hal.summary));
+    // ④ 空 hits / 空答案 → null（0 阻断不炸）
+    assert.strictEqual(await f.checkFaithfulness({ answer: 'x'.repeat(20), hits: [] }), null);
+    assert.strictEqual(await f.checkFaithfulness({ answer: '', hits }), null);
+  });
+
+  // ---- AI-03：召回多指标（Recall@K / MRR / NDCG）----
+  await t('AI-03：rankMetrics 纯函数——Top-1/hit@K/rank/MRR/NDCG 各形态口径', () => {
+    const { rankMetrics } = require('../src-server/lib/kb-eval-regression');
+    // 首位命中：全指标满分
+    const m1 = rankMetrics(['包含甲目标词的内容', '无关内容'], ['甲目标词']);
+    assert.strictEqual(m1.top1, true); assert.strictEqual(m1.rank, 1); assert.strictEqual(m1.mrr, 1); assert.strictEqual(m1.ndcg, 1);
+    // 第 2 位命中：MRR=0.5，NDCG < 1（排序质量惩罚）
+    const m2 = rankMetrics(['无关内容', '包含甲目标词'], ['甲目标词']);
+    assert.strictEqual(m2.top1, false); assert.strictEqual(m2.hitK, true); assert.strictEqual(m2.rank, 2);
+    assert.strictEqual(m2.mrr, 0.5);
+    assert.ok(m2.ndcg > 0.5 && m2.ndcg < 1, '第 2 位命中 NDCG 应 (0.5,1)：' + m2.ndcg);
+    // 未命中：全 0
+    const m3 = rankMetrics(['无关一', '无关二'], ['目标词']);
+    assert.strictEqual(m3.top1, false); assert.strictEqual(m3.hitK, false); assert.strictEqual(m3.mrr, 0); assert.strictEqual(m3.ndcg, 0);
+    // 多期望词覆盖率：2 词中 1 词 → recall 0.5
+    const m4 = rankMetrics(['包含甲词'], ['甲词', '乙词']);
+    assert.strictEqual(m4.recall, 0.5, '期望词覆盖率应为 0.5');
+  });
+
+  await t('AI-03：rerunEvalSet 落多指标——evaluations.metrics 含 hit@K/召回@K/MRR/NDCG，result 明细增补字段且旧字段兼容', async () => {
+    const { rerunEvalSet } = require('../src-server/lib/kb-eval-regression');
+    const kbid = globalThis.__ai04KbId; // 复用图谱测试库（已有张伟/李娜分块）
+    assert.ok(kbid, '依赖 AI-04 测试库');
+    db.prepare(`INSERT INTO evaluations (name,kb_id,type,dataset,status,score,created_at) VALUES ('AI03多指标评测集',?,'kb',?,'done',NULL,datetime('now','localtime'))`)
+      .run(kbid, JSON.stringify([
+        { query: '张伟负责什么工作', expect_terms: ['张伟'] },
+        { query: '李娜担任什么职务', expect_terms: ['李娜'] },
+      ]));
+    const ev = db.prepare(`SELECT * FROM evaluations WHERE name='AI03多指标评测集' AND kb_id=?`).get(kbid);
+    const r = await rerunEvalSet(ev);
+    assert.ok(r.score > 0, 'Top-1 均分应为正（两问皆应首位命中）：' + r.score);
+    assert.ok(r.metrics && r.metrics.k === 10 && r.metrics.cases === 2, '聚合应含 K=10 与用例数：' + JSON.stringify(r.metrics));
+    assert.ok(r.metrics.hit_at_k > 0 && r.metrics.mrr > 0 && r.metrics.ndcg > 0, 'hit@K/MRR/NDCG 应为正：' + JSON.stringify(r.metrics));
+    assert.ok(r.metrics.recall_at_k > 0, '召回@K 应为正');
+    const stored = JSON.parse(db.prepare('SELECT metrics FROM evaluations WHERE id=?').get(ev.id).metrics);
+    assert.ok(stored.mrr != null && stored.ndcg != null, 'metrics 列应持久化多指标');
+    const detail0 = JSON.parse(db.prepare('SELECT result FROM evaluations WHERE id=?').get(ev.id).result)[0];
+    assert.ok('query' in detail0 && 'hit' in detail0 && 'score' in detail0, '旧字段应保留（前端/基线导入兼容）');
+    assert.ok('rank' in detail0 && 'mrr' in detail0 && 'ndcg' in detail0 && 'recall' in detail0, '新字段应增补：' + JSON.stringify(Object.keys(detail0)));
+  });
+
+  await t('AI-03：ragFourMetrics 启发式四指标——检索好/跑题/幻觉三形态可判（无供应商 heuristic 模式）', async () => {
+    const rm = require('../src-server/lib/rag-metrics');
+    const contexts = ['员工迟到需填写补卡单，由部门主管审批后生效。', '报销须在费用发生后 30 天内提交财务系统。'];
+    const good = await rm.ragFourMetrics({ query: '迟到怎么处理', contexts, answer: '员工迟到需填写补卡单，由部门主管审批后生效。[1]' });
+    assert.strictEqual(good.mode, 'heuristic');
+    assert.ok(good.context_precision > 0 && good.answer_relevancy > 0 && good.faithfulness === 1, '好回答四指标应全正：' + JSON.stringify(good));
+    const hal = await rm.ragFourMetrics({ query: '迟到怎么处理', contexts, answer: '迟到一律罚款五百元并全公司通报批评，情节严重者开除。[1]' });
+    assert.ok(hal.faithfulness < good.faithfulness, '幻觉回答忠实度应低于有据回答');
+    const off = await rm.ragFourMetrics({ query: '公司年报净利润是多少', contexts, answer: '员工迟到需填写补卡单，由部门主管审批后生效。' });
+    assert.ok(off.answer_relevancy < good.answer_relevancy, '跑题回答相关性应低');
+    assert.strictEqual(off.context_recall, 0, '问题所需信息未被覆盖时上下文召回率应为 0');
+  });
+
+  await t('AI-03：runRagBaseline 端到端（answerFn DI 注入）——落 evaluations(type=rag) + 四指标聚合 + score 可比', async () => {
+    const rm = require('../src-server/lib/rag-metrics');
+    const kbid = globalThis.__ai04KbId;
+    assert.ok(kbid, '依赖 AI-04 测试库');
+    const out = await rm.runRagBaseline({
+      kbId: kbid,
+      cases: [
+        { query: '张伟负责什么工作', expect_terms: ['张伟'] },
+        { query: '李娜担任什么职务', expect_terms: ['李娜'] },
+      ],
+      opts: {
+        answerFn: async ({ query, contexts }) => {
+          const hit = contexts.find(c => c.includes(query.includes('张伟') ? '张伟' : '李娜')) || contexts[0] || '';
+          return `根据资料：${String(hit).slice(0, 40)}[1]`;
+        },
+      },
+    });
+    assert.strictEqual(out.ok, true, '基线应成功：' + JSON.stringify(out).slice(0, 200));
+    assert.strictEqual(out.cases, 2);
+    assert.ok(out.metrics.evaluated_answers === 2, 'answerFn 注入下两条用例均可评答案侧：' + JSON.stringify(out.metrics));
+    for (const k of ['context_precision', 'context_recall', 'answer_relevancy', 'faithfulness']) {
+      assert.ok(Number.isFinite(out.metrics[k]), `四指标 ${k} 应有值：` + JSON.stringify(out.metrics));
+    }
+    const row = db.prepare(`SELECT * FROM evaluations WHERE id=? AND type='rag'`).get(out.id);
+    assert.ok(row, '应落 evaluations type=rag 行');
+    assert.ok(Number.isFinite(row.score) && row.score > 0, 'score 应为四指标均值（可排序可比）');
+    // 反例：空用例集
+    const bad = await rm.runRagBaseline({ kbId: kbid, cases: [] });
+    assert.strictEqual(bad.ok, false, '空用例应被拒绝');
+  });
+
   try { db.close(); } catch { }
   fs.rmSync(process.env.AGENT_DATA_DIR, { recursive: true, force: true });
   console.log('\n———————————————');

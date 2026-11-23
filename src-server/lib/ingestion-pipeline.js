@@ -296,6 +296,25 @@ const PIPELINE_STEPS = {
     },
   },
 
+  graphrag: {
+    name: 'graphrag',
+    label: '知识图谱抽取',
+    desc: '后台 fire-and-forget 用 LLM 抽取实体与关系三元组入库（M4 AI-04；不阻塞上传，无供应商/失败静默，单文件分块数设上限控成本）',
+    post: true,
+    async run(ctx) {
+      // 懒加载避免启动期依赖图扩大；图谱抽取可能较慢（逐分块 LLM 调用），必须不阻塞摄取响应
+      const { buildGraphForFile } = require('./graphrag');
+      buildGraphForFile(ctx.fileId, ctx.kb.id).catch(e => {
+        // 图谱抽取失败落 err_logs 可观测（与 regression 步骤同语义），不影响文件已成功入库的状态
+        try {
+          db.prepare('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)')
+            .run('kb-graphrag', `库#${ctx.kb.id} 文件#${ctx.fileId}（${ctx.name}）图谱抽取失败：${e && e.message}`, now());
+        } catch { }
+      });
+      return { ok: true };
+    },
+  },
+
   regression: {
     name: 'regression',
     label: '召回评测回归',
@@ -314,8 +333,10 @@ const PIPELINE_STEPS = {
   },
 };
 
-/** 默认管道步骤名数组（顺序即执行顺序；注册表键序与此一致） */
-const DEFAULT_PIPELINE = ['parse', 'ocr', 'vision-describe', 'clean', 'chunk', 'toc', 'metadata', 'keywords', 'regression'];
+/** 默认管道步骤名数组（顺序即执行顺序；注册表键序与此一致）。
+ *  M4 AI-04（2026-11-23）：keywords 后新增 graphrag（post，fire-and-forget）——实体/三元组抽取自此接入默认管道；
+ *  存量库的自定义 pipeline 数组不含 graphrag 则不启用（与「默认管道 keywords 后加 graphrag」的排期口径一致）。 */
+const DEFAULT_PIPELINE = ['parse', 'ocr', 'vision-describe', 'clean', 'chunk', 'toc', 'metadata', 'keywords', 'graphrag', 'regression'];
 
 /** 步骤名白名单校验：是否为注册表内合法步骤 */
 function VALID_STEP(name) {

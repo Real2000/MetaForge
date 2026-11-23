@@ -51,11 +51,12 @@ async function genSuggestions(userInput, assistantReply, agentName) {
 }
 
 /** 长期记忆提取（借鉴 SinguX「记忆-长期记忆」）：从本轮对话中提取值得跨会话记住的用户特征事实，
- *  去重后落库 agent_memories。P1-4 增加 type/confidence/source/summary 字段，支持事实/偏好/摘要三种类型 */
+ *  去重后落库 agent_memories。P1-4 增加 type/confidence/source/summary 字段，支持事实/偏好/摘要三种类型。
+ *  M4 AI-05（2026-11-23）：落库改经 lib/memory-recall.recordMemories——语义同义合并（cosine>0.92 更新
+ *  既有行而非新增近义重复）+ 向量随写缓存（供召回侧 Top-K 相关性排序）；嵌入失败静默降级，绝不阻断 */
 async function extractMemory(agent, username, userInput, assistantReply) {
   try {
-    const existing = db.prepare('SELECT fact, type FROM agent_memories WHERE agent_id=? AND username=?').all(agent.id, username).map(r => ({ fact: r.fact, type: r.type }));
-    const existingFacts = existing.map(r => r.fact);
+    const existingFacts = db.prepare('SELECT fact FROM agent_memories WHERE agent_id=? AND username=?').all(agent.id, username).map(r => r.fact);
     const r = await chatOnce([
       { role: 'system', content: `你是用户记忆提取器。根据对话内容提取值得长期记住的当前用户特征事实（如职业、偏好、称呼、业务背景），忽略一次性问题内容。
 规则：只输出 JSON 数组（如 ["用户是银行客户经理","用户偏好简洁回复"]），最多 3 条，每条不超过 25 字；没有值得记住的内容输出 []；不要其他任何文字。` },
@@ -64,11 +65,9 @@ async function extractMemory(agent, username, userInput, assistantReply) {
     const m = (r.full || '').match(/\[[\s\S]*\]/);
     if (!m) return;
     const facts = JSON.parse(m[0]).filter(x => typeof x === 'string' && x.trim()).slice(0, 3).map(x => x.trim().slice(0, 40));
-    for (const f of facts) {
-      if (existingFacts.some(e => e.includes(f) || f.includes(e))) continue; // 去重（含互为子串）
-      const type = /偏好|喜欢|不喜欢|希望|想要/.test(f) ? 'preference' : 'fact';
-      db.prepare('INSERT INTO agent_memories (agent_id,username,fact,type,confidence,source,created_at) VALUES (?,?,?,?,1.0,?,?)').run(agent.id, username, f, type, 'chat', now());
-    }
+    if (!facts.length) return;
+    // AI-05：精确/子串去重 + 同义合并 + 向量随写缓存统一由 memory-recall 收口（嵌入不可用静默降级，0 阻断）
+    await require('../lib/memory-recall').recordMemories({ agentId: agent.id, username, facts, source: 'chat' });
   } catch { /* 静默 */ }
 }
 
@@ -1039,7 +1038,13 @@ router.post('/stream', async (req, res) => {
     }
     let memRows = [];
     if (agent?.long_memory) {
-      memRows = db.prepare('SELECT fact, type, confidence FROM agent_memories WHERE agent_id=? AND username=? ORDER BY type ASC, confidence DESC LIMIT 20').all(agent.id, req.user.username);
+      // M4 AI-05：按当前 query 语义相关性召回 Top-K（替代固定 LIMIT 20 全量注入）；低置信/长期未用记忆衰减；
+      // 嵌入不可用自动降级本地哈希，任何异常回落旧行为（type ASC/confidence DESC LIMIT 20），0 阻断
+      try {
+        memRows = await require('../lib/memory-recall').recallMemories(agent.id, req.user.username, chatInput.trim() || input, { topK: 8, trace: retrievalTrace });
+      } catch {
+        memRows = db.prepare('SELECT fact, type, confidence FROM agent_memories WHERE agent_id=? AND username=? ORDER BY type ASC, confidence DESC LIMIT 20').all(agent.id, req.user.username);
+      }
       if (memRows.length) {
         system += `\n\n【长期记忆】已记住的当前用户特征（回复时自然利用，无需重复询问）：\n${memRows.map(m => '- ' + m.fact).join('\n')}`;
       }
@@ -1459,6 +1464,24 @@ router.post('/stream', async (req, res) => {
         logSecurityEvent('pii_output', `输出含 ${types.join('、')}，已自动脱敏`, '自动脱敏', 'chat');
       }
       send('notice', { msg: outPii.length && !outCheck.words.length ? '🔒 回复中的个人信息已按合规要求自动脱敏。' : '回复内容包含违规词汇或个人信息，已自动脱敏处理。' });
+    }
+
+    // M4 AI-07（2026-11-23）：答案忠实度/引用校验——KB 命中且非中断时执行；L1 引用域校验恒开（0 成本），
+    // L2 LLM 批量裁决有供应商时默认开（AGENT_FAITHFULNESS_LLM=0 可关，8s 硬超时回落词面）。
+    // 不达标仅标注「低置信」（不做重答——流式内容已下发，二次生成体验差且成本翻倍）；0 阻断：任何异常跳过。
+    if (kbHits.length && !stopped) {
+      try {
+        const fv = await require('../lib/faithfulness').checkFaithfulness({ answer: outMasked, hits: kbHits, query: chatInput.trim() || input });
+        if (fv) {
+          retrievalTrace.faithfulness = fv.summary; // 随 chat_traces.retrieval_trace 落库（AI-13 可观测）
+          if (fv.lowConfidence) {
+            send('notice', {
+              msg: `⚠️ 检索依据提示：本回答部分内容缺乏知识库支撑（支撑度 ${Math.round((fv.score ?? 0) * 100)}%` +
+                `${fv.invalidCitations.length ? `，含 ${fv.invalidCitations.length} 处无效引用编号` : ''}），请核实关键结论。`,
+            });
+          }
+        }
+      } catch { /* 校验失败不影响回答下发 */ }
     }
 
     const tokens = Math.ceil(outMasked.length * 0.6);

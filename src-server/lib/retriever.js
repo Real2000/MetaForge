@@ -10,6 +10,8 @@
  * 6. 元数据过滤（V1.2 #2 2026-10-30）：opts.metadataFilter（JSON 对象，AND 语义）——分块行通过当且仅当
  * 7. 重排阈值门控 + 库级配置（M4 AI-09 2026-11-23）：kbs 可配 rerank_enabled/rerank_model/rerank_top_n/
  *    rerank_threshold（库级覆盖传入 opts）；重排分数低于阈值的片段不进 context；降级/生效写 opts.trace
+ * 8. GraphRAG 图谱通道（M4 AI-04 2026-11-23）：查询关联实体 → 支撑关系分块作为 RRF 第三通道
+ *    （固定权重 GRAPH_W，在 wB+wV 之外叠加；opts.graph=false 可关）；命中标记 r.graph + channels='graph'
  *    过滤的每个键都满足 meta[key] === 过滤值，或 meta[key] 为数组且包含该值；无元数据/缺键的行被
  *    滤除（fail-closed，防误授权）；不传或空对象时行为与无过滤完全一致（黄金基线护栏红线）
  * 返回 [{content, file, kb, kb_id, score(融合), bm25, vec, engine, channels, hit_terms, rerank_score}]
@@ -31,6 +33,8 @@ const RERANK_MODEL = 'bge-reranker-v2-m3'; // 默认重排模型
 const RERANK_TIMEOUT = 10000; // 重排调用超时
 const RERANK_CANDIDATES = 30; // 粗召回送入 Rerank 的候选数
 const RERANK_TOP_N = 5;      // Rerank 后精排输出数
+const GRAPH_W = 0.25;        // 图谱通道 RRF 融合权重（AI-04；在 wB+wV 之外叠加，wB=wV=0.5 时约占 1/5，仅助推不主导）
+const GRAPH_TOP_K = 8;       // 图谱关联实体取数上限（实体链接 topK）
 
 const { injectWatermark } = require('./trusted-kb-gateway'); // U2-7 外部源引用水印
 
@@ -405,6 +409,27 @@ async function retrieve(query, kbId = null, topN = 5, threshold = 0.01, opts = {
   const qTerms = terms(query);
   if (!qTerms.length) return [];
 
+  // 通道 0：GraphRAG 图谱（M4 AI-04）——查询词关联实体 → 一度关系 → 支撑分块作为第三通道并入 RRF 融合。
+  // 实体表为空时一次 EXISTS 探测即短路（无图谱数据的库零开销）；任何异常静默跳过（0 阻断，主检索不受影响）。
+  // 懒加载 graphrag（其依赖 llm.js）避免无图谱路径的依赖图扩大。
+  let graphRank = null;
+  if (opts.graph !== false) {
+    try {
+      const hasEntities = db.prepare('SELECT EXISTS(SELECT 1 FROM entities) AS has').get().has;
+      if (hasEntities) {
+        const { retrieveGraph } = require('./graphrag');
+        const g = retrieveGraph(query, kbId, opts.graphTopK || GRAPH_TOP_K);
+        if (g && Array.isArray(g.chunk_ids) && g.chunk_ids.length) {
+          const idToIdx = new Map(rows.map((r, i) => [Number(r.id), i]));
+          graphRank = g.chunk_ids.map(cid => idToIdx.get(Number(cid))).filter(i => i != null); // 行号基于元数据过滤后的 rows
+          if (graphRank.length && _trace) {
+            _trace.graph = { entities: g.entities.length, relations: g.relations.length, chunks: graphRank.length };
+          }
+        }
+      }
+    } catch { /* 图谱通道异常不影响主检索 */ }
+  }
+
   // 通道 1：BM25（同步）
   const bm25 = bm25Scores(rows, qTerms);
 
@@ -422,7 +447,7 @@ async function retrieve(query, kbId = null, topN = 5, threshold = 0.01, opts = {
   if (parsed.every(p => p.engine === 'B3')) {
     // 全部已有 bge 缓存，查询向量走网关（失败则整体降级本地重算）
     const q = await bgeEmbed([query]);
-    if (q) { if (_trace) _trace.engine = engine; return rerankAndSlice(query, finish(rows, bm25, parsed.map(p => p.v), new Float32Array(q[0]), engine, RERANK_CANDIDATES, threshold, vecWeight, qTerms), topN, rerankOpts, kbId); }
+    if (q) { if (_trace) _trace.engine = engine; return rerankAndSlice(query, finish(rows, bm25, parsed.map(p => p.v), new Float32Array(q[0]), engine, RERANK_CANDIDATES, threshold, vecWeight, qTerms, graphRank), topN, rerankOpts, kbId); }
   }
   const missIdx = rows.map((_, i) => i).filter(i => parsed[i].engine !== 'B3');
   if (missIdx.length) {
@@ -434,7 +459,7 @@ async function retrieve(query, kbId = null, topN = 5, threshold = 0.01, opts = {
         parsed[idx] = { v: new Float32Array(got[k + 1]), engine: 'B3' };
       });
       if (_trace) _trace.engine = engine;
-      return rerankAndSlice(query, finish(rows, bm25, parsed.map(p => p.v), new Float32Array(got[0]), engine, RERANK_CANDIDATES, threshold, vecWeight, qTerms), topN, rerankOpts, kbId);
+      return rerankAndSlice(query, finish(rows, bm25, parsed.map(p => p.v), new Float32Array(got[0]), engine, RERANK_CANDIDATES, threshold, vecWeight, qTerms, graphRank), topN, rerankOpts, kbId);
     }
   }
 
@@ -448,7 +473,7 @@ async function retrieve(query, kbId = null, topN = 5, threshold = 0.01, opts = {
     return v;
   });
   if (_trace) _trace.engine = engine;
-  return rerankAndSlice(query, finish(rows, bm25, vecs, qVec, engine, RERANK_CANDIDATES, threshold, vecWeight, qTerms), topN, rerankOpts, kbId);
+  return rerankAndSlice(query, finish(rows, bm25, vecs, qVec, engine, RERANK_CANDIDATES, threshold, vecWeight, qTerms, graphRank), topN, rerankOpts, kbId);
 }
 
 /** Rerank 重排（优先）→ 如果不可用/被关闭/失败，退回 RRF 排名前 topN 条。opts.rerankEnabled=false 跳过重排，opts.rerankModel 指定模型
@@ -545,8 +570,9 @@ function attachChapterContext(results) {
   return results;
 }
 
-/** 加权 RRF 融合 + 排序输出（两种引擎共用）。vecWeight 为向量通道权重（0~1）；qTerms 用于计算每条结果的命中词 */
-function finish(rows, bm25, vecs, qVec, engine, topN, threshold, vecWeight = 0.5, qTerms = []) {
+/** 加权 RRF 融合 + 排序输出（两种引擎共用）。vecWeight 为向量通道权重（0~1）；qTerms 用于计算每条结果的命中词
+ *  graphRank（AI-04）：图谱通道命中的行索引数组（按图谱关联度排序）——固定权重 GRAPH_W 参与融合，命中标记 r.graph。 */
+function finish(rows, bm25, vecs, qVec, engine, topN, threshold, vecWeight = 0.5, qTerms = [], graphRank = null) {
   const vec = vecs.map(v => cosine(qVec, v));
   const K = 60;
   const wV = Math.min(1, Math.max(0, vecWeight)); // 向量通道权重（0=纯关键词，1=纯向量）
@@ -556,6 +582,12 @@ function finish(rows, bm25, vecs, qVec, engine, topN, threshold, vecWeight = 0.5
   const rrf = new Array(rows.length).fill(0);
   bm25Rank.forEach((idx, rank) => { if (bm25[idx] > 0) rrf[idx] += wB / (K + rank + 1); });
   vecRank.forEach((idx, rank) => { if (vec[idx] > 0.05) rrf[idx] += wV / (K + rank + 1); });
+  const graphSet = new Set();
+  if (graphRank && graphRank.length) {
+    graphRank.forEach((idx, rank) => {
+      if (idx >= 0 && idx < rows.length) { rrf[idx] += GRAPH_W / (K + rank + 1); graphSet.add(idx); }
+    });
+  }
 
   const out = rows.map((r, i) => ({
     id: r.id, parent_id: r.parent_id ?? null, chapter_id: r.chapter_id ?? null, // P1/P0-TOC 修复：携带分块ID与归属，供上下文挂载
@@ -571,11 +603,12 @@ function finish(rows, bm25, vecs, qVec, engine, topN, threshold, vecWeight = 0.5
     .sort((a, b) => b.score - a.score)
     .slice(0, topN);
 
-  // 命中通道标识（bm25/vec/both）+ 命中查询词（前端高亮用）——仅对输出条目计算，开销可控
+  // 命中通道标识（bm25/vec/both/graph）+ 命中查询词（前端高亮用）——仅对输出条目计算，开销可控
   const qSet = new Set(qTerms);
   for (const r of out) {
-    const bm25Hit = r.bm25 > 0, vecHit = r.vec > 0.05;
-    r.channels = bm25Hit && vecHit ? 'both' : bm25Hit ? 'bm25' : vecHit ? 'vec' : 'none';
+    const bm25Hit = r.bm25 > 0, vecHit = r.vec > 0.05, graphHit = graphSet.has(r._i);
+    if (graphHit) r.graph = true; // AI-04：图谱通道命中标记（可观测；与 channels 字段解耦不破坏前端既有语义）
+    r.channels = bm25Hit && vecHit ? 'both' : bm25Hit ? 'bm25' : vecHit ? 'vec' : graphHit ? 'graph' : 'none';
     if (qSet.size) {
       try { r.hit_terms = [...new Set(terms(rows[r._i].content).filter(t => qSet.has(t)))].slice(0, 20); } catch { }
     }

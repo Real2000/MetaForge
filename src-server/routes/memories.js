@@ -72,7 +72,8 @@ router.post('/merge', adminOnly, (req, res) => {
   const newType = TYPE_SET.has(type) ? type : (TYPE_SET.has(keep.type) ? keep.type : 'fact');
   const maxConf = Math.max(...rows.map(r => (r.confidence == null ? 1.0 : r.confidence)));
   const tx = db.transaction(() => {
-    db.prepare('UPDATE agent_memories SET fact=?, type=?, confidence=?, source=? WHERE id=?')
+    // AI-05（2026-11-23）：合并后 fact 已变——向量缓存一并置空（召回侧懒重算），last_used_at 同步清零防陈旧衰减基点
+    db.prepare('UPDATE agent_memories SET fact=?, type=?, confidence=?, source=?, embedding=NULL, last_used_at=NULL WHERE id=?')
       .run(merged, newType, maxConf, keep.source || 'admin-merge', keep.id);
     for (const id of dropIds) db.prepare('DELETE FROM agent_memories WHERE id=?').run(id);
     db.prepare('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)')

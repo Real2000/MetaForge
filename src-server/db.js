@@ -1030,6 +1030,13 @@ if (!evalCols.includes('type')) {
   db.exec(`UPDATE evaluations SET type='agent' WHERE type IS NULL OR type=''`);
   console.log('[db] evaluations 表已迁移：新增 type 字段（agent|kb 双型评测，存量归一 agent）');
 }
+// M4 AI-03（2026-11-23）：召回评测多指标聚合列——type='kb' 行存 { top1, hit_at_k, recall_at_k, mrr, ndcg }（JSON），
+// 与 score（Top-1 均分，向后兼容字段）并存；type='rag' 行存 RAGAS 四指标聚合 { context_precision, context_recall,
+// answer_relevancy, faithfulness, ... }。NULL = 未评测/旧数据（读取侧归一）。
+if (!evalCols.includes('metrics')) {
+  db.exec(`ALTER TABLE evaluations ADD COLUMN metrics TEXT DEFAULT NULL`);
+  console.log('[db] evaluations 表已迁移：新增 metrics 列（召回多指标/RAG 四指标聚合 JSON）');
+}
 // 钉钉回调事件幂等去重表（V1.3 #4）：钉钉失败会重试（最长 24h），重复投递必须 ACK 不重放
 // event_id 为钉钉回调体 EventId；INSERT 冲突 = 已处理过 → 直接返回成功
 db.exec(`CREATE TABLE IF NOT EXISTS dingtalk_events (
@@ -2159,6 +2166,17 @@ db.exec('CREATE INDEX IF NOT EXISTS idx_bc_device ON bridge_crashes(device_id);'
   if (!cols.includes('source')) db.exec("ALTER TABLE agent_memories ADD COLUMN source TEXT DEFAULT 'chat'");
   if (!cols.includes('summary')) db.exec("ALTER TABLE agent_memories ADD COLUMN summary TEXT DEFAULT ''");
   if (!cols.includes('summary_source')) db.exec("ALTER TABLE agent_memories ADD COLUMN summary_source TEXT DEFAULT ''");
+  // M4 AI-05（2026-11-23）记忆语义召回：embedding（float32 BLOB，与 kb_chunks 同格式：engine tag + 小端浮点，
+  // 由 lib/memory-recall.js 读写）+ last_used_at（衰减基点：长期未用记忆降权；召回命中后回写）。
+  // 两列均允许 NULL：存量记忆无向量时懒计算补齐（召回侧批量嵌入并回写，与 kb_chunks.embedding 同模式）。
+  if (!cols.includes('embedding')) {
+    db.exec('ALTER TABLE agent_memories ADD COLUMN embedding BLOB DEFAULT NULL');
+    console.log('[db] agent_memories 表已迁移：新增 embedding 列（记忆语义向量缓存，懒计算）');
+  }
+  if (!cols.includes('last_used_at')) {
+    db.exec("ALTER TABLE agent_memories ADD COLUMN last_used_at TEXT DEFAULT NULL");
+    console.log('[db] agent_memories 表已迁移：新增 last_used_at 列（时间衰减基点）');
+  }
 }
 
 
