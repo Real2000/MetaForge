@@ -108,7 +108,7 @@ function authKeyForAgent(k, agentId) {
 }
 
 function unauthorized(res) {
-  res.status(401).json({ error: { message: '无效的 API Key，请在智能体平台后台「智能体管理 → API」获取', type: 'invalid_api_key' } });
+  res.status(401).json({ error: { message: '无效的 API Key，请在 MetaForge 后台「智能体管理 → API」获取', type: 'invalid_api_key' } });
 }
 
 // 模型列表：每个已发布智能体对外即一个"模型"
@@ -204,7 +204,7 @@ router.post('/v1/chat/completions', keyChatLimit, keyQuota, async (req, res) => 
   // V1.2 审查加固 2026-10-30：API Key 持有者检索同样受智能体元数据过滤约束（fail-closed）——
   // 无用户链路：占位符键置哨兵恒不命中（部门内容不对无部门身份的 Key 持有者开放），固定值键照常生效
   if (agent.kb_id) kbContext = (await retrieve(input, agent.kb_id, 5, 0.01, { metadataFilter: resolveKbFilter(agent, null) || undefined })).map(x => x.content);
-  const sys = agent.prompt || '你是企业智能体平台的 AI 助手。';
+  const sys = agent.prompt || '你是 MetaForge 平台的 AI 助手。';
   const sysFull = kbContext.length
     ? sys + `\n\n以下是知识库检索到的相关内容，请优先依据这些内容回答：\n${kbContext.map((c, i) => `[${i + 1}] ${c}`).join('\n')}`
     : sys;

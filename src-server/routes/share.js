@@ -183,7 +183,7 @@ router.post('/:token/chat', shareChatLimit, async (req, res) => {
       kbContext = hits.map(x => x.content);
       if (hits.length) send('kb', { hits });
     }
-    const sys = a.prompt || '你是企业智能体平台的 AI 助手。';
+    const sys = a.prompt || '你是 MetaForge 平台的 AI 助手。';
     const sysFull = kbContext.length
       ? sys + `\n\n以下是知识库检索到的相关内容，请优先依据这些内容回答：\n${kbContext.map((c, i) => `[${i + 1}] ${c}`).join('\n')}`
       : sys;

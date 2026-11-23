@@ -43,7 +43,7 @@ export async function render(el) {
     @media (max-width:768px){ .pr-hero h1{font-size:24px} .pr-grid{grid-template-columns:1fr} }
   </style>
   <div class="pr-nav">
-    <div class="logo"><span class="mark" style="width:30px;height:30px;border-radius:8px;background:linear-gradient(135deg,#3b82f6,#8b5cf6);display:flex;align-items:center;justify-content:center;color:#fff">A</span>${t('智能体平台')}</div>
+    <div class="logo"><span class="mark" style="width:30px;height:30px;border-radius:8px;background:linear-gradient(135deg,#3b82f6,#8b5cf6);display:flex;align-items:center;justify-content:center;color:#fff">M</span>${t('MetaForge')}</div>
     <div style="display:flex;gap:10px">
       ${logged
         ? `<a class="btn sm" href="#/home">${t('进入控制台')}</a>`

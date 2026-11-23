@@ -997,7 +997,7 @@ router.post('/stream', async (req, res) => {
     };
     const applyVars = (text) => String(text || '').replace(/\{\{\s*(SYS_USER_ID|USER_UID|USER_NAME|USER_LANG|AGENT_ID|AGENT_NAME|CONVERSATION_ID|REQUEST_ID)\s*\}\}/g, (_, k) => varValues[k] ?? '');
 
-    let system = applyVars(agent?.prompt) || '你是企业智能体平台的 AI 助手，请专业、清晰地回答用户问题。';
+    let system = applyVars(agent?.prompt) || '你是 MetaForge 平台的 AI 助手，请专业、清晰地回答用户问题。';
     // P5.27d/P5.28 首页助手能力声明（agent 为空 = 默认对话入口）：四大场景路由 + 可用工具 + 反编造约束。
     // 动机（实测两个问题）：① 历史会话里"我无法操作您的电脑"的旧回复会把模型带偏（工具已具备却仍拒绝）；
     // ② 模型看到历史成功案例后会直接"声称已创建"而不调工具（桌面实际没有该文件夹——编造）。

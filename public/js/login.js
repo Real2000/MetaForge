@@ -68,7 +68,7 @@ export function render(root) {
   <div class="login-wrap">
     <div class="pref-float"><span class="pref-lang">${getLang() === 'en' ? 'EN' : '中'}</span></div>
     <div class="login-left">
-      <div class="logo-row"><span class="mark">A</span>${t('智能体平台')}</div>
+      <div class="logo-row"><span class="mark">M</span>${t('MetaForge')}</div>
       <h1>${t('一站式企业 AI 办公入口')}</h1>
       <p>${t('以企业智能体、数字员工、部门 AI 助理为组合的智能体矩阵，融合知识库检索增强、定时任务调度与多供应商模型接入，让员工无需适配多系统即可通过 AI 高效开展工作。')}</p>
       <div class="login-feats">

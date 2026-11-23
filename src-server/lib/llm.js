@@ -301,7 +301,7 @@ function mockAnswer(messages, opts = {}) {
     return `以下是为您完成的翻译：\n\n原文：${q}\n\n译文：（演示模式）Translation service is running in demo mode. Configure a model provider API Key in 后台「模型接入」to enable real model output.`;
   }
   if (/(你好|您好|hi|hello|在吗)/i.test(q)) {
-    return `您好！我是${agentName ? '「' + agentName + '」' : '智能体平台 AI 助手'}。当前处于内置演示模式（未配置真实模型 Key）。我可以协助您：\n\n1. 解答智能体平台功能相关问题\n2. 进行文本创作、翻译与整理\n3. 基于知识库内容做检索问答\n\n请问有什么可以帮您？`;
+    return `您好！我是${agentName ? '「' + agentName + '」' : 'MetaForge AI 助手'}。当前处于内置演示模式（未配置真实模型 Key）。我可以协助您：\n\n1. 解答 MetaForge 平台功能相关问题\n2. 进行文本创作、翻译与整理\n3. 基于知识库内容做检索问答\n\n请问有什么可以帮您？`;
   }
   return `收到您的指令：「${q.slice(0, 120)}」\n\n（当前为内置演示模式回复：进入管理后台 → 模型接入，为默认供应商填写 API Key 并保存后，此处将调用真实大模型输出流式回答。当前回复链路已完整验证：敏感词检测 → 知识库检索 → 模型调用 → 流式输出 → 用量统计。）`;
 }

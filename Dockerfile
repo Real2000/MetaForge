@@ -1,11 +1,11 @@
-# 智能体平台 · 多阶段构建（快速+最小镜像）
+# MetaForge · 多阶段构建（快速+最小镜像）
 # 使用方式：
 #   # 构建 + 启动全栈
 #   docker compose up -d
 #
 #   # 单构建
-#   docker build -t agent-platform .
-#   docker run -d -p 3210:3210 -v ./data:/app/data agent-platform
+#   docker build -t metaforge .
+#   docker run -d -p 3210:3210 -v ./data:/app/data metaforge
 
 # ---- 阶段 1：构建依赖 ----
 FROM node:18-slim AS builder

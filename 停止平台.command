@@ -1,5 +1,5 @@
 #!/bin/bash
-# 智能体平台 - 停止服务（2026-11-12，与「启动平台.command」配套）
+# MetaForge - 停止服务（2026-11-12，与「启动平台.command」配套）
 # 安全设计：按端口定位 → 校验进程命令行包含 server.js 才停止；
 #           其他程序占用 3210 端口时只提示、不误杀
 cd "$(dirname "$0")"
@@ -13,7 +13,7 @@ if [ -z "$PIDS" ]; then
   exit 0
 fi
 
-echo "正在停止智能体平台…"
+echo "正在停止 MetaForge…"
 for PID in $PIDS; do
   CMD="$(ps -p "${PID}" -o command= 2>/dev/null)"
   case "$CMD" in

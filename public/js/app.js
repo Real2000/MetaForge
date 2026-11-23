@@ -133,7 +133,7 @@ function layoutShell(kind, currentPath, title, contentHTML) {
     <div class="layout">
       <div class="sidebar-mask" id="sidebarMask"></div>
       <aside class="sidebar" id="mainSidebar">
-        <a class="logo" href="#/home"><span class="mark">A</span>${t('智能体平台')}</a>
+        <a class="logo" href="#/home"><span class="mark">M</span>${t('MetaForge')}</a>
         <nav class="nav-group">${renderNav(frontNav, currentPath)}</nav>
         <div class="foot">
           <div style="display:flex;gap:6px;padding:0 4px 8px">${prefToggleHTML()}</div>
@@ -152,7 +152,7 @@ function layoutShell(kind, currentPath, title, contentHTML) {
   <div class="layout">
     <div class="sidebar-mask" id="sidebarMask"></div>
     <aside class="sidebar" id="mainSidebar">
-      <a class="logo" href="#/home"><span class="mark">A</span>${t('智能体平台')}</a>
+      <a class="logo" href="#/home"><span class="mark">M</span>${t('MetaForge')}</a>
       <nav class="nav-group">
         <div class="nav-title">${kind === 'admin' ? t('管理后台') : t('工作台')}</div>
         ${renderNav(navs, currentPath)}
@@ -164,7 +164,7 @@ function layoutShell(kind, currentPath, title, contentHTML) {
     </aside>
     <div class="main">
       <div class="topbar">
-        <div class="crumb"><button class="mobile-menu-btn" id="menuBtn" title="菜单" aria-label="打开导航菜单">☰</button> ${t('智能体平台')} <span>/</span> <b>${esc(t(title))}</b></div>
+        <div class="crumb"><button class="mobile-menu-btn" id="menuBtn" title="菜单" aria-label="打开导航菜单">☰</button> ${t('MetaForge')} <span>/</span> <b>${esc(t(title))}</b></div>
         <div class="right">
           ${prefToggleHTML()}
           <div class="space-selector" id="spaceSelector">

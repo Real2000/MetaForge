@@ -58,7 +58,7 @@ router.post('/', async (req, res) => {
         return ok({
           protocolVersion: '2024-11-05',
           capabilities: { tools: {} },
-          serverInfo: { name: 'agent-platform-mcp', version: '1.0.0', title: '智能体平台 MCP 服务' },
+          serverInfo: { name: 'agent-platform-mcp', version: '1.0.0', title: 'MetaForge MCP 服务' },
           instructions: '本服务把平台已发布智能体暴露为 MCP 工具（agent_{id}）。画布工作流的工具参数由 Start 节点变量自动生成（input + 自定义变量，文件参数传上传后的文件 ID）；表单模式传 input 任务文本即可（task 为兼容别名）。工具清单与参数 schema 见 tools/list；完整接口文档在平台管理端「智能体管理 → 📄 文档」。',
         });
       case 'ping':

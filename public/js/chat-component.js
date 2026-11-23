@@ -29,7 +29,7 @@ const SKILLS = [
   { id: 'image', icon: '🎨', label: t('图片生成'), ph: t('描述你想生成的画面，如：一张蓝色科技风的产品海报') },
   { id: 'video', icon: '🎬', label: t('视频生成'), ph: t('描述你想生成的视频画面，如：机器人挥手打招呼，镜头拉近') },
   { id: 'tts', icon: '🎙️', label: t('语音生成'), ph: t('输入要合成语音的文本，如：欢迎语或公告内容') },
-  { id: 'ppt', icon: '📊', label: t('PPT生成'), ph: t('输入 PPT 主题，如：智能体平台产品介绍') },
+  { id: 'ppt', icon: '📊', label: t('PPT生成'), ph: t('输入 PPT 主题，如：MetaForge 产品介绍') },
 ];
 // P4 模型隔离（2026-10-22）：每种创作模式只显示对应类型的模型——对话→chat、图片→image、视频→video、语音→tts、PPT→chat（大纲由对话模型生成）
 const SKILL_MODEL_TYPE = { chat: 'chat', image: 'image', video: 'video', tts: 'tts', ppt: 'chat' };
@@ -335,7 +335,7 @@ export function mountChat(el, opts) {
         <div class="welcome-hero">
           <div style="font-size:44px;margin-bottom:12px">${b?.icon || '👋'}</div>
           <h2>${esc(b ? b.name : t('有什么可以帮您？'))}</h2>
-          <p>${esc(b?.desc || t('我是智能体平台 AI 助手，支持知识库检索增强与多模型切换'))}</p>
+          <p>${esc(b?.desc || t('我是 MetaForge AI 助手，支持知识库检索增强与多模型切换'))}</p>
         </div>
         ${openingHtml}
         <div class="quick-qs" style="margin-bottom:22px">${qs.map((q, i) => `<span class="quick-q" data-q="${i}">${esc(q)}</span>`).join('')}</div>`;

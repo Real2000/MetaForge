@@ -11,7 +11,7 @@ export function setLang(lang) { localStorage.setItem(LANG_KEY, lang === 'en' ? '
 
 const EN = {
   // ---------- 框架 / 导航 ----------
-  '智能体平台': 'Agent Platform',
+  'MetaForge': 'MetaForge',
   '工作台': 'Workspace',
   '管理后台': 'Admin Console',
   '前台首页': 'Home',
@@ -212,7 +212,7 @@ const EN = {
   '任务已提交，生成完成后自动播放（通常 1~3 分钟）': 'Task submitted. Playback starts when ready (usually 1–3 min)',
   '请稍后重试或调整描述': 'Please retry later or adjust the prompt',
   '有什么可以帮您？': 'How can I help you?',
-  '我是智能体平台 AI 助手，支持知识库检索增强与多模型切换': 'I am the platform AI assistant with RAG and multi-model support',
+  '我是 MetaForge AI 助手，支持知识库检索增强与多模型切换': 'I am MetaForge AI assistant with RAG and multi-model support',
   'AI 助手': 'AI Assistant',
   // ---------- 智能体页 ----------
   '企业智能体': 'Enterprise Agents',
@@ -370,7 +370,7 @@ const EN = {
   '做一份"智能体平台产品介绍"PPT': 'Make a PPT introducing this platform',
   '描述你想生成的画面，如：一张蓝色科技风的产品海报': 'Describe the image, e.g. a blue tech-style poster',
   '描述你想生成的视频画面，如：机器人挥手打招呼，镜头拉近': 'Describe the video, e.g. a robot waving, camera zooming in',
-  '输入 PPT 主题，如：智能体平台产品介绍': 'Enter PPT topic, e.g. Product Introduction',
+  '输入 PPT 主题，如：MetaForge 产品介绍': 'Enter PPT topic, e.g. MetaForge Product Introduction',
   '您好！我是平台 AI 助手，支持多模态创作：': 'Hi! I am the platform AI assistant with multi-modal creation:',
   '选择下方技能按钮即可切换创作模式。': 'Tap a skill button below to switch modes.',
   '以企业智能体、数字员工、部门 AI 助理为组合的智能体矩阵，融合知识库检索增强、定时任务调度与多供应商模型接入，让员工无需适配多系统即可通过 AI 高效开展工作。': 'An agent matrix of enterprise agents, digital employees and department assistants, with RAG, scheduled tasks and multi-provider models — all AI work in one place.',

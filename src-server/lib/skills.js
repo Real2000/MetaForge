@@ -159,7 +159,7 @@ async function genPPT(topic) {
   const pptx = new PptxGenJS();
   pptx.defineLayout({ name: 'W16x9', width: 13.33, height: 7.5 });
   pptx.layout = 'W16x9';
-  pptx.author = '智能体平台';
+  pptx.author = 'MetaForge';
   pptx.title = outline.title || t;
 
   const BRAND = '2563EB';
@@ -174,7 +174,7 @@ async function genPPT(topic) {
   cover.addShape('rect', { x: 0.9, y: 2.1, w: 0.14, h: 2.5, fill: { color: BRAND } });
   cover.addText(outline.title || t, { x: 1.35, y: 2.3, w: 10.5, h: 1.2, fontSize: 44, bold: true, color: DARK, fontFace: 'Microsoft YaHei' });
   cover.addText(outline.subtitle || '', { x: 1.35, y: 3.55, w: 10.5, h: 0.7, fontSize: 20, color: GRAY, fontFace: 'Microsoft YaHei' });
-  cover.addText('由智能体平台 AI 生成 · ' + new Date().toLocaleDateString('zh-CN'), { x: 1.35, y: 6.5, w: 10, h: 0.5, fontSize: 12, color: '94A3B8' });
+  cover.addText('由 MetaForge AI 生成 · ' + new Date().toLocaleDateString('zh-CN'), { x: 1.35, y: 6.5, w: 10, h: 0.5, fontSize: 12, color: '94A3B8' });
 
   // 内容页
   outline.pages.slice(0, 12).forEach((pg, idx) => {

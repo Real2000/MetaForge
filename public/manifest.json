@@ -1,6 +1,6 @@
 {
-  "name": "智能体平台",
-  "short_name": "智能体平台",
+  "name": "MetaForge",
+  "short_name": "MetaForge",
   "description": "一站式企业 AI 办公入口：智能体矩阵、知识库 RAG、画布工作流编排、定时任务与多模型接入",
   "start_url": "/#/home",
   "scope": "/",

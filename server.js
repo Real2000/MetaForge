@@ -1,5 +1,5 @@
 /**
- * 企业级智能体平台 - 服务入口
+ * MetaForge 企业级智能体平台 - 服务入口
  * 前台：首页对话 / 智能体 / 知识库 / 任务管理
  * 后台：数据看板 / 智能体管理 / 用户管理 / 知识库管理 / 接入管理 / 模型接入 / 安全合规 / 用量与配额 / 系统监控 / 运营监控
  */
@@ -272,7 +272,7 @@ app.use((err, req, res, next) => {
 
 const server = app.listen(PORT, () => {
   console.log('==============================================');
-  console.log('  智能体平台已启动');
+  console.log('  MetaForge 智能体平台已启动');
   console.log(`  前台入口:  http://localhost:${PORT}/`);
   console.log('  默认账号:  admin（首次登录强制改密）');
   console.log('             demo（首次登录强制改密）');
