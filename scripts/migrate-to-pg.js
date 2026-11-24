@@ -127,6 +127,9 @@ function canon(v, pgType) {
     return `f:${String(Math.fround(v))}`; // 单精度归一（见头注释：两侧同归一，纯精度差不误报）
   }
   if (/^bytea$/.test(pgType)) {
+    // 空串归一：sqlite 旧 TEXT DEFAULT '' 时代的无向量行（src ''）与改型后的空 bytea 同为
+    // 「无向量」语义——归一为空 hex 对账；非空非 Buffer 值仍 BAD（真数据形态差异不掩盖）
+    if (v === '') return 'b:';
     if (!Buffer.isBuffer(v)) return `BAD:${typeof v}`;
     return `b:${v.toString('hex')}`;
   }
@@ -218,6 +221,35 @@ async function syncSequences(conn) {
   return r.rows.length;
 }
 
+// ---------- bm25_tsv 存量回填（PG-5 tsvector PoC，2026-11-24） ----------
+// 时序设计：回填不在迁移步做（143 在空库首启即记账——若彼时回填，搬运后数据将永远 NULL）；
+// 由本工具在搬运后统一执行。只处理 tsv IS NULL 的行——幂等重跑只补增量。
+// 口径：lib/text-terms 单一事实源（content+keywords 完整 _idx，与检索端严格一致）。
+async function backfillTsv(conn) {
+  const hasCol = (await conn.query("SELECT 1 AS v FROM information_schema.columns WHERE table_name='kb_chunks' AND column_name='bm25_tsv'")).rows[0];
+  if (!hasCol) return -1; // 目标库无此列（未跑迁移 143 的旧版本）——跳过不阻断搬运
+  const { tsvText } = require(path.join(__dirname, '..', 'src-server', 'lib', 'text-terms'));
+  const BATCH = 500;
+  let total = 0, lastId = 0;
+  for (;;) {
+    const rows = (await conn.query('SELECT id, content, keywords FROM kb_chunks WHERE bm25_tsv IS NULL AND id > $1 ORDER BY id LIMIT $2', [lastId, BATCH])).rows;
+    if (!rows.length) break;
+    await conn.query('BEGIN');
+    try {
+      for (const r of rows) {
+        await conn.query("UPDATE kb_chunks SET bm25_tsv = to_tsvector('simple', $2) WHERE id = $1", [r.id, tsvText(r.content, r.keywords)]);
+      }
+      await conn.query('COMMIT');
+    } catch (e) {
+      await conn.query('ROLLBACK').catch(() => { });
+      throw new Error(`bm25_tsv 回填失败（id ${lastId}~${rows[rows.length - 1].id}）：${e.message}`);
+    }
+    total += rows.length; lastId = rows[rows.length - 1].id;
+    if (rows.length < BATCH) break;
+  }
+  return total;
+}
+
 // ---------- main ----------
 async function main() {
   const t0 = Date.now();
@@ -258,6 +290,16 @@ async function main() {
     }
   }
   const seqN = await syncSequences(conn);
+  // PG-5：存量 tsv 回填（runbook S5 后自动包含；时长计入报告供时长预估）
+  const t0t = Date.now();
+  const tsvN = await backfillTsv(conn);
+  if (tsvN >= 0) console.log(`[migrate-to-pg] bm25_tsv 存量回填：${tsvN} 行（${Date.now() - t0t}ms，幂等重跑只补增量）`);
+  // PG-5 实测踩坑：批量导入后必跑 ANALYZE——统计失真时 planner 对候选集 MATCH 的行数估计错误
+  //（实测估 rows=6 而实际 10 万）导致索引选择失当（弃 GIN 走 kb_id 索引逐行过滤，1.2s 级误判）。
+  // ANALYZE 幂等（重跑刷新统计），几秒内完成。
+  const t0a = Date.now();
+  await conn.query('ANALYZE');
+  console.log(`[migrate-to-pg] ANALYZE 全库统计已刷新（${Date.now() - t0a}ms）`);
   const el = Date.now() - t0;
   console.log(`———————————————`);
   console.log(`[migrate-to-pg] 搬运完成：${tables.length} 表 / ${totalRows} 行 / 序列同步 ${seqN} 表`);

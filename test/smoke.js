@@ -987,6 +987,34 @@ function t(name, fn) {
       assert.ok(/activeSlot/.test(workerSrc) && /Atomics\.store\(activeSlot\.head, 0, 2\)/.test(workerSrc),
         'worker 应写槽，溢出时置状态 2 回退文件通道');
     });
+    await t('PG-5：tsvector 候选集 PoC 守卫——分词单一事实源 + 双写/回填/迁移全链形态', () => {
+      const fs5 = require('fs');
+      const rd = (p) => fs5.readFileSync(path.join(__dirname, '..', p), 'utf8');
+      // 分词单一事实源（写侧 tsv 与读侧 tsquery 同口径，防召回回归）
+      const ttSrc = rd('src-server/lib/text-terms.js');
+      assert.ok(/function terms\(/.test(ttSrc) && /function tsvText\(/.test(ttSrc) && /function idxText\(/.test(ttSrc),
+        'text-terms 应为分词单一事实源（terms/tsvText/idxText）');
+      const retSrc = rd('src-server/lib/retriever.js');
+      assert.ok(/require\('\.\/text-terms'\)/.test(retSrc), '检索端应复用 text-terms（复制漂移防线）');
+      assert.ok(!/function tokenize\(/.test(retSrc), 'retriever 不应内联分词实现');
+      // 候选集路径（PG 方言 MATCH + LIMIT；列缺失防御性回落全量）
+      assert.ok(/TSV_CANDIDATES/.test(retSrc) && /to_tsquery\('simple'/.test(retSrc) && /_pgTsvReady\(\)/.test(retSrc),
+        'PG 方言应有 tsvector 候选集路径（MATCH+LIMIT+列就绪探测兜底）');
+      // 摄取/编辑/合并/关键词生成双写
+      assert.ok(/bm25_tsv/.test(rd('src-server/lib/ingestion-pipeline.js')) && /tsvText/.test(rd('src-server/lib/ingestion-pipeline.js')),
+        '摄取管道应双写 bm25_tsv');
+      const knSrc = rd('src-server/routes/knowledge.js');
+      assert.ok((knSrc.match(/bm25_tsv=to_tsvector\('simple', \?\)/g) || []).length >= 3,
+        '编辑（带元数据/纯内容）与合并三处应同步重算 tsv');
+      assert.ok(/bm25_tsv=to_tsvector/.test(rd('src-server/lib/keywordgen.js')), '关键词生成应回写完整 _idx 口径 tsv');
+      // 迁移步（列+GIN/复合 GIN/embedding 改型）与搬运回填+ANALYZE
+      const migSrc = rd('src-server/lib/migrate.js');
+      assert.ok(/bm25_tsv tsvector/.test(migSrc) && /id: 145/.test(migSrc) && /btree_gin/.test(migSrc),
+        '迁移步应建 tsv 列与复合 GIN (kb_id, bm25_tsv)');
+      assert.ok(/ALTER COLUMN embedding TYPE bytea/.test(migSrc), '步 144 应改型 embedding（AI-02 float32 在 PG 端的 text 列遗留）');
+      const toolSrc = rd('scripts/migrate-to-pg.js');
+      assert.ok(/backfillTsv/.test(toolSrc) && /ANALYZE/.test(toolSrc), '搬运工具应含 tsv 存量回填与 ANALYZE（统计回真防 planner 误判）');
+    });
     await t('MT-7：db.js 接线守卫——AGENT_DB_DRIVER 分支 + sqlite 缺省路径 + 探测方言化收敛', () => {
       const fs2 = require('fs');
       const dbSrc = fs2.readFileSync(path.join(__dirname, '..', 'src-server', 'db.js'), 'utf8');
@@ -11393,8 +11421,12 @@ print('PY_OK')
 
   await t('AI-02：分块编辑/合并同步失效向量缓存——embedding 置空（源码护栏）', () => {
     const src = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'routes', 'knowledge.js'), 'utf8');
-    assert.ok(/SET content=\?, metadata=\?, embedding=NULL/.test(src), '编辑（带元数据）应同步置空向量');
-    assert.ok(/SET content=\?, embedding=NULL/.test(src), '编辑/合并应同步置空向量');
+    // PG-5 tsvector 双写（2026-11-24）后 SET 列为运行时方言拼接（模板字面量）——整句正则不可靠，
+    // 改锚语义单元：content 变更写点 ×3（编辑带元数据/纯内容/合并），每处必须伴随
+    // embedding=NULL（向量缓存失效）与 bm25_tsv 重算（候选集口径同步）——缺任一即错漏召回
+    assert.ok((src.match(/UPDATE kb_chunks SET content=\?/g) || []).length >= 3, 'content 变更写点应为三处（编辑×2/合并）');
+    assert.ok((src.match(/embedding=NULL/g) || []).length >= 3, 'AI-02：content 变更应同步置空向量缓存');
+    assert.ok((src.match(/bm25_tsv=to_tsvector\('simple', \?\)/g) || []).length >= 3, 'PG-5：content 变更应同步重算 tsv');
   });
 
   await t('AI-02：检索写回的向量为 BLOB 且可被 parseVec 回读（端到端）', async () => {

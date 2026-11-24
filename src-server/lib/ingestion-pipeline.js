@@ -385,24 +385,31 @@ function persistSuccess(ctx) {
   const blockedChunks = [];
 
   // 先插父分片，再插子分片
+  // PG-5 tsvector PoC（2026-11-24）：PG 方言下摄取双写 bm25_tsv（候选集 MATCH 依赖，
+  // docs/全文检索PG方案.md）——keywords 摄取时尚未生成（三后处理异步补），tsv 先覆盖
+  // content 口径；keywordgen 回填时并入完整 _idx 口径（content+keywords）。sqlite 无此列。
+  const _pgTsv = (process.env.DB_DIALECT || 'sqlite') === 'kingbase'; // dm 无 tsvector（M9 评估）；探测由检索端 _pgTsvReady 兜底
+  const { tsvText } = require('./text-terms');
   if (ctx.hasParentSlice && ctx.parentChunks.length) {
-    const insParent = db.prepare('INSERT INTO kb_chunks (file_id,kb_id,content,parent_id,modality) VALUES (?,?,?,?,?)');
+    const insParent = db.prepare(`INSERT INTO kb_chunks (file_id,kb_id,content,parent_id,modality${_pgTsv ? ',bm25_tsv' : ''}) VALUES (?,?,?,?,?${_pgTsv ? ",to_tsvector('simple', ?)" : ''})`);
     ctx.parentChunks.forEach(pc => {
       const result = review(pc, 'kb_import');
       if (result.blocked) { blockedChunks.push('父分片：' + result.reason); return; }
-      insParent.run(ctx.fileId, kb.id, result.cleaned || pc, null, ctx.visionUsed ? 'image' : 'text');
+      const pcContent = result.cleaned || pc;
+      insParent.run(ctx.fileId, kb.id, pcContent, null, ctx.visionUsed ? 'image' : 'text', ...(_pgTsv ? [tsvText(pcContent)] : []));
     });
   }
   // AI-11（2026-11-23）：图片文件（visionUsed）分块标 modality='image'——文搜图命中可标识来源，
   // 图搜图可限定检索域；文本文件保持 'text'（列默认，存量行自动归一）
-  const ins = db.prepare('INSERT INTO kb_chunks (file_id,kb_id,content,parent_id,chapter_id,modality) VALUES (?,?,?,?,?,?)');
+  const ins = db.prepare(`INSERT INTO kb_chunks (file_id,kb_id,content,parent_id,chapter_id,modality${_pgTsv ? ',bm25_tsv' : ''}) VALUES (?,?,?,?,?,?${_pgTsv ? ",to_tsvector('simple', ?)" : ''})`);
   const parentStartIdx = ctx.hasParentSlice ? ctx.parentChunks.length : 0;
   const chunkModality = ctx.visionUsed ? 'image' : 'text';
   chunks.forEach((c, i) => {
     const result = review(c, 'kb_import');
     if (result.blocked) { blockedChunks.push(`分块 #${i + 1}：${result.reason}`); return; }
     const parentId = ctx.hasParentSlice && ctx.childToParent[i] >= 0 ? (parentStartIdx + ctx.childToParent[i] + 1) : null;
-    ins.run(ctx.fileId, kb.id, result.cleaned || c, parentId, ctx.chapterIds ? ctx.chapterIds[i] : null, chunkModality);
+    const cContent = result.cleaned || c;
+    ins.run(ctx.fileId, kb.id, cContent, parentId, ctx.chapterIds ? ctx.chapterIds[i] : null, chunkModality, ...(_pgTsv ? [tsvText(cContent)] : []));
   });
 
   // 有审核拦截的分块 → 记录但不中断已通过的分块写入（不影响已合法内容入库）

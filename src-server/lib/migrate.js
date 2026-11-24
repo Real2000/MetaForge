@@ -359,7 +359,7 @@ const ALL_MIGRATIONS = [
   { id: 9,  name: 'messages.branch - 分支标识', table: 'messages', column: 'branch', def: "TEXT DEFAULT 'main'" },
   { id: 10, name: 'sessions.active_branch - 活跃分支', table: 'sessions', column: 'active_branch', def: "TEXT DEFAULT 'main'" },
   // === 知识库字段 ===
-  { id: 11, name: 'kb_chunks.embedding - 向量嵌入', table: 'kb_chunks', column: 'embedding', def: "TEXT DEFAULT ''" },
+  { id: 11, name: 'kb_chunks.embedding - 向量嵌入', table: 'kb_chunks', column: 'embedding', def: 'BLOB DEFAULT NULL' }, // PG-5 实测修正（2026-11-24）：def 原为 TEXT（JSON 文本时代），AI-02 改 float32 BLOB 写入后未跟进——sqlite 弱类型掩盖、PG 严格类型下二进制插 text 报 invalid byte sequence。存量库改型见步 144；新库直接建对
   { id: 12, name: 'kbs.chunk_size - 切片大小', table: 'kbs', column: 'chunk_size', def: 'INTEGER DEFAULT 500' },
   { id: 13, name: 'kbs.chunk_overlap - 切片重叠', table: 'kbs', column: 'chunk_overlap', def: 'INTEGER DEFAULT 0' },
   { id: 14, name: 'kbs.chunk_separator - 切片分隔符', table: 'kbs', column: 'chunk_separator', def: "TEXT DEFAULT '\\n\\s*\\n'" },
@@ -891,6 +891,54 @@ const ALL_MIGRATIONS = [
   // （scripts/migrate-to-pg.js 对账列检查 fail）。入迁移框架补列，存量库形态对齐。
   { id: 141, name: 'expert_catalog.created_by - 结构漂移补列（PG-3 搬运对账）', table: 'expert_catalog', column: 'created_by', def: "TEXT DEFAULT ''" },
   { id: 142, name: 'sub_agent_library.created_by - 结构漂移补列（PG-3 搬运对账）', table: 'sub_agent_library', column: 'created_by', def: "TEXT DEFAULT ''" },
+  // === PG-5 tsvector PoC（2026-11-24）：全文检索候选集索引列 ===
+  // sqlite 检索走 FTS5/内存通道（缺省），tsv 列 PG 专有——10 万分块下内存通道实测 P95 37s
+  // 不达标（docs/全文检索PG方案.md），候选集路径（MATCH + LIMIT）依赖此列与 GIN 索引。
+  // 存量回填不在迁移步做（本步在空库首启即记账，若此处回填，搬运后的数据将永远 NULL）——
+  // 回填由 scripts/migrate-to-pg.js 搬运后统一执行（工具内置，见其 backfillTsv）。
+  // sqlite 跳过执行但照常记账（防每次启动重跑判定）。
+  { id: 143, name: 'kb_chunks.bm25_tsv - PG 全文检索候选集索引列 + GIN（PG-5）', up: (ctx) => {
+    if ((process.env.DB_DIALECT || 'sqlite') !== 'kingbase') return; // sqlite：FTS5/内存通道；dm：tsvector 为 PG 系专有，M9 信创时评估替代
+    if (!ctx.hasColumn('kb_chunks', 'bm25_tsv')) ctx.db.exec('ALTER TABLE kb_chunks ADD COLUMN bm25_tsv tsvector');
+    ctx.db.exec('CREATE INDEX IF NOT EXISTS idx_kb_chunks_tsv ON kb_chunks USING GIN (bm25_tsv)');
+  }, down: ({ db }) => {
+    // down 与 up 对称：sqlite 未执行 up（方言分支）→ no-op；BE-E1 回滚链在 sqlite 模式下逐步逆序，
+    // PG 语法（DROP COLUMN IF EXISTS）在 sqlite 不合法会断链
+    if ((process.env.DB_DIALECT || 'sqlite') !== 'kingbase') return;
+    db.exec('DROP INDEX IF EXISTS idx_kb_chunks_tsv');
+    db.exec('DROP INDEX IF EXISTS idx_kb_chunks_tsv2');
+    db.exec('ALTER TABLE kb_chunks DROP COLUMN IF EXISTS bm25_tsv');
+  } },
+  // === PG-5 实测暴露（2026-11-24）：步 11 的 embedding def 历史上为 TEXT（JSON 文本时代），AI-02 改
+  // float32 BLOB 写入后未跟进——sqlite 弱类型掩盖、PG 严格类型下二进制插 text 必炸（造数库搬运实锤
+  // invalid byte sequence 0x00）。新库已由步 11 修正建型；本步修存量 PG 库（ALTER 改型 bytea）。
+  // 存量值形态 NULL/'' 转 bytea 均无损（生产向量未启用、embedding 全 NULL）。
+  { id: 144, name: 'kb_chunks.embedding 改型 text→BLOB（PG 端向量二进制兼容，PG-5 实测暴露）', up: (ctx) => {
+    if ((process.env.DB_DIALECT || 'sqlite') !== 'kingbase') return; // sqlite 弱类型无需改；dm 无先例（M9 评估）
+    const ty = ctx.db.prepare("SELECT data_type AS t FROM information_schema.columns WHERE table_name='kb_chunks' AND column_name='embedding'").get();
+    if (ty && ty.t === 'bytea') return; // 新库（步 11 修正后首启）直接建对——幂等跳过
+    // 存量列带步 11 时代的 DEFAULT ''（text）——bytea 无法自动 cast 默认值，须先 DROP（列默认本就无意义）
+    ctx.db.exec('ALTER TABLE kb_chunks ALTER COLUMN embedding DROP DEFAULT');
+    ctx.db.exec('ALTER TABLE kb_chunks ALTER COLUMN embedding TYPE bytea USING embedding::bytea');
+  }, down: ({ db }) => {
+    // 对称 no-op：sqlite 未执行 up；PG 语法（ALTER TYPE）在 sqlite 不合法会断回滚链
+    if ((process.env.DB_DIALECT || 'sqlite') !== 'kingbase') return;
+    db.exec("ALTER TABLE kb_chunks ALTER COLUMN embedding TYPE text USING embedding::text");
+    db.exec("ALTER TABLE kb_chunks ALTER COLUMN embedding SET DEFAULT ''");
+  } },
+  // === PG-5 PoC 实测调优（2026-11-24）：复合 GIN (kb_id, bm25_tsv) ===
+  // 单列 GIN 下 planner 常弃 GIN（单库场景 kb_id 选择性高 + RLS 行过滤不可索引化）；
+  // btree_gin（trusted 扩展，库 owner 可建）使 kb_id 也入 GIN，两谓词同索引。当前 planner
+  // 仍多选 Seq+早停（docs/全文检索PG方案.md 尾部归因），复合形态为版本演进/低频词查询保底。
+  { id: 145, name: 'kb_chunks 复合 GIN (kb_id, bm25_tsv)（PG-5 实测调优）', up: (ctx) => {
+    if ((process.env.DB_DIALECT || 'sqlite') !== 'kingbase') return;
+    try { ctx.db.exec('CREATE EXTENSION IF NOT EXISTS btree_gin'); } catch { /* 扩展不可用（非 trusted/无权限）→ 保留单列 GIN，不阻断 */ return; }
+    ctx.db.exec('CREATE INDEX IF NOT EXISTS idx_kb_chunks_tsv2 ON kb_chunks USING GIN (kb_id, bm25_tsv)');
+    try { ctx.db.exec('DROP INDEX IF EXISTS idx_kb_chunks_tsv'); } catch { /* 旧单列索引删除失败不阻断（冗余索引仅耗空间） */ }
+  }, down: ({ db }) => {
+    db.exec('DROP INDEX IF EXISTS idx_kb_chunks_tsv2');
+    // 回滚后单列形态由 143 up 重放恢复（down 逆序：145 先拆复合 → 143 down 再整体清理/重放）
+  } },
 ];
 
 module.exports = {

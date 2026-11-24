@@ -8,6 +8,10 @@
 const { db } = require('../db');
 const dal = require('./dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const { chatOnce, getConfiguredProviders } = require('./llm');
+// PG-5 tsvector PoC（2026-11-24）：keywords 生成后重算 bm25_tsv 为完整 _idx 口径
+//（content+keywords，lib/text-terms 单一事实源——检索端 _idx 同款）；sqlite 无此列。
+const _PG_TSV = (process.env.DB_DIALECT || 'sqlite') === 'kingbase'; // dm 无 tsvector（M9 评估）
+const { tsvText } = require('./text-terms');
 
 const CONCURRENCY = 4;   // 并发生成数（避免打爆网关限流）
 const MAX_CHUNKS = 300;  // 单文件生成上限（防超大文件一次性消耗过多 token）
@@ -58,7 +62,16 @@ async function generateForFile(fileId) {
       const row = targets[idx++];
       try {
         const meta = await genForChunk(row.content);
-        if (meta) { dal.runq('UPDATE kb_chunks SET keywords=? WHERE id=?', [JSON.stringify(meta), row.id]); generated++; } else failed++;
+        const metaJson = meta ? JSON.stringify(meta) : null;
+        if (meta) {
+          if (_PG_TSV) {
+            dal.runq("UPDATE kb_chunks SET keywords=?, bm25_tsv=to_tsvector('simple', ?) WHERE id=?",
+              [metaJson, tsvText(row.content, metaJson), row.id]);
+          } else {
+            dal.runq('UPDATE kb_chunks SET keywords=? WHERE id=?', [metaJson, row.id]);
+          }
+          generated++;
+        } else failed++;
       } catch { failed++; }
     }
   };

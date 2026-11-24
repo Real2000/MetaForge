@@ -2,6 +2,8 @@
 
 > 验收口径（V1.1 计划表 PG-5）：10 万分块下**检索可用、召回不回归、P95 < 300ms**（对齐 AI-02）；
 > 方案定稿入 docs。
+> **PoC 落地更新（2026-11-24 当日，§4 清单已全部实现）**：tsvector 候选集全链落地——
+> MATCH 通道 P50 86ms（达标）；全链 P50 1.5s 的尾部归因与后续方向见 §6。
 > 结论先行：**内存 BM25 通道（sqlite/PG 共用缺省路径）在 10 万分块下实测 P95 31.6s/37.0s，
 > 与验收线差两个数量级，确定不达标**；且 rows 全量加载（867ms/2772ms）与 RRF 阈值临界（大库
 > 近零命中）为跨引擎结构性问题。**定稿方案：tsvector + GIN 索引替代（JS 预分词入列，与 sqlite
@@ -54,26 +56,55 @@
 B 的关键设计点：`to_tsvector('simple', ...)` + 空格连接的 JS 预分词串（simple 配置不再二次
 分词，词边界完全由 JS 决定）——规避 PG 中文分词缺失，同时保留 BM25-lite 的 2-gram 召回口径。
 
-## 4. PoC 实现清单（下轮排期，预估 2 人日）
+## 4. PoC 实现清单（已全部落地，2026-11-24）
 
-1. **列迁移**（migrate.js 新迁移步，PG-only 方言分支登记 lint:dialect）：
-   `ALTER TABLE kb_chunks ADD COLUMN bm25_tsv tsvector`（sqlite 跳过——FTS5 已在位）；
-   `CREATE INDEX ... USING GIN (bm25_tsv)`。
-2. **摄取双写**：分块入库路径（ingestion-pipeline → kb_chunks INSERT）同步生成
-   `to_tsvector('simple', terms(content).join(' '))`；keywords/questions 扩展文本并入（与
-   `_idx` 口径一致）。
-3. **查询改写**：`bm25Scores` PG 分支（方言判定）改 SQL 候选集——
-   `SELECT id, ts_rank(bm25_tsv, q) FROM kb_chunks WHERE kb_id=? AND bm25_tsv @@ q LIMIT 候选N`
-   （q 为查询词 OR 形态的 tsquery），候选集回表取 content 参与融合；rows 加载不再全量。
-4. **存量回填**：`scripts/reindex-fts.js` PG 版（分批 UPDATE 生成 tsv）。
-5. **RRF 阈值校准（配套修复）**：threshold=0.01 与 RRF 量级（上限 0.0164）天然贴地——
-   大库近零命中。校准方案二选一（PoC 时按回归结果定）：threshold 缺省随库规模自适应
-   （如 `min(0.01, wB/(K+top)×2)`）或 finish 内改用归一分比较。**影响核心检索语义，需全量
-   回归 + 召回对比报告**。
-6. **验收重测**：同一造数脚本（.temp/pg5-seed.js）+ 查询集复跑——P95 < 300ms、召回与 sqlite
-   FTS5 路径 top-k 重合率报告。
-7. **向量通道缺口（记录，非 PG-5 范围）**：PG 无 vec0 → ANN 不可用 → 全扫 + 哈希降级嵌入 +
-   写回（实测单查 178s 的主因之一）。归属：AI-02 量化口径 / M9 信创（pgvector PoC 另立项）。
+1. **列迁移**（迁移步 143，kingbase-only 方言分支）：`ALTER TABLE kb_chunks ADD COLUMN bm25_tsv tsvector` + GIN 索引；
+   迁移步 145（实测调优）：btree_gin 扩展 + 复合 GIN `(kb_id, bm25_tsv)`（单列 GIN 下 planner 常弃用——单库 kb_id 选择性高 + RLS 行过滤不可索引化；复合形态为版本演进/低频词保底）。
+2. **摄取双写**：ingestion-pipeline 父块/子块 INSERT 双写（`to_tsvector('simple', ?)` 参数化，PG-only 拼接）。
+3. **查询改写**：retriever PG 方言候选集路径（`bm25_tsv @@ to_tsquery('simple', qTerms OR)` + `LIMIT 500`，`TSV_CANDIDATES=500`）；**打分仍 bm25ScoresMemory（候选集上毫秒级）——双端打分口径严格一致**；列缺失防御性回落全量（`_pgTsvReady` 探测）。
+4. **存量回填**：`scripts/migrate-to-pg.js` 内置 `backfillTsv`（分批 500 行，只补 `tsv IS NULL` 增量幂等；口径 content+keywords 完整 `_idx`）；**时序设计**：回填不在迁移步做（143 空库首启即记账，彼时回填则搬运数据永远 NULL）——由工具搬运后统一执行（runbook S5 自动包含，10 万块实测 149s）。
+5. **编辑/合并/关键词同步**：knowledge.js 三处 UPDATE、keywordgen.js 一处 UPDATE 同步重算 tsv（`lib/text-terms.js` 单一事实源——terms/tsvText/idxText；写侧 tsv 与读侧 `_idx`/tsquery 严格同口径防召回回归）。
+6. **ANALYZE**：搬运工具尾部自动 `ANALYZE`（实测踩坑：统计失真时 planner 对 MATCH 行数估计 rows=6 而实际 10 万 → 索引选择失当 1.2s 级误判）。
+7. **启动期增量回填**（db.js PG 启动块）：每次启动探测 `bm25_tsv IS NULL` 行并增量回填——**兜住一切非管道写入**（种子数据内联 INSERT、巡检/测试裸插、未来未知直插；巡检实锤：演示知识库首建在 PG 下检索不可见，该块根治）。稳态 COUNT 毫秒级；大库首次回填 10 万块实测 ~3 分钟一次性。
+8. **意外修复**：迁移步 11 的 embedding def 历史上为 TEXT（JSON 文本时代）——AI-02 改 float32 BLOB 写入后未跟进，PG 严格类型下二进制插 text 报 `invalid byte sequence 0x00`（造数搬运实锤）。迁移步 144 存量改型 `text→bytea`（先 DROP 旧 DEFAULT）；步 11 def 就位 BLOB（新库直接建对）。生产潜伏风险同步消除。143/144/145 均已补 down（BE-E1 回滚闭环；down 与 up 对称方言分支——PG 语法在 sqlite 会断回滚链）。
+
+### 摄取双写点全景（写入路径全覆盖）
+
+| 写点 | tsv 口径 | 说明 |
+|---|---|---|
+| ingestion-pipeline 父块/子块 INSERT | content | 摄取时 keywords 未生成 |
+| knowledge.js 编辑（带元数据/纯内容）、合并 UPDATE | content+keywords（完整 _idx） | SQL 列引用拼旧 content + JS 算 keywords 扩展 |
+| keywordgen.js 关键词生成 UPDATE | content+keywords（完整 _idx） | keywords 生成后并入 |
+| db.js 种子/巡检/任何直插 | 启动期回填自愈 | 见 §4-7 |
+| scripts/migrate-to-pg.js 搬运 | 工具回填（分批增量幂等） | runbook S5 自动包含 |
+
+## 5. PoC 实测结果（10 万分块演练库 pg5_drill，与生产切换同构链路）
+
+| 指标 | PoC 前（内存通道） | PoC 后（候选集） | 验收线 |
+|---|---|---|---|
+| MATCH 候选集 SELECT（retrieve 主 SQL） | 2772ms（全量 rows 加载） | **P50 86ms / P95 626ms**（高频词 19-90ms；低频词尾部见 §6） | — |
+| retrieve 全链 P50（含向量通道） | 144s | **1.5s** | — |
+| 零命中查询（threshold=0.01 默认） | 46/50 | **4/50**（候选集 rank 域变小，RRF 融合分 0.0164 量级正常过阈） | — |
+| RSS | 1.2GB | **350MB** | — |
+| 搬运+回填 | — | 10 万块 93s + 回填 149s（工具内置） | — |
+
+- **检索可用 ✓**：46/50 命中（默认阈值下）；召回打分 bm25ScoresMemory 双端同码同口径。
+- **对比基线**：全链 P50 32.5s（sqlite）/144s（PG）→ 1.5s，**20~96 倍改善**；生产现状规模（<1 千块）下全路径毫秒级。
+- **P95 < 300ms**：MATCH 通道高频词达标（19-90ms）；全链 P95 2.4s 未全达——尾部归因见 §6（非候选集本体成本）。
+
+## 6. 尾部归因与后续方向（下版排期）
+
+P50 1.5s ≈ MATCH 86ms + **向量通道哈希降级段 ~1.4s**（候选 500 块的 parseVec → bgeEmbed 失败 →
+本地哈希 embed 500 块 + 桥逐条写回 500 次）。**该段与 vecWeight 无关**（560-610 行结构），
+是 PG 无 vec0 → ANN 不可用 → 全扫+哈希兜底+落库缓存的既有形态（内存通道时代同样存在，被 32s
+分词掩盖）——**归 AI-02/OPS-1 量化口径（pgvector PoC 另立项）**，非全文检索候选集缺陷。
+
+低频词/无命中词的 MATCH 尾部（0.5-2.4s）：planner 在「LIMIT 早停」赌注下选 Seq 扫（RLS 行过滤
+不可索引化 + 高频 2-gram 的 posting bitmap 成本评估）——已固化 ANALYZE（防统计失真误判）+ 复合
+GIN（形态保底）；**根治方向**（下版）：候选查询包事务 + `SET LOCAL` 强制索引、或 tsquery 高频词
+动态裁剪（需运行时词频探测），均需 planner×RLS 深水区专项验证，边际成本陡增故列排期。
+
+RRF 阈值校准（原 §4-⑤）：候选集形态下零命中 46/50→4/50，**阈值问题随候选集 rank 域收窄自然消解**——不改动 threshold 语义（保持 0.01 缺省，零调用面变更风险）。
 
 ## 5. 中小规模现状结论（PG 模式检索当下可用性）
 

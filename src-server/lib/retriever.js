@@ -36,6 +36,20 @@ const BGE_TIMEOUT = 12000;    // 嵌入调用超时（超时/失败自动降级�
 const RERANK_MODEL = 'bge-reranker-v2-m3'; // 默认重排模型
 const RERANK_TIMEOUT = 10000; // 重排调用超时
 const RERANK_CANDIDATES = 30; // 粗召回送入 Rerank 的候选数
+
+// PG-5 tsvector PoC（2026-11-24）：候选集规模——覆盖 RERANK_CANDIDATES(30) + RRF rank 域余量；
+// rows 全量加载在 10 万分块下实测 P95 37s（sqlite 867ms）不可行，MATCH 候选替代（方案定稿见
+// docs/全文检索PG方案.md §4）
+const TSV_CANDIDATES = 500;
+let _tsvReady = null; // 模块级缓存（方言+列存在性一次探测；迁移后需重启生效——列是启动期迁移落的）
+function _pgTsvReady() {
+  if (_tsvReady != null) return _tsvReady;
+  if ((process.env.DB_DIALECT || 'sqlite') === 'sqlite') return (_tsvReady = false);
+  try {
+    _tsvReady = !!db.prepare("SELECT 1 AS v FROM information_schema.columns WHERE table_name='kb_chunks' AND column_name='bm25_tsv'").get();
+  } catch { _tsvReady = false; } // 探测异常（迁移未跑/库不可达）→ 回落全量路径，不阻断检索
+  return _tsvReady;
+}
 const RERANK_TOP_N = 5;      // Rerank 后精排输出数
 const GRAPH_W = 0.25;        // 图谱通道 RRF 融合权重（AI-04；在 wB+wV 之外叠加，wB=wV=0.5 时约占 1/5，仅助推不主导）
 const GRAPH_TOP_K = 8;       // 图谱关联实体取数上限（实体链接 topK）
@@ -165,20 +179,7 @@ function normalizeKbRerankConfig(kb) {
   };
 }
 
-function tokenize(s) {
-  return (s || '')
-    .toLowerCase()
-    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
-    .split(/\s+/)
-    .filter(w => w.length > 0);
-}
-// 中文额外生成 2-gram
-function terms(s) {
-  const set = new Set(tokenize(s));
-  const joined = (s || '').replace(/\s+/g, '');
-  for (let i = 0; i + 1 < joined.length; i++) set.add(joined.slice(i, i + 2));
-  return [...set];
-}
+const { tokenize, terms } = require('./text-terms'); // PG-5：分词单一事实源（写侧 tsv/读侧 tsquery 同口径防召回回归）
 
 /** FNV-1a 哈希 → [0, DIM) */
 function hashIdx(str) {
@@ -419,20 +420,35 @@ async function retrieve(query, kbId = null, topN = 5, threshold = 0.01, opts = {
   // AI-02 收尾：ANN 候选判定（扩展可用 + 库域限定 + 未显式关闭）——成立时主 SELECT 不取 embedding BLOB
   //（KNN 在库内算距离，向量不出库；这是 10 万分块下性能收益的本体）；opts.ann=false 可强制全扫（调试/对照）
   const annCandidate = kbId != null && opts.ann !== false && require('./vector-index').available();
-  // PG-5 实测踩坑修复（2026-11-24）：原句 `WHERE (? IS NULL OR c.kb_id = ?)` 在 PG 端报
-  // 「could not determine data type of parameter $1」——$1 IS NULL 不提供类型线索，PG 参数推断
-  // 失败（sqlite 动态类型宽松不炸）——即 PG 模式下 kbId=null 的跨库检索全链崩溃（e2e 用例均带
-  // kbId 故未暴露）。全库排查此模式仅此一处（其余 IS NULL 均为列值判定、类型可推断）。
-  // 改为按 kbId 有无拼两个 SQL 形态：语义与原句严格一致（null→全库，非空→限定）。
-  const _rowsStmt = db.prepare(`
-    SELECT c.id, c.content, c.kb_id, c.file_id, c.parent_id, c.chapter_id, ${annCandidate ? '' : 'c.embedding,'} c.keywords, c.metadata, c.modality, f.name AS file, k.name AS kb,
-      k.rerank_enabled AS kb_rerank_enabled, k.rerank_model AS kb_rerank_model, k.rerank_top_n AS kb_rerank_top_n, k.rerank_threshold AS kb_rerank_threshold
+  // PG-5 PoC（2026-11-24）：tsvector 候选集路径——PG 方言下主 SELECT 先经 GIN 索引 MATCH 收
+  // 候选（10 万分块全量加载实测 P95 37s/rows 2772ms 不可行，见 docs/全文检索PG方案.md），
+  // rows 从全量降至候选几百行；打分仍 bm25ScoresMemory（候选集上毫秒级）——双端打分口径
+  // 严格一致（召回对齐验收的前提）。列缺失（迁移未跑）防御性回落全量路径（行为与旧版一致）。
+  const pgTsv = _pgTsvReady();
+  const CAND_COLS = `c.id, c.content, c.kb_id, c.file_id, c.parent_id, c.chapter_id, ${annCandidate ? '' : 'c.embedding,'} c.keywords, c.metadata, c.modality, f.name AS file, k.name AS kb,
+      k.rerank_enabled AS kb_rerank_enabled, k.rerank_model AS kb_rerank_model, k.rerank_top_n AS kb_rerank_top_n, k.rerank_threshold AS kb_rerank_threshold`;
+  const CAND_FROM = `
     FROM kb_chunks c
     LEFT JOIN kb_files f ON f.id = c.file_id
-    LEFT JOIN kbs k ON k.id = c.kb_id
+    LEFT JOIN kbs k ON k.id = c.kb_id`;
+  let rows;
+  if (pgTsv) {
+    // qTerms 提前（候选集 tsquery 与后续打分共用，避免双算）；terms 产物仅含字母数字——
+    // 无 tsquery 特殊字符（& | ! ( ) : *），to_tsquery 直拼零注入面
+    const qTermsEarly = terms(query);
+    if (!qTermsEarly.length) return [];
+    const tsq = qTermsEarly.join(' | ');
+    // ts_rank 不用于排序候选（打分仍 JS bm25ScoresMemory 同口径）——LIMIT 只截断候选规模，
+    // 覆盖 RERANK_CANDIDATES(30)+RRF rank 域余量（500 实测后可调）
+    rows = kbId != null
+      ? db.prepare(`SELECT ${CAND_COLS} ${CAND_FROM} WHERE c.kb_id = ? AND (k.enabled IS NULL OR k.enabled = 1) AND c.bm25_tsv @@ to_tsquery('simple', ?) LIMIT ${TSV_CANDIDATES}`).all(kbId, tsq)
+      : db.prepare(`SELECT ${CAND_COLS} ${CAND_FROM} WHERE (k.enabled IS NULL OR k.enabled = 1) AND c.bm25_tsv @@ to_tsquery('simple', ?) LIMIT ${TSV_CANDIDATES}`).all(tsq);
+  } else {
+    rows = db.prepare(`
+    SELECT ${CAND_COLS} ${CAND_FROM}
     WHERE ${kbId != null ? 'c.kb_id = ? AND ' : ''}(k.enabled IS NULL OR k.enabled = 1)
-  `);
-  const rows = kbId != null ? _rowsStmt.all(kbId) : _rowsStmt.all();
+  `).all(kbId);
+  }
   if (!rows.length) return [];
   const kbChunkTotal = rows.length; // AI-02 收尾：本库分块总数（覆盖度闸分母；须在元数据过滤 splice 前捕获）
   // AI-09：库级重排配置（从本行携带的 kbs 列构建，免额外查询；kbId 为空时不应用库级配置）

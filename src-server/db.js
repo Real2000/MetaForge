@@ -3140,3 +3140,35 @@ if (DB_DRIVER === 'pg') {
   db.setTenantInjection(true);
   console.log('[db][PG-1] 写路径租户列注入已启用（数字租户上下文的 INSERT 自动补 tenant_id，1585+ 调用点零改动）');
 }
+
+// ================== PG-5 tsvector PoC（2026-11-24）：bm25_tsv 启动期增量回填 ==================
+// 摄取/编辑/合并/关键词生成路径已双写 tsv；但种子数据（本文件内联 INSERT）与任何非管道写入
+// （巡检/测试/未来直插）tsv 为 NULL——MATCH 候选集检索不可见（巡检实锤：演示知识库首建即空）。
+// 每次启动探测 NULL 行数并增量回填（只补 NULL，幂等；正常稳态 COUNT≈毫秒级，大库首次回填
+// 10 万块实测 ~3 分钟一次性）。失败不阻断启动（下次启动重试；期间检索对这些块不可见属降级）。
+if (DB_DRIVER === 'pg') {
+  try {
+    const pending = db.withTenant('platform', () =>
+      db.prepare('SELECT COUNT(*) c FROM kb_chunks WHERE bm25_tsv IS NULL').get());
+    if (pending && pending.c > 0) {
+      console.log(`[db][PG-5] bm25_tsv 启动期增量回填：${pending.c} 行（非管道写入兜底）`);
+      const { tsvText } = require('./lib/text-terms');
+      db.withTenant('platform', () => {
+        let lastId = 0;
+        const updTsv = db.prepare("UPDATE kb_chunks SET bm25_tsv = to_tsvector('simple', ?) WHERE id = ?");
+        for (;;) {
+          const rows = db.prepare('SELECT id, content, keywords FROM kb_chunks WHERE bm25_tsv IS NULL AND id > ? ORDER BY id LIMIT 500').all(lastId);
+          if (!rows.length) break;
+          db.exec('BEGIN');
+          for (const r of rows) updTsv.run(tsvText(r.content, r.keywords), r.id);
+          db.exec('COMMIT');
+          lastId = rows[rows.length - 1].id;
+          if (rows.length < 500) break;
+        }
+      });
+      console.log('[db][PG-5] bm25_tsv 回填完成');
+    }
+  } catch (e) {
+    console.error('[db][PG-5] bm25_tsv 回填失败（下次启动重试）：', e.message);
+  }
+}

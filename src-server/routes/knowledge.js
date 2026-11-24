@@ -19,6 +19,11 @@ const dal = require('../lib/dal'); // BE-C1：新增强制统一出口（方言�
 const { auth } = require('../lib/auth');
 const { retrieve, rerankModels } = require('../lib/retriever');
 const { generateForFile } = require('../lib/keywordgen');
+// PG-5 tsvector PoC（2026-11-24）：编辑/合并改 content 时同步重算 bm25_tsv（候选集 MATCH
+// 依赖——否则编辑后仍按旧词入候选，错漏召回）；口径=检索 _idx 同款（content+keywords，
+// lib/text-terms 单一事实源）。sqlite 无此列不拼接（行为零变化）。
+const _PG_TSV = (process.env.DB_DIALECT || 'sqlite') === 'kingbase'; // dm 无 tsvector（M9 评估）
+const { tsvText } = require('../lib/text-terms');
 const { extractMetadataForFile, sanitizeMetadata } = require('../lib/kb-metadata'); // V1.2 #2 2026-10-30：自动元数据抽取 + 入参清洗
 const { retrieveGraph } = require('../lib/graphrag');
 const { rerunEvalSet, runKbRegression } = require('../lib/kb-eval-regression'); // V1.3 #6 2026-10-30：知识库级召回评测集重跑核心 + 库变更自动回归
@@ -365,9 +370,13 @@ router.put('/chunks/:chunkId', (req, res) => {
   if (metadata !== undefined) {
     const clean = sanitizeMetadata(metadata);
     const metaSql = Object.keys(clean).length ? JSON.stringify(clean) : null;
-    dal.runq('UPDATE kb_chunks SET content=?, metadata=?, embedding=NULL WHERE id=?', [String(content || ''), metaSql, c.id]);
+    const newContent = String(content || '');
+    dal.runq(`UPDATE kb_chunks SET content=?, ${_PG_TSV ? "bm25_tsv=to_tsvector('simple', ?)," : ''} metadata=?, embedding=NULL WHERE id=?`,
+      _PG_TSV ? [newContent, tsvText(newContent, c.keywords), metaSql, c.id] : [newContent, metaSql, c.id]);
   } else {
-    dal.runq('UPDATE kb_chunks SET content=?, embedding=NULL WHERE id=?', [String(content || ''), c.id]);
+    const newContent = String(content || '');
+    dal.runq(`UPDATE kb_chunks SET content=?, ${_PG_TSV ? "bm25_tsv=to_tsvector('simple', ?)," : ''} embedding=NULL WHERE id=?`,
+      _PG_TSV ? [newContent, tsvText(newContent, c.keywords), c.id] : [newContent, c.id]);
   }
   vectorIndex.remove(c.kb_id, [c.id]); // AI-02 收尾：内容变更 → 影子表向量同步失效（下次检索回填新内容向量）
   // 更新文件 chunk_count（不做严格同步，简单 +1 即可）
@@ -398,7 +407,9 @@ router.post('/chunks/merge', (req, res) => {
   const deny = denyIfNotAllowed(kb, req.user);
   if (deny) return res.json(deny);
   // AI-02：合并后目标分块内容变更→同步失效其向量缓存（下次检索重算）；源分块行删除即携带其向量一并清除
-  dal.runq('UPDATE kb_chunks SET content=?, embedding=NULL WHERE id=?', [(source.content + '\n' + target.content).trim(), target.id]);
+  const mergedContent = (source.content + '\n' + target.content).trim();
+  dal.runq(`UPDATE kb_chunks SET content=?, ${_PG_TSV ? "bm25_tsv=to_tsvector('simple', ?)," : ''} embedding=NULL WHERE id=?`,
+    _PG_TSV ? [mergedContent, tsvText(mergedContent, target.keywords), target.id] : [mergedContent, target.id]);
   dal.runq('DELETE FROM kb_chunks WHERE id=?', [source.id]);
   vectorIndex.remove(source.kb_id, [target.id, source.id]); // AI-02 收尾：目标重算 + 源删除，两侧向量同步失效
   res.json({ code: 0, msg: '已合并' });
