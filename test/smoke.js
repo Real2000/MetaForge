@@ -946,7 +946,8 @@ function t(name, fn) {
       // RLS 注入：SET LOCAL 事务级（连接归池不残留）
       assert.ok(/set_config\('app\.tenant_id'/.test(workerSrc), '应注入会话变量（RLS 强制隔离）');
       const bridgeSrc = fs2.readFileSync(path.join(__dirname, '..', 'src-server', 'lib', 'pg-bridge.js'), 'utf8');
-      assert.ok(/Atomics\.wait\(state, 0, 0, CALL_TIMEOUT_MS\)/.test(bridgeSrc), '主线程应同步等待（带超时防死锁）');
+      assert.ok(/Atomics\.wait\(state, 0, 0, timeoutMs\)/.test(bridgeSrc) && /TIMEOUT_BY_OP_MS/.test(bridgeSrc),
+        '主线程应同步等待（带超时防死锁，PG-2 按 op 分级：query/run 10s、exec 60s）');
       assert.ok(!/rows\[0\] \|\| null/.test(bridgeSrc), 'get 契约：无行返回 undefined（better-sqlite3 语义）');
       // setTenantContext 入参窄化守卫（PoC 二跑踩坑）：曾误写 Number(tenantId)（闭包初值 null →
       // Number(null)=0），一切租户上下文静默归 0、RLS 隔离形同虚设——静态锚定防复发
@@ -970,9 +971,21 @@ function t(name, fn) {
         && /transaction\(fn\)[\s\S]{0,300}BEGIN/.test(bridgeSrc),
         'transaction(fn) 应返回可调用包装（better-sqlite3 契约）');
       // PG-1（2026-11-24）租约内禁止嵌套 BEGIN/COMMIT：内层 COMMIT 会提前提交外层事务
-      //（原子性破坏——双插入任一失败也无法整笔回滚）；租约内失败也不得 ROLLBACK（留给外层清理）
+      //（原子性破坏——双插入任一失败也无法整笔回滚）；租约内仍 local=true（随外层事务生效/回滚）
       assert.ok(/const inLease = conn === txConn/.test(workerSrc), 'worker 应判定事务租约（防嵌套 BEGIN/COMMIT）');
-      assert.ok(/req\.tenantId != null && !inLease/.test(workerSrc), '租约内失败不应 ROLLBACK 外层事务');
+      // PG-2（2026-11-24）：RLS 往返压缩——连接级会话租户缓存（命中免设）+ 归还保留缓存；
+      // 单语句失败自动回滚自身，残留由 ensureNoTenantSession 按需 RESET（无自包事务可 ROLLBACK）
+      assert.ok(/__mfTenant/.test(workerSrc) && /async function ensureTenantSession/.test(workerSrc),
+        'worker 应维护连接级会话租户缓存（withTenant 4 次往返→1-2 次）');
+      assert.ok(/async function ensureNoTenantSession/.test(workerSrc) && /RESET app\.tenant_id/.test(workerSrc),
+        '无上下文语句租用残留连接应先 RESET（脏连接防护：不得按残留租户被 RLS 过滤）');
+      assert.ok(/release: \(\) => conn\.release\(\)/.test(workerSrc),
+        '归还应保留会话租户缓存（清零会让每次调用都未命中——3 次往返白干）');
+      assert.ok(/if \(txConn\.__mfTenant != null\)/.test(workerSrc), 'BEGIN 租约应防御性清会话租户残留');
+      // PG-2：SAB 结果槽（去文件化）——单槽无竞争（主线程串行）+ 三态协议 + 溢出文件兑底
+      assert.ok(/SLOT_BYTES/.test(bridgeSrc) && /slotBuf/.test(bridgeSrc), '主线程应预分配 SAB 结果槽');
+      assert.ok(/activeSlot/.test(workerSrc) && /Atomics\.store\(activeSlot\.head, 0, 2\)/.test(workerSrc),
+        'worker 应写槽，溢出时置状态 2 回退文件通道');
     });
     await t('MT-7：db.js 接线守卫——AGENT_DB_DRIVER 分支 + sqlite 缺省路径 + 探测方言化收敛', () => {
       const fs2 = require('fs');

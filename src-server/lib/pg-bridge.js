@@ -36,7 +36,10 @@ const { PLATFORM_PLANE_EXCLUDE } = require('./pg-rls');
 const TENANT_CONTENT_TABLES = new Set(TENANT_TABLES.filter((t) => !PLATFORM_PLANE_EXCLUDE.includes(t)));
 
 /** 占位符转换与调用超时（见 createPgBridge 内联说明） */
-const CALL_TIMEOUT_MS = 30000;
+/** PG-2（2026-11-24）超时分级：query/run 10s（业务语句）；exec 60s（DDL/迁移/种子多语句块）；
+ *  init 15s。原单值 30s 对慢 DDL 不够、对快查询过长（超时期间主线程假死同步阻塞）。
+ *  超时值按 op 取用，未列 op 回退 query 档。 */
+const TIMEOUT_BY_OP_MS = { query: 10000, run: 10000, exec: 60000, init: 15000 };
 
 /**
  * SQLite 风格 `?` 占位符 → PG 风格 `$1..$n`（词法感知：字符串/注释内的 ? 不是占位符）。
@@ -132,6 +135,15 @@ function createPgBridge(opts = {}) {
   // 同步握手状态槽：0=请求进行中（主线程 wait 阻塞于此值），worker 完成 store 1 + notify 唤醒
   const state = new Int32Array(new SharedArrayBuffer(4));
   const stateBuf = state.buffer;
+  // PG-2（2026-11-24）SAB 结果槽（去文件化）：单槽 1MB——同步桥主线程串行阻塞（一次仅一个
+  // 进行中调用），单槽无竞争；主线程阻塞期间 postMessage 不可达，SAB 是 worker→主线程传结果的
+  // 零 syscall 通道（原路径每调用 write/read/unlink 三次文件 IO，为单语句往返的主要恒定开销）。
+  // 槽头 8 字节（Int32×2：[0]=状态 0进行中/1=SAB载荷/2=溢出文件；[1]=载荷字节长）；
+  // 超限载荷（大结果集）溢出回文件通道，行为与旧路径一致。
+  const SLOT_HEAD = 8;
+  const SLOT_BYTES = 1024 * 1024;
+  const slotBuf = new SharedArrayBuffer(SLOT_HEAD + SLOT_BYTES);
+  const slotHead = new Int32Array(slotBuf, 0, 2);
   const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), 'mt7-bridge-'));
   let seq = 0;
   let tenantId = null; // RLS 会话上下文（闭包兜底：启动期种子/脚本/PoC 显式设置；请求域优先走 ALS）
@@ -166,15 +178,27 @@ function createPgBridge(opts = {}) {
   // 同步阻塞期间正忙于执行，unref 不影响同步调用的正确性（唤醒仍由 Atomics.notify 承担）。
   worker.unref();
 
-  /** 同步调用 worker：postMessage → Atomics.wait（阻塞至 notify/超时）→ 读结果文件 */
+  /** 同步调用 worker：postMessage → Atomics.wait（阻塞至 notify/超时）→ 读结果（SAB 优先，溢出回退文件）
+   *  槽状态三态：1=SAB 载荷（常规路径，零文件 IO）；2=溢出文件（超限结果集）；其他=协议异常
+   *  （防不静默：先试文件兑底，再报协议错）。 */
   function callSync(req) {
+    const timeoutMs = TIMEOUT_BY_OP_MS[req.op] || TIMEOUT_BY_OP_MS.query;
     const file = path.join(tmpBase, `r${++seq}.json`);
     Atomics.store(state, 0, 0);
-    worker.postMessage({ ...req, file, stateBuf });
-    const r = Atomics.wait(state, 0, 0, CALL_TIMEOUT_MS);
-    if (r === 'timed-out') throw new Error(`pg-bridge：查询超时（${CALL_TIMEOUT_MS}ms）——${String(req.sql || req.op).slice(0, 80)}`);
+    Atomics.store(slotHead, 0, 0); // 清槽状态（上次结果作废；len 由 worker 就绪时写入）
+    worker.postMessage({ ...req, file, stateBuf, slotBuf });
+    const r = Atomics.wait(state, 0, 0, timeoutMs);
+    if (r === 'timed-out') throw new Error(`pg-bridge：查询超时（${timeoutMs}ms）——${String(req.sql || req.op).slice(0, 80)}`);
+    const st = Atomics.load(slotHead, 0);
     let raw;
-    try { raw = fs.readFileSync(file, 'utf8'); } finally { try { fs.unlinkSync(file); } catch { } }
+    if (st === 1) {
+      raw = Buffer.from(slotBuf, SLOT_HEAD, Atomics.load(slotHead, 1)).toString('utf8');
+    } else {
+      // 2=溢出文件；其他=协议异常——统一文件兑底，不可读则显式报错（不静默丢结果）
+      try { raw = fs.readFileSync(file, 'utf8'); } catch {
+        throw new Error('pg-bridge：结果通道协议异常（slot status=' + st + '）');
+      } finally { try { fs.unlinkSync(file); } catch { } }
+    }
     const parsed = JSON.parse(raw);
     if (!parsed.ok) throw new Error(`pg-bridge：${parsed.error}`);
     return parsed;

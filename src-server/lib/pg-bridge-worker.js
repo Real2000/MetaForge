@@ -18,27 +18,72 @@ const { parentPort } = require('worker_threads'); // worker 线程收父消息�
 let Pool = null;
 let pool = null;
 let txConn = null; // 事务租约连接
+let activeSlot = null; // 当前请求的 SAB 结果槽（PG-2：主线程串行 → 单槽无竞争；每消息重绑）
 
+/** PG-2（2026-11-24）SAB 结果槽写入：常规载荷走共享内存（零文件 IO，单语句往返的恒定开销
+ *  主要来自原路径的 write/read/unlink 三次 syscall）；超限/槽异常溢出文件通道（status=2）。
+ *  写序：先写数据区与长度，最后 store 状态——Atomics.store 为顺序一致，主线程读到状态 1 时
+ *  数据必已就绪。 */
 function finish(stateArr, file, payload) {
+  if (activeSlot) {
+    try {
+      const json = JSON.stringify(payload);
+      const bytes = Buffer.byteLength(json);
+      if (bytes <= activeSlot.cap) {
+        Buffer.from(activeSlot.buf, 8).write(json, 0, bytes, 'utf8');
+        Atomics.store(activeSlot.head, 1, bytes);
+        Atomics.store(activeSlot.head, 0, 1);
+        Atomics.store(stateArr, 0, 1);
+        Atomics.notify(stateArr, 0);
+        return;
+      }
+    } catch { /* 槽写异常 → 文件兑底，不静默丢结果 */ }
+  }
   try {
     require('fs').writeFileSync(file, JSON.stringify(payload));
   } catch (e) {
     // 结果文件写失败也要唤醒主线程（否则 Atomics.wait 挂满超时）——错误经共享槽旁路文件传递
     try { require('fs').writeFileSync(file + '.err', String(e && e.message || e)); } catch { }
   }
+  if (activeSlot) Atomics.store(activeSlot.head, 0, 2);
   Atomics.store(stateArr, 0, 1);
   Atomics.notify(stateArr, 0);
 }
 
+/** PG-2（2026-11-24）RLS 上下文往返压缩：连接级会话租户缓存（conn.__mfTenant）。
+ *  原路径每语句包「BEGIN+set_config(local)+语句+COMMIT」四次串行往返（withTenant P95 3.1ms，
+ *  验收硬指标 1.5ms 达不到）。改为会话级 set_config（false）：命中免设（1 次往返），未命中
+ *  设一次。**归还保留缓存**（清零会让每次调用都未命中，3 次往返白干）；脏连接防护改为
+ *  「无上下文语句租用带残留连接时先 RESET」——无上下文语句不得看到残留会话值，有租户语句
+ *  按需覆盖无害。显式事务（租约）内仍用 local=true（随事务回滚，语义不变）。 */
+async function ensureTenantSession(conn, tv) {
+  if (conn.__mfTenant !== tv) {
+    await conn.query("SELECT set_config('app.tenant_id', $1, false)", [String(tv)]);
+    conn.__mfTenant = tv;
+  }
+}
+
+/** 无上下文语句的脏连接防护：租到带会话租户残留的连接先清零（否则语句会按残留租户被
+ *  RLS 过滤——错租户读）。有租户语句走 ensureTenantSession 按需覆盖，无需预清。 */
+async function ensureNoTenantSession(conn) {
+  if (conn.__mfTenant != null) {
+    try { await conn.query('RESET app.tenant_id'); } catch { /* 连接已坏：池重建无残留 */ }
+    conn.__mfTenant = null;
+  }
+}
+
 async function acquireConn() {
-  if (txConn) return { conn: txConn, release: () => { } }; // 事务期固定租约
+  if (txConn) return { conn: txConn, release: () => { } }; // 事务期固定租约（归还由 COMMIT/ROLLBACK 分支处理）
   const conn = await pool.connect();
-  return { conn, release: () => conn.release() };
+  return { conn, release: () => conn.release() }; // PG-2：归还保留 __mfTenant 缓存（脏连接防护见 ensureNoTenantSession）
 }
 
 parentPort.on('message', (req) => {
   const { op, sql, args, file, stateBuf } = req;
   const stateArr = stateBuf ? new Int32Array(stateBuf) : new Int32Array(new SharedArrayBuffer(4));
+  // PG-2：每消息重绑 SAB 结果槽（主线程串行——同一时刻仅一个活跃槽；structured clone 对
+  // SAB 是共享引用非拷贝，每消息传递开销可忽略）
+  activeSlot = req.slotBuf ? { buf: req.slotBuf, head: new Int32Array(req.slotBuf, 0, 2), cap: req.slotBuf.byteLength - 8 } : null;
   (async () => {
     if (op === 'init') {
       const pg = require('pg');
@@ -67,6 +112,12 @@ parentPort.on('message', (req) => {
       if (kw === 'BEGIN') {
         if (txConn) { finish(stateArr, file, { ok: false, error: 'pg-bridge：不支持的嵌套事务（外层未结束）' }); return; }
         txConn = await pool.connect();
+        // 防御：带会话级租户残留的连接进显式事务——事务内无上下文语句会看到残留会话值
+        //（PG-2 归还已改为保留缓存，残留是常态而非异常——此处 RESET 即主防线，非兑底）
+        if (txConn.__mfTenant != null) {
+          try { await txConn.query('RESET app.tenant_id'); } catch { }
+          txConn.__mfTenant = null;
+        }
         try { await txConn.query('BEGIN'); finish(stateArr, file, { ok: true, rows: [], rowCount: 0 }); }
         catch (e) { const c = txConn; txConn = null; c.release(); finish(stateArr, file, { ok: false, error: String(e && e.message || e) }); }
         return;
@@ -75,7 +126,7 @@ parentPort.on('message', (req) => {
       const c = txConn; txConn = null;
       try { await c.query(kw); finish(stateArr, file, { ok: true, rows: [], rowCount: 0 }); }
       catch (e) { finish(stateArr, file, { ok: false, error: String(e && e.message || e) }); }
-      finally { c.release(); }
+      finally { c.release(); } // 租约连接 __mfTenant 恒 null（BEGIN 防御清零）——直接归还即无残留
       return;
     }
 
@@ -86,9 +137,8 @@ parentPort.on('message', (req) => {
     const inLease = conn === txConn;
     try {
       if (op === 'query' || op === 'run') {
-        // RLS 注入：设置租户上下文时包「事务级 set_config + 语句」——SET LOCAL 事务内生效，
-        // 连接归还池后不残留（脏连接隔离）；'platform' 为显式跨租户逃逸值（RLS 策略分支匹配，
-        // 代码级 opt-in）；数字值经 Number() 窄化后内插（无注入面）
+        // RLS 注入（PG-2 压缩）：非租约路径走连接级会话租户缓存（命中免设）；租约内仍
+        // local=true（随外层事务生效/回滚，不得污染会话级状态）；'platform' 为显式逃逸值
         let full = String(sql), fullArgs = args || [];
         let result;
         if (req.tenantId != null) {
@@ -97,12 +147,11 @@ parentPort.on('message', (req) => {
             await conn.query(`SELECT set_config('app.tenant_id', '${tv}', true)`);
             result = await conn.query(full, fullArgs);
           } else {
-            await conn.query('BEGIN');
-            await conn.query(`SELECT set_config('app.tenant_id', '${tv}', true)`);
+            await ensureTenantSession(conn, tv);
             result = await conn.query(full, fullArgs);
-            await conn.query('COMMIT');
           }
         } else {
+          if (!inLease) await ensureNoTenantSession(conn); // 脏连接防护：无上下文语句不得按残留租户被 RLS 过滤
           result = await conn.query(full, fullArgs);
         }
         const payload = { ok: true, rows: result.rows || [], rowCount: result.rowCount || 0 };
@@ -115,7 +164,7 @@ parentPort.on('message', (req) => {
         }
         finish(stateArr, file, payload);
       } else if (op === 'exec') {
-        // 多语句块（DDL/迁移）：RLS 上下文下同样包事务（set_config 语义生效）；租约内不嵌套
+        // 多语句块（DDL/迁移）：同 query/run 的会话级缓存路径；租约内不嵌套（local=true）
         if (req.tenantId != null) {
           const tv2 = req.tenantId === 'platform' ? 'platform' : Number(req.tenantId);
           if (inLease) {
@@ -123,13 +172,12 @@ parentPort.on('message', (req) => {
             const r = await conn.query(String(sql));
             finish(stateArr, file, { ok: true, rows: r.rows || [], rowCount: r.rowCount || 0 });
           } else {
-            await conn.query('BEGIN');
-            await conn.query(`SELECT set_config('app.tenant_id', '${tv2}', true)`);
+            await ensureTenantSession(conn, tv2);
             const r = await conn.query(String(sql));
-            await conn.query('COMMIT');
             finish(stateArr, file, { ok: true, rows: r.rows || [], rowCount: r.rowCount || 0 });
           }
         } else {
+          if (!inLease) await ensureNoTenantSession(conn); // 脏连接防护（同 query/run 分支）
           const r = await conn.query(String(sql)); // pg simple query：多语句块原生支持
           finish(stateArr, file, { ok: true, rows: r.rows || [], rowCount: r.rowCount || 0 });
         }
@@ -137,13 +185,11 @@ parentPort.on('message', (req) => {
         finish(stateArr, file, { ok: false, error: `pg-bridge：未知 op ${op}` });
       }
     } catch (e) {
-      // 连接状态复位规则：
-      //   · RLS 自包事务（本函数 BEGIN 的）失败 → ROLLBACK 复位后归还（连接不带 aborted 态回池）
-      //   · 事务租约（外层 db.transaction 持有）失败 → 本层不动（不 ROLLBACK 已中止的外层事务），
-      //     错误上抛由外层 ROLLBACK 走同一租约连接完成清理（释放也留给外层 COMMIT/ROLLBACK 分支）
-      if (req.tenantId != null && !inLease) {
-        try { await conn.query('ROLLBACK'); } catch { /* 连接已坏时归还由池重建 */ }
-      }
+      // 连接状态复位规则（PG-2 简化）：非租约路径已无自包事务（会话级缓存免 BEGIN/COMMIT），
+      // 单语句失败自动回滚自身；__mfTenant 残留在归还时保留（连接级缓存），由
+      // ensureNoTenantSession 在下次无上下文语句时按需 RESET（脏连接防护）。
+      // 事务租约（外层 db.transaction 持有）失败：本层不动（不 ROLLBACK 已中止的外层事务），
+      // 错误上抛由外层 ROLLBACK 走同一租约连接完成清理。
       finish(stateArr, file, { ok: false, error: String(e && e.message || e) });
     } finally {
       release();
