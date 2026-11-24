@@ -85,6 +85,15 @@ else
   echo "[1/3] 依赖已就绪"
 fi
 
+# ---- 3a. 数据库切换点（PG-4，2026-11-24）：存在 db.env 则加载 ----
+# 用途：sqlite→PG 切换（AGENT_DB_DRIVER=pg + PG_CONN）零编辑脚本——
+#   切换：创建 db.env（模板见 docs/PG切换runbook.md）；回滚：删除 db.env。
+# 无 db.env 时行为不变（缺省 sqlite，生产零影响）。set -a 使变量随 nohup 传给 node。
+if [ -f "db.env" ]; then
+  set -a; . "db.env"; set +a
+  echo "[i] 已加载数据库配置 db.env（AGENT_DB_DRIVER=${AGENT_DB_DRIVER:-sqlite}）"
+fi
+
 # ---- 3. 常驻启动（nohup：关闭窗口服务不停止；日志落盘）----
 echo "[2/3] 启动服务…（常驻后台，关闭本窗口不影响运行）"
 echo "      Docker 部署：docker compose up -d（详见 docs/ 与根目录 Dockerfile）"

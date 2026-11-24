@@ -30,3 +30,6 @@ public/downloads/
 *.tar.gz
 .DS_Store
 __pycache__/
+
+# PG-4：数据库切换点（db.env 含连接凭据，严禁提交）
+db.env
