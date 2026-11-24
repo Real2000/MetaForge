@@ -885,6 +885,12 @@ const ALL_MIGRATIONS = [
     report TEXT DEFAULT '{}',
     created_at TEXT
   )` },
+  // === PG-3（2026-11-24）结构漂移补列：DDL 后期新增列此前无迁移步 ===
+  // expert_catalog/sub_agent_library 建表 DDL 后期加入 created_by，CREATE TABLE IF NOT EXISTS
+  // 对存量旧表不生效——旧库（生产 platform.db 实测）永久缺列，与 PG 端新形态不一致
+  // （scripts/migrate-to-pg.js 对账列检查 fail）。入迁移框架补列，存量库形态对齐。
+  { id: 141, name: 'expert_catalog.created_by - 结构漂移补列（PG-3 搬运对账）', table: 'expert_catalog', column: 'created_by', def: "TEXT DEFAULT ''" },
+  { id: 142, name: 'sub_agent_library.created_by - 结构漂移补列（PG-3 搬运对账）', table: 'sub_agent_library', column: 'created_by', def: "TEXT DEFAULT ''" },
 ];
 
 module.exports = {
