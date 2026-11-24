@@ -24,6 +24,17 @@ function dayKey(d = new Date()) {
 
 /** 每日数据库备份（VACUUM INTO：在线一致性快照，WAL 安全） */
 function dailyBackup() {
+  // PG-6（2026-11-24）显式方言降级：VACUUM INTO 为 SQLite 专有（在线一致性快照；占位符目标
+  // 亦仅 SQLite 支持）。PG 模式无内建等价（pg_dump 属外部工具，M7 OPS-3 双轨排期）——显式
+  // 跳过并记 op_logs 审计：降级是登记决策而非错误。旧形态（无分支裸奔）在 PG 模式每天 03:30
+  // 必炸进 catch，写一条假 err_logs「备份失败」噪音，且掩盖「PG 模式备份零产出」这一运维事实
+  //（切换 runbook 已要求 PG 侧另行安排 pg_dump 兜底）。
+  if ((process.env.DB_DIALECT || 'sqlite') !== 'sqlite') {
+    const msg = `PG 模式：VACUUM INTO 备份跳过（sqlite 专有；pg_dump 双轨见 M7 OPS-3）`;
+    console.log(`[ops] ${msg}`);
+    try { dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', ['system', '数据库备份', msg, '', now()]); } catch { /* 审计写失败不阻塞（调度循环容错） */ }
+    return { ok: true, skipped: true, msg };
+  }
   try {
     fs.mkdirSync(BACKUP_DIR, { recursive: true });
     const fname = `platform-${dayKey()}.db`;
