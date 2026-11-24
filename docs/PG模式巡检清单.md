@@ -1,8 +1,9 @@
 # PG 模式巡检清单（M6 / PG-6，2026-11-24）
 
 > 范围：`lint:dialect` 审计下 kingbase（PG 系）方言登记项的 **PG 运行时等价复核** + 全功能巡检。
-> 结论先行：**13 处登记项等价实现全部在位；巡检 12/12 通过**；本轮唯一代码修复为
-> `ops.js dailyBackup` 显式方言降级分支（原裸奔 catch 形态见 §3）。
+> 结论先行：**13 处登记项等价实现全部在位；巡检 13/13 通过**；本轮代码修复两处：
+> `ops.js dailyBackup` 显式方言降级（§3）、`retriever.js` 主 SELECT 的 PG 参数推断崩溃修复
+>（PG-5 实测暴露的 PG-1 遗留缺陷，详见 docs/全文检索PG方案.md §2）。
 
 ## 1. 登记项等价实现复核（kingbase 方言，lint:dialect）
 
@@ -74,7 +75,19 @@ AGENT_DB_DRIVER=pg PG_CONN=<业务角色连接串> AGENT_DATA_DIR=.temp/pg5-pg \
 npm run lint:dialect             # 期望：未登记 warning = 0
 ```
 
-本轮巡检结果（2026-11-24）：**12/12 通过**（探测 API / Text2SQL 方言分叉 / 目录拦截 ×5 /
-检索通道 / upsert / 序列 / dailyBackup 降级）。
+本轮巡检结果（2026-11-24）：**13/13 通过**（探测 API / Text2SQL 方言分叉 / 目录拦截 ×5 /
+检索链路（小库验证） / upsert / 序列 / dailyBackup 降级 / 外壳自证）。
+
+## 6. 补充修复（同轮，归属 PG-5 实测发现）
+
+- **retriever.js 主 SELECT PG 崩溃**：`WHERE (? IS NULL OR c.kb_id = ?)` 在 PG 端报
+  「could not determine data type of parameter $1」——**PG 模式下检索全链崩溃**（kbId
+  限定/跨库均不可用；e2e 未覆盖检索路径故未暴露）。已改为按 kbId 有无拼两个 SQL 形态。
+  全库排查此模式仅此一处。详见 docs/全文检索PG方案.md §2。
+- **巡检脚本外壳缺陷**（.temp，未入库）：同步 try/catch 捕不到 async 用例断言——
+  retriever 用例曾假 ✓；改 promise 收集 + 统一 await 后真验证。
+- **retriever 大库阈值行为（记录，非缺陷，跨引擎一致）**：10 万块时 RRF 融合分 ≈0.0085
+  低于缺省 threshold=0.01 → 近零命中（sqlite 同样）——分数量级校准随 PG-5 tsvector PoC
+  配套（docs/全文检索PG方案.md §4-⑤）。
 
 > AI生成

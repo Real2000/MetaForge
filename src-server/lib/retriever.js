@@ -419,14 +419,20 @@ async function retrieve(query, kbId = null, topN = 5, threshold = 0.01, opts = {
   // AI-02 收尾：ANN 候选判定（扩展可用 + 库域限定 + 未显式关闭）——成立时主 SELECT 不取 embedding BLOB
   //（KNN 在库内算距离，向量不出库；这是 10 万分块下性能收益的本体）；opts.ann=false 可强制全扫（调试/对照）
   const annCandidate = kbId != null && opts.ann !== false && require('./vector-index').available();
-  const rows = db.prepare(`
+  // PG-5 实测踩坑修复（2026-11-24）：原句 `WHERE (? IS NULL OR c.kb_id = ?)` 在 PG 端报
+  // 「could not determine data type of parameter $1」——$1 IS NULL 不提供类型线索，PG 参数推断
+  // 失败（sqlite 动态类型宽松不炸）——即 PG 模式下 kbId=null 的跨库检索全链崩溃（e2e 用例均带
+  // kbId 故未暴露）。全库排查此模式仅此一处（其余 IS NULL 均为列值判定、类型可推断）。
+  // 改为按 kbId 有无拼两个 SQL 形态：语义与原句严格一致（null→全库，非空→限定）。
+  const _rowsStmt = db.prepare(`
     SELECT c.id, c.content, c.kb_id, c.file_id, c.parent_id, c.chapter_id, ${annCandidate ? '' : 'c.embedding,'} c.keywords, c.metadata, c.modality, f.name AS file, k.name AS kb,
       k.rerank_enabled AS kb_rerank_enabled, k.rerank_model AS kb_rerank_model, k.rerank_top_n AS kb_rerank_top_n, k.rerank_threshold AS kb_rerank_threshold
     FROM kb_chunks c
     LEFT JOIN kb_files f ON f.id = c.file_id
     LEFT JOIN kbs k ON k.id = c.kb_id
-    WHERE (? IS NULL OR c.kb_id = ?) AND (k.enabled IS NULL OR k.enabled = 1)
-  `).all(kbId, kbId);
+    WHERE ${kbId != null ? 'c.kb_id = ? AND ' : ''}(k.enabled IS NULL OR k.enabled = 1)
+  `);
+  const rows = kbId != null ? _rowsStmt.all(kbId) : _rowsStmt.all();
   if (!rows.length) return [];
   const kbChunkTotal = rows.length; // AI-02 收尾：本库分块总数（覆盖度闸分母；须在元数据过滤 splice 前捕获）
   // AI-09：库级重排配置（从本行携带的 kbs 列构建，免额外查询；kbId 为空时不应用库级配置）
