@@ -93,6 +93,10 @@ function extractSqlLiterals(src, rel) {
     if (ch !== "'" && ch !== '"' && ch !== '`') continue; // 动态拼接/变量 → 跳过（片段级审计覆盖不到，构造类别登记兜底）
     const end = skipString(src, i);
     let sql = src.slice(i + 1, end - 1);
+    // PG-1（2026-11-23）：源码切片保留 JS 转义（如 datetime(\'now\',\'localtime\')），与运行时真实
+    // SQL 不一致——方言改写按运行时文本匹配，转义残留造成漏匹配假阴性（datetime 残留网首跑
+    // 暴露：auth/payment/security 的转义形态 10 处被误报残留）。统一反转义为运行时文本。
+    sql = sql.replace(/\\(['"\\$`])/g, '$1').replace(/\\n/g, '\n').replace(/\\t/g, '\t');
     // 模板插值占位（避免把 JS 表达式当 SQL 翻译）
     sql = sql.replace(/\$\{[^}]*\}/g, '__EXPR__');
     if (!sql.trim()) continue;

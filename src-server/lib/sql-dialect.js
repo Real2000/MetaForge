@@ -25,14 +25,89 @@
 /* ---------------- 通用规则（dm / kingbase 共有） ---------------- */
 
 const COMMON_RULES = [
-  // 当前时间：SQLite datetime('now','localtime') / datetime('now') → 标准 CURRENT_TIMESTAMP
-  { re: /datetime\(\s*'now'\s*(?:,\s*'localtime'\s*)?\)/gi, to: 'CURRENT_TIMESTAMP' },
-  { re: /\bdate\(\s*'now'\s*(?:,\s*'localtime'\s*)?\)/gi, to: 'CURRENT_DATE' },
+  // datetime()/date() 不在此做正则映射：语义改写（TEXT 契约 + 基准时区 + 修饰符）见下方
+  // replaceDatetimeFn（PG-1 2026-11-23 语义修复——此前译作 CURRENT_TIMESTAMP/CURRENT_DATE
+  // 是「能解析但行为不等价」，PG 轨道 task_queue 首踩 text <= timestamptz 启动即崩）
   // IFNULL → COALESCE（三者等价）
   { re: /\bIFNULL\s*\(/gi, to: 'COALESCE(' },
   // 反引号标识符 → 双引号（SQLite 与 PG/dm 均支持双引号；反引号非标准）
   { re: /`([^`]+)`/g, to: '"$1"' },
 ];
+
+/* ---------------- datetime()/date() 语义改写（PG-1 2026-11-23） ----------------
+ * sqlite 的 datetime()/date() 返回 TEXT（'YYYY-MM-DD HH:MM:SS' / 'YYYY-MM-DD'）；此前正则映射为
+ * CURRENT_TIMESTAMP/CURRENT_DATE 是「能解析但行为不等价」：PG 里它们是 timestamptz/date
+ * 强类型——TEXT 列与之比较直接报 operator does not exist（PG 轨道 task_queue 首踩
+ * text <= timestamptz，启动即崩），且返回形态违背 TEXT 契约。
+ * 时间基准对齐 db.js now()/daysAgo()：业务写入固定 Asia/Shanghai（UTC+8 无夏令时）的 'sv-SE'
+ * 墙钟文本——翻译层同基准，与部署机/容器/会话时区解耦；sqlite datetime('now')=UTC 与
+ * 'localtime'=本地的双钟语义在此统一为业务基准（跨钟比较即数小时级错乱，读写同钟才可比）。
+ * dm 无 AT TIME ZONE 投影语法，基钟用 SYSDATE（MT-9 达梦接入时需校准库时区为 Asia/Shanghai）。 */
+
+/** 业务基准时区（与 db.js now()/daysAgo() 的写入基钟一致） */
+const TZ_BASE = 'Asia/Shanghai';
+
+/** 方言基钟表达式（PG 系：timestamptz 投影到业务基准时区的墙钟 timestamp；dm：SYSDATE） */
+function clockExpr(isDm) {
+  return isDm ? 'SYSDATE' : `now() AT TIME ZONE '${TZ_BASE}'`;
+}
+
+/** TEXT 列/值 → timestamp（PG 系 ::timestamp；dm CAST——epoch/to_char 均需强类型入参） */
+function tsCast(expr, isDm) {
+  return isDm ? `CAST(${expr} AS TIMESTAMP)` : `(${expr})::timestamp`;
+}
+
+/** 函数实参顶层逗号切分（本族实参不含逗号；若含逗号字符串会切歪 → 逐项校验失败整体放弃，安全无损） */
+function splitFnArgs(s) {
+  return String(s).split(',').map((x) => x.trim()).filter(Boolean);
+}
+
+/** 修饰符解析：'localtime'→skip（基钟即业务基准）；±N unit→区间算术；'start of X'→截断。
+ *  未知修饰符返回 null（调用方整体放弃改写——不臆造，残留进 unsupported 告警网）。 */
+function datetimeModifier(mod, isDm) {
+  const raw = String(mod).trim().replace(/^'(.*)'$/, '$1').trim();
+  if (/^localtime$/i.test(raw)) return { skip: true };
+  let m = /^([+-]?)\s*(\d+)\s+(second|minute|hour|day|month|year)s?$/i.exec(raw);
+  if (m) {
+    const sign = m[1] === '-' ? '-' : '+';
+    // PG 系：interval '30 days'；dm（Oracle 式）：INTERVAL '30' DAY
+    return { expr: isDm ? `${sign} INTERVAL '${m[2]}' ${m[3].toUpperCase()}` : `${sign} interval '${m[2]} ${m[3].toLowerCase()}'` };
+  }
+  m = /^start of (day|month|year)$/i.exec(raw);
+  if (m) {
+    // PG 系 date_trunc；dm TRUNC（日/DD 月/MM 年/YYYY）
+    const dmFmt = { day: 'DD', month: 'MM', year: 'YYYY' }[m[1].toLowerCase()];
+    return { wrap: isDm ? `TRUNC(<E>, '${dmFmt}')` : `date_trunc('${m[1].toLowerCase()}', <E>)` };
+  }
+  return null;
+}
+
+/**
+ * datetime()/date('now'…) → TEXT 契约等价改写（sqlite 语义：返回 TEXT）。
+ * 覆盖：'now' 基钟、'localtime'（并入业务基准）、±N unit、'start of day|month|year'、
+ * 列形态 datetime(col)（TEXT→timestamp 规范化）；参数化修饰符（?||' seconds'，queue 退避）
+ * 不可静态改写 → 保留原文（调用点已改 JS 计算，见 lib/queue/memory-driver.js）。
+ */
+function replaceDatetimeFn(sql, dialectName) {
+  const isDm = dialectName === 'dm';
+  const FMT = { datetime: "'YYYY-MM-DD HH24:MI:SS'", date: "'YYYY-MM-DD'" };
+  return String(sql).replace(/\b(datetime|date)\(\s*([^()]*?)\s*\)/gi, (whole, fn, argsRaw) => {
+    const parts = splitFnArgs(argsRaw);
+    if (!parts.length || parts.some((p) => p.includes('?'))) return whole;
+    const first = parts[0];
+    let expr;
+    if (/^'now'$/i.test(first)) expr = clockExpr(isDm);
+    else if (/^[\w."]+$/i.test(first)) expr = tsCast(first, isDm); // 列形态：TEXT 规范化
+    else return whole;
+    for (const mod of parts.slice(1)) {
+      const r = datetimeModifier(mod, isDm);
+      if (!r) return whole; // 未知修饰符：不臆造
+      if (r.skip) continue;
+      expr = r.wrap ? r.wrap.replace('<E>', expr) : `${expr} ${r.expr}`;
+    }
+    return `to_char(${expr}, ${FMT[String(fn).toLowerCase()]})`;
+  });
+}
 
 /* ---------------- strftime() 处理（BE-C2 2026-11-22） ---------------- */
 
@@ -59,17 +134,20 @@ function replaceStrftime(sql, dialectName) {
     const arg0 = String(argRaw || '').trim();
     const isNow = /^'now'(\s*,\s*'localtime')?$/.test(arg0) || arg0 === '';
     if (fmt === '%s') {
+      // PG-1（2026-11-23）：列实参补 ::timestamp/CAST 强转——EXTRACT(EPOCH FROM text) 直接报错
+      //（billing-gate 的 hold TTL 判定实参为 created_at TEXT 列，原文直发即崩）
       if (isDm) {
         return isNow
           ? `DATEDIFF(SECOND, TIMESTAMP '1970-01-01 00:00:00', SYSDATE)`
-          : `DATEDIFF(SECOND, TIMESTAMP '1970-01-01 00:00:00', ${arg0})`;
+          : `DATEDIFF(SECOND, TIMESTAMP '1970-01-01 00:00:00', ${tsCast(arg0, isDm)})`;
       }
       return isNow
         ? `EXTRACT(EPOCH FROM now())::bigint`
-        : `EXTRACT(EPOCH FROM ${arg0})::bigint`;
+        : `EXTRACT(EPOCH FROM ${tsCast(arg0, isDm)})::bigint`;
     }
     if (!arg0) return whole; // 无参数（无目标列）不臆造
-    return `to_char(${arg0}, '${convertStrftimeFormat(fmt)}')`;
+    // PG-1：'now' 实参走基钟表达式、列实参强转——to_char(text, …) 在 PG 系同样直接报错
+    return `to_char(${isNow ? clockExpr(isDm) : tsCast(arg0, isDm)}, '${convertStrftimeFormat(fmt)}')`;
   });
 }
 
@@ -102,6 +180,9 @@ const DIALECTS = {
       // MERGE INTO 模板或应用层先查后写
       { name: 'ON CONFLICT upsert', re: /\bON\s+CONFLICT\b/i },
       { name: 'sqlite_master 系统表', re: /\bsqlite_master\b|\bsqlite_sequence\b/i },
+      // PG-1（2026-11-23）残留网：datetime()/date()/strftime() 经改写后仍存留的形态
+      //（参数化修饰符、未知修饰符）——此前静默漏过属审计盲区，显式产出 warning
+      { name: 'datetime()/date()/strftime() 残留', re: /\b(datetime|strftime)\s*\(|\bdate\s*\(\s*'now'/i },
     ],
   },
 
@@ -131,6 +212,9 @@ const DIALECTS = {
       { name: 'PRAGMA', re: /\bPRAGMA\b/i },
       // ON CONFLICT upsert：PG 系原生兼容，不告警（smoke 单测锚定该语义）
       { name: 'sqlite_master 系统表', re: /\bsqlite_master\b|\bsqlite_sequence\b/i },
+      // PG-1（2026-11-23）残留网：datetime()/date()/strftime() 经改写后仍存留的形态
+      //（参数化修饰符、未知修饰符）——此前静默漏过属审计盲区，显式产出 warning
+      { name: 'datetime()/date()/strftime() 残留', re: /\b(datetime|strftime)\s*\(|\bdate\s*\(\s*'now'/i },
     ],
   },
 };
@@ -200,8 +284,11 @@ function translate(sql, dialectName = 'sqlite') {
     }
   }
 
-  // --- strftime(…) → to_char/epoch 等价改写（BE-C2） ---
+  // --- strftime(…) → to_char/epoch 等价改写（BE-C2；PG-1 补实参强转） ---
   out = replaceStrftime(out, d.name);
+
+  // --- datetime()/date() → TEXT 契约等价改写（PG-1 2026-11-23 语义修复） ---
+  out = replaceDatetimeFn(out, d.name);
 
   // --- 正则规则逐条应用 ---
   for (const r of d.rules) out = out.replace(r.re, r.to);

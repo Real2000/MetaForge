@@ -133,10 +133,15 @@ const { currentRequestId } = require('./request-context');
 // 避免迁移加列后旧行 canonical 变化导致 verifyChain 误报篡改）
 const NON_HASH_COLS = ['id', 'prev_hash', 'record_hash', 'request_id'];
 /** 目标表是否有 request_id 列（每次探测不做长缓存：BE-E1 down/up 窗口后仍新鲜；
- *  旧 schema 表（如独立内存库/未迁移库）返回 false → 降级不注入，审计写入永不因关联键缺失而失败） */
+ *  旧 schema 表（如独立内存库/未迁移库）返回 false → 降级不注入，审计写入永不因关联键缺失而失败）。
+ *  MT-7/PG-1（2026-11-23）：PRAGMA 为 SQLite 专有——PG 桥下抛错被 catch 静默吞掉 → 恒 false →
+ *  request_id 全量丢失（BE-F1 日志链断裂）。非 sqlite 方言改走 information_schema（BE-C2 登记
+ *  的替代路径；prepareRaw 即桥 prepare，? 由桥转 $n，参数化防注入边界与 PRAGMA 标识符内联等价） */
 function hasRidColumn(prepareRaw, table) {
   try {
-    const cols = prepareRaw(`PRAGMA table_info(${table})`).all();
+    const cols = (process.env.DB_DIALECT || 'sqlite') === 'sqlite'
+      ? prepareRaw(`PRAGMA table_info(${table})`).all()
+      : prepareRaw("SELECT column_name AS name FROM information_schema.columns WHERE table_schema='public' AND lower(table_name)=lower(?)").all(table);
     return cols.some((c) => c.name === 'request_id');
   } catch { return false; }
 }

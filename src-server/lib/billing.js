@@ -116,7 +116,9 @@ function deptCostOfMonth(month) {
     FROM usage_records ur
     LEFT JOIN departments d ON d.id = ur.dept_id
     WHERE ur.dimension='model' AND ur.created_at LIKE ? || '%'
-    GROUP BY ur.dept_id`, [m]);
+    -- d.name/d.monthly_budget 为分组键 ur.dept_id 的函数依赖列（JOIN ON d.id=ur.dept_id）——
+    -- sqlite 容忍聚合裸列，PG 严格要求入 GROUP BY；加入后分组语义完全一致（PG-1 2026-11-24）
+    GROUP BY ur.dept_id, d.name, d.monthly_budget`, [m]);
   // LEFT JOIN 未命中 name 的（dept_id 为 NULL 或部门已删）归入「未归属」
   const noDept = { dept_id: null, dept_name: '未归属', members: 0, tokens: 0, cost: 0, budget: 0 };
   const out = [];
@@ -160,7 +162,7 @@ function tenantCostOfMonth(month, tenantId = null) {
     FROM usage_records ur
     LEFT JOIN tenants t ON t.id = ur.tenant_id
     WHERE ur.dimension='model' AND ur.created_at LIKE ? || '%'${limit}
-    GROUP BY ur.tenant_id`, [...args]);
+    GROUP BY ur.tenant_id, t.name`, [...args]);
   const tenants = rows.map(r => ({
     tenant_id: r.tenant_id,
     tenant_name: r.tenant_name || (r.tenant_id == null ? '未归属' : `租户#${r.tenant_id}`),
@@ -217,7 +219,7 @@ function tenantReportCsv({ month, tenantId = null } = {}) {
       SUM(ur.tokens) AS tokens, SUM(ur.prompt_tokens) AS pt, SUM(ur.completion_tokens) AS ct, SUM(ur.cost) AS cost, COUNT(*) AS calls
     FROM usage_records ur LEFT JOIN tenants t ON t.id = ur.tenant_id
     WHERE ur.dimension='model' AND ur.created_at LIKE ? || '%'${hasTenant(tenantId) ? ' AND ur.tenant_id = ?' : ''}
-    GROUP BY ur.tenant_id, ur.username ORDER BY ur.tenant_id, cost DESC`, [...(hasTenant(tenantId) ? [rep.month, Number(tenantId)] : [rep.month])]);
+    GROUP BY ur.tenant_id, ur.username, t.name ORDER BY ur.tenant_id, cost DESC`, [...(hasTenant(tenantId) ? [rep.month, Number(tenantId)] : [rep.month])]);
   const esc = (v) => {
     const s = String(v ?? '');
     return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;

@@ -31,7 +31,11 @@ function create(registry) {
     const delay = opts.delay || 0;
     const maxRetries = opts.maxRetries != null ? opts.maxRetries : MAX_RETRIES;
     const priority = opts.priority || 0;
-    dal.runq(`INSERT INTO task_queue (job_id, name, payload, status, priority, max_retries, retry_count, delay_ms, created_at, scheduled_at) VALUES (?,?,?,?,?,?,0,?,?,?)`, [jobId, name, JSON.stringify(payload), 'pending', priority, maxRetries, delay, now(), delay ? new Date(Date.now() + delay).toISOString().replace('T', ' ').slice(0, 19) : now()]);
+    // PG-1（2026-11-23）：延迟任务的 scheduled_at 原用 toISOString()（UTC）写入，与 now() 及方言层
+    // 基钟（Asia/Shanghai，见 sql-dialect TZ_BASE）不同钟——跨钟比较会让延迟任务提前数小时触发。
+    // 统一为业务基准钟（与 db.js now() 同钟），双驱动行为一致。
+    const schedAt = delay ? new Date(Date.now() + delay).toLocaleString('sv-SE', { timeZone: 'Asia/Shanghai' }) : now();
+    dal.runq(`INSERT INTO task_queue (job_id, name, payload, status, priority, max_retries, retry_count, delay_ms, created_at, scheduled_at) VALUES (?,?,?,?,?,?,0,?,?,?)`, [jobId, name, JSON.stringify(payload), 'pending', priority, maxRetries, delay, now(), schedAt]);
     if (!delay) setImmediate(() => processQueue());
     else setTimeout(() => processQueue(), delay);
     return jobId;
@@ -56,7 +60,11 @@ function create(registry) {
       const retries = (job.retry_count || 0) + 1;
       if (retries < (job.max_retries || MAX_RETRIES)) {
         const delay = RETRY_BASE_DELAY * Math.pow(2, retries - 1);
-        dal.runq(`UPDATE task_queue SET status='pending', retry_count=?, scheduled_at=datetime('now','localtime',?||' seconds'), error=? WHERE id=?`, [retries, String(delay / 1000), e.message, job.id]);
+        // PG-1（2026-11-23）：datetime() 的参数化修饰符（?||' seconds'）不可静态方言改写——改为
+        // JS 侧算好绝对时刻传参（基钟 Asia/Shanghai，与 now()/方言层 TZ_BASE 同钟；语义与
+        // 原「now+delay 秒」等价）。sqlite 驱动不再依赖 datetime()，双驱动同一句 SQL。
+        const nextAt = new Date(Date.now() + delay).toLocaleString('sv-SE', { timeZone: 'Asia/Shanghai' });
+        dal.runq(`UPDATE task_queue SET status='pending', retry_count=?, scheduled_at=?, error=? WHERE id=?`, [retries, nextAt, e.message, job.id]);
         setTimeout(() => processQueue(), delay);
       } else {
         dal.runq(`UPDATE task_queue SET status='failed', finished_at=datetime('now','localtime'), error=? WHERE id=?`, [e.message, job.id]);

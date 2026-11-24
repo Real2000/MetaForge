@@ -86,6 +86,15 @@ function sanitizeSelectSql(raw) {
   for (const t of refs) {
     if (DB_DENY_TABLES.has(t)) return { err: `不允许访问敏感表：${t}` };
   }
+  // PG-1（2026-11-23）：PG 模式补系统目录防线——pg_* 目录经隐式 search_path 可裸引用（如 FROM
+  // pg_class），与 information_schema 一样能绕过表黑名单探测全库结构（含敏感表列名）。
+  // 与 P0-2 的 sqlite_master/pragma_ 收口同向；sqlite 方言分支不激活（smoke 断言不受影响）。
+  // 注意须在含前缀形态上拦截（information_schema.tables / pg_catalog.pg_class），
+  // refs 提取只保留末段标识符，拦不到 schema 前缀。
+  if ((process.env.DB_DIALECT || 'sqlite') !== 'sqlite') {
+    const cat = /\b(?:from|join)\s+(pg_[a-z_]+|pg_catalog|information_schema)\b/i.exec(norm);
+    if (cat) return { err: `不允许访问系统目录：${cat[1]}` };
+  }
   const lm = /\blimit\s+(\d+)\s*(offset\s+\d+)?\s*$/i.exec(sql);
   if (lm) {
     if (+lm[1] > 500) sql = sql.slice(0, lm.index) + 'LIMIT 500' + (lm[2] ? ' ' + lm[2] : '');
@@ -101,6 +110,33 @@ function dbCell(v) {
   return s.length > 80 ? s.slice(0, 77) + '…' : s;
 }
 function mdEscapeCell(s) { return String(s).replace(/\|/g, '\\|').replace(/\n/g, ' '); }
+
+/** MT-7/PG-1（2026-11-23）schema 探测方言化：sqlite_master/PRAGMA 为 SQLite 专有（BE-C2 登记
+ *  残留）——PG 桥下表清单直接抛错、列探测静默吞空，Text2SQL 整链失效。非 sqlite 方言走
+ *  information_schema：列含 name/type（data_type），pk 经 table_constraints + key_column_usage
+ *  关联标记（PRAGMA table_info 的 pk 字段等价物）。返回 { parts, isSqlite } 供提示词方言分叉 */
+function describeDbSchema() {
+  const isSqlite = (process.env.DB_DIALECT || 'sqlite') === 'sqlite';
+  const tables = (isSqlite
+    ? dal.q(`SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`)
+    : dal.q(`SELECT table_name AS name FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE'`)
+  ).map(r => r.name).filter(t => !DB_DENY_TABLES.has(t));
+  const parts = [];
+  for (const t of tables) {
+    try {
+      const cols = isSqlite
+        ? dal.q(`PRAGMA table_info("${t}")`)
+        : dal.q(`SELECT c.column_name AS name, c.data_type AS type,
+              EXISTS(SELECT 1 FROM information_schema.table_constraints tc
+                     JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name
+                     WHERE tc.constraint_type='PRIMARY KEY' AND tc.table_schema='public'
+                       AND tc.table_name = c.table_name AND kcu.column_name = c.column_name) AS pk
+       FROM information_schema.columns c WHERE c.table_schema='public' AND c.table_name=? ORDER BY c.ordinal_position`, [t]);
+      parts.push(`${t}(${cols.map(c => `${c.name} ${c.type || 'TEXT'}${c.pk ? ' PK' : ''}`).join(', ')})`);
+    } catch { }
+  }
+  return { parts, isSqlite };
+}
 
 const db_query = {
   schema: {
@@ -120,24 +156,23 @@ const db_query = {
   run: async (args) => {
     const question = String(args.question || '').trim();
     if (!question) return '缺少 question 参数';
-    // 1. 读取库 schema（排除敏感表），供 LLM 生成 SQL
-    const tables = dal.q(`SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`)
-      .map(r => r.name).filter(t => !DB_DENY_TABLES.has(t));
-    const schemaParts = [];
-    for (const t of tables) {
-      try {
-        const cols = dal.q(`PRAGMA table_info("${t}")`)
-          .map(c => `${c.name} ${c.type || 'TEXT'}${c.pk ? ' PK' : ''}`);
-        schemaParts.push(`${t}(${cols.join(', ')})`);
-      } catch { }
-    }
-    // 2. LLM 生成 SQL（低温、只输出 SQL）
+    // 1. 读取库 schema（排除敏感表），供 LLM 生成 SQL（方言化探测见 describeDbSchema）
+    const { parts: schemaParts, isSqlite } = describeDbSchema();
+    // 2. LLM 生成 SQL（低温、只输出 SQL）——提示词随方言分叉：PG 下若仍诱导 SQLite 专有函数
+    //    （datetime('now',…)），生成的 SQL 必然执行失败；Text2SQL 正确性要求
+    //    「探测方言 = 生成方言 = 执行方言」三者一致
     let r;
     try {
+      const sys = isSqlite
+        ? '你是 SQLite SQL 专家。只输出一条 SQL 语句本身，不要解释、不要 markdown 代码块、不要分号外的任何文字。'
+        : '你是 PostgreSQL SQL 专家。只输出一条 SQL 语句本身，不要解释、不要 markdown 代码块、不要分号外的任何文字。';
+      const reqs = isSqlite
+        ? `- SQLite 方言，只读 SELECT（可用 WITH/COUNT/SUM/AVG/GROUP BY）\n- 时间列均为 TEXT 'YYYY-MM-DD HH:MM:SS' 格式，比较时用 datetime() 或字符串截断\n- 常用时间函数参考：datetime('now','localtime','-30 days')；日期分组用 substr(created_at,1,10)`
+        : `- PostgreSQL 方言，只读 SELECT（可用 WITH/COUNT/SUM/AVG/GROUP BY）\n- 时间列均为 TEXT 'YYYY-MM-DD HH:MM:SS' 格式，直接做字符串比较（PG 无 datetime() 函数）\n- 时间参考：created_at >= to_char(now() - interval '30 days','YYYY-MM-DD HH24:MI:SS')；日期分组用 substr(created_at,1,10)`;
       r = await chatOnce([
-        { role: 'system', content: '你是 SQLite SQL 专家。只输出一条 SQL 语句本身，不要解释、不要 markdown 代码块、不要分号外的任何文字。' },
+        { role: 'system', content: sys },
         {
-          role: 'user', content: `数据库表结构如下：\n${schemaParts.join('\n')}\n\n用户问题：${question}\n\n要求：\n- SQLite 方言，只读 SELECT（可用 WITH/COUNT/SUM/AVG/GROUP BY）\n- 时间列均为 TEXT 'YYYY-MM-DD HH:MM:SS' 格式，比较时用 datetime() 或字符串截断\n- 常用时间函数参考：datetime('now','localtime','-30 days')；日期分组用 substr(created_at,1,10)\n- 结果加合理 LIMIT（≤200）`,
+          role: 'user', content: `数据库表结构如下：\n${schemaParts.join('\n')}\n\n用户问题：${question}\n\n要求：\n${reqs}\n- 结果加合理 LIMIT（≤200）`,
         },
       ], { temperature: 0.1, max_reply: 600 });
     } catch (e) {
@@ -148,9 +183,13 @@ const db_query = {
     // 3. 执行并格式化为 Markdown 表格
     try {
       const stmt = db.prepare(check.sql);
-      const cols = stmt.columns().map(c => c.name);
       const rows = stmt.all();
       if (!rows.length) return `查询执行成功，但结果为空（0 行）。\n\n执行的 SQL：\n${check.sql}`;
+      // PG 桥语句仅 all/get/run/pluck（无 .columns()，BE-C1 形态审计全库 0 处使用）——有行时列名
+      // 由首行键派生；0 行已在上方提前返回不受影响。sqlite 路径保持 .columns() 原行为
+      const cols = typeof stmt.columns === 'function'
+        ? stmt.columns().map(c => c.name)
+        : Object.keys(rows[0]);
       const show = rows.slice(0, 50);
       const head = `| ${cols.map(c => mdEscapeCell(c)).join(' | ')} |`;
       const sep = `| ${cols.map(() => '---').join(' | ')} |`;

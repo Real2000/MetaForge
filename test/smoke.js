@@ -690,15 +690,50 @@ function t(name, fn) {
     const { translate } = require('../src-server/lib/sql-dialect');
     assert.strictEqual(translate('SELECT 1', 'sqlite').sql, 'SELECT 1', 'sqlite 恒等');
     const dm = translate("SELECT datetime('now','localtime')", 'dm');
-    assert.ok(/CURRENT_TIMESTAMP/.test(dm.sql), 'datetime→CURRENT_TIMESTAMP：' + dm.sql);
+    assert.ok(/to_char\(SYSDATE, 'YYYY-MM-DD HH24:MI:SS'\)/.test(dm.sql), 'datetime→to_char(SYSDATE)（TEXT 契约，PG-1 语义修复）：' + dm.sql);
     const kb = translate("SELECT strftime('%s','now','localtime') - strftime('%s', t)", 'kingbase');
     assert.ok(/EXTRACT\(EPOCH FROM/.test(kb.sql), 'strftime %s→epoch：' + kb.sql);
     const kbDate = translate("SELECT strftime('%Y-%m-%d', t)", 'kingbase');
-    assert.ok(/to_char\(t, 'YYYY-MM-DD'\)/.test(kbDate.sql), 'strftime 日期→to_char：' + kbDate.sql);
+    assert.ok(/to_char\(\(t\)::timestamp, 'YYYY-MM-DD'\)/.test(kbDate.sql), 'strftime 日期→to_char（列实参强转，PG-1）：' + kbDate.sql);
     assert.ok(/IDENTITY/.test(translate('CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT)', 'dm').sql), 'dm AUTOINCREMENT→IDENTITY');
     assert.ok(/SERIAL/.test(translate('CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT)', 'kingbase').sql), 'kingbase AUTOINCREMENT→SERIAL');
     const warn = translate('INSERT OR REPLACE INTO t (a) VALUES (?)', 'kingbase');
     assert.ok(warn.warnings.length > 0, '未映射构造应产出告警');
+  });
+
+  // 【PG-1（2026-11-23）】datetime()/date() 语义改写：TEXT 契约 + 业务基准钟 + 修饰符 + 残留告警网
+  // 背景：此前 datetime('now','localtime')→CURRENT_TIMESTAMP 是「能解析但行为不等价」——PG 里
+  // timestamptz 强类型与 TEXT 列比较直接报 operator does not exist（PG 轨道 task_queue 首踩）。
+  await t('PG-1：datetime/date 语义改写——TEXT 契约 + 基准时钟 + 修饰符 + 列形态 + 残留告警网', () => {
+    const { translate } = require('../src-server/lib/sql-dialect');
+    // 基钟：TEXT 契约（不再产 timestamptz），基准 Asia/Shanghai（与 db.js now() 写入同钟）
+    const kb = translate("SELECT * FROM task_queue WHERE scheduled_at <= datetime('now','localtime')", 'kingbase');
+    assert.ok(/to_char\(now\(\) AT TIME ZONE 'Asia\/Shanghai', 'YYYY-MM-DD HH24:MI:SS'\)/.test(kb.sql), 'datetime→TEXT 墙钟：' + kb.sql);
+    assert.ok(!/CURRENT_TIMESTAMP/.test(kb.sql), '不应再译作 CURRENT_TIMESTAMP（类型陷阱）');
+    assert.strictEqual(kb.warnings.length, 0, '标准形态不应产出 warning');
+    // ±N unit 修饰符：PG 系 interval / dm Oracle 式 INTERVAL
+    const mod = translate("SELECT datetime('now','localtime','-30 days')", 'kingbase');
+    assert.ok(/- interval '30 day'/.test(mod.sql), '±N unit→interval：' + mod.sql);
+    const dmMod = translate("SELECT datetime('now','localtime','-30 days')", 'dm');
+    assert.ok(/SYSDATE - INTERVAL '30' DAY/.test(dmMod.sql), 'dm 修饰符 Oracle 式：' + dmMod.sql);
+    // start of day：PG date_trunc / dm TRUNC
+    const trunc = translate("SELECT datetime('now','localtime','start of day')", 'kingbase');
+    assert.ok(/date_trunc\('day', now\(\) AT TIME ZONE 'Asia\/Shanghai'\)/.test(trunc.sql), 'start of day→date_trunc：' + trunc.sql);
+    const dmTrunc = translate("SELECT datetime('now','localtime','start of month')", 'dm');
+    assert.ok(/TRUNC\(SYSDATE, 'MM'\)/.test(dmTrunc.sql), 'dm start of month→TRUNC：' + dmTrunc.sql);
+    // 列形态：datetime(col) → TEXT 规范化（localbridge 在线态判定）
+    const col = translate("SELECT CASE WHEN datetime(last_seen) > datetime('now','localtime','-15 seconds') THEN 1 ELSE 0 END FROM localbridge_devices", 'kingbase');
+    assert.ok(/to_char\(\(last_seen\)::timestamp/.test(col.sql) && /- interval '15 second'/.test(col.sql), '列形态强转 + 修饰符：' + col.sql);
+    // date('now') → TEXT 日期（feedback 今日统计）
+    const d8 = translate("SELECT COUNT(*) FROM feedbacks WHERE created_at >= date('now','localtime')", 'kingbase');
+    assert.ok(/to_char\(now\(\) AT TIME ZONE 'Asia\/Shanghai', 'YYYY-MM-DD'\)/.test(d8.sql), 'date→TEXT 日期：' + d8.sql);
+    // 参数化修饰符：不可静态改写 → 保留原文 + 残留告警网（调用点应改 JS 计算，见 memory-driver）
+    const param = translate("SELECT datetime('now','localtime',?||' seconds')", 'kingbase');
+    assert.ok(/datetime\(/.test(param.sql), '参数化修饰符不应臆造改写');
+    assert.ok(param.warnings.some((w) => /残留/.test(w)), '残留应产出 warning（审计网）：' + param.warnings.join(';'));
+    // sqlite 方言：恒等零回归
+    const s = translate("SELECT datetime('now','localtime','-30 days')", 'sqlite');
+    assert.strictEqual(s.sql, "SELECT datetime('now','localtime','-30 days')", 'sqlite 恒等');
   });
 
   // 【BE-C2 收尾（2026-11-23）】方言闭环：downgrades 机制 / 新构造映射 / upsert 标准化 / 审计门禁
@@ -841,24 +876,45 @@ function t(name, fn) {
         Module._resolveFilename = origResolve; // 恢复解析器——劫持仅限本断言内
       }
     });
-    await t('MT-7：RLS 策略 SQL——ENABLE+FORCE（owner 不旁路）+ POLICY 双向 + 会话变量回退', () => {
-      const { rlsPolicySql, DEFAULT_RLS_TABLES } = require('../src-server/lib/pg-rls');
+    await t('MT-7/PG-1：RLS 策略 SQL v2——FORCE + 双向策略 + platform 逃逸 cast-safe + 平面排除语义', () => {
+      const { rlsPolicySql, PLATFORM_PLANE_EXCLUDE, rlsTableList } = require('../src-server/lib/pg-rls');
       const sql = rlsPolicySql('agents');
       assert.ok(/ALTER TABLE agents ENABLE ROW LEVEL SECURITY/.test(sql), '应启用 RLS');
       assert.ok(/ALTER TABLE agents FORCE ROW LEVEL SECURITY/.test(sql), '应 FORCE（owner 也受控——DB 层强制隔离的验收语义）');
-      assert.ok(/USING \(tenant_id = [\s\S]*current_setting\('app\.tenant_id', true\)/.test(sql), '读策略应基于会话变量');
-      assert.ok(/WITH CHECK \(tenant_id =/.test(sql), '写策略应校验租户归属（防跨租户写入）');
-      assert.ok(/COALESCE\(NULLIF\(current_setting\('app\.tenant_id', true\), ''\), '0'\)/.test(sql),
-        '未设会话变量应回退 0（平台基线租户——单租户部署行为与现状一致）');
+      assert.ok(/USING \(/.test(sql) && /WITH CHECK \(/.test(sql), 'POLICY 应双向（USING 管读 + WITH CHECK 管写）');
+      // 'platform' 显式逃逸分支：平台平面运维的代码级 opt-in 通道（FORCE 下唯一跨租户路径）
+      assert.ok(/current_setting\('app\.tenant_id', true\) = 'platform'/.test(sql),
+        '应有 platform 显式逃逸分支（平台运维 opt-in，非用户可控输入）');
+      // cast-safe：'platform' 须双重 NULLIF 归一后再参与 ::int 比较，否则 OR 分支因非数字串直接报错。
+      // PG-1 复现踩坑（2026-11-24）：v2 曾误写三参 NULLIF(x,'','platform')——NULLIF 仅收 2 参，
+      // 多语句块整体解析失败致 ENABLE/FORCE 全部未执行且被启动 catch 吞掉（策略数 0、假绿）。
+      // 锚定正确形态（逐层 2 参嵌套）+ 三参负向检查（括号配平守卫查不出参数个数错误）
+      assert.ok(sql.includes("COALESCE(NULLIF(NULLIF(current_setting('app.tenant_id', true), ''), 'platform'), '0')::int"),
+        '匹配分支应为逐层 2 参 NULLIF 嵌套（cast-safe）：' + sql);
+      assert.ok(!sql.includes(", '', 'platform'") && !sql.includes(", '', '0'"),
+        '不得出现三参 NULLIF 形态（如 ", \'\', \'platform\'"——PG 仅收 2 参，整体解析失败——曾致 RLS 静默全失效）');
+      assert.ok(/COALESCE\([\s\S]*'0'\)::int/.test(sql), '未设上下文应回退 0（平台基线租户）');
       assert.ok(/DROP POLICY IF EXISTS/.test(sql), '策略应幂等（重复执行安全）');
-      // 括号配平（PG 解析器硬校验）——MT-7 PoC 首跑踩坑：WITH CHECK 曾多一个右括号致
-      // syntax error at or near ")"，且该错被 db.js 的非致命 catch 吞掉（策略数 0、静默不隔离）。
-      // 文本断言无法覆盖此类缺陷，配平校验锚定回归。
+      // 括号配平（PG 解析器硬校验）——PoC 首跑踩坑：WITH CHECK 曾多一个右括号致 syntax error，
+      // 且该错被 db.js 非致命 catch 吞掉（策略数 0、静默不隔离）。文本断言覆盖不了此类缺陷。
       const open = (sql.match(/\(/g) || []).length;
       const close = (sql.match(/\)/g) || []).length;
       assert.strictEqual(open, close, `RLS 策略 SQL 括号应配平（open=${open}, close=${close}）`);
-      assert.deepStrictEqual(DEFAULT_RLS_TABLES, ['agents', 'kbs', 'sessions', 'messages', 'tasks'],
-        'PoC 核心资源表清单（迁移 #122 已补齐 tenant_id）');
+      // 平面排除语义（PG-1 定稿锚定）：认证网关/审计/0 层基线分层表不参与 RLS——
+      // 单租户匹配策略会破坏其跨租户或基线可见性语义（防线保持应用层）
+      assert.ok(PLATFORM_PLANE_EXCLUDE.includes('users') && PLATFORM_PLANE_EXCLUDE.includes('op_logs')
+        && PLATFORM_PLANE_EXCLUDE.includes('secrets'),
+        'users（认证网关）/op_logs（审计）/secrets（tenant_id=0 全局基线分层）应在排除清单');
+      assert.ok(!PLATFORM_PLANE_EXCLUDE.includes('agents') && !PLATFORM_PLANE_EXCLUDE.includes('kbs')
+        && !PLATFORM_PLANE_EXCLUDE.includes('sessions') && !PLATFORM_PLANE_EXCLUDE.includes('messages')
+        && !PLATFORM_PLANE_EXCLUDE.includes('tasks'),
+        '租户内容核心表不得进排除清单');
+      // 清单一致性（sqlite 测试库上自检）：TENANT_TABLES 89 张 − 平面排除 = RLS 覆盖面
+      const list = rlsTableList(db);
+      assert.strictEqual(list.length, 89 - PLATFORM_PLANE_EXCLUDE.length,
+        `RLS 覆盖清单应 = 89 − ${PLATFORM_PLANE_EXCLUDE.length}，实际 ${list.length}`);
+      assert.ok(['agents', 'kbs', 'sessions', 'messages', 'tasks'].every(x => list.includes(x)),
+        'PoC 五张核心表应仍在覆盖清单（验收基线不回退）');
     });
     await t('MT-7：方言 BLOB→BYTEA + instr()→strpos()（kingbase）——迁移 #130 列定义与 api_key 加密迁移在 PG 侧可执行', () => {
       const { translate } = require('../src-server/lib/sql-dialect');
@@ -899,6 +955,24 @@ function t(name, fn) {
       // worker 不得阻止进程退出（PoC 首跑踩坑）：一次性脚本（node -e / CLI）主逻辑完成后因 worker
       // 存活而永不退出，表现为子进程挂死、execFileSync 逐级超时——unref 后进程存活只取决于主线程句柄
       assert.ok(/worker\.unref\(\)/.test(bridgeSrc), 'worker 应 unref（不阻止进程自然退出）');
+      // PG-1：请求级租户上下文（ALS）——闭包方案在 async 恢复点会串租（A await 期间 B 改写闭包，
+      // A 恢复后带着 B 的租户查询）。withTenant 是 auth 中间件的注入主通道，'platform' 为显式逃逸
+      assert.ok(/AsyncLocalStorage/.test(bridgeSrc) && /withTenant\(tid, fn\)/.test(bridgeSrc),
+        '桥应提供 withTenant 请求级 ALS 上下文（async 恢复点不串租）');
+      assert.ok(/effTenant\(\)/.test(bridgeSrc), '调用时应优先取 ALS 请求域上下文（闭包兑底）');
+      // worker 侧：'platform' 逃逸值不得经 Number() 窄化（NaN 会破坏 set_config）
+      assert.ok(/req\.tenantId === 'platform' \? 'platform' : Number\(req\.tenantId\)/.test(workerSrc),
+        "worker 应保留 'platform' 字面值（RLS 策略逃逸分支匹配）");
+      // PG-1（2026-11-24）transaction 契约：better-sqlite3 语义是「返回可调用包装」（调用点
+      // db.transaction(fn)(args)）。原实现直接执行并返回结果——调用点二次调用即 not a function，
+      // 且事务已 COMMIT 无法随异常回滚（PG 轨道 MT-10「400 返回却已落库」假象即此）
+      assert.ok(/return \(\.\.\.args\) => \{/.test(bridgeSrc)
+        && /transaction\(fn\)[\s\S]{0,300}BEGIN/.test(bridgeSrc),
+        'transaction(fn) 应返回可调用包装（better-sqlite3 契约）');
+      // PG-1（2026-11-24）租约内禁止嵌套 BEGIN/COMMIT：内层 COMMIT 会提前提交外层事务
+      //（原子性破坏——双插入任一失败也无法整笔回滚）；租约内失败也不得 ROLLBACK（留给外层清理）
+      assert.ok(/const inLease = conn === txConn/.test(workerSrc), 'worker 应判定事务租约（防嵌套 BEGIN/COMMIT）');
+      assert.ok(/req\.tenantId != null && !inLease/.test(workerSrc), '租约内失败不应 ROLLBACK 外层事务');
     });
     await t('MT-7：db.js 接线守卫——AGENT_DB_DRIVER 分支 + sqlite 缺省路径 + 探测方言化收敛', () => {
       const fs2 = require('fs');
@@ -912,6 +986,12 @@ function t(name, fn) {
         '启动期探测辅助应存在（方言分支）');
       const pragmaCount = (dbSrc.match(/db\.prepare\('PRAGMA table_info/g) || []).length;
       assert.strictEqual(pragmaCount, 0, '业务散点应全部收敛（0 处直连 PRAGMA；probeColumns 内部为模板串形态不在此计数）：' + pragmaCount);
+      // PG-1：租户上下文全链接线——auth.tenantContext 的全部出口经 enterTenantDb 包裹
+      //（req.tenant → ALS → RLS 会话变量；sqlite 无 withTenant 直通 next()，零回归）
+      const authSrc = fs2.readFileSync(path.join(__dirname, '..', 'src-server', 'lib', 'auth.js'), 'utf8');
+      const wired = (authSrc.match(/enterTenantDb\(req, next\)/g) || []).length;
+      assert.ok(wired >= 6, `tenantContext 各出口应经 enterTenantDb 包裹（定义+5 出口，实际 ${wired} 处）`);
+      assert.ok(/typeof db\.withTenant !== 'function'/.test(authSrc), 'sqlite 应直通 next()（零回归守卫）');
     });
   }
 
@@ -9362,10 +9442,12 @@ print('PY_OK')
       assert.strictEqual(d.translate(sql, 'unknown-dialect').sql, sql, '未知方言应回退 sqlite 恒等');
     });
 
-    await t('U2-1/N7-P4: SQL 方言 —— 达梦映射（CURRENT_TIMESTAMP / IDENTITY / COALESCE / 引号）', () => {
+    await t('U2-1/N7-P4: SQL 方言 —— 达梦映射（datetime TEXT 契约 / IDENTITY / COALESCE / 引号）', () => {
       const d = require(path.join(__dirname, '..', 'src-server', 'lib', 'sql-dialect'));
-      assert.strictEqual(d.translate("SELECT datetime('now','localtime')", 'dm').sql, 'SELECT CURRENT_TIMESTAMP');
-      assert.strictEqual(d.translate("SELECT datetime('now')", 'dm').sql, 'SELECT CURRENT_TIMESTAMP');
+      // PG-1（2026-11-24）语义修复：datetime() 译作 CURRENT_TIMESTAMP 是「能解析但行为不等价」
+      //（timestamptz 强类型与 TEXT 列比较即崩）——改译 to_char(TEXT 契约，sqlite 语义一致）
+      assert.strictEqual(d.translate("SELECT datetime('now','localtime')", 'dm').sql, "SELECT to_char(SYSDATE, 'YYYY-MM-DD HH24:MI:SS')");
+      assert.strictEqual(d.translate("SELECT datetime('now')", 'dm').sql, "SELECT to_char(SYSDATE, 'YYYY-MM-DD HH24:MI:SS')");
       assert.strictEqual(d.translate('id INTEGER PRIMARY KEY AUTOINCREMENT', 'dm').sql, 'id INT IDENTITY(1,1) PRIMARY KEY');
       assert.strictEqual(d.translate('SELECT IFNULL(a,0)', 'dm').sql, 'SELECT COALESCE(a,0)');
       assert.strictEqual(d.translate('SELECT `col` FROM t', 'dm').sql, 'SELECT "col" FROM t');

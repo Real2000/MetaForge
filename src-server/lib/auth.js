@@ -229,15 +229,25 @@ function isTenantPublicPath(reqPath) {
   const p = stripVersion(String(reqPath || ''));
   return TENANT_PUBLIC_PREFIXES.some(pre => p === pre || p.startsWith(pre + '/'));
 }
+/** PG-1（MT-7 全量）：把 req.tenant 绑定为 DB 层 RLS 会话上下文（ALS 请求级——async 恢复点不串租）。
+ *  sqlite 的 db 对象无 withTenant 方法 → 直通 next()，零回归。db 已在模块顶部经 '../db' 注入，
+ *  无加载环——勿用惰性 require：曾误写 require('./db')，双重缺陷（lib/ 下路径应为 ../db；且
+ *  require('../db') 返回 module.exports 对象而非 db 实例，withTenant 恒 undefined → RLS 静默旁路） */
+function enterTenantDb(req, next) {
+  if (typeof db.withTenant !== 'function') return next();
+  const tid = req.tenant && Number.isFinite(Number(req.tenant.id)) ? Number(req.tenant.id) : null;
+  return db.withTenant(tid, next);
+}
+
 function tenantContext(req, res, next) {
   if (!MULTI_TENANT) {
     req.tenant = { id: DEFAULT_TENANT_ID, name: '默认租户', single: true };
-    return next();
+    return enterTenantDb(req, next);
   }
   // 公开端点（登录/健康/发现/版本）无需租户上下文
   if (isTenantPublicPath(req.path)) {
     req.tenant = { id: DEFAULT_TENANT_ID, source: 'public' };
-    return next();
+    return enterTenantDb(req, next);
   }
   // 多租户：先尝试认证，用于平台超管旁路与用户权威租户
   const payload = verify(readToken(req));
@@ -250,13 +260,13 @@ function tenantContext(req, res, next) {
     const tid = (r && Number.isFinite(r.id) && r.id > 0) ? r.id : (user.tenant_id || DEFAULT_TENANT_ID);
     req.tenant = { id: tid, source: r ? r.source : 'superadmin-default', bypass: true };
     auditTenantBypass(req, user, tid);
-    return next();
+    return enterTenantDb(req, next);
   }
   // 已认证普通用户：以其 users.tenant_id 为权威（防头伪造跨租户）
   if (user) {
     const tid = user.tenant_id || DEFAULT_TENANT_ID;
     req.tenant = { id: tid, source: 'user' };
-    return next();
+    return enterTenantDb(req, next);
   }
   // 未认证（API Key/Agent 调用等）：JWT/头/子域，缺则拒绝
   const r = resolveTenantId(req);
@@ -264,7 +274,7 @@ function tenantContext(req, res, next) {
     return res.status(403).json({ code: 403, msg: '缺少租户上下文（tenant_id）' });
   }
   req.tenant = { id: r.id, source: r.source };
-  return next();
+  return enterTenantDb(req, next);
 }
 
 module.exports = { sign, verify, auth, adminOnly, platformAdminOnly, tenantAdminOnly: adminOnly, revokeToken, bumpTokenVersion, cleanBlacklist, tenantContext, isPlatformSuperadmin, MULTI_TENANT, TOKEN_TTL_MS, readToken, setAuthCookie, clearAuthCookie, PLATFORM_ADMINS, DEFAULT_TENANT_ID };

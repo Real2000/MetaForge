@@ -28,17 +28,54 @@ function t(name, fn) {
   const { db } = require('../src-server/db');
   const { spaceFilterSql, filterBySpace, spaceVisibleTo, reqTenantOpt } = require('../src-server/lib/space-utils');
   const dal = require('../src-server/lib/dal');
+  // PG 模式（MT-7/PG-1：FORCE RLS 已生效）：直连 db 的写入/读取须在对应租户上下文内
+  //（与 auth 中间件同语义）；sqlite 无 withTenant → 直通执行，双驱动共用同一套用例。
+  const hasPgCtx = typeof db.withTenant === 'function';
+  const asTenant = (tid, fn) => (hasPgCtx ? db.withTenant(tid, fn) : fn());
 
   // ---------- 造双租户数据 ----------
   const now = new Date().toISOString();
-  db.prepare("INSERT INTO users (username,password,nickname,role,status,created_at,tenant_id) VALUES ('bob','x','Bob','user',1,?,2)").run(now);
-  db.prepare("INSERT INTO spaces (name,type,owner,members,created_at,tenant_id) VALUES ('T2企业空间','enterprise','bob',1,?,2)").run(now);
-  const sp2 = db.prepare("SELECT id FROM spaces WHERE name='T2企业空间'").get().id;
-  db.prepare("INSERT INTO agents (name,type,space_id,owner,status,visibility,tenant_id) VALUES ('T2智能体','digital',?,'bob','published','public',2)").run(sp2);
-  db.prepare("INSERT INTO agents (name,type,space_id,owner,status,visibility,tenant_id) VALUES ('T1智能体','digital',NULL,'admin','published','public',1)").run();
-  db.prepare("INSERT INTO kbs (name,owner,space_id,created_at,tenant_id) VALUES ('T2知识库','bob',?,?,2)").run(sp2, now);
-  db.prepare("INSERT INTO kbs (name,owner,space_id,created_at,tenant_id) VALUES ('T1知识库','admin',0,?,1)").run(now);
-  db.prepare("INSERT INTO tasks (name,target_type,target_id,username,created_at,tenant_id) VALUES ('T2任务','agent',1,'bob',?,2)").run(now);
+  const sp2 = asTenant(2, () => {
+    db.prepare("INSERT INTO users (username,password,nickname,role,status,created_at,tenant_id) VALUES ('bob','x','Bob','user',1,?,2)").run(now);
+    db.prepare("INSERT INTO spaces (name,type,owner,members,created_at,tenant_id) VALUES ('T2企业空间','enterprise','bob',1,?,2)").run(now);
+    const sid = db.prepare("SELECT id FROM spaces WHERE name='T2企业空间'").get().id;
+    db.prepare("INSERT INTO agents (name,type,space_id,owner,status,visibility,tenant_id) VALUES ('T2智能体','digital',?,'bob','published','public',2)").run(sid);
+    db.prepare("INSERT INTO kbs (name,owner,space_id,created_at,tenant_id) VALUES ('T2知识库','bob',?,?,2)").run(sid, now);
+    db.prepare("INSERT INTO tasks (name,target_type,target_id,username,created_at,tenant_id) VALUES ('T2任务','agent',1,'bob',?,2)").run(now);
+    return sid;
+  });
+  asTenant(1, () => {
+    db.prepare("INSERT INTO agents (name,type,space_id,owner,status,visibility,tenant_id) VALUES ('T1智能体','digital',NULL,'admin','published','public',1)").run();
+    db.prepare("INSERT INTO kbs (name,owner,space_id,created_at,tenant_id) VALUES ('T1知识库','admin',0,?,1)").run(now);
+  });
+
+  // ---------- 0. PG-1：DB 层 FORCE RLS 实证（PG 轨道专属；sqlite 无 RLS 跳过） ----------
+  // 背景（2026-11-24 复现踩坑）：三参 NULLIF 语法错使 applyRls 整体失败且被启动 catch 吞掉——
+  // 策略数 0，此前 26 项全绿仅靠应用层过滤（DAL tenantWhere），DB 层隔离从未被验证过（假绿）。
+  // 本用例绕开应用层直查 db，验证 RLS 会话变量隔离的真实生效。
+  if (hasPgCtx) {
+    await t('PG-1：DB 层 FORCE RLS 实证——策略已应用 + 跨租户行会话隔离不可见（非应用层）', () => {
+      const pol = db.prepare("SELECT COUNT(*) c FROM pg_policy WHERE polname='tenant_isolation'").get().c;
+      // 期望覆盖面动态计算（TENANT_TABLES − 平面排除；workflow_templates 入排除后为 68）
+      const { TENANT_TABLES } = require('../src-server/lib/tenant-tables');
+      const { PLATFORM_PLANE_EXCLUDE } = require('../src-server/lib/pg-rls');
+      const expectPol = TENANT_TABLES.length - PLATFORM_PLANE_EXCLUDE.length;
+      assert.ok(pol >= expectPol, `tenant_isolation 策略应 ≥${expectPol} 张（实际 ${pol}）——applyRls 失败防线（启动 fail-closed）`);
+      const seen1 = asTenant(1, () => db.prepare('SELECT COUNT(*) c FROM agents WHERE tenant_id=2').get().c);
+      assert.strictEqual(seen1, 0, 'tenant=1 上下文直查不得见 tenant=2 行（DB 层 RLS）');
+      const seenNoCtx = db.prepare('SELECT COUNT(*) c FROM agents WHERE tenant_id=2').get().c;
+      assert.strictEqual(seenNoCtx, 0, '无上下文（基线 0）直查不得见 tenant=2 行（fail-closed）');
+      const seenPlat = db.withTenant('platform', () => db.prepare('SELECT COUNT(*) c FROM agents WHERE tenant_id=2').get().c);
+      assert.ok(seenPlat >= 1, "'platform' 显式逃逸应可见（运维通道）");
+      // 写向隔离：tenant=1 上下文写入 tenant_id=2 行应被 WITH CHECK 拒绝
+      let denied = false;
+      asTenant(1, () => {
+        try { db.prepare("INSERT INTO agents (name,type,space_id,owner,status,visibility,tenant_id) VALUES ('RLS-WRITE-PROBE','digital',NULL,'admin','published','public',2)").run(); }
+        catch { denied = true; }
+      });
+      assert.ok(denied, '跨租户写入应被 WITH CHECK 拒绝（DB 层 fail-closed）');
+    });
+  }
 
   const listAgents = (sqlStr, args) => db.prepare(`SELECT a.name FROM agents a WHERE 1=1 ${sqlStr}`).all(...args).map(r => r.name);
   const base = ` AND a.status='published'`;
@@ -54,19 +91,19 @@ function t(name, fn) {
   });
 
   // ---------- 2. 多租户交叉不可见（agents） ----------
-  await t('多租户：tenant=1 视角看不到他租户智能体', () => {
+  await t('多租户：tenant=1 视角看不到他租户智能体', () => asTenant(1, () => {
     const { sqlStr, args } = spaceFilterSql('a', { username: 'admin', role: 'admin' }, { tenantId: 1 });
     const names = listAgents(base + sqlStr, args);
     assert.ok(!names.includes('T2智能体'), 'tenant=1 不应见 T2智能体：' + JSON.stringify(names));
     assert.ok(names.includes('T1智能体'), 'tenant=1 应见 T1智能体：' + JSON.stringify(names));
-  });
+  }));
 
-  await t('多租户：tenant=2 视角看不到本租户外（且 admin 亦受边界）', () => {
+  await t('多租户：tenant=2 视角看不到本租户外（且 admin 亦受边界）', () => asTenant(2, () => {
     const { sqlStr, args } = spaceFilterSql('a', { username: 'admin', role: 'admin' }, { tenantId: 2 });
     const names = listAgents(base + sqlStr, args);
     assert.ok(!names.includes('T1智能体'), 'tenant=2 不应见 T1智能体：' + JSON.stringify(names));
     assert.ok(names.includes('T2智能体'), 'tenant=2 应见 T2智能体：' + JSON.stringify(names));
-  });
+  }));
 
   // ---------- 3. filterBySpace（kbs，JS 侧） ----------
   await t('多租户：filterBySpace 跨租户知识库被过滤', () => {
@@ -85,8 +122,8 @@ function t(name, fn) {
 
   // ---------- 4. spaceVisibleTo 跨租户 ----------
   await t('spaceVisibleTo：跨租户空间不可见、本租户企业空间可见', () => {
-    assert.strictEqual(spaceVisibleTo(db, sp2, 'bob', { tenantId: 1 }), false, 'tenant=1 看 tenant=2 空间应不可见');
-    assert.strictEqual(spaceVisibleTo(db, sp2, 'bob', { tenantId: 2 }), true, 'tenant=2 看本租户企业空间应可见');
+    assert.strictEqual(asTenant(1, () => spaceVisibleTo(db, sp2, 'bob', { tenantId: 1 })), false, 'tenant=1 看 tenant=2 空间应不可见');
+    assert.strictEqual(asTenant(2, () => spaceVisibleTo(db, sp2, 'bob', { tenantId: 2 })), true, 'tenant=2 看本租户企业空间应可见');
   });
 
   // ---------- 5. reqTenantOpt / DAL 出口 ----------
@@ -103,10 +140,15 @@ function t(name, fn) {
     assert.deepStrictEqual(dal.tenantWhere('a', 3), { sqlStr: ' AND a.tenant_id=?', args: [3] });
   });
 
-  await t('DAL q()：经方言出口（sqlite 恒等）且在隔离库可用', () => {
+  await t('DAL q()：经方言出口（sqlite 恒等 / PG 走 kingbase 翻译）且在隔离库可用', () => {
     const rows = dal.q('SELECT COUNT(*) AS c FROM users');
     assert.ok(rows[0].c >= 1, 'q() 应返回计数');
-    assert.strictEqual(dal.translateSql('SELECT datetime(\'now\')'), "SELECT datetime('now')", 'sqlite 方言恒等翻译');
+    if (hasPgCtx) {
+      // PG 轨道：dal 绑定 kingbase 方言，datetime → CURRENT_TIMESTAMP（BE-C2 语义锚定）
+      assert.strictEqual(dal.translateSql("SELECT datetime('now')"), "SELECT to_char(now() AT TIME ZONE 'Asia/Shanghai', 'YYYY-MM-DD HH24:MI:SS')", 'PG 轨道应经方言翻译（TEXT 契约 + 业务基准钟，PG-1 语义修复）');
+    } else {
+      assert.strictEqual(dal.translateSql("SELECT datetime('now')"), "SELECT datetime('now')", 'sqlite 方言恒等翻译');
+    }
   });
 
   // ---------- 6. HTTP：多租户 fail-closed ----------
@@ -115,8 +157,11 @@ function t(name, fn) {
   const child = spawn(process.execPath, ['server.js'], {
     cwd: path.join(__dirname, '..'),
     env: { ...process.env, PORT: String(port), AGENT_DATA_DIR: process.env.AGENT_DATA_DIR, AGENT_MULTI_TENANT: '1', PAYMENT_CALLBACK_SECRET: 'e2e-pay-secret', AGENT_FETCH_ALLOW_PRIVATE: '1' },
-    stdio: 'ignore',
+    stdio: ['ignore', 'pipe', 'pipe'], // PG 轨道排障：服务启动失败时需看到 stderr（不能 ignore）
   });
+  let srvLog = '';
+  child.stdout.on('data', c => { srvLog += c; });
+  child.stderr.on('data', c => { srvLog += c; });
   try {
     let up = false;
     for (let i = 0; i < 50 && !up; i++) {
@@ -124,6 +169,9 @@ function t(name, fn) {
       try { up = (await fetch(origin + '/api/health')).ok; } catch { }
     }
     await t('HTTP 多租户：公开端点 /api/health 正常（200）', () => {
+      if (!up) { // 服务未就绪：透出启动日志尾部，避免 PG 轨道排障盲区
+        console.error('     [server 启动日志尾部]\n     ' + String(srvLog).trim().split('\n').slice(-20).join('\n     '));
+      }
       assert.ok(up, 'server 应在 10s 内就绪');
     });
     await t('HTTP 多租户：缺租户上下文的受保护端点 → 403（fail-closed）', async () => {

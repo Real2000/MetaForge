@@ -41,7 +41,16 @@ parentPort.on('message', (req) => {
   const stateArr = stateBuf ? new Int32Array(stateBuf) : new Int32Array(new SharedArrayBuffer(4));
   (async () => {
     if (op === 'init') {
-      Pool = require('pg').Pool;
+      const pg = require('pg');
+      // PG-1 类型对齐（2026-11-23 PG 轨道首跑踩坑）：pg 默认把 int8（COUNT(*)/SUM/MAX(id) 等聚合
+      // 与 bigint 列）解析为字符串、numeric（AVG 等）亦为字符串，而 better-sqlite3 返回 number——
+      // 业务层大量 `count === 0` 判等（如 db.js 种子首启判定 userCount === 0）在 PG 下静默走岔
+      // （"0" !== 0 → 种子块整块跳过 → 平台超管缺位 → 登录/开通/计费商用链路连锁崩）。
+      // 桥的契约是「PG 行为对齐 sqlite、业务层 1585+ 处零改动」，故在驱动层注册解析器归一为
+      // number；int8 超出 Number.isSafeInteger（2^53）时保留原字符串，防大数精度损坏。
+      pg.types.setTypeParser(20, (v) => { const n = Number(v); return Number.isSafeInteger(n) ? n : v; });
+      pg.types.setTypeParser(1700, (v) => { const n = Number(v); return Number.isFinite(n) ? n : v; });
+      Pool = pg.Pool;
       pool = new Pool({ connectionString: req.connString, max: req.poolMax || 4 });
       finish(stateArr, file, { ok: true, rows: [], rowCount: 0 });
       return;
@@ -71,19 +80,28 @@ parentPort.on('message', (req) => {
     }
 
     const { conn, release } = await acquireConn();
+    // PG-1（2026-11-24）租约判定：conn 即 txConn 时处于外层 db.transaction 事务内——内层严禁
+    // 再包 BEGIN/COMMIT（内层 COMMIT 会提前提交外层事务，原子性破坏），只注入会话变量
+    //（set_config local=true 随外层事务生效/回滚）。
+    const inLease = conn === txConn;
     try {
       if (op === 'query' || op === 'run') {
         // RLS 注入：设置租户上下文时包「事务级 set_config + 语句」——SET LOCAL 事务内生效，
-        // 连接归还池后不残留（脏连接隔离）；tenantId 经 Number() 窄化后内插（数字无注入面）
+        // 连接归还池后不残留（脏连接隔离）；'platform' 为显式跨租户逃逸值（RLS 策略分支匹配，
+        // 代码级 opt-in）；数字值经 Number() 窄化后内插（无注入面）
         let full = String(sql), fullArgs = args || [];
-        if (req.tenantId != null) {
-          await conn.query('BEGIN');
-          await conn.query(`SELECT set_config('app.tenant_id', '${Number(req.tenantId)}', true)`);
-        }
         let result;
         if (req.tenantId != null) {
-          result = await conn.query(full, fullArgs);
-          await conn.query('COMMIT');
+          const tv = req.tenantId === 'platform' ? 'platform' : Number(req.tenantId);
+          if (inLease) {
+            await conn.query(`SELECT set_config('app.tenant_id', '${tv}', true)`);
+            result = await conn.query(full, fullArgs);
+          } else {
+            await conn.query('BEGIN');
+            await conn.query(`SELECT set_config('app.tenant_id', '${tv}', true)`);
+            result = await conn.query(full, fullArgs);
+            await conn.query('COMMIT');
+          }
         } else {
           result = await conn.query(full, fullArgs);
         }
@@ -97,13 +115,20 @@ parentPort.on('message', (req) => {
         }
         finish(stateArr, file, payload);
       } else if (op === 'exec') {
-        // 多语句块（DDL/迁移）：RLS 上下文下同样包事务（set_config 语义生效）
+        // 多语句块（DDL/迁移）：RLS 上下文下同样包事务（set_config 语义生效）；租约内不嵌套
         if (req.tenantId != null) {
-          await conn.query('BEGIN');
-          await conn.query(`SELECT set_config('app.tenant_id', '${Number(req.tenantId)}', true)`);
-          const r = await conn.query(String(sql));
-          await conn.query('COMMIT');
-          finish(stateArr, file, { ok: true, rows: r.rows || [], rowCount: r.rowCount || 0 });
+          const tv2 = req.tenantId === 'platform' ? 'platform' : Number(req.tenantId);
+          if (inLease) {
+            await conn.query(`SELECT set_config('app.tenant_id', '${tv2}', true)`);
+            const r = await conn.query(String(sql));
+            finish(stateArr, file, { ok: true, rows: r.rows || [], rowCount: r.rowCount || 0 });
+          } else {
+            await conn.query('BEGIN');
+            await conn.query(`SELECT set_config('app.tenant_id', '${tv2}', true)`);
+            const r = await conn.query(String(sql));
+            await conn.query('COMMIT');
+            finish(stateArr, file, { ok: true, rows: r.rows || [], rowCount: r.rowCount || 0 });
+          }
         } else {
           const r = await conn.query(String(sql)); // pg simple query：多语句块原生支持
           finish(stateArr, file, { ok: true, rows: r.rows || [], rowCount: r.rowCount || 0 });
@@ -114,9 +139,9 @@ parentPort.on('message', (req) => {
     } catch (e) {
       // 连接状态复位规则：
       //   · RLS 自包事务（本函数 BEGIN 的）失败 → ROLLBACK 复位后归还（连接不带 aborted 态回池）
-      //   · 事务租约（外层 db.transaction 持有）失败 → 本层不动，错误上抛由外层 ROLLBACK
-      //     走同一租约连接完成清理（释放也留给外层 COMMIT/ROLLBACK 分支）
-      if (req.tenantId != null) {
+      //   · 事务租约（外层 db.transaction 持有）失败 → 本层不动（不 ROLLBACK 已中止的外层事务），
+      //     错误上抛由外层 ROLLBACK 走同一租约连接完成清理（释放也留给外层 COMMIT/ROLLBACK 分支）
+      if (req.tenantId != null && !inLease) {
         try { await conn.query('ROLLBACK'); } catch { /* 连接已坏时归还由池重建 */ }
       }
       finish(stateArr, file, { ok: false, error: String(e && e.message || e) });

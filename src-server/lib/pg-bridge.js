@@ -27,6 +27,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const { Worker } = require('worker_threads');
+const { AsyncLocalStorage } = require('async_hooks'); // PG-1：请求级租户上下文（防 async 恢复点串租）
 const { translate: _translateSql } = require('./sql-dialect'); // 桥内置方言翻译（见 prepare/exec 内联说明）
 
 /** 占位符转换与调用超时（见 createPgBridge 内联说明） */
@@ -83,7 +84,23 @@ function createPgBridge(opts = {}) {
   const stateBuf = state.buffer;
   const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), 'mt7-bridge-'));
   let seq = 0;
-  let tenantId = null; // RLS 会话上下文（PoC：调用方显式设置；业务全链路接线属全量迁移范围）
+  let tenantId = null; // RLS 会话上下文（闭包兜底：启动期种子/脚本/PoC 显式设置；请求域优先走 ALS）
+  // PG-1（2026-11-23）请求级租户上下文：闭包方案在 Express async 处理链下有「恢复点串租」天险
+  //（A 请求 await 期间 B 请求改写闭包，A 恢复后带着 B 的租户查询）。ALS 上下文随异步链传播，
+  // 请求级隔离由此成立。生效优先级：ALS（withTenant 请求域）> 闭包（setTenantContext）。
+  const tenantAls = new AsyncLocalStorage();
+  /** 归一化租户上下文值：'platform'（跨租户显式逃逸，RLS 策略分支匹配）| 数字租户 id | null（基线） */
+  function normTenant(tid) {
+    if (tid === 'platform') return 'platform';
+    if (tid == null) return null;
+    const n = Number(tid);
+    if (!Number.isFinite(n) || n < 0) throw new Error('pg-bridge：非法租户上下文（' + String(tid) + '）');
+    return n;
+  }
+  const effTenant = () => {
+    const s = tenantAls.getStore();
+    return s ? s.tenantId : tenantId;
+  };
 
   const worker = new Worker(path.join(__dirname, 'pg-bridge-worker.js'), { workerData: null });
   // 关键（PoC 首跑踩坑回归锚定）：Worker 线程默认阻止所在进程退出——一次性脚本（node -e 验证子进程 /
@@ -116,13 +133,20 @@ function createPgBridge(opts = {}) {
     // 使一切租户上下文静默归 0、RLS 隔离形同虚设（PoC 复现踩坑；smoke 静态守卫已锚定）。
     setTenantContext(tid) { tenantId = tid == null ? null : Number(tid); },
     getTenantContext() { return tenantId; },
+    /** 请求级租户上下文（ALS）：fn 的全部同步/异步续体（含 await 恢复点）内生效——
+     *  auth.tenantContext 中间件对每个请求调用，是 RLS 租户注入的主通道；
+     *  'platform' 为平台平面运维的显式跨租户逃逸（代码级 opt-in，非用户可控输入） */
+    withTenant(tid, fn) {
+      if (typeof fn !== 'function') throw new Error('pg-bridge.withTenant(tid, fn)：fn 必须为函数');
+      return tenantAls.run({ tenantId: normTenant(tid) }, fn);
+    },
 
     prepare(sql) {
       // 内置方言翻译（kingbase/PG 系）：覆盖框架层直连 db.prepare 的 SQL（audit/retriever 等
       // 不走 dal 的出口）——dal 出口的 SQL 已翻译过，translate 幂等（已替换文本不再命中规则），二次经过无害
       const t = _translateSql(String(sql), 'kingbase');
       const { sql: pgSql, n } = convertPlaceholders(t.sql);
-      const run0 = (op, args) => callSync({ op, sql: pgSql, args: args.slice(0, n), tenantId });
+      const run0 = (op, args) => callSync({ op, sql: pgSql, args: args.slice(0, n), tenantId: effTenant() });
       return {
         all(...args) { return run0('query', args).rows; },
         get(...args) { return run0('query', args).rows[0]; }, // better-sqlite3 契约：无行 → undefined
@@ -142,21 +166,28 @@ function createPgBridge(opts = {}) {
 
     exec(sql) {
       // 同 prepare：内置翻译（多语句块——DDL 经 db.js exec 包装已翻译，此处幂等兜底框架层直连）
-      callSync({ op: 'exec', sql: convertPlaceholders(_translateSql(String(sql), 'kingbase').sql).sql, tenantId });
+      callSync({ op: 'exec', sql: convertPlaceholders(_translateSql(String(sql), 'kingbase').sql).sql, tenantId: effTenant() });
       return undefined; // better-sqlite3 exec 无返回值
     },
 
     transaction(fn) {
+      // better-sqlite3 契约：transaction(fn) 返回「可调用包装」，调用点形态 db.transaction(fn)(args)。
+      // PG-1 复现踩坑（2026-11-24）：原实现直接执行并返回结果——调用点二次调用即报
+      // "db.transaction(...) is not a function"，且事务已 COMMIT、结果无法随异常回滚
+      //（PG 轨道 MT-10 开通租户出现「400 返回但租户+管理员已落库」假象，run4 排障定位）。
+      if (typeof fn !== 'function') throw new Error('pg-bridge.transaction(fn)：fn 必须为函数');
       // 同步事务：BEGIN（worker 租约连接）→ fn()（内部语句自动路由租约连接）→ COMMIT / 异常 ROLLBACK
-      callSync({ op: 'exec', sql: 'BEGIN' });
-      try {
-        const out = fn();
-        callSync({ op: 'exec', sql: 'COMMIT' });
-        return out;
-      } catch (e) {
-        try { callSync({ op: 'exec', sql: 'ROLLBACK' }); } catch { /* 回滚失败保留原始异常优先上抛 */ }
-        throw e;
-      }
+      return (...args) => {
+        callSync({ op: 'exec', sql: 'BEGIN' });
+        try {
+          const out = fn(...args);
+          callSync({ op: 'exec', sql: 'COMMIT' });
+          return out;
+        } catch (e) {
+          try { callSync({ op: 'exec', sql: 'ROLLBACK' }); } catch { /* 回滚失败保留原始异常优先上抛 */ }
+          throw e;
+        }
+      };
     },
 
     pragma() { return undefined; }, // busy_timeout/journal_mode 为 SQLite 专有——PG 由连接参数承担

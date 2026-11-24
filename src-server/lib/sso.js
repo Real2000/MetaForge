@@ -17,8 +17,16 @@ const { sign } = require('./auth');
 
 // P1-1 SSO 表按需创建（幂等）：仅在需要时执行，与 db.js 解耦，不影响无 SSO 环境的测试
 function ensureTables() {
-  // BE-C1（2026-11-23）：表存在性探测改走 dal.pluck（原 prepare().pluck() 语句复用形态）
-  const tableExists = (name) => dal.pluck("SELECT name FROM sqlite_master WHERE type='table' AND name=?", [name]);
+  // MT-7/PG-1（2026-11-23）启动期探测方言化：sqlite_master/PRAGMA 为 SQLite 专有（BE-C2 方言登记
+  // 差异），PG 模式下原文直发即报错——本函数在模块顶层执行，会把 server.js 启动直接打崩
+  //（PG 轨道 e2e 首跑踩坑）。非 sqlite 方言走 information_schema 标准目录视图（登记的替代路径）。
+  const isSqlite = (process.env.DB_DIALECT || 'sqlite') === 'sqlite';
+  const tableExists = (name) => {
+    if (!isSqlite) {
+      try { return !!dal.getq('SELECT 1 FROM information_schema.tables WHERE lower(table_name)=lower(?)', [name]); } catch { return false; }
+    }
+    try { return !!dal.pluck("SELECT name FROM sqlite_master WHERE type='table' AND name=?", [name]); } catch { return false; }
+  };
   if (!tableExists('sso_providers')) {
     dal.exec(`CREATE TABLE IF NOT EXISTS sso_providers (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -41,7 +49,9 @@ function ensureTables() {
   }
   // 2026-11-12 P1-1b 修复：早期建表语句缺 type 列（routes/sso.js INSERT/UPDATE 均用到），
   // 导致创建服务商 500「no column named type」；对已建表的老库（含生产）幂等补列
-  const ssoCols = dal.q('PRAGMA table_info(sso_providers)').map(c => c.name);
+  const ssoCols = isSqlite
+    ? dal.q('PRAGMA table_info(sso_providers)').map(c => c.name)
+    : dal.q("SELECT column_name AS name FROM information_schema.columns WHERE lower(table_name)=lower('sso_providers')").map(c => c.name);
   if (!ssoCols.includes('type')) {
     dal.exec("ALTER TABLE sso_providers ADD COLUMN type TEXT DEFAULT 'oidc'");
     console.log('[sso] sso_providers 表已迁移：新增 type 字段');

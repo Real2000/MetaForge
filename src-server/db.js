@@ -1832,15 +1832,21 @@ db.exec(`CREATE TABLE IF NOT EXISTS workflow_templates (
   }
 }
 
+// ---------------- PG-1（2026-11-24）启动期跨租户维护上下文 ----------------
+// 二启起 FORCE RLS 已生效：无上下文的 boot-path SELECT 只见基线 0 行（存量清洗静默漏扫），
+// UPDATE 一旦命中即 WITH CHECK 违约崩启动。启动期种子/清洗/回填属平台平面运维语义，
+// 显式走 'platform' 逃逸（RLS 策略分支，代码级 opt-in）；sqlite 无 withTenant 直通（零回归）。
+const bootCtx = (fn) => (typeof db.withTenant === 'function' ? db.withTenant('platform', fn) : fn());
+
 // P5.34b（审查建议）：存量清洗——agents/skill_assets 的 tools 中被注入的违禁工具（create_task/
 // local_exec）一次性剔除（幂等：每次启动执行，无违禁项则无操作；新写入已被各入口白名单拦截，
 // 此处清存量，防 @技能/@专家/copy 等旁路继续生效）。位置在全部建表之后（skill_assets 在前文创建）
-{
+bootCtx(() => {
   const { AGENT_TOOL_DENY } = require('./lib/tool-deny'); // 零依赖模块，避免 db ↔ tools 循环依赖
   const denyArr = [...AGENT_TOOL_DENY];
   if (denyArr.length) {
     let cleaned = 0;
-    const rows = db.prepare(`SELECT id, tools FROM agents WHERE ${denyArr.map(() => "tools LIKE ?").join(' OR ')}`).all(...denyArr.map(w => `%"${w}"%`));
+    const rows = db.prepare(`SELECT id, tools FROM agents WHERE ${denyArr.map(() => "tools LIKE ?").join(' OR ')}`).all(...denyArr.map(w => `%,"${w}",%`));
     for (const r of rows) {
       try {
         const ts = JSON.parse(r.tools || '[]').filter(t => !AGENT_TOOL_DENY.has(t));
@@ -1848,7 +1854,7 @@ db.exec(`CREATE TABLE IF NOT EXISTS workflow_templates (
         cleaned++;
       } catch { /* 脏数据跳过 */ }
     }
-    const srows = db.prepare(`SELECT id, tools FROM skill_assets WHERE ${denyArr.map(() => "tools LIKE ?").join(' OR ')}`).all(...denyArr.map(w => `%"${w}"%`));
+    const srows = db.prepare(`SELECT id, tools FROM skill_assets WHERE ${denyArr.map(() => "tools LIKE ?").join(' OR ')}`).all(...denyArr.map(w => `%,"${w}",%`));
     for (const r of srows) {
       try {
         const ts = JSON.parse(r.tools || '[]').filter(t => !AGENT_TOOL_DENY.has(t));
@@ -1858,7 +1864,7 @@ db.exec(`CREATE TABLE IF NOT EXISTS workflow_templates (
     }
     if (cleaned) console.log(`[db] 存量清洗：已从 ${cleaned} 条 agents/skill_assets 记录中剔除违禁工具（${denyArr.join('/')}）`);
   }
-}
+});
 
 // ---------------- V2.4 #9 收尾（2026-11-02）：存量资源空间归属回填（幂等） ----------------
 // 规则（只处理 space_id 为 NULL/0 的存量行，已有归属的行不动；位置在 seed 之后，新库种子一并归类）：
@@ -1867,7 +1873,7 @@ db.exec(`CREATE TABLE IF NOT EXISTS workflow_templates (
 //   - 其他 owner → 该用户的个人空间（个人空间=私有的目标租户语义）；无个人空间则保持无归属不强行归类
 // 注：运行时创建的资源都带明确 space_id（个人空间 id 或 0=无归属），本块不会误改——仅当
 //     「无个人空间用户故意写 0」且之后该用户获得个人空间的边缘场景会被归类为个人空间（符合租户化方向）。
-{
+bootCtx(() => {
   const ent = db.prepare("SELECT id FROM spaces WHERE type='enterprise' ORDER BY id LIMIT 1").get();
   if (ent) {
     const ra1 = db.prepare(`UPDATE agents SET space_id=? WHERE (space_id IS NULL OR space_id=0) AND (owner IS NULL OR owner='' OR owner='admin')`).run(ent.id);
@@ -1881,7 +1887,7 @@ db.exec(`CREATE TABLE IF NOT EXISTS workflow_templates (
     const na = ra1.changes + ra2.changes, nk = rk1.changes + rk2.changes;
     if (na + nk > 0) console.log(`[db] V2.4 #9 存量空间归属回填：agents ${na} 行、kbs ${nk} 行（无主/admin→企业空间#${ent.id}，其余→个人空间）`);
   }
-}
+});
 
 // ---------------- 热表索引（2026-10-28 DB 优化：补齐 6 张高频表二级索引 + agents 高频查询）----------------
 // 幂等：IF NOT EXISTS 已存在则跳过；首次对存量数据建索引可能耗时数秒（WAL 下读不阻塞，但 better-sqlite3 同步会短暂冻结事件循环）
@@ -3091,15 +3097,37 @@ try {
   console.error('[migrate] 迁移框架初始化失败（非致命）：', e.message);
 }
 
+// ================== PG-1（2026-11-24）序列对齐：显式 id 插入后回拨 SERIAL sequence ==================
+// sqlite 的 AUTOINCREMENT 在显式 id 插入后自动推进 sqlite_sequence；PG SERIAL 的 sequence 不
+// 感知显式 id 插入——迁移/种子含显式 id（tenants 默认租户 id=1 等）时 nextval 落后于 MAX(id)，
+// 后续自增插入即 duplicate key（PG 轨道 MT-10 开通租户首踩 tenants_pkey）。这也是 M6 全量迁移
+//（sqlite→PG 数据搬运）后的必经收尾步骤。setval(..., MAX+1, false)：空表/数据稳定时幂等。
+// 时机在 RLS 应用之前（MAX(id) 需无租户上下文可见全量行；对齐后 RLS 才生效）。
+if (DB_DRIVER === 'pg') {
+  try {
+    // 'platform' 逃逸读全量：重启动时 RLS 已生效（FORCE 对 owner 也强制），无上下文的
+    // MAX(id) 只见基线 0 行——会把有数据的序列错误回拨到 1，复现 duplicate key（自踩防复发）
+    const seqTables = db.withTenant('platform', () =>
+      db.prepare("SELECT table_name AS t FROM information_schema.columns WHERE table_schema='public' AND column_name='id' AND column_default LIKE 'nextval%'").all());
+    db.withTenant('platform', () => {
+      for (const r of seqTables) {
+        db.exec(`SELECT setval(pg_get_serial_sequence('"${r.t}"', 'id'), COALESCE((SELECT MAX(id) FROM "${r.t}"), 0) + 1, false)`);
+      }
+    });
+    console.log(`[db][PG-1] 序列对齐：${seqTables.length} 张自增表已 setval(MAX(id)+1)`);
+  } catch (e) {
+    console.error('[db][PG-1] 序列对齐失败：', e.message);
+    throw e; // 序列错位会让全部自增写入报 duplicate key——致命而非降级可承受
+  }
+}
+
 // ================== MT-7（2026-11-23）RLS 应用：PG 模式下核心表启用行级安全 ==================
 // 时机在全部建表/迁移完成之后（策略应用对象是已存在的表）。幂等（POLICY IF NOT EXISTS 语义，
 // 见 lib/pg-rls.js）；sqlite 模式零执行零影响。
+// PG-1（2026-11-24）改 fail-closed：RLS 是 DB 层安全边界，静默失败 = 全库裸奔（此前非致命 catch
+// 吞掉三参 NULLIF 语法错——策略数 0、隔离形同虚设，e2e 仅靠应用层过滤假绿，复现踩坑防复发）。
 if (DB_DRIVER === 'pg') {
-  try {
-    const { applyRls } = require('./lib/pg-rls');
-    const applied = applyRls(db);
-    console.log(`[db][MT-7] RLS 策略已应用：${applied.join(', ')}（FORCE 行级隔离，会话变量 app.tenant_id）`);
-  } catch (e) {
-    console.error('[db][MT-7] RLS 策略应用失败（非致命，检查表是否含 tenant_id 列）：', e.message);
-  }
+  const { applyRls, PLATFORM_PLANE_EXCLUDE } = require('./lib/pg-rls');
+  const applied = applyRls(db);
+  console.log(`[db][MT-7] RLS 已应用 ${applied.length} 张租户内容表（FORCE + tenant_isolation，会话变量 app.tenant_id；平台平面表 ${PLATFORM_PLANE_EXCLUDE.length} 张走应用层防线）`);
 }
