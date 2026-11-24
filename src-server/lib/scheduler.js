@@ -2,7 +2,7 @@
  * 任务执行器 + Cron 调度器（30 秒扫描一次）
  * 2026-10-20：内置运维任务（每日备份/产物清理/日志归档），不依赖外部 cron
  */
-const { db, now } = require('../db');
+const { db, now, withDbTenant } = require('../db');
 const dal = require('./dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const { runAgent } = require('./workflow');
 const { lastFire } = require('./cron');
@@ -24,16 +24,20 @@ const LOCK_TTL = clusterLock.DEFAULT_TTL_MS;
 // 原先注册在 startScheduler() 内且用 global 守卫；抽到顶层后，worker.js 只需 require 本模块即可消费 'cron-task'，
 // 无需启动 30s 扫描 tick。register 对同名重复注册会抛错，模块缓存保证只执行一次。
 register('cron-task', async (payload) => {
-  const task = dal.getq('SELECT * FROM tasks WHERE id=?', [payload.taskId]);
+  // PG-1 增量（2026-11-24）：队列 worker/调度回调无请求 ALS——platform 逃逸读任务（跨租户派发面），
+  // 执行体按任务归属租户进入上下文（runTask 内 UPDATE tasks / INSERT task_runs / runAgent 写
+  // sessions/messages/chat_traces 全走 RLS；无上下文时全部不可见/违约）
+  const task = withDbTenant('platform', () => dal.getq('SELECT * FROM tasks WHERE id=?', [payload.taskId]));
   if (!task) throw new Error('任务不存在');
-  return await runTask(task);
+  return await withDbTenant(Number(task.tenant_id) || 1, () => runTask(task));
 });
 
 /** P5.34（审查 F8）：自动停用任务并通知归属者（配额耗尽/主体失效等场景共用）
  *  P5.34b（Y3）：outputMsg 只传原因短语（不再自带「任务已自动停用：」前缀），通知模板统一拼装 */
 function disableTask(task, reason, title) {
+  // task_runs 显式行归属租户（列默认 1 会让非 1 租户的执行记录错挂租户 1——应用层过滤与 RLS 双失明）
   dal.runq('UPDATE tasks SET enabled=0, last_run_at=?, last_result=? WHERE id=?', [now(), 'fail', task.id]);
-  dal.runq('INSERT INTO task_runs (task_id,status,started_at,finished_at,output) VALUES (?,?,?,?,?)', [task.id, 'fail', now(), now(), '任务已自动停用：' + reason]);
+  dal.runq('INSERT INTO task_runs (task_id,tenant_id,status,started_at,finished_at,output) VALUES (?,?,?,?,?,?)', [task.id, Number(task.tenant_id) || 1, 'fail', now(), now(), '任务已自动停用：' + reason]);
   try {
     dal.runq('INSERT INTO notifications (username,title,content,type,link,is_read,created_at) VALUES (?,?,?,?,?,0,?)', [task.username, title || '⏸️ 定时任务已自动停用', `任务「${task.name || task.id}」因 ${String(reason).replace(/\n[\s\S]*$/, '')} 已自动停用，可在「任务管理」页查看。`, 'task', '#/tasks', now()]);
   } catch { /* 通知失败不影响停用 */ }
@@ -89,7 +93,8 @@ async function runTask(task) {
     dal.runq('INSERT INTO err_logs (source,message,created_at) VALUES (?,?,?)', ['task-scheduler', `任务「${task.name}」执行失败：${e.message}`, now()]);
   }
   const finished = now();
-  dal.runq('INSERT INTO task_runs (task_id,status,started_at,finished_at,output) VALUES (?,?,?,?,?)', [task.id, status, started, finished, output]);
+  // task_runs 显式行归属租户（同 disableTask——非 1 租户的执行记录不可错挂租户 1）
+  dal.runq('INSERT INTO task_runs (task_id,tenant_id,status,started_at,finished_at,output) VALUES (?,?,?,?,?,?)', [task.id, Number(task.tenant_id) || 1, status, started, finished, output]);
   dal.runq('UPDATE tasks SET last_run_at=?, last_result=? WHERE id=?', [finished, status, task.id]);
   // P5.31 配额记账：定时任务的 token 消耗记到任务归属者（此前不记任何人；管理员建的历史任务 username='' 不记）
   try {
@@ -113,7 +118,9 @@ function startScheduler() {
       return;
     }
     try {
-      const tasks = dal.q('SELECT * FROM tasks WHERE enabled=1 AND exec_type=?', ['cron']);
+      // PG-1 增量：跨租户调度扫描（platform 逃逸）——无上下文直查 tasks 在 RLS 下只见基线 0 行，
+      // 调度器会静默空转；逐任务执行时由 cron-task handler 按归属租户进上下文
+      const tasks = withDbTenant('platform', () => dal.q('SELECT * FROM tasks WHERE enabled=1 AND exec_type=?', ['cron']));
       for (const t of tasks) {
         if (!t.cron) continue;
         const prev = fireMarks.get(t.id) || Date.parse(t.last_run_at || '') || Date.now() - 60000;

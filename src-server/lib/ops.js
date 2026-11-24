@@ -7,7 +7,7 @@
  */
 const fs = require('fs');
 const path = require('path');
-const { db, now } = require('../db');
+const { db, now, withDbTenant } = require('../db');
 const config = require('./config'); // P1-20 配置中心
 const dal = require('./dal'); // U2-2 数据库抽象层
 
@@ -129,12 +129,12 @@ function digestMemories() {
   const today = dayKey();
   try {
     const rows = dal.q(`
-      SELECT s.agent_id, s.username
+      SELECT s.agent_id, s.username, a.tenant_id AS tenant_id
       FROM sessions s
       JOIN messages m ON m.session_id = s.id
       JOIN agents a ON a.id = s.agent_id AND a.long_memory = 1
       WHERE m.created_at >= datetime('now','-1 day') AND m.role = 'user'
-      GROUP BY s.id HAVING COUNT(m.id) >= 5
+      GROUP BY s.id, a.tenant_id HAVING COUNT(m.id) >= 5
     `);
     if (!rows.length) return { ok: true, skipped: true, msg: '今日无待摘要会话' };
     const seen = new Set();
@@ -151,7 +151,8 @@ function digestMemories() {
       if (!userMsgs.length) continue;
       const topics = userMsgs.slice(0, 5).map(t => t.length > 50 ? t.slice(0, 50) + '…' : t);
       const summary = `用户提出 ${userMsgs.length} 条消息。话题：${topics.join('； ')}。`;
-      dal.runq(`INSERT INTO agent_memories (agent_id,username,fact,type,confidence,source,summary,created_at) VALUES (?,?,?,?,?,?,?,datetime('now','localtime'))`, [r.agent_id, r.username, summary, 'fact', 0.5, 'digest', summary]);
+      // 行归属租户显式列值（随 agent 归属租户——平台摘要任务跨租户运维，新行租户不得错挂列默认 1）
+      dal.runq(`INSERT INTO agent_memories (agent_id,username,fact,type,confidence,source,summary,tenant_id,created_at) VALUES (?,?,?,?,?,?,?, ?, datetime('now','localtime'))`, [r.agent_id, r.username, summary, 'fact', 0.5, 'digest', summary, Number(r.tenant_id) || 1]);
       seen.add(key);
     }
     if (seen.size) {
@@ -170,7 +171,7 @@ function digestMemories() {
 function runEvalRegression() {
   const today = dayKey();
   try {
-    const kbs = dal.q("SELECT id, name, owner FROM kbs WHERE enabled=1");
+    const kbs = dal.q("SELECT id, name, owner, tenant_id FROM kbs WHERE enabled=1");
     let totalEvalCount = 0;
     for (const kb of kbs) {
       const evals = dal.q("SELECT id, name, score, dataset, kb_id FROM evaluations WHERE kb_id=? AND type='kb'", [kb.id]);
@@ -179,9 +180,10 @@ function runEvalRegression() {
         const { rerunEvalSet } = require('./kb-eval-regression');
         rerunEvalSet(ev).then(r => {
           if (r && r.score !== undefined) {
-            dal.runq(`INSERT INTO recall_eval_results (kb_id, eval_name, version, type, total_questions, avg_recall, avg_accuracy, scores, negatives, missees, triggered_by, created_by, created_at)
-              VALUES (?,?,?,?,?,?,?,?,?,?,'schedule',?,?)`, [kb.id, ev.name, r.version || 'v1', 'full', r.items_count || 0, r.score || 0, 0,
-                JSON.stringify(r.detail || []), '[]', '[]', 'system', now()]);
+            // 行归属租户显式列值（随 kb 归属租户——平台回归任务跨租户运维）
+            dal.runq(`INSERT INTO recall_eval_results (kb_id, eval_name, version, type, total_questions, avg_recall, avg_accuracy, scores, negatives, missees, triggered_by, created_by, tenant_id, created_at)
+              VALUES (?,?,?,?,?,?,?,?,?,?,'schedule',?, ?,?)`, [kb.id, ev.name, r.version || 'v1', 'full', r.items_count || 0, r.score || 0, 0,
+                JSON.stringify(r.detail || []), '[]', '[]', 'system', Number(kb.tenant_id) || 1, now()]);
             console.log(`[ops] 评测回归：kb#${kb.id}「${ev.name}」= ${r.score}`);
           }
         }).catch(e => console.warn(`[ops] 评测回归失败：kb#${kb.id}/eval#${ev.id}`, e.message));
@@ -242,7 +244,10 @@ function startOps(guard) {
   // U2-1 / N7-P2：可选 guard —— 集群下传入「是否 leader」判断，非 leader 进程的定时触发直接跳过（不重复备份/清理）。
   // 不传 guard 时等价于恒真，单进程路径行为与引入前完全一致。
   const allow = typeof guard === 'function' ? guard : () => true;
-  const run = (job, fn) => { if (allow()) dailyOps(job, fn); };
+  // PG-1 增量（2026-11-24）：运维任务统一 platform 逃逸上下文——摘要/评测/预算读写 sessions/messages/
+  // kbs/departments 等租户表（无上下文在 RLS 下只见基线 0 行，静默空转）；写入行的归属租户由
+  // 各任务显式列值指定（digestMemories/runEvalRegression 的 INSERT）。备份/清理/归档仅碰平面表，包裹无副作用。
+  const run = (job, fn) => { if (allow()) dailyOps(job, () => withDbTenant('platform', fn)); };
   // 启动 60 秒后先跑一轮（首次部署即有备份），此后每 30 分钟检查跨日触发
   setTimeout(() => { run('backup', dailyBackup); run('uploads', cleanupUploads); run('logs', archiveLogs); }, 60000);
   setInterval(() => {

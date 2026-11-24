@@ -993,6 +993,66 @@ function t(name, fn) {
       assert.ok(wired >= 6, `tenantContext 各出口应经 enterTenantDb 包裹（定义+5 出口，实际 ${wired} 处）`);
       assert.ok(/typeof db\.withTenant !== 'function'/.test(authSrc), 'sqlite 应直通 next()（零回归守卫）');
     });
+
+    // 【PG-1 增量（2026-11-24）】写路径租户列自动注入（桥层）+ 后台路径上下文接线
+    // 背景：业务 INSERT 普遍不写 tenant_id（列默认 1）——租户≠1 请求下新行错挂租户 1，
+    // PG 模式被 RLS WITH CHECK 直接拒绝。注入器在桥层统一兜底，1585+ 调用点零改动。
+    await t('PG-1 增量：桥层 INSERT 租户列注入器——典型/显式/排除表/防御形态（纯函数单测）', () => {
+      const { injectTenantVersion, TENANT_CONTENT_TABLES, convertPlaceholders } = require('../src-server/lib/pg-bridge');
+      // 覆盖面与 pg-rls 同源（单一事实源：改排除清单两侧同步）
+      assert.ok(TENANT_CONTENT_TABLES.has('sessions') && TENANT_CONTENT_TABLES.has('agents') && !TENANT_CONTENT_TABLES.has('users') && !TENANT_CONTENT_TABLES.has('workflow_templates'),
+        '注入覆盖面应 = TENANT_TABLES − 平面排除（users/workflow_templates 平面表不注入）');
+      // ① 典型形态：cols 尾注入 tenant_id + VALUES 尾注入占位符
+      const r1 = injectTenantVersion('INSERT INTO sessions (agent_id,title,username,created_at,updated_at) VALUES ($1,$2,$3,$4,$5)', 5);
+      assert.ok(r1 && r1.n === 6, '注入后占位符数 n+1：' + JSON.stringify(r1));
+      assert.strictEqual(r1.sql, 'INSERT INTO sessions (agent_id,title,username,created_at,updated_at, tenant_id) VALUES ($1,$2,$3,$4,$5, $6)',
+        'cols 尾加 tenant_id、VALUES 尾加 $n+1（括号配平）：' + (r1 && r1.sql));
+      // ② 显式含 tenant_id → 不注入（显式优先：ops/scheduler 后台路径显式写行归属）
+      assert.strictEqual(injectTenantVersion('INSERT INTO agents (name,tenant_id) VALUES ($1,$2)', 2), null, '显式 tenant_id 应跳过');
+      // ③ 平面表（users）→ 不注入
+      assert.strictEqual(injectTenantVersion('INSERT INTO users (username,nickname) VALUES ($1,$2)', 2), null, '排除清单表应跳过');
+      // ④ ON CONFLICT 尾保留（INSERT OR IGNORE/REPLACE 经方言层标准化后的形态）
+      const r4 = injectTenantVersion('INSERT INTO kbs (name,owner) VALUES ($1,$2) ON CONFLICT (name) DO NOTHING', 2);
+      assert.ok(r4 && /ON CONFLICT \(name\) DO NOTHING$/.test(r4.sql), 'ON CONFLICT 尾应保留：' + (r4 && r4.sql));
+      // ⑤ 多行 VALUES / INSERT..SELECT / 无列清单 → 防御直通 null（宁可不动不臆造）
+      assert.strictEqual(injectTenantVersion('INSERT INTO kbs (name,owner) VALUES ($1,$2),($3,$4)', 4), null, '多行 VALUES 不注入');
+      assert.strictEqual(injectTenantVersion('INSERT INTO kbs SELECT * FROM tmp', 0), null, 'INSERT..SELECT 不注入');
+      assert.strictEqual(injectTenantVersion('INSERT INTO kbs VALUES ($1)', 1), null, '无列清单不注入');
+      // ⑥ 值区含函数与括号字面量（翻译后的 to_char / 带括号字符串）——字符串感知括号匹配
+      const r6 = injectTenantVersion("INSERT INTO tasks (name,created_at) VALUES ($1, to_char(now() AT TIME ZONE 'Asia/Shanghai', 'YYYY-MM-DD HH24:MI:SS'))", 1);
+      assert.ok(r6 && /VALUES \(\$1, to_char[\s\S]*'YYYY-MM-DD HH24:MI:SS'\), \$2\)$/.test(r6.sql), '函数括号应正确配平：' + (r6 && r6.sql));
+      // ⑦ 桥 prepare 的双版本选择守卫（run 时取开关+ALS 租户，非 prepare 时固化）——开关防启动期
+      //    种子在租户列迁移前显式引用 tenant_id（列不存在而炸，PG 轨道首踩）
+      const bridgeSrc = require('fs').readFileSync(path.join(__dirname, '..', 'src-server', 'lib', 'pg-bridge.js'), 'utf8');
+      assert.ok(/const inj = injectTenantVersion\(pgSql, n\)/.test(bridgeSrc) && /tenantInjectEnabled && typeof tid === 'number'/.test(bridgeSrc),
+        'prepare 应预生成注入版 + run 时按「开关+数字租户」动态选用（启动期语句跨上下文复用安全）');
+      assert.ok(/setTenantInjection\(enabled\)/.test(bridgeSrc) && /db\.setTenantInjection\(true\)/.test(require('fs').readFileSync(path.join(__dirname, '..', 'src-server', 'db.js'), 'utf8')),
+        'db.js 应在迁移+RLS 完成后打开注入开关（启动种子维持列默认归属）');
+    });
+
+    await t('PG-1 增量：后台路径上下文接线——withDbTenant 导出 / scheduler / ops 静态守卫', () => {
+      const fs2 = require('fs');
+      const { withDbTenant } = require('../src-server/db');
+      assert.strictEqual(typeof withDbTenant, 'function', 'db 应导出 withDbTenant（后台模块统一入口）');
+      const dbSrc = fs2.readFileSync(path.join(__dirname, '..', 'src-server', 'db.js'), 'utf8');
+      assert.ok(/const bootCtx = \(fn\) => withDbTenant\('platform', fn\)/.test(dbSrc), 'bootCtx 应为 withDbTenant 的 platform 特化（单一实现）');
+      // scheduler：cron handler 平台读 + 按任务归属租户执行；tick 扫描 platform；task_runs 显式租户列
+      const schedSrc = fs2.readFileSync(path.join(__dirname, '..', 'src-server', 'lib', 'scheduler.js'), 'utf8');
+      assert.ok(/withDbTenant\('platform', \(\) => dal\.getq\('SELECT \* FROM tasks WHERE id=\?/.test(schedSrc),
+        'cron-task handler 应 platform 读任务（队列 worker 无请求 ALS）');
+      assert.ok(/withDbTenant\(Number\(task\.tenant_id\) \|\| 1, \(\) => runTask\(task\)\)/.test(schedSrc),
+        '执行体应按任务归属租户进上下文');
+      assert.ok(/withDbTenant\('platform', \(\) => dal\.q\('SELECT \* FROM tasks WHERE enabled=1/.test(schedSrc),
+        'tick 扫描应 platform 逃逸（无上下文直查只见基线 0 行，调度器静默空转）');
+      const trExplicit = (schedSrc.match(/INSERT INTO task_runs \(task_id,tenant_id,/g) || []).length;
+      assert.strictEqual(trExplicit, 2, 'task_runs 两处 INSERT（disableTask/runTask）应显式租户列：' + trExplicit);
+      // ops：任务统一 platform 包裹 + 两处写行显式租户列
+      const opsSrc = fs2.readFileSync(path.join(__dirname, '..', 'src-server', 'lib', 'ops.js'), 'utf8');
+      assert.ok(/dailyOps\(job, \(\) => withDbTenant\('platform', fn\)\)/.test(opsSrc), 'ops 任务应统一 platform 逃逸上下文');
+      assert.ok(/INSERT INTO agent_memories \(agent_id,username,fact,type,confidence,source,summary,tenant_id,created_at\)/.test(opsSrc),
+        '记忆摘要 INSERT 应显式行归属租户');
+      assert.ok(/recall_eval_results \(kb_id,[^)]*tenant_id, created_at\)/.test(opsSrc), '评测回归 INSERT 应显式行归属租户');
+    });
   }
 
   // ================ P3 扩展工具（2026-10-22）：Text2SQL / 图表 / Word / MCP Server / 分类器路由 ================

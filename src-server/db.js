@@ -1832,11 +1832,16 @@ db.exec(`CREATE TABLE IF NOT EXISTS workflow_templates (
   }
 }
 
+// ---------------- PG-1 增量（2026-11-24）后台路径租户上下文 ----------------
+// 调度器/队列/ops 等无请求 ALS 的调用方，以任务归属租户（或 'platform' 运维逃逸）进入 DB
+// 上下文（RLS 会话变量）；sqlite 无 withTenant 直通（零回归）。导出供后台模块统一使用。
+const withDbTenant = (tid, fn) => (typeof db.withTenant === 'function' ? db.withTenant(tid, fn) : fn());
+
 // ---------------- PG-1（2026-11-24）启动期跨租户维护上下文 ----------------
 // 二启起 FORCE RLS 已生效：无上下文的 boot-path SELECT 只见基线 0 行（存量清洗静默漏扫），
 // UPDATE 一旦命中即 WITH CHECK 违约崩启动。启动期种子/清洗/回填属平台平面运维语义，
-// 显式走 'platform' 逃逸（RLS 策略分支，代码级 opt-in）；sqlite 无 withTenant 直通（零回归）。
-const bootCtx = (fn) => (typeof db.withTenant === 'function' ? db.withTenant('platform', fn) : fn());
+// 显式走 'platform' 逃逸（withDbTenant 的运维特化）；sqlite 无 withTenant 直通（零回归）。
+const bootCtx = (fn) => withDbTenant('platform', fn);
 
 // P5.34b（审查建议）：存量清洗——agents/skill_assets 的 tools 中被注入的违禁工具（create_task/
 // local_exec）一次性剔除（幂等：每次启动执行，无违禁项则无操作；新写入已被各入口白名单拦截，
@@ -1973,7 +1978,7 @@ const dbRead = new Proxy({}, {
 // 强制经 lib/audit 过「脱敏 + UTC + 哈希链」，调用方无从绕过（含直接 db.prepare 写入）。
 try { require('./lib/audit').installGuard(db); } catch (e) { console.error('[db][SEC-12] 审计日志守卫装配失败：' + e.message); }
 
-module.exports = { db, dbRead, hashPwd, hashPwdAsync, verifyPwd, now, daysAgo, tableEntities, tableEntityRelations, upsertCheckpoint, getCheckpoint, deleteCheckpoint };
+module.exports = { db, dbRead, hashPwd, hashPwdAsync, verifyPwd, now, daysAgo, tableEntities, tableEntityRelations, upsertCheckpoint, getCheckpoint, deleteCheckpoint, withDbTenant };
 
 // ---------- P1-4 修复 2026-11-09 / SEC-10（M2 批次4）：加密密钥初始化与校验 ----------
 // 密钥来源优先级（SEC-10，同 crypto-util）：环境变量 AGENT_ENCRYPTION_KEY > 文件 <DATA_DIR>/encryption.key(0600) > secrets 表（兼容）
@@ -3130,4 +3135,8 @@ if (DB_DRIVER === 'pg') {
   const { applyRls, PLATFORM_PLANE_EXCLUDE } = require('./lib/pg-rls');
   const applied = applyRls(db);
   console.log(`[db][MT-7] RLS 已应用 ${applied.length} 张租户内容表（FORCE + tenant_isolation，会话变量 app.tenant_id；平台平面表 ${PLATFORM_PLANE_EXCLUDE.length} 张走应用层防线）`);
+  // PG-1 增量：至此建表→迁移（租户列已补齐）→RLS 全部就绪，打开写路径租户列注入——启动期种子
+  // 在开关关闭下维持列默认归属（P5.31 等种子先于租户列迁移执行，注入版显式引用会列不存在而炸）
+  db.setTenantInjection(true);
+  console.log('[db][PG-1] 写路径租户列注入已启用（数字租户上下文的 INSERT 自动补 tenant_id，1585+ 调用点零改动）');
 }

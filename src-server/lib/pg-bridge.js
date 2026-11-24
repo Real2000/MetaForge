@@ -29,6 +29,11 @@ const os = require('os');
 const { Worker } = require('worker_threads');
 const { AsyncLocalStorage } = require('async_hooks'); // PG-1：请求级租户上下文（防 async 恢复点串租）
 const { translate: _translateSql } = require('./sql-dialect'); // 桥内置方言翻译（见 prepare/exec 内联说明）
+const { TENANT_TABLES } = require('./tenant-tables');
+const { PLATFORM_PLANE_EXCLUDE } = require('./pg-rls');
+
+/** 租户内容表清单（与 pg-rls 覆盖面同源：TENANT_TABLES − 平面排除——单一事实源，改排除清单两侧同步生效） */
+const TENANT_CONTENT_TABLES = new Set(TENANT_TABLES.filter((t) => !PLATFORM_PLANE_EXCLUDE.includes(t)));
 
 /** 占位符转换与调用超时（见 createPgBridge 内联说明） */
 const CALL_TIMEOUT_MS = 30000;
@@ -61,6 +66,51 @@ function convertPlaceholders(sql) {
     out += ch; i++;
   }
   return { sql: out, n };
+}
+
+/** 返回 s[openIdx]='(' 的配对 ')' 下标（忽略单/双引号字符串内字符）；无匹配 -1。
+ *  audit.js 同源算法的轻量副本——避免桥 → audit 模块依赖（audit 在 db.js 装配期包装 prepare，
+ *  桥不反向依赖装配层模块）。 */
+function matchParen(s, openIdx) {
+  let depth = 0, inStr = null;
+  for (let i = openIdx; i < s.length; i++) {
+    const ch = s[i];
+    if (inStr) { if (ch === inStr) inStr = null; continue; }
+    if (ch === "'" || ch === '"') { inStr = ch; continue; }
+    if (ch === '(') depth++;
+    else if (ch === ')') { depth--; if (depth === 0) return i; }
+  }
+  return -1;
+}
+
+/** 写路径租户列注入（PG-1 全链收口 2026-11-24）：解析「INSERT INTO <租户表> (cols) VALUES(…)」
+ *  且 cols 不含 tenant_id 的单行 INSERT，生成注入版 SQL（cols 尾加 tenant_id，VALUES 尾加占位符）。
+ *  背景：业务 INSERT 普遍不写 tenant_id（列默认 1）——租户≠1 请求下新行错挂租户 1，
+ *  PG 模式被 RLS WITH CHECK 直接拒绝（租户 2 用户无法建会话）；逐处补列改动面大且易漏。
+ *  防御：形态不识别（INSERT…SELECT / 无列清单 / 多行 VALUES / RETURNING）→ 返回 null 原版直通；
+ *  已显式含 tenant_id → null（显式优先，ops 后台路径显式写行归属租户）。
+ *  @returns {{sql: string, n: number} | null} n 为注入后的占位符总数 */
+function injectTenantVersion(pgSql, n) {
+  const head = /^\s*INSERT\s+INTO\s+["`]?(\w+)["`]?\s*\(([^()]*)\)\s*VALUES\s*\(/i.exec(pgSql);
+  if (!head) return null;
+  const table = head[1].toLowerCase();
+  if (!TENANT_CONTENT_TABLES.has(table)) return null;
+  const cols = head[2].split(',').map((c) => c.trim().replace(/^["'`]|["'`]$/g, '').toLowerCase()).filter(Boolean);
+  if (!cols.length || cols.includes('tenant_id')) return null;
+  const valuesOpen = pgSql.indexOf('(', head.index + head[0].length - 1);
+  const valuesClose = matchParen(pgSql, valuesOpen);
+  if (valuesClose < 0) return null;
+  // trim：VALUES 右括号后的前导空白会破坏 ^on 锚定（ON CONFLICT 尾误判为不可识别形态）
+  const tail = pgSql.slice(valuesClose + 1).replace(/;?\s*$/, '').trim();
+  // 尾部仅允许 ON CONFLICT 子句（OR IGNORE/REPLACE 已被方言层标准化）；其余（多行 VALUES 分组、
+  // RETURNING 等）一律放弃注入回到原版——注入器宁可不动也不臆造语义
+  if (tail && !/^on\s+conflict\b/i.test(tail)) return null;
+  const colsOpen = head.index + head[0].indexOf('(');
+  const injected = pgSql.slice(0, colsOpen)
+    + '(' + head[2].trim() + ', tenant_id) VALUES ('
+    + pgSql.slice(valuesOpen + 1, valuesClose).trim() + `, $${n + 1})`
+    + (tail ? ' ' + tail : '');
+  return { sql: injected, n: n + 1 };
 }
 
 /**
@@ -102,6 +152,13 @@ function createPgBridge(opts = {}) {
     return s ? s.tenantId : tenantId;
   };
 
+  // PG-1 全链收口：写路径租户列注入的运行期开关——启动期（建表→迁移→RLS 应用完成前）关闭：
+  // 租户列由迁移补齐，种子先于列存在执行（P5.31 系统智能体在 db.js 1612，列迁移在其后），
+  // 注入版显式引用 tenant_id 会列不存在而炸；开关由 db.js 在迁移+RLS 完成后打开，启动种子
+  // 维持列默认归属（P5.31 声明即租户 1）。开关在 run 时读取：prepare 只做纯结构分析，启动期
+  // prepare 的长寿命语句对象在运行期复用时开关已开，注入不丢。
+  let tenantInjectEnabled = false;
+
   const worker = new Worker(path.join(__dirname, 'pg-bridge-worker.js'), { workerData: null });
   // 关键（PoC 首跑踩坑回归锚定）：Worker 线程默认阻止所在进程退出——一次性脚本（node -e 验证子进程 /
   // CLI migrate.js）主逻辑完成后将因 worker 存活而永不退出，表现为子进程挂死、execFileSync 逐级超时。
@@ -140,23 +197,37 @@ function createPgBridge(opts = {}) {
       if (typeof fn !== 'function') throw new Error('pg-bridge.withTenant(tid, fn)：fn 必须为函数');
       return tenantAls.run({ tenantId: normTenant(tid) }, fn);
     },
+    /** 写路径租户列注入开关（db.js 在迁移+RLS 应用后打开；详见上方注释） */
+    setTenantInjection(enabled) { tenantInjectEnabled = !!enabled; },
 
     prepare(sql) {
       // 内置方言翻译（kingbase/PG 系）：覆盖框架层直连 db.prepare 的 SQL（audit/retriever 等
       // 不走 dal 的出口）——dal 出口的 SQL 已翻译过，translate 幂等（已替换文本不再命中规则），二次经过无害
       const t = _translateSql(String(sql), 'kingbase');
       const { sql: pgSql, n } = convertPlaceholders(t.sql);
-      const run0 = (op, args) => callSync({ op, sql: pgSql, args: args.slice(0, n), tenantId: effTenant() });
+      // 写路径租户列注入：预生成注入版；run 时按「开关 + 当前 ALS 租户」动态选用（双版本而非
+      // prepare 时固化——模块级语句对象跨请求上下文复用，租户值必须每次调用时取）。数字租户 →
+      // 注入版+尾参；'platform'/null → 原版（平台运维路径按约定显式写 tenant_id，见 ops/scheduler 接线）。
+      const inj = injectTenantVersion(pgSql, n);
+      const run0 = (op, args, tid) => {
+        const useInj = !!inj && tenantInjectEnabled && typeof tid === 'number';
+        return callSync({
+          op,
+          sql: useInj ? inj.sql : pgSql,
+          args: useInj ? [...args.slice(0, n), tid] : args.slice(0, n),
+          tenantId: tid,
+        });
+      };
       return {
-        all(...args) { return run0('query', args).rows; },
-        get(...args) { return run0('query', args).rows[0]; }, // better-sqlite3 契约：无行 → undefined
+        all(...args) { return run0('query', args, effTenant()).rows; },
+        get(...args) { return run0('query', args, effTenant()).rows[0]; }, // better-sqlite3 契约：无行 → undefined
         run(...args) {
-          const r = run0('run', args);
+          const r = run0('run', args, effTenant());
           return { changes: r.rowCount, lastInsertRowid: r.lastval };
         },
         pluck() {
           return { get: (...args) => {
-            const rows = run0('query', args).rows;
+            const rows = run0('query', args, effTenant()).rows;
             return rows[0] ? Object.values(rows[0])[0] : undefined;
           } };
         },
@@ -195,4 +266,4 @@ function createPgBridge(opts = {}) {
   };
 }
 
-module.exports = { createPgBridge, convertPlaceholders };
+module.exports = { createPgBridge, convertPlaceholders, injectTenantVersion, TENANT_CONTENT_TABLES };

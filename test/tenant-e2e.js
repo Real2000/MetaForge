@@ -190,6 +190,7 @@ function t(name, fn) {
     };
     const jpost = async (url, token, body) => (await fetch(origin + url, { method: 'POST', headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}) }, body: JSON.stringify(body || {}) })).json();
     let adminTok = '';
+    let t2Tok = ''; // 租户 2 管理员令牌（跨用例复用——登录有限流，重复 login 会挤爆后续用例）
 
     await t('MT-08：平台超管登录返回 tenant_id 与 platform_admin 标记', async () => {
       const j = await login('admin', 'admin123');
@@ -216,10 +217,10 @@ function t(name, fn) {
       assert.strictEqual(j.code, 0, JSON.stringify(j));
       assert.strictEqual(j.data.user.tenant_id, 2, '派生管理员应属新租户');
       assert.strictEqual(j.data.user.platform_admin, 0, '派生管理员非平台超管');
-      const btok = j.data.token;
-      const uj = await (await fetch(origin + '/api/users', { headers: { Authorization: 'Bearer ' + btok } })).json();
+      t2Tok = j.data.token;
+      const uj = await (await fetch(origin + '/api/users', { headers: { Authorization: 'Bearer ' + t2Tok } })).json();
       assert.ok(uj.data.length >= 1 && uj.data.every(u => u.tenant_id === 2), '应仅见本租户用户：' + JSON.stringify(uj.data.map(u => u.username)));
-      const tr = await fetch(origin + '/api/tenants', { headers: { Authorization: 'Bearer ' + btok } });
+      const tr = await fetch(origin + '/api/tenants', { headers: { Authorization: 'Bearer ' + t2Tok } });
       assert.strictEqual(tr.status, 403, '租户管理员访问租户列表应 403');
     });
 
@@ -235,6 +236,44 @@ function t(name, fn) {
       assert.strictEqual(mj.data.username, 'e2eadm', '借用令牌应以目标用户身份生效');
     });
 
+    // ---------- 7.5 PG-1 增量（2026-11-24）：写路径注入器 + 后台接线（PG 轨道专属）----------
+    // 背景：业务 INSERT 普遍不写 tenant_id（列默认 1）——租户 2 请求下新行错挂租户 1，
+    // PG 模式被 RLS WITH CHECK 直接拒绝（无法建会话）。桥层注入器统一兜底，本组用例端到端实证。
+    if (hasPgCtx) {
+      await t('PG-1 增量：租户 2 HTTP 建会话——桥层租户列注入器落正确归属 + 双向隔离', async () => {
+        // 复用 MT-08 的 t2Tok——登录有限流（每分钟 N 次），重复 login 会挤爆后续停用租户用例
+        const r = await (await fetch(origin + '/api/chat/sessions', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + t2Tok }, body: JSON.stringify({ title: 'T2注入器会话' }) })).json();
+        assert.strictEqual(r.code, 0, JSON.stringify(r));
+        const row = db.withTenant('platform', () => db.prepare('SELECT tenant_id FROM sessions WHERE id=?').get(r.data.id));
+        assert.ok(row && Number(row.tenant_id) === 2, `会话行应归属租户 2（桥注入器生效），实际 ${row && row.tenant_id}`);
+        const list = await (await fetch(origin + '/api/chat/sessions', { headers: { Authorization: 'Bearer ' + t2Tok } })).json();
+        assert.ok(list.code === 0 && Array.isArray(list.data) && list.data.some(s => s.id === r.data.id), '租户 2 用户应能读到自己的新会话');
+        const leak = asTenant(1, () => db.prepare('SELECT id FROM sessions WHERE id=?').get(r.data.id));
+        assert.ok(!leak, '租户 1 不得见到租户 2 会话（DB 层 RLS）');
+      });
+
+      await t('PG-1 增量：后台摘要任务接线——platform 跨租户读 + 显式行归属租户落库', () => {
+        const { withDbTenant } = require('../src-server/db');
+        const ops = require('../src-server/lib/ops');
+        const shanghaiNow = new Date().toLocaleString('sv-SE', { timeZone: 'Asia/Shanghai' });
+        const aid = asTenant(2, () => {
+          const a = db.prepare("INSERT INTO agents (name,type,owner,status,visibility,tenant_id,long_memory) VALUES ('T2记忆助手','digital','e2eadm','published','public',2,1)").run();
+          const sid = db.prepare("INSERT INTO sessions (agent_id,title,username,tenant_id,created_at,updated_at) VALUES (?,?,?,?,?,?)").run(a.lastInsertRowid, '摘要用例', 'e2eadm', 2, shanghaiNow, shanghaiNow).lastInsertRowid;
+          const insMsg = db.prepare("INSERT INTO messages (session_id,role,content,tokens,tenant_id,created_at) VALUES (?, 'user', ?, 0, 2, ?)");
+          for (let i = 0; i < 5; i++) insMsg.run(sid, '话题 ' + i + '：会话内容样本', shanghaiNow);
+          return a.lastInsertRowid;
+        });
+        // 镜像 startOps 的包裹方式（运维任务统一 platform 逃逸上下文——无上下文时 RLS 下只见基线 0 行）
+        const r = withDbTenant('platform', () => ops.digestMemories());
+        assert.ok(r && r.ok, '摘要任务应成功：' + JSON.stringify(r));
+        const mem = db.withTenant('platform', () => db.prepare("SELECT tenant_id, source FROM agent_memories WHERE agent_id=? AND source='digest' LIMIT 1").get(aid));
+        assert.ok(mem, '应产出摘要行（platform 跨租户读到租户 2 会话——后台接线生效）');
+        assert.strictEqual(Number(mem.tenant_id), 2, '摘要行应显式归属租户 2（不随列默认错挂租户 1）');
+        const leak = asTenant(1, () => db.prepare('SELECT id FROM agent_memories WHERE agent_id=? LIMIT 1').get(aid));
+        assert.ok(!leak, '租户 1 不得见到租户 2 的记忆行（RLS）');
+      });
+    }
+
     // ---------- 8. MT-11/12/13 商用闭环（账单 / 隔离 / 支付） ----------
     await t('MT-11：租户账单隔离——平台超管跨租户、租户管理员仅本租户（伪造 tenant_id 被强制）', async () => {
       const ins = "INSERT INTO usage_records (username,dimension,dimension_key,tokens,count,cost,prompt_tokens,completion_tokens,tenant_id,created_at) VALUES (?,?,?,?,1,?,?,?,?,datetime('now','localtime'))";
@@ -244,7 +283,7 @@ function t(name, fn) {
       assert.strictEqual(superAll.code, 0, JSON.stringify(superAll));
       const tids = superAll.data.tenants.map(x => x.tenant_id);
       assert.ok(tids.includes(2), '平台超管应见新租户成本：' + JSON.stringify(tids));
-      const btok = (await login('e2eadm', 'E2e@2026')).data.token;
+      const btok = t2Tok; // 复用 MT-08 登录令牌——登录有限流（1 分钟窗口），逐用例重复 login 会挤爆后续用例
       const mine = await (await fetch(origin + '/api/billing/tenants', { headers: { Authorization: 'Bearer ' + btok } })).json();
       assert.ok(mine.data.tenants.length > 0 && mine.data.tenants.every(x => x.tenant_id === 2), '租户管理员仅见本租户：' + JSON.stringify(mine.data.tenants));
       const force = await (await fetch(origin + '/api/billing/tenants?tenant_id=1', { headers: { Authorization: 'Bearer ' + btok } })).json();
@@ -252,14 +291,14 @@ function t(name, fn) {
     });
 
     await t('MT-11：跨租户调整用户配额被拒（403）', async () => {
-      const btok = (await login('e2eadm', 'E2e@2026')).data.token;
+      const btok = t2Tok; // 复用 MT-08 登录令牌——登录有限流（1 分钟窗口），逐用例重复 login 会挤爆后续用例
       const r = await fetch(origin + '/api/quota/users/admin', { method: 'PUT', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + btok }, body: JSON.stringify({ total: 123 }) });
       assert.strictEqual(r.status, 403, '跨租户改配额应 403，实际 ' + r.status);
     });
 
     await t('MT-12：密钥分层——租户层列表仅见本层；平台全局层不含租户密钥', async () => {
       await jpost('/api/secrets', adminTok, { name: 'E2E_GLOBAL', value: 'gvalue-12345' });
-      const btok = (await login('e2eadm', 'E2e@2026')).data.token;
+      const btok = t2Tok; // 复用 MT-08 登录令牌——登录有限流（1 分钟窗口），逐用例重复 login 会挤爆后续用例
       await jpost('/api/secrets', btok, { name: 'E2E_T2', value: 't2val-123456' });
       const tj = await (await fetch(origin + '/api/secrets', { headers: { Authorization: 'Bearer ' + btok } })).json();
       assert.ok(tj.data.some(x => x.name === 'E2E_T2'), '租户层应见本租户密钥');
@@ -272,7 +311,7 @@ function t(name, fn) {
     await t('MT-12：供应商可见性——租户层可见「全局基线 ∪ 本租户」，不可见他租户层', async () => {
       await jpost('/api/providers', adminTok, { name: 'E2E_全局供应商', base_url: 'https://api.example.com/v1', models: ['m-e2e'] });
       await jpost('/api/providers?tenant_id=1', adminTok, { name: 'E2E_T1供应商', base_url: 'https://api.t1.com/v1', models: ['m-t1'] });
-      const btok = (await login('e2eadm', 'E2e@2026')).data.token;
+      const btok = t2Tok; // 复用 MT-08 登录令牌——登录有限流（1 分钟窗口），逐用例重复 login 会挤爆后续用例
       await jpost('/api/providers', btok, { name: 'E2E_T2供应商', base_url: 'https://api.t2.com/v1', models: ['m-t2'] });
       const list = await (await fetch(origin + '/api/providers', { headers: { Authorization: 'Bearer ' + btok } })).json();
       const names = (list.data || []).map(p => p.name);
@@ -282,7 +321,7 @@ function t(name, fn) {
     });
 
     await t('MT-13：租户下单 → 平台超管标记已支付 → 订阅生效 + 成员配额下发', async () => {
-      const btok = (await login('e2eadm', 'E2e@2026')).data.token;
+      const btok = t2Tok; // 复用 MT-08 登录令牌——登录有限流（1 分钟窗口），逐用例重复 login 会挤爆后续用例
       const c = await jpost('/api/payment/orders', btok, { type: 'subscribe', plan_key: 'pro', channel: 'sandbox' });
       assert.strictEqual(c.code, 0, JSON.stringify(c));
       const no = c.data.order_no;
@@ -298,7 +337,7 @@ function t(name, fn) {
     });
 
     await t('MT-13：沙箱回调验签 + 幂等（同 event_id 只生效一次）；未签名被拒', async () => {
-      const btok = (await login('e2eadm', 'E2e@2026')).data.token;
+      const btok = t2Tok; // 复用 MT-08 登录令牌——登录有限流（1 分钟窗口），逐用例重复 login 会挤爆后续用例
       const c = await jpost('/api/payment/orders', btok, { type: 'recharge', amount: 66, channel: 'sandbox' });
       const no = c.data.order_no;
       const r0 = await fetch(origin + '/api/payment/callback/sandbox', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ order_no: no, event_id: 'e2e-evt-x', status: 'paid', amount: 66 }) });
@@ -320,7 +359,7 @@ function t(name, fn) {
     });
 
     await t('MT-10：停用租户后其账号登录被拒、旧令牌失效', async () => {
-      const btok = (await login('e2eadm', 'E2e@2026')).data.token;
+      const btok = t2Tok; // 复用 MT-08 登录令牌——登录有限流（1 分钟窗口），逐用例重复 login 会挤爆后续用例
       const r = await fetch(origin + '/api/tenants/2/status', { method: 'PUT', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + adminTok }, body: JSON.stringify({ status: 'disabled' }) });
       assert.strictEqual((await r.json()).code, 0);
       const blocked = await login('e2eadm', 'E2e@2026');
