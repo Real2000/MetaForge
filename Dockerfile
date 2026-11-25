@@ -37,7 +37,18 @@ RUN apt-get update -qq && apt-get install -y -qq \
 COPY --from=builder /app/node_modules ./node_modules
 
 # 拷贝项目文件
-COPY package.json server.js src-server/ public/ docs/ scripts/ ./
+# XC-4（2026-11-25）：两处历史遗留修复——
+# ① 移除 docs/：.dockerignore 既定排除「文档不入生产镜像」，而运行时对 docs/ 零依赖
+#   （源码内 docs 引用均为注释）；原 COPY docs/ 与 .dockerignore 自相矛盾，任何平台构建
+#   在 checksum 阶段必炸（"/docs": not found）。
+# ② 目录独立 COPY 到显式目标：Docker 的 COPY 目录语义是「只拷内容到目标」——原写法
+#   `COPY ... src-server/ public/ scripts/ ./` 会把子目录内容摊平进 /app（src-server/db.js
+#   落到 /app/db.js），server.js require('./src-server/...') 必挂。此 Dockerfile 写于项目
+#   早期（db.js 在根目录）的布局，src-server/ 化重构后从未同步（也从未成功构建过）。
+COPY package.json server.js ./
+COPY src-server ./src-server
+COPY public ./public
+COPY scripts ./scripts
 # 确保目录存在
 RUN mkdir -p data public/uploads public/downloads
 

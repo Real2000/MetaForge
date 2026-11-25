@@ -139,6 +139,24 @@ export AGENT_DB_NAME=agent_platform
 - 默认 `AGENT_DB_DRIVER=sqlite` / `SQL_DIALECT=sqlite`，方言恒等转换，不影响现有部署。
 - 方言适配覆盖：`datetime('now','localtime')`→`CURRENT_TIMESTAMP`、`AUTOINCREMENT`→`IDENTITY`/`SERIAL`、
   `INSERT OR IGNORE`→`ON CONFLICT DO NOTHING`、`IFNULL`→`COALESCE` 等；未映射构造会显式告警，需人工确认。
+- **XC-1 实测补充（2026-11-25）**：KingbaseES V9R1C10（server_version 12.1，PG12 系协议）全链实测
+  通过——119 表 + 140 迁移 + RLS 89 表 + MT-7 验收三点 + tenant-e2e 29 用例**零适配**；部署三步
+  （管理端）：`CREATE USER mt7_app` → `CREATE DATABASE xxx OWNER mt7_app` →
+  `CREATE SCHEMA public AUTHORIZATION mt7_app`（PG12 系 public 归超户，库主不可自建——差异清单见
+  `docs/XC-1kingbase实测差异清单.md`）；官方容器镜像需 `--privileged` 启动。
+
+## 六-B、国产 CPU 多架构交付矩阵（XC-4，2026-11-25）
+
+| 架构 | 便携包路径（本手册 §二） | 容器路径 | 状态 |
+| --- | --- | --- | --- |
+| linux/x86_64 | `package-portable.sh` ✓ | `docker build` ✓ | 既有可用 |
+| linux/arm64（鲲鹏/飞腾） | `CROSS_PLATFORM=linux-arm64` 预编译 ✓ | `docker buildx build --platform linux/arm64 --load .` ✓ | **XC-4 实测打通**（QEMU binfmt，详见 `docs/XC-4国产OS与CPU交叉构建.md`） |
+| loong64（龙芯 3A5000/3C5000） | 待扩展（需龙芯档案馆 Node 二进制 + loong64 工具链 rebuild） | **本机不可模拟**（binfmt 无 loong64）→ 龙芯实机构建或第三方 binfmt | 方案定稿（XC-4 文档 §三），待客户环境联调 |
+
+容器镜像离线导出：`docker save metaforge:arm64 -o metaforge-arm64.tar` → 目标机
+`docker load -i`（与便携包路径二选一；原 better-sqlite3/pg 无 loong64 prebuilt 时实机源码编译，
+工具链见 XC-4 文档 §3.2）。
+
 
 ## 七、常见问题
 
