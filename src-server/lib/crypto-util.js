@@ -86,10 +86,15 @@ function loadEncryptionKey() {
   return k;
 }
 
-/** 密钥来源与版本信息（启动日志/巡检/测试用） */
+/** 密钥来源与版本信息（启动日志/巡检/测试用）
+ *  XC-3 新增：algo（当前写入算法）与 sm4Kid（国密密钥集 kid）——versions 维持纯 AES kid 集（启动日志零变化） */
 function keyInfo() {
   const r = resolveKeys();
-  return { source: r.source, kid: r.primaryKid, versions: [...r.ring.keys()], hasPrimary: !!r.primary };
+  return {
+    source: r.source, kid: r.primaryKid, versions: [...r.ring.keys()], hasPrimary: !!r.primary,
+    algo: currentCryptoAlgo(),
+    sm4Kid: r.primary ? sm4Keyset(r.primary).kid : null,
+  };
 }
 
 /** 清缓存（写入新密钥后热更新） */
@@ -103,12 +108,70 @@ function primaryKey() {
   return resolveKeys().primary || null;
 }
 
+/* ==================== XC-3（2026-11-25）国密双轨原型 ====================
+ * D-7 拍板：SM4 + SM3 双轨先行。构造与改造面详见 docs/国密双轨评估报告.md。
+ * 本 OpenSSL 构建无 SM4-GCM/CCM —— 原型用 SM4-CTR（机密性）+ HMAC-SM3 标签（完整性）
+ * 组合 Encrypt-then-MAC（IND-CPA + INT-CTXT 组合安全）；MAC 截断 128bit 与 GCM tag 同位宽。
+ * 兼容设计：国密密文与 AES 密文 4 段格式严格同构，算法路由完全由 kid 命名空间承担
+ * （AES kid=sha256 域；国密 kid=SM3 派生域）——格式探测与 AES 路径零改动。 */
+const SM4_MAC_BYTES = 16;       // EtM 标签截断长度（与 GCM authTag 同位宽）
+const SM4_DERIVE_ENC = 1;       // 派生域分离标签：SM4 加密钥
+const SM4_DERIVE_MAC = 2;       // 派生域分离标签：HMAC 认证钥
+const SM4_DERIVE_KID = 3;       // 派生域分离标签：kid（绑定加密钥）
+
+/** 国密写入开关：AGENT_CRYPTO_ALGO=sm4 国密优先；缺省 aes-gcm（生产零影响） */
+function currentCryptoAlgo() {
+  return String(process.env.AGENT_CRYPTO_ALGO || '').trim() === 'sm4' ? 'sm4' : 'aes-gcm';
+}
+
+/** 主密钥 → 国密密钥集（加密钥 16B + 认证钥 32B + kid）。SM3 域分离派生，零新供给面；
+ *  轮换正交：密钥环内任意主钥均可派生（换钥后旧国密密文照解） */
+function sm4Keyset(masterKey) {
+  const derive = (label, buf) => crypto.createHash('sm3').update(Buffer.concat([Buffer.from([label]), buf])).digest();
+  const enc = derive(SM4_DERIVE_ENC, masterKey).subarray(0, 16);
+  const mac = derive(SM4_DERIVE_MAC, masterKey);
+  const kid = derive(SM4_DERIVE_KID, enc).toString('hex').slice(0, 8);
+  return { enc, mac, kid };
+}
+
+/** 国密解密（EtM：先恒时验 MAC 再解密）；失败返回 null（与 tryDecrypt 同契约） */
+function tryDecryptSm4(ks, ivHex, macHex, ctHex) {
+  try {
+    const iv = Buffer.from(ivHex, 'hex');
+    const ct = Buffer.from(ctHex, 'hex');
+    const mac = crypto.createHmac('sm3', ks.mac).update(Buffer.concat([iv, ct])).digest().subarray(0, SM4_MAC_BYTES);
+    if (!crypto.timingSafeEqual(mac, Buffer.from(macHex, 'hex'))) return null; // 完整性先验 fail-closed
+    const di = crypto.createDecipheriv('sm4-ctr', ks.enc, iv);
+    return di.update(ct).toString('utf8') + di.final('utf8');
+  } catch { return null; }
+}
+
+/** 国密密文按 kid 路由：密钥环逐钥派生比对（环内通常 1~3 把，SM3 派生微秒级） */
+function tryDecryptSm4ByKid(ring, kid, ivHex, macHex, ctHex) {
+  for (const masterKey of ring.values()) {
+    const ks = sm4Keyset(masterKey);
+    if (ks.kid !== kid) continue;
+    const out = tryDecryptSm4(ks, ivHex, macHex, ctHex);
+    if (out !== null) return out;
+  }
+  return null;
+}
+
 /**
  * AES-256-GCM 加密
  * @returns {string} `kid.ivHex.authTagHex.ciphertextHex`（SEC-10：带 kid 前缀的多版本格式）
+ * XC-3：AGENT_CRYPTO_ALGO=sm4 时改写国密密文（同构 4 段：kid.iv.mac.ct，sm4Kid 标记算法域）
  */
 function encrypt(plaintext) {
   const key = loadEncryptionKey();
+  if (currentCryptoAlgo() === 'sm4') {
+    const ks = sm4Keyset(key);
+    const iv = crypto.randomBytes(IV_LENGTH); // CTR nonce；32hex 与 AES 段位同构（格式探测零改动）
+    const ci = crypto.createCipheriv('sm4-ctr', ks.enc, iv);
+    const ct = Buffer.concat([ci.update(plaintext, 'utf8'), ci.final()]);
+    const mac = crypto.createHmac('sm3', ks.mac).update(Buffer.concat([iv, ct])).digest().subarray(0, SM4_MAC_BYTES);
+    return `${ks.kid}.${iv.toString('hex')}.${mac.toString('hex')}.${ct.toString('hex')}`;
+  }
   const kid = kidOf(key);
   const iv = crypto.randomBytes(IV_LENGTH);
   const cipher = crypto.createCipheriv(ALGORITHM, key, iv);
@@ -149,8 +212,12 @@ function decrypt(encrypted) {
   const { ring, primaryKid } = resolveKeys();
   const candidates = [];
   if (kid && ring.has(kid)) candidates.push(ring.get(kid));
-  else if (!kid) {
-    // 旧格式：优先当前密钥，再试其余（轮换兼容）
+  else if (kid) {
+    // XC-3：非 AES kid——尝试国密派生域命中（存量 AES 密文走上面的原路径，字节级零回归）
+    const sm4Out = tryDecryptSm4ByKid(ring, kid, ivHex, tagHex, ctHex);
+    if (sm4Out !== null) return sm4Out;
+  } else if (!kid) {
+    // 旧格式：优先当前密钥，再试其余（轮换兼容）——历史上只可能 AES
     if (ring.has(primaryKid)) candidates.push(ring.get(primaryKid));
     for (const [k, v] of ring) if (k !== primaryKid) candidates.push(v);
   }
@@ -162,4 +229,4 @@ function decrypt(encrypted) {
   return '';
 }
 
-module.exports = { encrypt, decrypt, keyInfo, resetKeyCache, keyFilePath, kidOf, primaryKey };
+module.exports = { encrypt, decrypt, keyInfo, resetKeyCache, keyFilePath, kidOf, primaryKey, sm4Keyset, currentCryptoAlgo };

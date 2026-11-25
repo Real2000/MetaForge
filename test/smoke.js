@@ -5640,6 +5640,78 @@ function t(name, fn) {
         cu.resetKeyCache();
       }
     });
+    // ---------- XC-3 国密双轨原型（M9，2026-11-25；构造依据 docs/国密双轨评估报告.md） ----------
+    await t('XC-3：国密双轨——SM3 官方向量与密钥集派生确定性', () => {
+      const cu = require('../src-server/lib/crypto-util');
+      const crypto = require('crypto');
+      // SM3 标准测试向量（GB/T 32905-2016）：SM3("abc") = 66c7f0f462eeedd9…（不可用会在此抛错）
+      const v = crypto.createHash('sm3').update('abc').digest('hex');
+      assert.ok(/^[0-9a-f]{64}$/.test(v), 'SM3 输出 64 hex');
+      assert.strictEqual(v.slice(0, 16), '66c7f0f462eeedd9', 'SM3("abc") 官方向量前缀');
+      // 派生确定性 / 异钥区分
+      const buf = crypto.randomBytes(32);
+      const a = cu.sm4Keyset(buf), b = cu.sm4Keyset(buf), c = cu.sm4Keyset(crypto.randomBytes(32));
+      assert.strictEqual(a.kid, b.kid, '同主钥派生确定');
+      assert.notStrictEqual(a.kid, c.kid, '异主钥 kid 区分');
+      assert.ok(/^[0-9a-f]{8}$/.test(a.kid) && a.enc.length === 16 && a.mac.length === 32, '密钥集形态（kid 8hex / enc 16B / mac 32B）');
+    });
+    await t('XC-3：国密双轨——密文格式同构、kid 双域不冲突、双轨互解零回归', async () => {
+      const cu = require('../src-server/lib/crypto-util');
+      const crypto = require('crypto');
+      const sE = process.env.AGENT_ENCRYPTION_KEY, sA = process.env.AGENT_CRYPTO_ALGO;
+      try {
+        const k1 = crypto.randomBytes(32).toString('hex');
+        process.env.AGENT_ENCRYPTION_KEY = k1; delete process.env.AGENT_CRYPTO_ALGO; cu.resetKeyCache();
+        assert.strictEqual(cu.keyInfo().algo, 'aes-gcm', '缺省算法应为 aes-gcm（生产零影响）');
+        const aesCt = cu.encrypt('双轨同明文样本');
+        // 国密模式写入
+        process.env.AGENT_CRYPTO_ALGO = 'sm4'; cu.resetKeyCache();
+        assert.strictEqual(cu.keyInfo().algo, 'sm4');
+        const sm4Kid = cu.keyInfo().sm4Kid;
+        assert.ok(/^[0-9a-f]{8}$/.test(sm4Kid || ''), 'keyInfo 应暴露 sm4Kid');
+        const sm4Ct = cu.encrypt('双轨同明文样本');
+        // 段格式同构（同明文四段等长：8/32/32/N——解密格式探测零改动的结构前提）
+        const segLen = (s) => s.split('.').map((x) => x.length).join('/');
+        assert.strictEqual(segLen(aesCt), segLen(sm4Ct), '国密密文与 AES 密文段格式同构');
+        // kid 双域：国密 kid ≠ AES kid，且不落 AES 密钥环
+        assert.notStrictEqual(sm4Ct.split('.')[0], aesCt.split('.')[0]);
+        assert.strictEqual(sm4Ct.split('.')[0], sm4Kid, '国密密文 kid 应为 keyInfo.sm4Kid');
+        // 双轨互解（国密模式下 AES 存量可解；回 AES 模式后国密密文可解）
+        assert.strictEqual(cu.decrypt(aesCt), '双轨同明文样本', '国密模式下存量 AES 密文可解（零回归）');
+        assert.strictEqual(cu.decrypt(sm4Ct), '双轨同明文样本', '国密密文可解');
+        delete process.env.AGENT_CRYPTO_ALGO; cu.resetKeyCache();
+        assert.strictEqual(cu.decrypt(sm4Ct), '双轨同明文样本', 'AES 模式下国密密文可解（双轨并存）');
+        assert.strictEqual(cu.decrypt(aesCt), '双轨同明文样本', 'AES 往返不回归');
+      } finally {
+        if (sE === undefined) delete process.env.AGENT_ENCRYPTION_KEY; else process.env.AGENT_ENCRYPTION_KEY = sE;
+        if (sA === undefined) delete process.env.AGENT_CRYPTO_ALGO; else process.env.AGENT_CRYPTO_ALGO = sA;
+        cu.resetKeyCache();
+      }
+    });
+    await t('XC-3：国密双轨——EtM 篡改检测（ct/iv 翻位恒时拒绝）与轮换正交', async () => {
+      const cu = require('../src-server/lib/crypto-util');
+      const crypto = require('crypto');
+      const sE = process.env.AGENT_ENCRYPTION_KEY, sP = process.env.AGENT_ENCRYPTION_KEY_PREV, sA = process.env.AGENT_CRYPTO_ALGO;
+      try {
+        const k1 = crypto.randomBytes(32).toString('hex'), k2 = crypto.randomBytes(32).toString('hex');
+        // 国密密文 EtM 完整性
+        process.env.AGENT_ENCRYPTION_KEY = k1; process.env.AGENT_CRYPTO_ALGO = 'sm4'; delete process.env.AGENT_ENCRYPTION_KEY_PREV; cu.resetKeyCache();
+        const ct = cu.encrypt('完整性样本');
+        const flip = (s, i) => { const seg = s.split('.'); const last = i === 3 ? seg[3] : seg[i]; seg[i] = (i === 3 ? last.slice(0, -2) + (last.endsWith('00') ? '11' : '00') : '0' + last.slice(1)); return seg.join('.'); };
+        assert.strictEqual(cu.decrypt(flip(ct, 3)), '', 'ct 翻位应被 MAC 拒解（返回空串 fail-closed）');
+        assert.strictEqual(cu.decrypt(flip(ct, 1)), '', 'iv 翻位应被 MAC 拒解');
+        // 轮换正交：k1 国密密文 → k2 主钥 + k1 进 PREV
+        const rotCt = cu.encrypt('轮换前国密密文');
+        process.env.AGENT_ENCRYPTION_KEY = k2; process.env.AGENT_ENCRYPTION_KEY_PREV = k1; cu.resetKeyCache();
+        assert.strictEqual(cu.decrypt(rotCt), '轮换前国密密文', '换钥后旧主钥国密密文仍可解（PREV 派生域）');
+        assert.strictEqual(cu.keyInfo().algo, 'sm4', 'keyInfo.algo 持续正确');
+      } finally {
+        if (sE === undefined) delete process.env.AGENT_ENCRYPTION_KEY; else process.env.AGENT_ENCRYPTION_KEY = sE;
+        if (sP === undefined) delete process.env.AGENT_ENCRYPTION_KEY_PREV; else process.env.AGENT_ENCRYPTION_KEY_PREV = sP;
+        if (sA === undefined) delete process.env.AGENT_CRYPTO_ALGO; else process.env.AGENT_CRYPTO_ALGO = sA;
+        cu.resetKeyCache();
+      }
+    });
     await t('SEC-10：密钥与密文不同源——文件密钥落 0600、密钥不入库、变更即刻热更新', () => {
       const cu = require('../src-server/lib/crypto-util');
       const { upsert, invalidate } = require('../src-server/lib/secrets');
