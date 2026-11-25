@@ -103,7 +103,15 @@ function withTimeout(promise, ms) {
   return Promise.race([promise, timeout]).finally(() => { if (timer) clearTimeout(timer); });
 }
 
-/** 默认实现：调用非流式 LLM（chatOnce），无真实模型/空返回 → 返回 null（交由上层回落原 query） */
+/**
+ * 默认实现：调用非流式 LLM（chatOnce），无真实模型/空返回 → 返回 null（交由上层回落原 query）
+ *
+ * 延迟边界（AI-Q1 实测记录，2026-11-25）：reasoning 型网关（glm5.2/dsv4 全系）一次改写约 30s+
+ *（~900 token 思考固定开销），而 retriever 调用点默认 8s 超时——chat 主链路内联改写在当前网关
+ * 形态下大多超时回落（0 阻断安全降级，宁回落不拖慢用户）；真改写增益在显式放宽 timeoutMs 的
+ * 批处理路径生效（如 AI-Q1/AI-Q2 评测跑分 60s 配额）。网关出现非 reasoning 快速模型后，内联
+ * 增益自动恢复（retriever opts.rewriteModel 已透传可选专用模型）。
+ */
 async function _defaultImpl(raw, turns, opts = {}) {
   const { chatOnce } = require('./llm');
   const histText = turns.map(t => `${t.role === 'assistant' ? '助手' : '用户'}：${String(t.content).slice(0, 300)}`).join('\n');
@@ -114,13 +122,32 @@ async function _defaultImpl(raw, turns, opts = {}) {
   const r = await chatOnce(messages, {
     model: opts.model,
     temperature: 0,
-    max_reply: 200,
+    // AI-Q1（2026-11-25）实测修正：reasoning 型网关（glm5.2/dsv4 全系）隐藏 ~900 token 思考后才
+    // 输出正文——原 max_reply=200 下 content 恒空、full 装的是思考首行，sanitize 取首行即被
+    // 思考垃圾污染（生产同网关从未产出真改写，AI-01 增益失效的根因）。配额提至 2000；返回值
+    // 只认 content（思考不配作查询），空则返回 null 走「回落原 query」（净化优于污染）。
+    max_reply: 2000,
     hardTimeoutMs: Number(opts.timeoutMs) || 8000,
     username: opts.username,
     tenantId: opts.tenantId,
   });
-  if (!r || r.mode === 'mock' || !r.full) return null; // 无真实模型 → 不改写（回落原 query）
-  return r.full;
+  if (!r || r.mode === 'mock') return null; // 无真实模型 → 不改写（回落原 query）
+  const content = String(r.content || '').trim();
+  const full = String(r.full || '').trim();
+  if (!content) {
+    // AI-Q1 实测补充：reasoning 型网关常把最终答案写在思考流末行而 content 恒空（dsv4.1/glm
+    // 全系如此）——取 full 末一非空行为候选，剥「所以/输出/改写为」类收束前缀；仍不像查询
+    // （>200 字或带分析结构）则回落 null（原 query 净化优于思考污染）
+    if (!full) return null;
+    const lastLine = full.split('\n').map(x => x.trim()).filter(Boolean).pop() || '';
+    const candidate = lastLine
+      .replace(/^(所以[：:]?|即可[。]?|输出[。]?|最终答案[：:]?|改写(后)?(为|结果)[：:]?)+/, '')
+      .replace(/^[“”「」'"《》]+|[”」'"《》]+$/g, '')
+      .trim();
+    const looksLikeQuery = candidate && candidate.length <= 120 && !/^([*#\d]+[.\)、]|[【\[])/.test(candidate.slice(0, 6));
+    return looksLikeQuery ? candidate : null;
+  }
+  return content;
 }
 
 /**

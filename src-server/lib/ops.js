@@ -358,6 +358,19 @@ function startOps(guard) {
   setTimeout(alertTick, 120000);  // 启动 2 分钟首轮（避开启动高峰的天然延迟误报）
   setInterval(alertTick, 5 * 60000);
   console.log('[ops][metrics] 健康监控已启动（事件循环/内存/错误率/慢请求 四规则，5 分钟巡检，告警走通知中心）');
+
+  // AI-Q2（2026-11-25）：RAGAS 评测夜跑（每日 03:00 窗口判定，挂 30 分钟轮询——dayKey 防重入
+  // 在 eval-nightly 内部隔离）；成本护栏 50 用例/夜（D-8 口径）；回归劣化/改善双向通知平台超管。
+  const evalNightly = require('./eval-nightly');
+  const evalTick = () => {
+    if (!allow()) return;
+    const hour = new Date().getHours();
+    if (hour !== 3) return; // 每日 03:00~03:59 窗口内首个轮询触发（dayKey 防重入）
+    withDbTenant('platform', () => evalNightly.runRagNightly()).catch((e) =>
+      console.error('[ops][eval-nightly] 夜跑异常（不阻断调度循环）：', e.message));
+  };
+  setInterval(evalTick, 30 * 60000);
+  console.log('[ops][eval-nightly] 评测夜跑已启用（每日 03:00，RAGAS 重跑 + 前后对比自动报告）');
   // U0-8：启动后 2 分钟跑第一轮摘要，后每 2 小时检查
   setTimeout(() => run('digest', digestMemories), 120000);
   setInterval(() => run('digest', digestMemories), 120 * 60000);

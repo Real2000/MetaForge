@@ -11865,6 +11865,8 @@ print('PY_OK')
     // 反例：空用例集
     const bad = await rm.runRagBaseline({ kbId: kbid, cases: [] });
     assert.strictEqual(bad.ok, false, '空用例应被拒绝');
+    // 清理自身评测行（AI-Q2 夜跑全库扫 type='rag'——遗留测试数据会改变夜跑用例的集数/预算断言）
+    db.prepare('DELETE FROM evaluations WHERE id=?').run(out.id);
   });
 
   // ==================== AI-02 收尾（D-4 拍板 SQLite-vec）向量索引 2026-11-23 ====================
@@ -12452,6 +12454,126 @@ print('PY_OK')
       const vd = await visionDescribe(Buffer.from('x'), 'mock-vl-model');
       assert.strictEqual(vd.ok, true, 'mock 模式应成功返回描述文本：' + JSON.stringify(vd).slice(0, 120));
       assert.ok((vd.text || '').includes('请描述这张图片'), '描述文本应回显多模态 user 消息的 text 片段（数组兼容实锤）：' + (vd.text || '').slice(0, 60));
+    });
+  }
+
+  // ==================== M8 · AI 增益验收收口：AI-Q1 三修复锚点 + AI-Q2 评测夜跑（2026-11-25） ====================
+  console.log('【M8】AI-Q1 密钥/改写修复锚点 + AI-Q2 夜跑全链（diffMetrics null 守卫 / 趋势行 / 护栏截断 / dayKey 防重入）');
+  {
+    const { db } = require('../src-server/db');
+    await t('AI-Q1：llm.js 密文 Key 读取侧三点解密——默认/已配置列表/我的模型（SEC-10 遗留根治）', () => {
+      const src = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'lib', 'llm.js'), 'utf8');
+      assert.ok(/function withPlainKey\(p\)/.test(src), 'withPlainKey 应集中封装（解密失败保留原值降级）');
+      assert.ok(/return withPlainKey\(p\);/.test(src), 'getDefaultProvider 读取点应解密');
+      assert.ok(/return rows\.map\(withPlainKey\)/.test(src), 'getConfiguredProviders 读取点应解密（密文 Bearer 直发网关必 401 的根因）');
+      assert.ok(/withPlainKey\(\{ \.\.\.up, id: 'u' \+ up\.id/.test(src), 'buildCandidates user_providers 读取点应解密（我的模型同为密文存储）');
+    });
+
+    await t('AI-Q1：retriever.js 嵌入/重排密文 Key 两点解密（_withPlainKey 与 llm 同源口径）', () => {
+      const src = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'lib', 'retriever.js'), 'utf8');
+      assert.ok(/function _withPlainKey\(p\)/.test(src), '_withPlainKey 应封装');
+      assert.strictEqual((src.match(/\.map\(_withPlainKey\)/g) || []).length, 2, 'bgeProviders/rerankProviders 两读取点均应解密');
+    });
+
+    await t('AI-Q1：query-rewrite reasoning 网关适配——配额 2000 / content 优先 / full 末行回退', () => {
+      const src = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'lib', 'query-rewrite.js'), 'utf8');
+      assert.ok(/max_reply: 2000,/.test(src), '配额应提至 2000（reasoning ~900 token 思考后正文才落位，原 200 恒空）');
+      assert.ok(/if \(!content\) \{/.test(src), 'content 空时才走 full 回退（content 优先）');
+      assert.ok(/full\.split\('\\n'\)\.map\(x => x\.trim\(\)\)\.filter\(Boolean\)\.pop\(\)/.test(src), '应取 full 末一非空行为候选（收束语在末行）');
+      assert.ok(/looksLikeQuery/.test(src) && /candidate\.length <= 120/.test(src), '仍不像查询应回落 null（净化优于污染）');
+      // 既有 mock 注入点不受适配影响（__setImpl 绕开 _defaultImpl，sanitize 首行清洗语义保持）
+      assert.ok(/const impl = typeof opts\.impl === 'function' \? opts\.impl : \(_impl \|\| _defaultImpl\)/.test(src), '测试注入点应保持');
+    });
+
+    await t('AI-Q2：diffMetrics 四态 + null 守卫行为断言（Number(null)=0 经典坑回归线）', () => {
+      const { diffMetrics, __constants } = require('../src-server/lib/eval-nightly');
+      const P = { context_precision: 0.9, context_recall: 0.9, answer_relevancy: 0.9, faithfulness: 0.9 };
+      // 劣化：单项 -10pp → degraded 且仅该项入 diffs
+      let r = diffMetrics(P, { ...P, context_precision: 0.8 });
+      assert.strictEqual(r.verdict, 'degraded', '劣化判定');
+      assert.strictEqual(r.diffs.length, 1, '仅劣化项入 diffs');
+      // 改善：+9pp 且无劣化项 → improved
+      r = diffMetrics(P, { ...P, context_precision: 0.99, faithfulness: 0.99 });
+      assert.strictEqual(r.verdict, 'improved', '改善判定（双向可见）');
+      // 稳定：全指标 ±1pp（阈值 5pp 内）→ stable 且 diffs 空
+      r = diffMetrics(P, { ...P, context_precision: 0.91, answer_relevancy: 0.89 });
+      assert.strictEqual(r.verdict, 'stable');
+      assert.strictEqual(r.diffs.length, 0, '阈值外不入 diffs');
+      // null 守卫（回归核心）：无答案轮 null 若被 Number(null)=0 当 0 比对，互补 null 应误报 ±90pp
+      r = diffMetrics(
+        { context_precision: 0.9, context_recall: null, answer_relevancy: 0.9, faithfulness: null },
+        { context_precision: null, context_recall: 0.9, answer_relevancy: null, faithfulness: 0.9 });
+      assert.strictEqual(r.verdict, 'stable', '互补 null（无答案轮 ↔ 可评轮）不应判劣化/改善');
+      assert.strictEqual(r.diffs.length, 0, '单侧 null 指标全部跳过');
+      assert.strictEqual(__constants.MAX_CASES_PER_NIGHT, 50, '成本护栏 50 用例/夜（D-8 分级预算）');
+      assert.strictEqual(__constants.DIFF_ALERT_PP, 5, '逐指标告警阈值 ±5pp');
+    });
+
+    await t('AI-Q2：夜跑全链（无模型环境 0 LLM 走通）——趋势行同名追加/空集跳过/0 阻断/null 对比不误报/dayKey 防重入', async () => {
+      const { runRagNightly, __resetDay } = require('../src-server/lib/eval-nightly');
+      try {
+        db.prepare(`INSERT INTO kbs (name,description,enabled,owner,created_at) VALUES ('AI-Q2 夜跑测试库','',1,'aiq2u',datetime('now','localtime'))`).run();
+        const kbId = db.prepare(`SELECT id FROM kbs WHERE name='AI-Q2 夜跑测试库'`).get().id;
+        db.prepare(`INSERT INTO kb_files (kb_id,name,size,status,chunk_count,created_at) VALUES (?,'制度.docx',1024,'success',1,datetime('now','localtime'))`).run(kbId);
+        const fid = db.prepare('SELECT id FROM kb_files WHERE kb_id=? ORDER BY id DESC').get(kbId).id;
+        db.prepare('INSERT INTO kb_chunks (file_id,kb_id,content) VALUES (?,?,?)').run(fid, kbId, '年假需提前三天申请，按工龄递增天数。');
+        // 既有 rag 集：1 用例（前次跑分 metrics 全 null——无答案轮基线）+ 空数据集（0 阻断路径）
+        db.prepare(`INSERT INTO evaluations (name,kb_id,type,dataset,status,score,metrics,created_at)
+          VALUES (?,?,'rag',?,'done',0,?,datetime('now','localtime'))`)
+          .run('AI-Q2smoke·制度集', kbId, JSON.stringify([{ query: '年假规则', expect_terms: ['年假'] }]),
+            JSON.stringify({ cases: 1, evaluated_answers: 0, context_precision: null, context_recall: null, answer_relevancy: null, faithfulness: null }));
+        db.prepare(`INSERT INTO evaluations (name,kb_id,type,dataset,status,created_at) VALUES (?,?,'rag','[]','done',datetime('now','localtime'))`)
+          .run('AI-Q2smoke·空集', kbId);
+        const before = db.prepare("SELECT COUNT(*) c FROM evaluations WHERE type='rag' AND kb_id=?").get(kbId).c;
+        const res = await runRagNightly();
+        assert.strictEqual(res.ok, true, '夜跑应 ok（无生成模型 → no_answer 全链不阻断）');
+        assert.strictEqual(res.runCount, 1, '空数据集应跳过不计 runCount');
+        assert.strictEqual(res.truncated, false, '未触护栏');
+        const rows = db.prepare("SELECT id,name,metrics FROM evaluations WHERE type='rag' AND kb_id=? ORDER BY id").all(kbId);
+        assert.strictEqual(rows.length, before + 1, '实跑集应 INSERT 一条趋势行');
+        assert.strictEqual(rows[rows.length - 1].name, 'AI-Q2smoke·制度集', '趋势行同名保留（/api/eval/trend 时间序可比）');
+        const m = JSON.parse(rows[rows.length - 1].metrics || '{}');
+        assert.strictEqual(m.context_precision, null, '无生成模型 → 答案侧指标 null（no_answer）');
+        // null 基线对比不误报：diffMetrics 全跳过 → stable → 通知零落库（Number(null)=0 误报回归线的行为闭环）
+        assert.strictEqual(db.prepare("SELECT COUNT(*) c FROM notifications WHERE title LIKE 'RAG%'").get().c, 0, '互补 null 对比不应发通知');
+        // 审计：op_logs 落「评价夜跑」行动作
+        const oplog = db.prepare("SELECT detail FROM op_logs WHERE action='评价夜跑' ORDER BY id DESC LIMIT 1").get();
+        assert.ok(oplog && /夜跑完成/.test(oplog.detail), 'op_logs 应有评价夜跑审计行');
+        // dayKey 防重入：同日二次调用 skipped 且不新增行
+        const again = await runRagNightly();
+        assert.ok(again.skipped && again.msg === '今日已跑', '同日二次调用应 skipped');
+        assert.strictEqual(db.prepare("SELECT COUNT(*) c FROM evaluations WHERE type='rag' AND kb_id=?").get(kbId).c, rows.length, 'skipped 路径不新增评测行');
+        // 护栏截断（真跑）：54 用例集 + 已用 1 → slice 49 < 54 → truncated 标注 + 明细 49 条
+        __resetDay();
+        const bulk = Array.from({ length: 54 }, (_, i) => ({ query: `问题${i}`, expect_terms: ['年假'] }));
+        db.prepare(`INSERT INTO evaluations (name,kb_id,type,dataset,status,created_at) VALUES (?,?,'rag',?,'done',datetime('now','localtime'))`)
+          .run('AI-Q2smoke·护栏集', kbId, JSON.stringify(bulk));
+        const res2 = await runRagNightly();
+        assert.strictEqual(res2.truncated, true, '总预算 50（1+49）超 54 用例应标注截断（含末集集内截断）');
+        const guard = db.prepare("SELECT result FROM evaluations WHERE name='AI-Q2smoke·护栏集' ORDER BY id DESC LIMIT 1").get();
+        assert.strictEqual(JSON.parse(guard.result || '[]').length, 49, '护栏集应只实跑前 49 用例（budget 50 - 首集 1）');
+      } finally {
+        __resetDay();
+        const kb = db.prepare(`SELECT id FROM kbs WHERE name='AI-Q2 夜跑测试库'`).get();
+        if (kb) {
+          db.prepare('DELETE FROM evaluations WHERE kb_id=?').run(kb.id);
+          db.prepare('DELETE FROM kb_chunks WHERE kb_id=?').run(kb.id);
+          db.prepare('DELETE FROM kb_files WHERE kb_id=?').run(kb.id);
+          db.prepare('DELETE FROM kbs WHERE id=?').run(kb.id);
+        }
+      }
+    });
+
+    await t('AI-Q2：evalTick 挂载锚点——每小时窗口判定 + platform 上下文 + 30 分钟轮询 + dayKey 内聚', () => {
+      const src = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'lib', 'ops.js'), 'utf8');
+      const nightSrc = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'lib', 'eval-nightly.js'), 'utf8');
+      assert.ok(/const evalNightly = require\('\.\/eval-nightly'\)/.test(src), 'ops 应按需加载 eval-nightly');
+      assert.ok(/if \(hour !== 3\) return;/.test(src), '每日 03:00~03:59 窗口判定（避开 03:30 备份组）');
+      assert.ok(/withDbTenant\('platform', \(\) => evalNightly\.runRagNightly\(\)\)/.test(src), '夜跑应包 platform 运维上下文');
+      assert.ok(/setInterval\(evalTick, 30 \* 60000\)/.test(src), '30 分钟轮询与备份组同构');
+      assert.ok(/_lastRunDay === today/.test(nightSrc), 'dayKey 防重入应内聚在 eval-nightly（同日只跑一次）');
+      assert.ok(/SELECT id, metrics, score, created_at FROM evaluations WHERE type='rag' AND kb_id=\? AND name=\? AND id < \?/.test(nightSrc), 'prevBaseline 同库同集取上一次跑分');
+      assert.ok(/GROUP BY kb_id, name\) g ON e\.id = g\.mid/.test(nightSrc), '同名评测集幂等选取每-name最新行（夜跑产物行不重复入列——防集数每夜翻倍雪崩、护栏失真）');
     });
   }
 
