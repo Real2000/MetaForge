@@ -28,6 +28,14 @@
  */
 const { db } = require('../db');
 const { assertPublicHttpUrl } = require('./ssrf-guard'); // SEC-05：向量/重排网关出站前的 SSRF 校验
+// AI-Q1（2026-11-25）SEC-10 遗留缺陷同步修复：bge/rerank 网关请求此前直接用 providers.api_key
+// 密文作为 Bearer（加密上线后必 401，嵌入/重排全降级本地）——与 llm.js withPlainKey 同源口径。
+const { decrypt: _decryptApiKey } = require('./crypto-util');
+function _withPlainKey(p) {
+  if (!p || typeof p !== 'object' || p.api_key == null || p.api_key === '') return p;
+  const plain = _decryptApiKey(p.api_key);
+  return plain ? { ...p, api_key: plain } : p; // 解密失败保留原值（降级而非硬断）
+}
 
 const DIM = 256;              // 本地哈希向量维度
 const BGE_DIM = 1024;         // bge-m3 向量维度
@@ -62,6 +70,7 @@ const { injectWatermark } = require('./trusted-kb-gateway'); // U2-7 外部源�
 function bgeProviders() {
   return db.prepare("SELECT * FROM providers WHERE configured=1 AND api_key != '' AND base_url != '' ORDER BY is_default DESC, id")
     .all()
+    .map(_withPlainKey) // AI-Q1：密钥解密（SEC-10 遗留）
     .filter(p => {
       try { return JSON.parse(p.models || '[]').some(m => /bge-m3|bge.*embed|embedding/i.test(m)); }
       catch { return false; }
@@ -100,6 +109,7 @@ async function bgeEmbed(texts) {
 function rerankProviders() {
   return db.prepare("SELECT * FROM providers WHERE configured=1 AND api_key != '' AND base_url != '' ORDER BY is_default DESC, id")
     .all()
+    .map(_withPlainKey) // AI-Q1：密钥解密（SEC-10 遗留，与 bgeProviders 同源）
     .filter(p => {
       try { return JSON.parse(p.models || '[]').some(m => /rerank|bge-reranker|reranker/i.test(m)); }
       catch { return false; }

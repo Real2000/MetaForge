@@ -16,9 +16,25 @@ const { db } = require('../db');
 const dal = require('./dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
 const circuit = require('./circuit');
 
+// AI-Q1（2026-11-25）修复 SEC-10 遗留缺陷：providers.api_key 自加密上线（2026-11-22）后为密文
+// 存储（routes/providers.js 写侧 encrypt），但 llm.js 读取侧未同步 decrypt——密文直发网关 401
+//（models/chat 实测坐实），真实调用全部熔断降级 mock。生产最近一次真实 chat 为 10-30（密文化
+// 前），缺陷潜伏近一月。解密集中在此一处（明文历史值 decrypt 原样返回，双形态兼容）。
+const { decrypt: _decryptApiKey } = require('./crypto-util');
+function withPlainKey(p) {
+  if (!p || typeof p !== 'object') return p;
+  // 仅当存在密钥字段才解：无 Key 供应商（未配置）不应产生空串覆盖
+  if (p.api_key != null && p.api_key !== '') {
+    const plain = _decryptApiKey(p.api_key);
+    return { ...p, api_key: plain || p.api_key }; // 解密失败（无匹配密钥）保留原值——降级 mock 而非硬断
+  }
+  return p;
+}
+
 function getDefaultProvider() {
-  const p = dal.getq('SELECT * FROM providers WHERE is_default=1 AND tenant_id=0');
-  return p || dal.getq('SELECT * FROM providers WHERE is_default=1 ORDER BY tenant_id LIMIT 1') || null;
+  const p = dal.getq('SELECT * FROM providers WHERE is_default=1 AND tenant_id=0')
+    || dal.getq('SELECT * FROM providers WHERE is_default=1 ORDER BY tenant_id LIMIT 1') || null;
+  return withPlainKey(p);
 }
 
 /** MT-12：由 username 反查租户（容错 null）——用于构建租户可见的供应商候选。*/
@@ -325,10 +341,10 @@ const NON_TEXT_MODEL_RE = /tts|asr|speech|whisper|embedding|rerank|image|video|a
 /** 已配置供应商清单（默认优先，跨供应商路由用）。MT-12：传入 tenantId 时仅返回「平台基线(0) ∪ 本租户」*/
 function getConfiguredProviders(tenantId) {
   const base = "SELECT * FROM providers WHERE configured=1 AND api_key != '' AND base_url != ''";
-  if (Number.isFinite(Number(tenantId))) {
-    return dal.q(`${base} AND (tenant_id=0 OR tenant_id=?) ORDER BY is_default DESC, id`, [Number(tenantId)]);
-  }
-  return dal.q(`${base} ORDER BY is_default DESC, id`);
+  const rows = Number.isFinite(Number(tenantId))
+    ? dal.q(`${base} AND (tenant_id=0 OR tenant_id=?) ORDER BY is_default DESC, id`, [Number(tenantId)])
+    : dal.q(`${base} ORDER BY is_default DESC, id`);
+  return rows.map(withPlainKey); // AI-Q1：密文 Key 解密（SEC-10 遗留，见顶部注释）
 }
 
 function safeModels(p) {
@@ -357,7 +373,7 @@ function buildCandidates(model, opts = {}) {
   if (model && opts.username && !NON_TEXT_MODEL_RE.test(model)) {
     const ups = dal.q("SELECT id, name, base_url, api_key, models FROM user_providers WHERE username=? AND status=1 AND api_key != '' AND base_url != '' ORDER BY id", [opts.username]);
     for (const up of ups) {
-      const p = { ...up, id: 'u' + up.id, name: (up.name || '自有模型') + '（我的）' };
+      const p = withPlainKey({ ...up, id: 'u' + up.id, name: (up.name || '自有模型') + '（我的）' }); // AI-Q1：user_providers 同为密文存储
       if (safeModels(up).includes(model) && !circuit.isOpen(p, model)) push(p, model);
     }
   }
