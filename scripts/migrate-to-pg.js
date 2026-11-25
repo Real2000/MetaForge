@@ -20,10 +20,14 @@
  *   - int8/numeric 解析器注册（与 lib/pg-bridge-worker.js 相同契约：COUNT/MAX 聚合归一 number）
  *     ——对账两侧读回值形态必须同构，否则哈希无意义；
  *   - 排除表：sqlite_master 内部表、FTS5 影子表（kb_chunks_fts%——PG 方言建表降级跳过，无此结构）、
- *     schema_anchor（平台自维护锚点：PG 端首启自建自算，搬 sqlite 时代的锚点反而会触发假漂移告警）；
+ *     vec0 虚表组（SW-1 复检发现：sqlite-vec 向量索引表 vec_kb_N 及其影子表——派生索引可重建、
+ *     目标库无此结构；识别见 collectVec0Group）、schema_anchor（平台自维护锚点：PG 端首启自建自算，
+ *     搬 sqlite 时代的锚点反而会触发假漂移告警）；
  *   - 幂等：每表 TRUNCATE 后整表重搬——中断重跑（或任意次重跑）结果恒一致，不依赖断点续传；
  *   - 分批事务：每批一个 BEGIN…COMMIT（批间落盘），中断只废当前表（下次重跑该表 TRUNCATE 重搬）；
- *   - 类型映射按目标端（PG information_schema 为对账真相标准）：integer/real/text/bytea 四类。
+ *   - 类型映射按目标端（PG information_schema 为对账真相标准）：integer/real/text/bytea 四类；
+ *     bytea 列源值经列级转换钩子 SRC_CONVERTERS——kb_chunks.embedding 旧 JSON 文本缓存 →
+ *     AI-02 float32 BLOB（toEmbeddingBlob；文本按原始字节直转 = 切换后向量静默失效）；
  *
  * 对账设计（diff=0 的口径）：
  *   - 行数对账：源/目标逐表 COUNT 比对；
@@ -58,6 +62,12 @@ const DST_CONN = process.env.PG_CONN || process.env.DATABASE_URL || '';
 const BATCH = Number(process.env.MIG_BATCH || 500) || 500;
 // 排除清单：FTS5 影子表（PG 无此结构）+ 平台自维护锚点（搬过去会假漂移）
 const EXCLUDE = (t) => t.startsWith('sqlite_') || t.startsWith('kb_chunks_fts') || t === 'schema_anchor';
+// SW-1 前置复检（2026-11-25）实跑生产快照发现：生产库因向量索引存在 sqlite-vec 虚表组
+// （虚表本体 vec_kb_N + 影子表 _info/_chunks/_rowids/_vector_chunksNN），PG 方言建表对其注释化
+// 跳过、目标库无此结构，fail-fast 将卡死切换窗口。口径：虚表组是 kb_chunks.embedding 的派生
+// 索引（可由数据重建），非事实数据——排除不构成数据丢失。由 collectVec0Group 在源端首枚举时
+// 填充（源库是唯一事实来源），两处消费点（源表清单/目标多表告警）共用同一 Set，防口径漂移。
+const VEC0_TABLES = new Set();
 const IDENT_RE = /^[a-zA-Z_][a-zA-Z0-9_]*$/; // 表/列名白名单（catalog 来源，防注入双保险）
 
 function fail(msg) { console.error(`[migrate-to-pg] ✗ ${msg}`); process.exit(1); }
@@ -84,8 +94,29 @@ async function openDst() {
 }
 
 // ---------- catalog 探测 ----------
+/** 识别 vec0 虚表组：本体按 sql 含 USING vec0 判定（不猜命名约定——vec_kb_<kbId> 拼接名不可枚举）。
+ *  影子表由 vec0 模块自建，但 sqlite_master 里带 CREATE TABLE 文本（SW-1 生产快照实测，非 NULL），
+ *  故收编条件为「所属虚表名前缀 + 已知后缀族」双判定：纯前缀匹配会把业务误建的同前缀表静默
+ *  跳过；双判定宁可漏识别——未来 sqlite-vec 新增后缀时 fail-fast 显式炸，不静默丢表。 */
+const VEC0_SHADOW_SUFFIX = /^(?:_info|_chunks|_rowids|_vector_chunks\d+)$/;
+function collectVec0Group(rows) {
+  const vtabs = rows.filter((r) => r.sql && /USING\s+vec0/i.test(r.sql)).map((r) => r.name);
+  const group = new Set(vtabs);
+  for (const v of vtabs) {
+    rows.forEach((r) => {
+      if (r.name.startsWith(v + '_') && VEC0_SHADOW_SUFFIX.test(r.name.slice(v.length))) group.add(r.name);
+    });
+  }
+  return group;
+}
+
 function srcTables(src) {
-  return src.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map((r) => r.name).filter((t) => !EXCLUDE(t));
+  const rows = src.prepare("SELECT name, sql FROM sqlite_master WHERE type='table'").all();
+  collectVec0Group(rows).forEach((t) => VEC0_TABLES.add(t));
+  if (VEC0_TABLES.size) {
+    console.log(`[migrate-to-pg] 跳过 sqlite-vec 虚表组 ${VEC0_TABLES.size} 张（派生索引可重建，目标库无此结构）：${[...VEC0_TABLES].sort().join(', ')}`);
+  }
+  return rows.map((r) => r.name).filter((t) => !EXCLUDE(t) && !VEC0_TABLES.has(t));
 }
 
 async function dstCatalog(conn) {
@@ -151,6 +182,48 @@ function tableHash(rows, cols, types) {
 // 目标行 → 可比对形态（pg 读回 Buffer/number/string/null）
 function canonDstRow(row, cols, types) { return rowHash(row, cols, types); }
 
+// ---------- 源值转换钩子（bytea 列的 sqlite 侧文本形态 → PG 侧二进制语义） ----------
+/** kb_chunks.embedding 源值 → AI-02 float32 BLOB（目标 bytea 语义）。
+ *  格式单一事实源在 retriever.js（encodeVec/parseVec：首字节 engine tag 1=B3/2=H + 小端
+ *  Float32×dim，B3=1024 维 / H=256 维）；但 retriever 顶层 require db，迁移工具不可反向依赖
+ *  （会触发 db.js 全量启动路径），故自带同构转换 + smoke 运行时守卫锁格式同步（转换结果必须被
+ *  retriever.decodeVec 精确还原）。
+ *  源形态（SW-1 生产快照实测，AI-02 懒迁移中间态三态混存）：float32 BLOB（新格式直写行）→ 原样
+ *  直通；H:/B3: 前缀 JSON / 裸 JSON（旧版本地哈希）→ 解析转 BLOB；'' → 空 bytea（无向量语义）；
+ *  null → null（SQL NULL）。不可解析/维度不符 → 抛错 fail-fast（静默丢向量 = 检索能力静默降级，
+ *  宁可炸出人工判）。 */
+const VEC_DIM = { B3: 1024, H: 256 };
+const VEC_TAG = { B3: 1, H: 2 };
+function toEmbeddingBlob(v) {
+  if (v === null || v === undefined) return null;
+  if (Buffer.isBuffer(v) || v instanceof Uint8Array) return Buffer.from(v); // 新格式直写行——原样
+  if (typeof v !== 'string') throw new Error(`kb_chunks.embedding 不可识别形态：${typeof v}`);
+  if (v === '') return Buffer.alloc(0);
+  let engine = 'H', raw = v; // 裸 JSON 视为旧版本地哈希（与 parseVec 同口径）
+  if (v.startsWith('B3:')) { engine = 'B3'; raw = v.slice(3); }
+  else if (v.startsWith('H:')) { engine = 'H'; raw = v.slice(2); }
+  let arr;
+  try { arr = JSON.parse(raw); } catch { throw new Error(`kb_chunks.embedding 文本不可解析（前 40 字符：${raw.slice(0, 40)}）`); }
+  if (!Array.isArray(arr) || arr.length !== VEC_DIM[engine]) throw new Error(`kb_chunks.embedding 维度不符：engine=${engine} dim=${Array.isArray(arr) ? arr.length : '非数组'}`);
+  const buf = Buffer.allocUnsafe(1 + arr.length * 4);
+  buf[0] = VEC_TAG[engine];
+  for (let i = 0; i < arr.length; i++) buf.writeFloatLE(arr[i], 1 + i * 4);
+  return buf;
+}
+
+// 列级白名单：显式逐列定义 bytea 语义转换（不做通配——未来新增 bytea 列须逐个评审，不臆测）
+const SRC_CONVERTERS = { 'kb_chunks.embedding': toEmbeddingBlob };
+const convertSrcValue = (table, col, v) => {
+  const fn = SRC_CONVERTERS[`${table}.${col}`];
+  return fn ? fn(v) : v;
+};
+/** 对账用源行：应用同一转换钩子（插入与哈希必须同钩子——两侧不同源则对账自欺） */
+function srcRowForHash(table, row, cols) {
+  const o = {};
+  for (const c of cols) { const v = convertSrcValue(table, c, row[c]); o[c] = v === undefined ? null : v; }
+  return o;
+}
+
 // ---------- 单表搬运（TRUNCATE → 分批插入） ----------
 async function copyTable(ctx, t) {
   const { src, conn, cat } = ctx;
@@ -173,7 +246,10 @@ async function copyTable(ctx, t) {
     if (!rows.length) break;
     await conn.query('BEGIN');
     try {
-      for (const r of rows) await conn.query(ins, cols.map((c) => r[c] ?? null));
+      for (const r of rows) await conn.query(ins, cols.map((c) => {
+        const v = convertSrcValue(t, c, r[c]); // bytea 列文本→BLOB 等语义转换（见 SRC_CONVERTERS）
+        return v === undefined ? null : v;
+      }));
       await conn.query('COMMIT');
     } catch (err) {
       await conn.query('ROLLBACK').catch(() => { });
@@ -198,7 +274,7 @@ async function verifyTable(ctx, t, srcCount) {
   const srcHave = new Set(src.pragma(`table_info(${q(t)})`).map((c) => c.name));
   const order = e.pk ? e.pk.map(q).join(', ') : cols.filter((c) => srcHave.has(c)).map(q).join(', ');
   const srcLines = src.prepare(`SELECT * FROM ${q(t)} ORDER BY ${cols.filter((c) => srcHave.has(c)).map((c) => q(c)).join(', ')}`).all()
-    .map((r) => rowHash(r, cols, types));
+    .map((r) => rowHash(srcRowForHash(t, r, cols), cols, types));
   const dstLines = (await conn.query(`SELECT * FROM ${q(t)} ORDER BY ${order}`)).rows
     .map((r) => canonDstRow(r, cols, types));
   if (srcLines.length !== dstLines.length) return `排序读行数漂移 src=${srcLines.length} dst=${dstLines.length}`;
@@ -260,7 +336,7 @@ async function main() {
   const sTables = srcTables(src);
   const missing = sTables.filter((t) => !cat.has(t));
   if (missing.length) fail(`目标库缺表（先以 AGENT_DB_DRIVER=pg 启动 db.js 建 schema）：${missing.join(', ')}`);
-  const extraDst = [...cat.keys()].filter((t) => !sTables.includes(t) && !EXCLUDE(t));
+  const extraDst = [...cat.keys()].filter((t) => !sTables.includes(t) && !EXCLUDE(t) && !VEC0_TABLES.has(t));
   if (extraDst.length) console.log(`[migrate-to-pg] ⚠ 目标多出表（源为空/新增表，跳过不搬）：${extraDst.join(', ')}`);
 
   const fromTable = opt('from-table'), onlyTable = opt('only-table');
@@ -321,4 +397,6 @@ function colsMatchWhitelist(t, cols) {
   return cols.every((c) => IDENT_RE.test(c));
 }
 
-main().catch((e) => { console.error('[migrate-to-pg] 致命错误：', e); process.exit(1); });
+// require 不触发 main（守卫出口）：collectVec0Group 供 smoke 运行时守卫直测（SW-1 vec0 排除）
+if (require.main === module) main().catch((e) => { console.error('[migrate-to-pg] 致命错误：', e); process.exit(1); });
+module.exports = { collectVec0Group, toEmbeddingBlob };

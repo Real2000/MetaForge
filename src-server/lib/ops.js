@@ -105,7 +105,10 @@ function resolvePgBackupCmd() {
       const list = require('child_process').execSync(
         "docker ps --format '{{.Names}}|{{.Ports}}'", { timeout: 5000, encoding: 'utf8' })
         .split('\n').filter(Boolean).map((l) => l.split('|'))
-        .filter(([, ports]) => /5432/.test(ports || ''));
+        // SW-1（2026-11-25）收窄为「发布到宿主机端口」命中（5432->）：同宿主机多栈并存时，复合栈
+        // 内部 postgres（Ports 形如 5432/tcp、无宿主机映射）同样被宽匹配 /5432/ 命中，docker ps
+        // 顺序不定时 list[0] 可能选中错误容器（库不存在→备份失败；若同名则更糟）。
+        .filter(([, ports]) => /5432->/.test(ports || ''));
       if (!list.length) throw new Error('未识别到 5432 端口容器（设 AGENT_PG_CONTAINER 指定）');
       container = list[0][0];
     } catch (e) { throw new Error('PG 备份命令探测失败：' + (e.message || e)); }

@@ -87,7 +87,9 @@ PG_CONN='<业务角色连接串>' node scripts/migrate-to-pg.js
 任何 `✗` 行都表示对应表失败——修复后重跑（工具幂等，重跑=TRUNCATE 重搬，安全）。
 
 - 搬运时长实测：2683 行 / 3 秒。线性外推：`预估秒数 ≈ 总行数 × 1.1ms / 1000`（含对账双读）；
-- WARNING 类（源缺列按 NULL 填充）：旧库缺新功能列时的预期行为，不阻塞；治本走迁移步补列。
+- WARNING 类（源缺列按 NULL 填充）：旧库缺新功能列时的预期行为，不阻塞；治本走迁移步补列；
+- sqlite-vec 虚表组（vec_kb_N 及 _info/_chunks/_rowids/_vector_chunksNN 影子表）：自动跳过——派生索引可重建、PG 端无此结构（SW-1 前置复检发现：合成数据演练未覆盖，生产快照首跑即踩中 fail-fast）；
+- kb_chunks.embedding 三态混存（H:/B3: 前缀 JSON、裸 JSON、float32 BLOB）：文本自动转 AI-02 float32 BLOB 后搬运（按原始字节直转 = 切换后向量静默失效）；已是 BLOB 的原样直通。
 
 ### S6 切换驱动（写 db.env）
 
@@ -95,11 +97,14 @@ PG_CONN='<业务角色连接串>' node scripts/migrate-to-pg.js
 cat > db.env <<'EOF'
 AGENT_DB_DRIVER=pg
 PG_CONN=postgres://<user>:<password>@<host>:5432/metaforge
+AGENT_PG_CONTAINER=mt7-poc-pg
 EOF
 ```
 
 > `db.env` 由「启动平台.command」自动加载（PG-4 起）；**密码明文落盘风险自负**——生产建议改用
 > PG 侧 trust/证书或部署密钥管理后仍走 db.env 引用。db.env 加入 .gitignore（切换后确认）。
+> `AGENT_PG_CONTAINER`（SW-1 拍板）：显式指定 PG 容器名，免去 dailyBackupPg 的 docker ps 端口自动
+> 探测在多栈宿主机上的顺序不确定性；配套加固：容器重启策略已设 `unless-stopped`。
 
 ### S7 PG 模式启动 + 验收锚点
 
@@ -108,7 +113,16 @@ bash 启动平台.command    # 预期日志：[i] 已加载数据库配置 db.en
 curl -sf http://localhost:3210/api/health && echo
 ```
 
-**数据验收锚点（双侧计数必须一致，sqlite 快照 vs PG 库）**：
+**S7 验收一条命令化（SW-1④ 交付）**：
+
+```bash
+BASE_URL=http://localhost:3210 PG_CONN=<切换目标连接串> \
+  SW_SQLITE=data/platform.db.bak-<S2快照名> npm run sw-verify
+```
+
+工具收敛四组锚点：health（10 次重试）/ 双侧计数锚点（核心七表必须相等；op_logs 漂移容忍——起服后 ops
+审计天然写入，只报告不判死）/ RLS 三态探针（基线 0、不存在租户 0、探针租户 >0）/ 序列健康（last ≥ max）。
+退出码 0=通过，可反复重跑（全部只读）。手工兜底（工具不可用时）：
 
 ```bash
 # sqlite 侧（快照）
@@ -119,6 +133,7 @@ psql "<PG_CONN>" -At -c "SET app.tenant_id='platform'; SELECT COUNT(*) FROM mess
 
 > 计数抽样覆盖：users / tenants / agents / sessions / messages / kb_chunks / workflow_runs。
 > 注意 PG 侧查询租户内容表必须 `SET app.tenant_id='platform'`（FORCE RLS 生效，见 §5）。
+> sw-verify 的计数以探针租户视角读（SW-1 E2E 实测：不带上下文直数租户内容表恒 0）。
 
 ---
 
@@ -169,7 +184,7 @@ sqlite 快照自 S2 起保留 **7 天**（D-5 拍板），过期后由值班删�
 
 | 项 | 状态 | 去向 |
 |---|---|---|
-| VACUUM INTO 备份降级 | PG 模式静默跳过 | M7 OPS-3：pg_dump 双轨 |
+| VACUUM INTO 备份降级 | OPS-3 已补轨：dailyBackupPg（pg_dump -Fc） | 已交付（SW-1 真实起服上下文实测端到端） |
 | FTS5 全文检索 | 降级内存 BM25 | PG-5：10 万分块实测收口 |
 | dm（达梦）方言 | MERGE 模板未落地 | M9 信创第一档 |
 | 平面表 21 张无 RLS | 应用层防线 | 设计如此（共享配置语义） |
@@ -185,8 +200,9 @@ sqlite 快照自 S2 起保留 **7 天**（D-5 拍板），过期后由值班删�
 | 二 | 补列后重置演练库重跑 | 全表 diff=0；缺列 NULL 填充路径实证；**踩坑**：超户裸建 public schema → 启动报 no schema（改 AUTHORIZATION 修复） |
 | 三 | 生产补列落地后终形态 | 124 表 / 2683 行全 diff=0、无警告；生产重启健康检查通过、锚点重锚一致 |
 | 四 | **本 runbook 全流程验收演练**（S1~S7 + 回滚，演练库 metaforge） | 切换全程 35 秒（S4 建链 5s + S5 搬运 3.6s + S7 启动+健康检查 7s）；**验收锚点 8/8 一致**（users/tenants/agents/sessions/messages/kb_chunks/workflow_runs/op_logs 双侧计数全等）；RLS 抽查：业务角色无上下文 messages=0 行（FORCE 拦截）、platform 逃逸=309 行；序列健康三表 seq=MAX+1；**回滚 RTO 实测 10 秒**（目标 ≤30 分钟）；演练库已按数据最小化原则 DROP |
+| 五 | **SW-1 切换前置复检**（2026-11-25，生产 VACUUM INTO 快照实搬，演练库 metaforge_sw1） | S4 建链 145/145 迁移 + RLS 68 表 + health OK；S5 **124 表 / 2929 行 diff=0（3.7s）**——实跑生产快照抓出并修复两个窗口必炸点：①sqlite-vec 虚表组 fail-fast（自动跳过）②embedding 三态混存（文本→AI-02 BLOB 转换，直转字节会令向量静默失效）；八表锚点双侧全等；回退演练：**热重启 1s**（切换夜真实形态），隔离目录首启 75s 为当日 ops 补跑一次性成本；dailyBackupPg 真实起服上下文端到端跑通；`npm run sw-verify` 验收工具交付并 E2E 全绿 |
 
-实测基线：搬运 3.6 秒 / 2683 行；PG 模式全链冷启动 5.87s；生产 PG 模式启动+健康检查 7s；回滚（停-删-启-健康检查）10s。
+实测基线：搬运 3.6 秒 / 2683 行；PG 模式全链冷启动 5.87s；生产 PG 模式启动+健康检查 7s；回滚（停-删-启-健康检查）10s；SW-1 生产快照实搬 2929 行 / 3.7s、回退热重启 1s（隔离目录首启含当日 ops 补跑 75s——切换夜回退目标目录为生产 data，当日任务已跑过，属热形态）。
 
 ---
 
@@ -198,7 +214,8 @@ bash 停止平台.command && cp data/platform.db data/platform.db.bak-$(date +%Y
 psql <admin> -c "CREATE DATABASE metaforge OWNER mt7_app;"
 AGENT_DB_DRIVER=pg PG_CONN=… node -e "require('./src-server/db');require('./src-server/lib/config');require('./src-server/lib/sso')"
 PG_CONN=… node scripts/migrate-to-pg.js        # 必须 diff = 0
-echo -e "AGENT_DB_DRIVER=pg\nPG_CONN=…" > db.env && bash 启动平台.command
+echo -e "AGENT_DB_DRIVER=pg\nPG_CONN=…\nAGENT_PG_CONTAINER=mt7-poc-pg" > db.env && bash 启动平台.command
+BASE_URL=http://localhost:3210 PG_CONN=… SW_SQLITE=<S2快照> npm run sw-verify   # S7 验收一条命令
 
 # 回滚
 bash 停止平台.command && rm db.env && bash 启动平台.command

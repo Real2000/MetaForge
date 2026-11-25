@@ -1015,6 +1015,74 @@ function t(name, fn) {
       const toolSrc = rd('scripts/migrate-to-pg.js');
       assert.ok(/backfillTsv/.test(toolSrc) && /ANALYZE/.test(toolSrc), '搬运工具应含 tsv 存量回填与 ANALYZE（统计回真防 planner 误判）');
     });
+    await t('SW-1：migrate-to-pg vec0 虚表组排除 + embedding 旧文本→BLOB 转换（运行时守卫）', () => {
+      // 背景：SW-1 前置复检实跑生产快照抓到两个切换窗口必炸点——①生产库含 sqlite-vec 虚表组
+      // （PG 方言建表注释化跳过、目标库无此结构，fail-fast 会卡死窗口）；②kb_chunks.embedding 为
+      // AI-02 懒迁移三态混存（H:/B3: 前缀 JSON、裸 JSON、float32 BLOB），文本按原始字节直转 bytea
+      // 会令切换后向量全数静默失效（decodeVec 长度校验 fail-closed → parseVec 判无向量）。
+      const { collectVec0Group, toEmbeddingBlob } = require(path.join(__dirname, '..', 'scripts', 'migrate-to-pg.js'));
+      // ① vec0 组识别：本体按 sql 含 USING vec0 + 四族影子后缀（宁漏勿误——漏识别 fail-fast 显式
+      //    炸，误识别静默丢表）；同前缀未知后缀与孤儿影子不收编
+      const mk = (name, sql) => ({ name, sql });
+      const g = collectVec0Group([
+        mk('users', 'CREATE TABLE users (id integer)'),
+        mk('vec_kb_1', 'CREATE VIRTUAL TABLE vec_kb_1 using vec0(embedding float[1024])'),
+        mk('vec_kb_1_info', 'CREATE TABLE vec_kb_1_info(key text primary key)'),
+        mk('vec_kb_1_chunks', 'CREATE TABLE vec_kb_1_chunks(chunk_id integer)'),
+        mk('vec_kb_1_rowids', 'CREATE TABLE vec_kb_1_rowids(rowid integer)'),
+        mk('vec_kb_1_vector_chunks00', 'CREATE TABLE vec_kb_1_vector_chunks00(rowid primary key)'),
+        mk('vec_kb_1_vector_chunks01', 'CREATE TABLE vec_kb_1_vector_chunks01(rowid primary key)'),
+        mk('vec_kb_1_custom', 'CREATE TABLE vec_kb_1_custom(x integer)'), // 同前缀未知后缀——不收编
+        mk('vec_kb_2_info', 'CREATE TABLE vec_kb_2_info(key text)'),     // 无虚表本体的孤儿影子——不收编
+      ]);
+      ['vec_kb_1', 'vec_kb_1_info', 'vec_kb_1_chunks', 'vec_kb_1_rowids', 'vec_kb_1_vector_chunks00', 'vec_kb_1_vector_chunks01']
+        .forEach((n) => assert.ok(g.has(n), `vec0 组应识别 ${n}`));
+      ['users', 'vec_kb_1_custom', 'vec_kb_2_info'].forEach((n) => assert.ok(!g.has(n), `不应误伤 ${n}`));
+      // ② embedding 转换：与检索层 decodeVec 闭环（格式单一事实源在 retriever.js encodeVec/parseVec；
+      //    retriever 顶层 require db 致迁移工具不可反向依赖，两侧格式同步靠本闭环锁死）
+      const { decodeVec } = require(path.join(__dirname, '..', 'src-server', 'lib', 'retriever.js'));
+      const vec = Array.from({ length: 256 }, (_, i) => (i === 5 ? 0.25 : i / 1000));
+      for (const legacy of ['H:' + JSON.stringify(vec), JSON.stringify(vec)]) { // 前缀文本 + 裸 JSON 旧格式
+        const dec = decodeVec(toEmbeddingBlob(legacy));
+        assert.ok(dec && dec.engine === 'H' && dec.v.length === 256 && dec.v[5] === 0.25,
+          `旧文本应转 BLOB 且被 decodeVec 精确还原（engine=${dec && dec.engine}）`);
+      }
+      const decB3 = decodeVec(toEmbeddingBlob('B3:' + JSON.stringify(Array.from({ length: 1024 }, () => 0.5))));
+      assert.ok(decB3 && decB3.engine === 'B3' && decB3.v.length === 1024, 'B3 1024 维分支应转换正确');
+      const passthrough = toEmbeddingBlob(Buffer.from([2, 0, 0, 0, 0])); // 新格式直写行——原样直通
+      assert.ok(Buffer.isBuffer(passthrough) && passthrough.length === 5, '已是 BLOB 的源值应原样直通');
+      assert.strictEqual(toEmbeddingBlob(null), null, 'NULL 应保持 SQL NULL');
+      assert.ok(toEmbeddingBlob('').length === 0, "'' 应转空 bytea（无向量语义）");
+      assert.throws(() => toEmbeddingBlob('[1,2,3]'), /维度不符/, '维度不符应 fail-fast（不静默丢向量）');
+      assert.throws(() => toEmbeddingBlob('H:not-json'), /不可解析/, '不可解析文本应 fail-fast');
+      assert.throws(() => toEmbeddingBlob(42), /不可识别形态/, '非文本非 BLOB 形态应 fail-fast');
+      // 接线静态守卫：两处 vec0 消费点 + 插入/对账同钩子（防对账自欺）+ require 不触发 main
+      const sw1Src = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'migrate-to-pg.js'), 'utf8');
+      assert.ok((sw1Src.match(/!VEC0_TABLES\.has\(t\)/g) || []).length >= 2,
+        'vec0 排除应覆盖源表清单与目标多表告警两处消费点');
+      assert.ok(/convertSrcValue\(t, c, r\[c\]\)/.test(sw1Src) && /srcRowForHash\(t, r, cols\)/.test(sw1Src),
+        '插入与对账应共用同一转换钩子');
+      assert.ok(/require\.main === module/.test(sw1Src), 'require 不得触发 main（守卫出口前提）');
+    });
+    await t('SW-1：sw-verify 切换窗口验收工具——锚点口径 + 漂移容忍 + 租户上下文前置（运行时）', () => {
+      const { compareAnchors } = require(path.join(__dirname, '..', 'scripts', 'sw-verify.js'));
+      const pg = { users: 8, tenants: 1, agents: 38, sessions: 92, messages: 309, kb_chunks: 68, workflow_runs: 62, op_logs: 1371 };
+      const sq = { ...pg, op_logs: 1370 };
+      // strict 表相等 → 全过；op_logs 漂移 → 容忍（起服后 ops 审计天然写入，只报告不判死）
+      const okRows = compareAnchors(pg, sq);
+      assert.ok(okRows.every((r) => r.ok), 'strict 相等 + op_logs 漂移应全过');
+      assert.ok(okRows.find((r) => r.table === 'op_logs').tolerant === true, 'op_logs 应为漂移容忍表');
+      assert.ok(!compareAnchors({ ...pg, agents: 0 }, sq).find((r) => r.table === 'agents').ok,
+        'strict 表不等必须判死（不等即切换夜止损）');
+      assert.ok(compareAnchors(pg, null).every((r) => r.ok), '未提供 sqlite 侧应跳过双侧对比（单侧形态）');
+      // 静态守卫：计数先设探针租户上下文（租户内容表 RLS 基线 fail-closed 不可见——E2E 实测抓回
+      // 的口径，漏设则 agents/sessions/messages/kb_chunks/workflow_runs 恒数 0）+ 锚点八表齐全
+      const sv = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'sw-verify.js'), 'utf8');
+      assert.ok(/set_config\('app\.tenant_id'/.test(sv), '计数必须先设探针租户上下文');
+      assert.ok(sv.includes("'users', 'tenants', 'agents', 'sessions', 'messages', 'kb_chunks', 'workflow_runs', 'op_logs'"),
+        '锚点八表应与 runbook S7 验收口径一致');
+      assert.ok(/require\.main === module/.test(sv), 'require 不得触发 main（守卫出口前提）');
+    });
     await t('OPS-3：备份双轨守卫——PG pg_dump 补轨与 sqlite 轨零变化', () => {
       const fs6 = require('fs');
       const opsSrc = fs6.readFileSync(path.join(__dirname, '..', 'src-server', 'lib', 'ops.js'), 'utf8');

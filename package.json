@@ -38,6 +38,7 @@
     "lint:dialect": "node scripts/lint-dialect.js",
     "lint:dialect:update": "node scripts/lint-dialect.js --update",
     "migrate": "node scripts/migrate.js",
+    "sw-verify": "node scripts/sw-verify.js",
     "dialect:audit": "node scripts/dialect-audit.js",
     "package": "node scripts/package.js",
     "package:version": "node scripts/package.js --version",
