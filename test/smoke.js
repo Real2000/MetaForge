@@ -12577,6 +12577,100 @@ print('PY_OK')
     });
   }
 
+  // ==================== M9 · XC-2 达梦方言 upsert 降级（2026-11-25） ====================
+  console.log('【M9 XC-2】跨方言 upsert 生成器（lib/upsert.js）三方言分支 + 8 处业务位清零');
+  {
+    const { db } = require('../src-server/db');
+    const { buildUpsert, currentDialect, __clearCache } = require('../src-server/lib/upsert');
+
+    await t('XC-2：buildUpsert 三方言 × 两模式 SQL 形态——占位符线性序/MERGE 关键件/Oracle 分支序', () => {
+      const spec = { table: 'notification_reads', keys: ['username', 'notification_id'], columns: ['username', 'notification_id', 'read_at'] };
+      __clearCache();
+      // sqlite ignore：INSERT OR IGNORE（存量语义零变——与改造前同型）
+      const sq = buildUpsert({ ...spec, ignore: true, dialect: 'sqlite' });
+      assert.strictEqual(sq, 'INSERT OR IGNORE INTO "notification_reads" ("username", "notification_id", "read_at") VALUES (?, ?, ?)', 'sqlite ignore 应与存量子句零差异');
+      // kingbase/PG ignore：ON CONFLICT (keys) DO NOTHING（显式冲突目标，避免宽唯一约束误吞）
+      const kb = buildUpsert({ ...spec, ignore: true, dialect: 'kingbase' });
+      assert.ok(/ON CONFLICT \("username", "notification_id"\) DO NOTHING$/.test(kb), 'kingbase ignore 应为显式冲突目标 DO NOTHING：' + kb);
+      assert.strictEqual((kb.match(/\?/g) || []).length, 3, '占位符按 columns 声明序线性排列');
+      // dm ignore：MERGE INTO ... USING 同序占位符 ... WHEN NOT MATCHED THEN INSERT
+      const dm = buildUpsert({ ...spec, ignore: true, dialect: 'dm' });
+      assert.ok(/^MERGE INTO "notification_reads" t USING \(SELECT \? AS "username", \? AS "notification_id", \? AS "read_at"\) src/.test(dm), 'USING 子句应同序消费占位符：' + dm);
+      assert.ok(/ON \(t\."username" = src\."username" AND t\."notification_id" = src\."notification_id"\)/.test(dm), 'ON 冲突目标应逐键对齐');
+      assert.ok(!/WHEN MATCHED/.test(dm), 'ignore 模式应仅 NOT MATCHED 分支');
+      assert.ok(/VALUES \(src\."username", src\."notification_id", src\."read_at"\)$/.test(dm), 'INSERT 值应引用 src 符号名（占位符只在 USING 出现一次——消灭 MERGE 重排陷阱的设计核心）');
+      // dm upsert（_config 形态）：MATCHED 分支在前（Oracle/DM 语序）+ 更新列 = columns − keys
+      const dmu = buildUpsert({ table: '_config', keys: ['key'], columns: ['key', 'value', 'updated_at'], ignore: false, dialect: 'dm' });
+      assert.ok(dmu.indexOf('WHEN MATCHED THEN UPDATE SET') < dmu.indexOf('WHEN NOT MATCHED THEN INSERT'), 'MATCHED 分支应在 NOT MATCHED 前（dm 遵循 Oracle 语序）');
+      assert.ok(/UPDATE SET "value" = src\."value", "updated_at" = src\."updated_at"/.test(dmu), '更新列应 columns−keys 且引用 src');
+      assert.ok(/excluded\./.test(buildUpsert({ ...spec, ignore: false, dialect: 'kingbase' })), 'kingbase upsert 用 excluded（PG 系原生形态）');
+      // 防御闸：未知方言 fail-fast / keys⊄columns 拒绝 / upsert 无可更新列拒绝
+      assert.throws(() => buildUpsert({ ...spec, dialect: 'oracle' }), /未知方言/, '未知方言应 fail-fast');
+      assert.throws(() => buildUpsert({ table: 't', keys: ['k'], columns: ['a'], dialect: 'dm' }), /冲突目标列/, 'keys⊄columns 应拒绝');
+      assert.throws(() => buildUpsert({ table: 't', keys: ['k'], columns: ['k'], ignore: false, dialect: 'dm' }), /可更新列/, 'columns 与 keys 全同时 upsert 模式应拒绝');
+      // 标识符注入转义（" 翻倍）
+      const dirty = buildUpsert({ table: 't"x', keys: ['k"x'], columns: ['k"x'], dialect: 'sqlite' });
+      assert.ok(dirty.includes('"t""x"') && dirty.includes('"k""x"'), '引号应翻倍转义：' + dirty);
+      // SQL 缓存生效（同 spec 二次调用命中缓存——热路径零重复拼接）
+      const a1 = buildUpsert({ ...spec, ignore: true, dialect: 'sqlite' });
+      const a2 = buildUpsert({ ...spec, ignore: true, dialect: 'sqlite' });
+      assert.strictEqual(a1, a2, '同 spec 生成结果恒定');
+    });
+
+    await t('XC-2：currentDialect 映射——AGENT_DB_DRIVER 权威源（pg→kingbase）/ DB_DIALECT 兼容兜底 / 缺省 sqlite', () => {
+      const origDriver = process.env.AGENT_DB_DRIVER, origDialect = process.env.DB_DIALECT;
+      delete process.env.AGENT_DB_DRIVER; delete process.env.DB_DIALECT;
+      try {
+        assert.strictEqual(currentDialect(), 'sqlite', '未配置时缺省 sqlite');
+        process.env.AGENT_DB_DRIVER = 'pg';
+        assert.strictEqual(currentDialect(), 'kingbase', 'PG 桥应映射 kingbase（PG 系方言）');
+        process.env.AGENT_DB_DRIVER = 'dm';
+        assert.strictEqual(currentDialect(), 'dm', 'dm 直映');
+        delete process.env.AGENT_DB_DRIVER; process.env.DB_DIALECT = 'dm';
+        assert.strictEqual(currentDialect(), 'dm', 'DB_DIALECT（dal 残留变量）应兼容兜底');
+      } finally {
+        if (origDriver === undefined) delete process.env.AGENT_DB_DRIVER; else process.env.AGENT_DB_DRIVER = origDriver;
+        if (origDialect === undefined) delete process.env.DB_DIALECT; else process.env.DB_DIALECT = origDialect;
+      }
+    });
+
+    await t('XC-2：语言级行为实测（sqlite 实库）——ignore 二次插入幂等 + 三列复合唯一约束', () => {
+      const ins = buildUpsert({ table: 'notification_reads', keys: ['username', 'notification_id'], columns: ['username', 'notification_id', 'read_at'], ignore: true, dialect: 'sqlite' });
+      db.prepare('DELETE FROM notification_reads WHERE username=?').run('xc2-smoke');
+      try {
+        db.prepare(ins).run('xc2-smoke', 999001, '2026-11-25 12:00:00');
+        db.prepare(ins).run('xc2-smoke', 999001, '2026-11-25 12:00:01'); // 二次插入撞唯一约束 → 静默跳过
+        assert.strictEqual(db.prepare('SELECT COUNT(*) c FROM notification_reads WHERE username=? AND notification_id=?').get('xc2-smoke', 999001).c, 1, '二次插入应幂等（首行保留）');
+        const fav = buildUpsert({ table: 'market_favorites', keys: ['username', 'item_type', 'item_id'], columns: ['username', 'item_type', 'item_id', 'created_at'], ignore: true, dialect: 'sqlite' });
+        db.prepare('DELETE FROM market_favorites WHERE username=?').run('xc2-smoke');
+        db.prepare(fav).run('xc2-smoke', 'wf_template', 'w1', '2026-11-25 12:00:00');
+        db.prepare(fav).run('xc2-smoke', 'wf_template', 'w1', '2026-11-25 12:00:01'); // 三列复合唯一
+        assert.strictEqual(db.prepare("SELECT COUNT(*) c FROM market_favorites WHERE username='xc2-smoke' AND item_type='wf_template' AND item_id='w1'").get().c, 1, '三列复合唯一二次插入应幂等');
+      } finally {
+        db.prepare('DELETE FROM notification_reads WHERE username=?').run('xc2-smoke');
+        db.prepare('DELETE FROM market_favorites WHERE username=?').run('xc2-smoke');
+      }
+    });
+
+    await t('XC-2：8 处业务位清零锚点——源码不再裸写 INSERT OR IGNORE 且走 buildUpsert 出口', () => {
+      const sites = ['src-server/db.js', 'src-server/lib/auth.js', 'src-server/lib/market-sync.js', 'src-server/lib/migrate.js', 'src-server/routes/security.js', 'src-server/routes/notify.js', 'src-server/routes/skills-market.js'];
+      for (const f of sites) {
+        const src = fs.readFileSync(path.join(__dirname, '..', f), 'utf8');
+        assert.ok(!/\.(run|runq)\(\s*['`]INSERT OR IGNORE/.test(src) && !/prepare\(\s*['`]INSERT OR IGNORE/.test(src), `${f} 不应裸写 INSERT OR IGNORE（dm 默默直插的方言地雷）`);
+        assert.ok(/buildUpsert/.test(src), `${f} 应引用 buildUpsert 跨方言出口`);
+      }
+      // 关键位 spec 锚点（表名 + 冲突目标列防漂移）
+      const migSrc = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'lib', 'migrate.js'), 'utf8');
+      assert.ok(/table: MIGRATIONS_TABLE, keys: \['id'\], columns: \['id', 'name', 'applied_at'\]/.test(migSrc), '迁移台账 upsert spec 应锚定 id 冲突目标');
+      const notifySrc = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'routes', 'notify.js'), 'utf8');
+      assert.ok(/keys: \['username', 'notification_id'\]/.test(notifySrc), '已读标记应锚定复合唯一约束列');
+      const authSrc = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'lib', 'auth.js'), 'utf8');
+      assert.ok(/table: 'token_blacklist', keys: \['jti'\]/.test(authSrc), 'token 黑名单应锚定 jti 冲突目标（dm 侧 MERGE 幂等去重）');
+      const favSrc = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'routes', 'skills-market.js'), 'utf8');
+      assert.ok(/keys: \['username', 'item_type', 'item_id'\]/.test(favSrc), '收藏应锚定三列复合唯一约束');
+    });
+  }
+
   try { db.close(); } catch { }
   fs.rmSync(process.env.AGENT_DATA_DIR, { recursive: true, force: true });
   console.log('\n———————————————');

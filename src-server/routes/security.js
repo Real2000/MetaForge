@@ -4,6 +4,7 @@ const dal = require('../lib/dal'); // BE-C1 统一查询出口（方言翻译，
 const { db, now } = require('../db');
 const { auth, adminOnly } = require('../lib/auth');
 const { parseLimit } = require('../lib/pagination'); // P1-3 2026-11-04：limit 容错统一解析
+const { buildUpsert } = require('../lib/upsert'); // XC-2 跨方言 upsert（sqlite/kingbase/dm MERGE）
 
 const router = express.Router();
 router.use(auth, adminOnly);
@@ -58,9 +59,15 @@ router.post('/words/batch', (req, res) => {
   const { text, category_id, input_block, output_block } = req.body || {};
   if (!text?.trim()) return res.json({ code: 400, msg: '请粘贴词汇内容（每行一个）' });
   const words = [...new Set(text.split(/\r?\n/).map(s => s.trim()).filter(Boolean))];
-  const INS_WORD_SQL = `INSERT OR IGNORE INTO words (category_id,word,input_block,output_block,hit_count,created_at) VALUES (?,?,?,?,0,datetime('now','localtime'))`;
+  // XC-2（2026-11-25）：INSERT OR IGNORE → 跨方言 upsert。words 表无唯一约束（前置 word 查重
+  // 为主体）：sqlite 侧 OR IGNORE 从不触发（现状零变）；dm 侧 MERGE ON word 为并发窗口原子兑底；
+  // hit_count/created_at 参数化（消除内嵌字面量与方言专有 datetime）
+  const INS_WORD_SQL = buildUpsert({
+    table: 'words', keys: ['word'],
+    columns: ['category_id', 'word', 'input_block', 'output_block', 'hit_count', 'created_at'],
+  });
   let n = 0;
-  words.forEach(w => { if (!dal.getq('SELECT id FROM words WHERE word=?', [w])) { dal.runq(INS_WORD_SQL, [category_id || null, w, input_block ? 1 : 0, output_block ? 1 : 0]); n++; } });
+  words.forEach(w => { if (!dal.getq('SELECT id FROM words WHERE word=?', [w])) { dal.runq(INS_WORD_SQL, [category_id || null, w, input_block ? 1 : 0, output_block ? 1 : 0, 0, now()]); n++; } });
   dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', [req.user.username, '批量导入敏感词', `${n} 个词汇`, req.ip, now()]);
   res.json({ code: 0, data: { added: n, total: words.length } });
 });

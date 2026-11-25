@@ -10,6 +10,7 @@
  */
 const { db, now } = require('../db');
 const dal = require('./dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
+const { buildUpsert } = require('./upsert'); // XC-2 跨方言 upsert（sqlite/kingbase/dm MERGE）
 
 async function syncOne(hub) {
   if (!hub || !hub.url || !hub.enabled) return { hub: hub?.id, status: 'skipped', reason: 'hub 未启用或无 URL' };
@@ -26,7 +27,12 @@ async function syncOne(hub) {
       if (exist) {
         dal.runq('UPDATE plugins SET name=?,version=?,description=?,entry=?,author=?,updated_at=? WHERE id=?', [item.name || '', item.version || '1.0.0', item.description || '', item.entry || '', item.author || '', now(), exist.id]);
       } else {
-        dal.runq('INSERT OR IGNORE INTO plugins (plugin_id,name,type,entry,icon,description,version,author,runtime,enabled,installed_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,0,?,?,?)', [item.plugin_id, item.name || item.plugin_id, 'tool', item.entry || '', item.icon || '🧩', item.description || '', item.version || '1.0.0', item.author || 'system', item.runtime || 'node', now(), now(), now()]);
+        // XC-2（2026-11-25）：INSERT OR IGNORE → 跨方言 upsert（plugin_id 唯一约束；前置 exist
+        // 已判重，此处为并发窗口原子兑底——dm MERGE / kingbase DO NOTHING）；enabled=0 参数化对齐声明式 spec
+        dal.runq(buildUpsert({
+          table: 'plugins', keys: ['plugin_id'],
+          columns: ['plugin_id', 'name', 'type', 'entry', 'icon', 'description', 'version', 'author', 'runtime', 'enabled', 'installed_at', 'created_at', 'updated_at'],
+        }), [item.plugin_id, item.name || item.plugin_id, 'tool', item.entry || '', item.icon || '🧩', item.description || '', item.version || '1.0.0', item.author || 'system', item.runtime || 'node', 0, now(), now(), now()]);
       }
       imported++;
     }

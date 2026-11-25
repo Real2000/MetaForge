@@ -1825,10 +1825,15 @@ db.exec(`CREATE TABLE IF NOT EXISTS workflow_templates (
 );`);
 // 内置模板幂等 seed（slug 已存在跳过；用户后续可存自定义变体）
 {
-  const ins = db.prepare(`INSERT OR IGNORE INTO workflow_templates (slug,name,icon,category,description,scene,workflow,builtin,use_count,created_by,created_at)
-    VALUES (?,?,?,?,?,?,?,?,0,'platform',datetime('now','localtime'))`);
+  // XC-2（2026-11-25）：INSERT OR IGNORE → 跨方言 upsert 出口（sqlite 零变 / kingbase PG 系 /
+  // dm MERGE，见 lib/upsert.js）；created_at 内嵌 datetime 参数化（now() 同格式，消除方言专有函数）
+  const { buildUpsert } = require('./lib/upsert');
+  const ins = db.prepare(buildUpsert({
+    table: 'workflow_templates', keys: ['slug'],
+    columns: ['slug', 'name', 'icon', 'category', 'description', 'scene', 'workflow', 'builtin', 'use_count', 'created_by', 'created_at'],
+  }));
   for (const s of require('./lib/wf-template-seed').SEEDS) {
-    ins.run(s.slug, s.name, s.icon, s.category, s.description, s.scene, JSON.stringify(s.workflow), 1);
+    ins.run(s.slug, s.name, s.icon, s.category, s.description, s.scene, JSON.stringify(s.workflow), 1, 0, 'platform', now());
   }
 }
 

@@ -22,6 +22,7 @@ const { auth } = require('../lib/auth');
 const { TOOL_DEFS, AGENT_TOOL_DENY, toolRiskOf } = require('../lib/tools');
 const { KEYED_TOOL_META } = require('../lib/tools-market');
 const { validateWorkflowV2 } = require('../lib/workflow-schema');
+const { buildUpsert } = require('../lib/upsert'); // XC-2 跨方言 upsert（sqlite/kingbase/dm MERGE）
 const dify = require('../lib/dify');
 const coze = require('../lib/coze');
 const { requireFeature } = require('../lib/edition');
@@ -260,7 +261,8 @@ router.post('/favorites', (req, res) => {
   if (!id) return res.json({ code: 400, msg: '缺少收藏对象（item_id）' });
   if (!favItemDetail(item_type, id, req.user.username)?.available) return res.json({ code: 400, msg: '收藏对象不存在或已下架' });
   // UNIQUE(username,item_type,item_id) 幂等：重复收藏 = 已收藏，返回成功
-  dal.runq('INSERT OR IGNORE INTO market_favorites (username,item_type,item_id,created_at) VALUES (?,?,?,?)', [req.user.username, item_type, id, now()]);
+  // XC-2（2026-11-25）：INSERT OR IGNORE → 跨方言 upsert（sqlite 零变 / kingbase DO NOTHING / dm MERGE）
+  dal.runq(buildUpsert({ table: 'market_favorites', keys: ['username', 'item_type', 'item_id'], columns: ['username', 'item_type', 'item_id', 'created_at'] }), [req.user.username, item_type, id, now()]);
   res.json({ code: 0, msg: '已收藏' });
 });
 

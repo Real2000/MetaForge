@@ -7,6 +7,7 @@
  */
 const crypto = require('crypto');
 const dal = require('./dal'); // BE-C1 统一查询出口（方言翻译，租户收敛见 tenantWhere）
+const { buildUpsert } = require('./upsert'); // XC-2 跨方言 upsert（sqlite/kingbase/dm MERGE）
 const fs = require('fs');
 const path = require('path');
 const { db } = require('../db');
@@ -147,7 +148,11 @@ function revokeToken(req) {
     const [body] = token.split('.');
     const payload = JSON.parse(Buffer.from(body, 'base64url').toString());
     if (payload.jti && payload.uid) {
-      dal.runq('INSERT OR IGNORE INTO token_blacklist (jti, username, created_at) VALUES (?,?,?)', [payload.jti, req.user?.username || String(payload.uid), new Date().toISOString()]);
+      // XC-2（2026-11-25）：跨方言 upsert（sqlite INSERT OR IGNORE 零变；dm MERGE ON jti）。
+      // 语义登记：jti 为普通索引非唯一约束——sqlite 侧 OR IGNORE 从不触发（插重复双行，现状如此）；
+      // dm 侧 MERGE 跳过——JWT jti 标准全局唯一，即幂等去重本意
+      dal.runq(buildUpsert({ table: 'token_blacklist', keys: ['jti'], columns: ['jti', 'username', 'created_at'] }),
+        [payload.jti, req.user?.username || String(payload.uid), new Date().toISOString()]);
     }
   } catch { }
 }

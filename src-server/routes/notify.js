@@ -7,6 +7,14 @@ const dal = require('../lib/dal'); // BE-C1 统一查询出口（方言翻译，
 const { db, now } = require('../db');
 const { auth } = require('../lib/auth');
 const { parseLimit } = require('../lib/pagination'); // P1-3 2026-11-04：limit 容错（原 ?limit=abc → NaN LIMIT 必 500）
+const { buildUpsert } = require('../lib/upsert'); // XC-2 跨方言 upsert（sqlite/kingbase/dm MERGE）
+
+// XC-2（2026-11-25）：已读标记 upsert spec（UNIQUE(username,notification_id) 复合唯一约束；
+// buildUpsert 内含 SQL 缓存，handler 热路径零重复拼接）
+const markReadSql = () => buildUpsert({
+  table: 'notification_reads', keys: ['username', 'notification_id'],
+  columns: ['username', 'notification_id', 'read_at'],
+});
 
 const router = express.Router();
 router.use(auth);
@@ -34,14 +42,14 @@ router.get('/', (req, res) => {
 
 // 标记单条已读
 router.post('/:id/read', (req, res) => {
-  dal.runq('INSERT OR IGNORE INTO notification_reads (username,notification_id,read_at) VALUES (?,?,?)', [req.user.username, req.params.id, now()]);
+  dal.runq(markReadSql(), [req.user.username, req.params.id, now()]);
   res.json({ code: 0, msg: '已读' });
 });
 
 // 全部已读
 router.post('/read-all', (req, res) => {
   const ids = dal.q(`SELECT id FROM notifications WHERE (username=? OR username='*')`, [req.user.username]);
-  ids.forEach(r => dal.runq('INSERT OR IGNORE INTO notification_reads (username,notification_id,read_at) VALUES (?,?,?)', [req.user.username, r.id, now()]));
+  ids.forEach(r => dal.runq(markReadSql(), [req.user.username, r.id, now()]));
   res.json({ code: 0, msg: '已全部标记为已读' });
 });
 

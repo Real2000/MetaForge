@@ -21,7 +21,8 @@
  * boot 同一目录把列补上了）。迁移执行器在 db.js 全部建表之后运行，时序天然正确。
  */
 
-const { db } = require('../db');
+const { db, now } = require('../db');
+const { buildUpsert } = require('./upsert'); // XC-2 跨方言 upsert（sqlite/kingbase/dm MERGE）
 
 /* ---------- 迁移注册表 ---------- */
 
@@ -150,7 +151,9 @@ function getAppliedIds() {
  */
 function markApplied(id, name) {
   ensureMigrationsTable();
-  db.prepare(`INSERT OR IGNORE INTO ${MIGRATIONS_TABLE} (id, name, applied_at) VALUES (?, ?, datetime('now','localtime'))`).run(id, name);
+  // XC-2（2026-11-25）：INSERT OR IGNORE → 跨方言 upsert（台账 id 为 PK 冲突目标；dm MERGE）。
+  // applied_at 参数化 now()（与 datetime('now','localtime') 同格式，消除方言专有函数）
+  db.prepare(buildUpsert({ table: MIGRATIONS_TABLE, keys: ['id'], columns: ['id', 'name', 'applied_at'] })).run(id, name, now());
 }
 
 /** 从台账移除某迁移记录（BE-E1 down 回滚时用） */
