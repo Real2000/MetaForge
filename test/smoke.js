@@ -11481,6 +11481,31 @@ print('PY_OK')
     assert.deepStrictEqual(qr.normalizeHistory(null), [], 'null → 空数组');
   });
 
+  await t('AI-01：extractQueryLike 净化闸——思考混体引号提取 / 收束前缀剥除 / 分析垃圾拒收（AI-01 重跑实测形态）', () => {
+    const qr = require('../src-server/lib/query-rewrite');
+    // 实测泄漏样本（dsv4.1 content 思考混体末行）：「…可以输出“真查询”。」→ 引号内短语优先
+    assert.strictEqual(qr.extractQueryLike('可以输出“年假需要提前多久申请”。'), '年假需要提前多久申请', '思考混体应取引号内真查询');
+    // 收束前缀剥除（老形态 full 末行同源逻辑）
+    assert.strictEqual(qr.extractQueryLike('所以：病假需要返岗后两个工作日内补交证明'), '病假需要返岗后两个工作日内补交证明', '「所以：」前缀应剥除');
+    // 正常单查询直取
+    assert.strictEqual(qr.extractQueryLike('OpenAI 兼容网关支持的最大并发'), 'OpenAI 兼容网关支持的最大并发');
+    // 分析结构垃圾拒收（宁可回落原 query 也不污染检索）
+    assert.strictEqual(qr.extractQueryLike('【第一步】首先分析用户意图，然后根据上下文逐项检查每个代词的指代对象并逐一排除候选，最终得出结论认为'), null, '带分析结构前缀应拒收');
+    assert.strictEqual(qr.extractQueryLike(''), null, '空文本 null');
+    assert.strictEqual(qr.extractQueryLike(null), null, 'null 输入应防御');
+  });
+
+  await t('AI-01：reasoning 形态净化闸与 prompt 判定标准——源码形态锚（AI-01 重跑抓漏后加固）', () => {
+    const src = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'lib', 'query-rewrite.js'), 'utf8');
+    // prompt 规则 2 可操作化：把「若不读历史无法明确指代就必须消解」写成硬标准（堵 reasoning 模型把含代词句误判「自包含」的后门）
+    assert.ok(/若不读对话历史就无法明确它指的是什么，就必须消解补全/.test(src), '规则 2 应为可操作判定标准');
+    assert.ok(/一律不得原样输出/.test(src), '含代词句应禁止原样输出（宁可补全也不要原样返回）');
+    // content 净化闸：单行短文本直取 + 多行/长文本末行提取（引号短语优先）——与 full 回退同款
+    assert.ok(/lines\.length === 1 && lines\[0\]\.length <= 120/.test(src), 'content 单行短文本应直取');
+    assert.ok(/return extractQueryLike\(lines\[lines\.length - 1\] \|\| content\);/.test(src), 'content 多行/长文本应按末行提取净化');
+    assert.ok(/const quoted = cand\.match\(\[“”\]\(\[\^“”\]\{6,120\}\)\[“”\]\);/.test(src) || /quoted = cand\.match/.test(src), '引号短语优先提取应存在');
+  });
+
   await t('AI-02：encodeVec/decodeVec float32 BLOB 往返（B3 1024 维 / H 256 维）+ fail-closed', () => {
     const r = require('../src-server/lib/retriever');
     const b3 = Float32Array.from({ length: 1024 }, (_, i) => Math.sin(i) * 0.5);
@@ -12478,9 +12503,9 @@ print('PY_OK')
     await t('AI-Q1：query-rewrite reasoning 网关适配——配额 2000 / content 优先 / full 末行回退', () => {
       const src = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'lib', 'query-rewrite.js'), 'utf8');
       assert.ok(/max_reply: 2000,/.test(src), '配额应提至 2000（reasoning ~900 token 思考后正文才落位，原 200 恒空）');
-      assert.ok(/if \(!content\) \{/.test(src), 'content 空时才走 full 回退（content 优先）');
+      assert.ok(/if \(content\) \{/.test(src), 'content 非空先走净化闸（content 优先）；空则落 full 末行回退');
       assert.ok(/full\.split\('\\n'\)\.map\(x => x\.trim\(\)\)\.filter\(Boolean\)\.pop\(\)/.test(src), '应取 full 末一非空行为候选（收束语在末行）');
-      assert.ok(/looksLikeQuery/.test(src) && /candidate\.length <= 120/.test(src), '仍不像查询应回落 null（净化优于污染）');
+      assert.ok(/extractQueryLike/.test(src) && /cleaned\.length <= 120/.test(src), '净化闸应存在且不像查询回落 null（净化优于污染）');
       // 既有 mock 注入点不受适配影响（__setImpl 绕开 _defaultImpl，sanitize 首行清洗语义保持）
       assert.ok(/const impl = typeof opts\.impl === 'function' \? opts\.impl : \(_impl \|\| _defaultImpl\)/.test(src), '测试注入点应保持');
     });

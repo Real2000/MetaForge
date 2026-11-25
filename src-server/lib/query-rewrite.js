@@ -19,10 +19,10 @@ let _impl = null; // 可注入的改写实现（测试用；生产为 null 走 _
 
 const SYS_PROMPT = [
   '你是检索查询改写器。任务：把用户的最新问题改写成一个「自包含、可独立检索」的查询语句——',
-  '消解代词与指代（它/这个/那个/上述/该方案/此功能…），补全被省略的主语或宾语，使其脱离对话历史也能被理解。',
+  '消解代词与指代（它/这个/那个/前者/后者/上述/该方案/最高档/第一种/后两种…），补全被省略的主语或宾语，使其脱离对话历史也能被理解。',
   '规则：',
-  '1. 只输出改写后的查询本身，不加引号、不加解释、不加任何前缀或标点装饰；',
-  '2. 若最新问题本身已自包含（无指代、无省略），原样输出；',
+  '1. 只输出改写后的查询本身一行，不加引号、不加解释、不加任何前缀或标点装饰；',
+  '2. 判定「自包含」的唯一标准：把最新问题单独拿出，若不读对话历史就无法明确它指的是什么，就必须消解补全——含代词或省略主宾的问题一律不得原样输出（宁可补全也不要原样返回）；',
   '3. 保留原问题的关键实体、指标、限定词，不得臆造历史中不存在的信息；',
   '4. 语言与用户问题一致，长度不超过 100 字。',
 ].join('\n');
@@ -103,6 +103,21 @@ function withTimeout(promise, ms) {
   return Promise.race([promise, timeout]).finally(() => { if (timer) clearTimeout(timer); });
 }
 
+/** 从候选行提取「像查询」的短句：剥收束前缀与引号；不像查询（长/分析结构）返回 null（净化优于污染）。
+ *  引号内短语优先——reasoning 思考体常以「…可以输出“真查询”」收束（AI-01 重跑实测样本）。 */
+function extractQueryLike(text) {
+  const cand = String(text || '').trim();
+  if (!cand) return null;
+  const quoted = cand.match(/[“”]([^“”]{6,120})[“”]/);
+  if (quoted) return quoted[1].trim();
+  const cleaned = cand
+    .replace(/^(所以[：:]?|即可[。]?|输出[。]?|最终答案[：:]?|改写(后)?(为|结果)[：:]?|可以输出[：:]?)+/, '')
+    .replace(/^[“”「」'"《》]+|[”」'"《》]+$/g, '')
+    .trim();
+  const looksLikeQuery = cleaned && cleaned.length <= 120 && !/^([*#\d]+[.\)、]|[【\[])/.test(cleaned.slice(0, 6));
+  return looksLikeQuery ? cleaned : null;
+}
+
 /**
  * 默认实现：调用非流式 LLM（chatOnce），无真实模型/空返回 → 返回 null（交由上层回落原 query）
  *
@@ -134,20 +149,20 @@ async function _defaultImpl(raw, turns, opts = {}) {
   if (!r || r.mode === 'mock') return null; // 无真实模型 → 不改写（回落原 query）
   const content = String(r.content || '').trim();
   const full = String(r.full || '').trim();
-  if (!content) {
-    // AI-Q1 实测补充：reasoning 型网关常把最终答案写在思考流末行而 content 恒空（dsv4.1/glm
-    // 全系如此）——取 full 末一非空行为候选，剥「所以/输出/改写为」类收束前缀；仍不像查询
-    // （>200 字或带分析结构）则回落 null（原 query 净化优于思考污染）
-    if (!full) return null;
-    const lastLine = full.split('\n').map(x => x.trim()).filter(Boolean).pop() || '';
-    const candidate = lastLine
-      .replace(/^(所以[：:]?|即可[。]?|输出[。]?|最终答案[：:]?|改写(后)?(为|结果)[：:]?)+/, '')
-      .replace(/^[“”「」'"《》]+|[”」'"《》]+$/g, '')
-      .trim();
-    const looksLikeQuery = candidate && candidate.length <= 120 && !/^([*#\d]+[.\)、]|[【\[])/.test(candidate.slice(0, 6));
-    return looksLikeQuery ? candidate : null;
+  if (content) {
+    // AI-01 重跑（2026-11-25）实测：reasoning 网关 content 形态不稳定——可能直接是查询，也可能
+    // 是「思考+可以输出“真查询”」混体（如：注意规则……可以输出“年假需要提前多久申请”）。净化闸：
+    // 单行短文本直取；多行/长文本按末行提取（引号短语优先）——不像查询 → null 回落（净化优于污染）
+    const lines = content.split('\n').map(x => x.trim()).filter(Boolean);
+    if (lines.length === 1 && lines[0].length <= 120 && !/^([*#\d]+[.\)、]|[【\[])/.test(lines[0].slice(0, 6))) {
+      return lines[0];
+    }
+    return extractQueryLike(lines[lines.length - 1] || content);
   }
-  return content;
+  if (!full) return null;
+  // content 恒空的老形态（AI-Q1 实测）：答案常在思考流末行（dsv4.1/glm 全系）——末一非空行提取
+  const lastLine = full.split('\n').map(x => x.trim()).filter(Boolean).pop() || '';
+  return extractQueryLike(lastLine);
 }
 
 /**
@@ -185,4 +200,6 @@ module.exports = {
   __setImpl: (fn) => { _impl = typeof fn === 'function' ? fn : null; },
   __clearCache: () => { _cache.clear(); },
   __cacheSize: () => _cache.size,
+  // 净化提取（content 思考混体闸）——导出供单测锚定行为
+  extractQueryLike,
 };
