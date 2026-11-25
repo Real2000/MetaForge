@@ -135,6 +135,23 @@ router.get('/users', (req, res) => {
   res.json({ code: 0, data: rows });
 });
 
+// OPS-2（2026-11-25）：系统健康监控（三层快照 + 最近告警历史）——adminOnly（router.use 已挂）
+// 数据源既有指标零改动；新增监控数据不动 access_logs（只读聚合，由 lib/metrics 采集）。
+router.get('/system-metrics', (req, res) => {
+  const metrics = require('../lib/metrics');
+  const snap = metrics.collectSnapshot();
+  // 告警历史（notifications 同步触达 + err_logs 留底，此处取留底最近 20 条做演进曲线）
+  const alerts = dal.q(`SELECT message, created_at FROM err_logs WHERE source='ops-metrics' ORDER BY id DESC LIMIT 20`);
+  res.json({
+    code: 0,
+    data: {
+      ...snap,
+      rules: metrics.__constants,
+      alerts,
+    },
+  });
+});
+
 // 会话详情（运营监控查看对话内容）
 router.get('/sessions/:id/messages', (req, res) => {
   res.json({ code: 0, data: dal.q('SELECT * FROM messages WHERE session_id=? ORDER BY id', [req.params.id]) });

@@ -1031,6 +1031,25 @@ function t(name, fn) {
       assert.ok(/backup_pg_cmd/.test(cfgSrc), 'backup_pg_cmd 应注册进配置中心');
       assert.ok(/VACUUM INTO/.test(opsSrc) && /KEEP_BACKUPS/.test(opsSrc), 'sqlite 轨 VACUUM INTO 与保留份数语义应零变化');
     });
+    await t('OPS-2：监控告警守卫——三层指标采集 + 四规则告警 + notifications 触达', () => {
+      const fs7 = require('fs');
+      const mtSrc = fs7.readFileSync(path.join(__dirname, '..', 'src-server', 'lib', 'metrics.js'), 'utf8');
+      const optsSrc = fs7.readFileSync(path.join(__dirname, '..', 'src-server', 'lib', 'ops.js'), 'utf8');
+      const statsSrc = fs7.readFileSync(path.join(__dirname, '..', 'src-server', 'routes', 'stats.js'), 'utf8');
+      // 三层采集：系统（事件循环 monitorEventLoopDelay + 内存/句柄）、业务（access_logs 聚合：
+      // 5xx/403/慢请求）、检索（chat/recall 端点聚合）
+      assert.ok(/monitorEventLoopDelay/.test(mtSrc) && /getActiveResourcesInfo/.test(mtSrc), '系统层应采事件循环延迟与句柄');
+      assert.ok(/status >= 500|status >= 500/.test(mtSrc) && /status = 403/.test(mtSrc), '业务层应聚合 5xx 错误率与 403 拒绝数');
+      assert.ok(/recall-test/.test(mtSrc) && /duration_ms/.test(mtSrc), '检索层应含检索端点延迟聚合');
+      // 四规则告警 + 节流 + notifications 触达（既有通知体系）+ err_logs 留底
+      assert.ok(/EVL_P95_ALERT_MS|RSS_ALERT_MB|ERR_RATE_ALERT|SLOW_ALERT_COUNT/.test(mtSrc), '四条告警规则阈值应存在');
+      assert.ok(/ALERT_THROTTLE_MS/.test(mtSrc), '同规则节流应存在（防刷屏）');
+      assert.ok(/INSERT INTO notifications/.test(mtSrc) && /ops-metrics/.test(mtSrc), '告警应触达通知中心并留底 err_logs');
+      // 挂载（5 分钟巡检独立间隔）与查询端点（adminOnly 由 stats router.use 既有承担）
+      assert.ok(/startMetrics\(\)/.test(optsSrc) && /5 \* 60000/.test(optsSrc), 'startOps 应挂载健康巡检（5 分钟）');
+      assert.ok(/platform_admin=1/.test(optsSrc), '告警触达对象应为平台超管');
+      assert.ok(/system-metrics/.test(statsSrc), 'GET /api/stats/system-metrics 端点应存在');
+    });
     await t('MT-7：db.js 接线守卫——AGENT_DB_DRIVER 分支 + sqlite 缺省路径 + 探测方言化收敛', () => {
       const fs2 = require('fs');
       const dbSrc = fs2.readFileSync(path.join(__dirname, '..', 'src-server', 'db.js'), 'utf8');

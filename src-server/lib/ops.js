@@ -327,7 +327,7 @@ function checkDeptBudgets() {
 
 function startOps(guard) {
   // U2-1 / N7-P2：可选 guard —— 集群下传入「是否 leader」判断，非 leader 进程的定时触发直接跳过（不重复备份/清理）。
-  // 不传 guard 时等价于恒真，单进程路径行为与引入前完全一致。
+  // 不传 guard时等价于恒真，单进程路径行为与引入前完全一致。
   const allow = typeof guard === 'function' ? guard : () => true;
   // PG-1 增量（2026-11-24）：运维任务统一 platform 逃逸上下文——摘要/评测/预算读写 sessions/messages/
   // kbs/departments 等租户表（无上下文在 RLS 下只见基线 0 行，静默空转）；写入行的归属租户由
@@ -341,6 +341,23 @@ function startOps(guard) {
     run('logs', archiveLogs);
   }, 30 * 60000);
   console.log(`[ops] 运维任务已启动（每日备份保留 ${KEEP_BACKUPS} 份 / 产物保留 ${UPLOAD_TTL_DAYS} 天 / 日志保留 ${LOG_TTL_DAYS} 天 / 记忆摘要已开启 / 评测回归已开启）`);
+
+  // OPS-2（2026-11-25）：健康监控与阈值告警——事件循环采样常驻 + 5 分钟巡检
+  //（区别于上面 30 分钟的备份组：健康巡检需要更细粒度；独立间隔零干扰）。
+  // 告警触达对象：平台超管（users.platform_admin=1，users 为平面表无 RLS，但读时仍包 platform 口径统一）。
+  const metrics = require('./metrics');
+  metrics.startMetrics();
+  const alertTick = () => {
+    if (!allow()) return; // 非 leader 不重复告警
+    try {
+      const admins = withDbTenant('platform', () => dal.q('SELECT username FROM users WHERE platform_admin=1').map((r) => r.username));
+      const { dispatched } = metrics.runAlertCheck(admins);
+      if (dispatched.length) console.log(`[ops][metrics] 触发告警 ${dispatched.length} 条：${dispatched.join('；')}`);
+    } catch (e) { console.error('[ops][metrics] 巡检异常（不阻断调度循环）：', e.message); }
+  };
+  setTimeout(alertTick, 120000);  // 启动 2 分钟首轮（避开启动高峰的天然延迟误报）
+  setInterval(alertTick, 5 * 60000);
+  console.log('[ops][metrics] 健康监控已启动（事件循环/内存/错误率/慢请求 四规则，5 分钟巡检，告警走通知中心）');
   // U0-8：启动后 2 分钟跑第一轮摘要，后每 2 小时检查
   setTimeout(() => run('digest', digestMemories), 120000);
   setInterval(() => run('digest', digestMemories), 120 * 60000);
