@@ -33,6 +33,7 @@ const CONFIG_DEFS = [
   { key: 'backup_keep', label: '备份保留份数', group: 'backup', type: 'number', env: 'AGENT_BACKUP_KEEP', default: 30, desc: '每日数据库备份保留最新 N 份，超出自动删除最旧备份' },
   { key: 'backup_exclude_tables', label: '备份排除表名', group: 'backup', type: 'string', default: '', desc: '逗号分隔的表名列表，备份时跳过这些表（如：err_logs,op_logs）' },
   { key: 'backup_exclude_dirs', label: '备份排除目录', group: 'backup', type: 'string', default: '', desc: '逗号分隔的 uploads 子目录名，备份产物时跳过（如：sandbox,exports）' },
+  { key: 'backup_pg_cmd', label: 'PG 备份命令（OPS-3）', group: 'backup', type: 'string', env: 'AGENT_BACKUP_PG_CMD', default: '', desc: 'PG 模式 pg_dump 命令模板（占位符 {user} {db}，stdout 为产物）。留空自动探测：docker exec 数据库容器内 pg_dump（容器名 AGENT_PG_CONTAINER 或按 5432 端口自动识别；要求容器内 local trust）' },
   { key: 'upload_ttl_days', label: '产物保留天数', group: 'backup', type: 'number', env: 'AGENT_UPLOAD_TTL_DAYS', default: 30, desc: '生成产物（图片、视频、临时文档）超过此天数自动清理' },
   { key: 'log_ttl_days', label: '日志保留天数', group: 'backup', type: 'number', env: 'AGENT_LOG_TTL_DAYS', default: 90, desc: 'op_logs/err_logs/task_runs 超过此天数自动归档删除' },
   // ---- 安全 ----

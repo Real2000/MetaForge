@@ -1015,6 +1015,22 @@ function t(name, fn) {
       const toolSrc = rd('scripts/migrate-to-pg.js');
       assert.ok(/backfillTsv/.test(toolSrc) && /ANALYZE/.test(toolSrc), '搬运工具应含 tsv 存量回填与 ANALYZE（统计回真防 planner 误判）');
     });
+    await t('OPS-3：备份双轨守卫——PG pg_dump 补轨与 sqlite 轨零变化', () => {
+      const fs6 = require('fs');
+      const opsSrc = fs6.readFileSync(path.join(__dirname, '..', 'src-server', 'lib', 'ops.js'), 'utf8');
+      const cfgSrc = fs6.readFileSync(path.join(__dirname, '..', 'src-server', 'lib', 'config.js'), 'utf8');
+      // PG 轨：dailyBackup 方言分支改走 dailyBackupPg（跳过形态已终结）
+      assert.ok(/dailyBackupPg\(\)/.test(opsSrc) && /function dailyBackupPg/.test(opsSrc), 'PG 模式应由 dailyBackupPg 补轨（pg_dump）');
+      assert.ok(!/VACUUM INTO 备份跳过/.test(opsSrc), 'PG 备份不得再是跳过形态（OPS-3 已补轨）');
+      // 超户执行（FORCE RLS 对 owner 强制——业务角色 pg_dump 必炸，演练实证）+ -Fc + 排除表 + 失败写 err_logs
+      assert.ok(/pg_dump -U postgres -Fc/.test(opsSrc), '缺省命令应为容器内超户 pg_dump -Fc（BYPASSRLS）');
+      assert.ok(/--exclude-table-data=/.test(opsSrc) && /backup_exclude_tables/.test(opsSrc), '排除表应对齐 P1-22 语义（结构保留数据排除）');
+      assert.ok(/ops-backup-pg/.test(opsSrc), 'PG 备份失败应写 err_logs（主备份失败即真失败，无降级语义）');
+      assert.ok(/docker ps/.test(opsSrc) && /AGENT_PG_CONTAINER/.test(opsSrc), '容器名 AGENT_PG_CONTAINER 显式 > 5432 端口自动探测');
+      // 配置项注册（自定义命令模板出口）+ sqlite 轨原语义保留
+      assert.ok(/backup_pg_cmd/.test(cfgSrc), 'backup_pg_cmd 应注册进配置中心');
+      assert.ok(/VACUUM INTO/.test(opsSrc) && /KEEP_BACKUPS/.test(opsSrc), 'sqlite 轨 VACUUM INTO 与保留份数语义应零变化');
+    });
     await t('MT-7：db.js 接线守卫——AGENT_DB_DRIVER 分支 + sqlite 缺省路径 + 探测方言化收敛', () => {
       const fs2 = require('fs');
       const dbSrc = fs2.readFileSync(path.join(__dirname, '..', 'src-server', 'db.js'), 'utf8');

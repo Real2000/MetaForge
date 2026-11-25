@@ -24,16 +24,10 @@ function dayKey(d = new Date()) {
 
 /** 每日数据库备份（VACUUM INTO：在线一致性快照，WAL 安全） */
 function dailyBackup() {
-  // PG-6（2026-11-24）显式方言降级：VACUUM INTO 为 SQLite 专有（在线一致性快照；占位符目标
-  // 亦仅 SQLite 支持）。PG 模式无内建等价（pg_dump 属外部工具，M7 OPS-3 双轨排期）——显式
-  // 跳过并记 op_logs 审计：降级是登记决策而非错误。旧形态（无分支裸奔）在 PG 模式每天 03:30
-  // 必炸进 catch，写一条假 err_logs「备份失败」噪音，且掩盖「PG 模式备份零产出」这一运维事实
-  //（切换 runbook 已要求 PG 侧另行安排 pg_dump 兜底）。
+  // OPS-3（2026-11-24）PG 补轨：VACUUM INTO 为 SQLite 专有，PG 模式改走 pg_dump
+  //（-Fc custom 格式：内建压缩 + pg_restore 自校验 + 排除表选项）。sqlite 模式行为不变。
   if ((process.env.DB_DIALECT || 'sqlite') !== 'sqlite') {
-    const msg = `PG 模式：VACUUM INTO 备份跳过（sqlite 专有；pg_dump 双轨见 M7 OPS-3）`;
-    console.log(`[ops] ${msg}`);
-    try { dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', ['system', '数据库备份', msg, '', now()]); } catch { /* 审计写失败不阻塞（调度循环容错） */ }
-    return { ok: true, skipped: true, msg };
+    return dailyBackupPg();
   }
   try {
     fs.mkdirSync(BACKUP_DIR, { recursive: true });
@@ -76,6 +70,86 @@ function dailyBackup() {
     console.error('[ops] 备份失败：', e.message);
     dal.insert('err_logs', { source: 'ops-backup', message: e.message, created_at: now() });
     return { ok: false, msg: e.message };
+  }
+}
+
+/* ============ OPS-3（2026-11-24）：PG 模式 pg_dump 备份轨 ============
+ * sqlite 轨（上方 VACUUM INTO）与 PG 轨（本组）共用 BACKUP_DIR/KEEP_BACKUPS/排除表配置，
+ * 双轨对齐「每日 03:30 调度 + 幂等 + 保留 N 份 + op_logs 审计」语义。
+ * 产物形态：platform-YYYY-MM-DD.dump（pg_dump -Fc custom 格式——内建压缩、文件头自校验、
+ * pg_restore 直接恢复；比 SQL 文本形态省 3-5×空间且可校验）。 */
+
+/** 解析 PG_CONN 连接串 → {user, db}（pg_dump 必需的两个参数源） */
+function pgConnParts() {
+  const url = process.env.PG_CONN || process.env.DATABASE_URL || '';
+  try {
+    const u = new URL(url);
+    return { user: decodeURIComponent(u.username || ''), db: (u.pathname || '/').replace(/^\//, '') };
+  } catch { return { user: '', db: '' }; }
+}
+
+/** 探测 pg_dump 命令：config backup_pg_cmd 模板优先，缺省 docker exec 容器内 postgres 超户执行
+ *  ——超户天然 BYPASSRLS（演练实证：FORCE RLS 下业务角色的 pg_dump COPY 直接报错
+ *  'query would be affected by row-level security policy'；NO FORCE 临时摘除会让备份窗口
+ *  RLS 失效，不取。超户只读 dump 动作 + 恢复侧 --role 对齐归属，备份语义本就含全租户数据）。 */
+function resolvePgBackupCmd() {
+  const custom = String(config.get('backup_pg_cmd') || '').trim();
+  const { db } = pgConnParts();
+  if (custom) {
+    const { user } = pgConnParts();
+    return custom.replaceAll('{user}', user).replaceAll('{db}', db);
+  }
+  let container = process.env.AGENT_PG_CONTAINER || '';
+  if (!container) {
+    try {
+      const list = require('child_process').execSync(
+        "docker ps --format '{{.Names}}|{{.Ports}}'", { timeout: 5000, encoding: 'utf8' })
+        .split('\n').filter(Boolean).map((l) => l.split('|'))
+        .filter(([, ports]) => /5432/.test(ports || ''));
+      if (!list.length) throw new Error('未识别到 5432 端口容器（设 AGENT_PG_CONTAINER 指定）');
+      container = list[0][0];
+    } catch (e) { throw new Error('PG 备份命令探测失败：' + (e.message || e)); }
+  }
+  return `docker exec ${container} pg_dump -U postgres -Fc ${db}`;
+}
+
+/** 解析模板/自动探测产物为 { file, args, exclude }（execFile 数组形态——命令注入面收敛为参数数组） */
+function pgBackupCmdParts(excludeTables) {
+  const raw = resolvePgBackupCmd();
+  const parts = raw.split(/\s+/).filter(Boolean);
+  // 排除表（P1-22 语义对齐：结构保留、数据排除）：表名过标识符白名单（config 来源仍防御）
+  const safe = excludeTables.filter((t) => /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(t));
+  for (const t of safe) parts.push(`--exclude-table-data=${t}`);
+  const [file, ...args] = parts;
+  return { file, args };
+}
+
+/** PG 每日备份：pg_dump -Fc → data/backups/platform-YYYY-MM-DD.dump（幂等/保留/审计同 sqlite 轨） */
+function dailyBackupPg() {
+  try {
+    fs.mkdirSync(BACKUP_DIR, { recursive: true });
+    const fname = `platform-${dayKey()}.dump`;
+    const target = path.join(BACKUP_DIR, fname);
+    if (fs.existsSync(target)) return { ok: true, skipped: true, msg: '今日已备份' }; // 幂等
+    const excludeRaw = config.get('backup_exclude_tables') || '';
+    const excludeTables = excludeRaw ? excludeRaw.split(',').map((s) => s.trim()).filter(Boolean) : [];
+    const { file, args } = pgBackupCmdParts(excludeTables);
+    // stdout 直收产物（execFileSync 默认 maxBuffer 1MB 不够，提至 2GB 兜大库）；timeout 300s
+    //（10 万块演练实测秒级，上限防调度线程挂死）
+    const dump = require('child_process').execFileSync(file, args, { timeout: 300000, maxBuffer: 2 * 1024 * 1024 * 1024 });
+    fs.writeFileSync(target, dump);
+    const all = fs.readdirSync(BACKUP_DIR).filter(f => /^platform-\d{4}-\d{2}-\d{2}\.dump$/.test(f)).sort();
+    while (all.length > KEEP_BACKUPS) fs.unlinkSync(path.join(BACKUP_DIR, all.shift()));
+    const sizeMB = (dump.length / 1048576).toFixed(2);
+    const msg = `${fname}（${sizeMB} MB，pg_dump -Fc，共保留 ${all.length} 份${excludeTables.length ? `，排除表：${excludeTables.join(',')}` : ''}）`;
+    console.log(`[ops] 数据库已备份（PG）：${msg}`);
+    dal.runq('INSERT INTO op_logs (username,action,detail,ip,created_at) VALUES (?,?,?,?,?)', ['system', '数据库备份', msg, '', now()]);
+    return { ok: true, msg: fname, sizeMB };
+  } catch (e) {
+    // PG 轨无 sqlite 轨的降级语义（VACUUM 跳过是登记决策）——pg_dump 是 PG 模式的主备份，失败即真失败
+    console.error('[ops] PG 备份失败：', e.message);
+    dal.insert('err_logs', { source: 'ops-backup-pg', message: String(e.message || e).slice(0, 500), created_at: now() });
+    return { ok: false, msg: String(e.message || e) };
   }
 }
 
