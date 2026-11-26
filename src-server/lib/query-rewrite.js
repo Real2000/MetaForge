@@ -41,6 +41,23 @@ function isEnabled() {
   return true;
 }
 
+/**
+ * AI-R4（M12，2026-11-26）：改写模型路由解析——显式 opts.model 优先，其次配置项 query_rewrite_model，
+ * 都没有则 undefined（交给网关默认路由/候选链）。配置为空不注入任何模型名，历史行为零回归。
+ * 为什么在此集中：query-rewrite / multi-query / metadata-infer 三处共用同一「改写专用模型」语义，
+ * 各模块自行读配置会漂移；retriever 也调用本函数保证 trace 与真实路由一致。
+ */
+function resolveRewriteModel(explicit) {
+  const m = explicit == null ? '' : String(explicit).trim();
+  if (m) return m;
+  try {
+    const cfg = require('./config');
+    const v = cfg && typeof cfg.get === 'function' ? cfg.get('query_rewrite_model') : '';
+    const s = v == null ? '' : String(v).trim();
+    return s || undefined;
+  } catch { return undefined; } // 配置层不可用 → 不指定模型（行为与旧版一致）
+}
+
 /** 规范化历史：仅保留 role/content 合法的 user/assistant 轮次，取最近 maxTurns 轮（默认 4） */
 function normalizeHistory(history, maxTurns = 4) {
   if (!Array.isArray(history)) return [];
@@ -59,8 +76,8 @@ function normalizeHistory(history, maxTurns = 4) {
 function fingerprint(s) {
   return crypto.createHash('sha1').update(String(s)).digest('hex').slice(0, 16);
 }
-function cacheKey(q, turns) {
-  return fingerprint(q + '\u0000' + turns.map(t => t.role[0] + ':' + t.content).join('\u0001'));
+function cacheKey(q, turns, model) {
+  return fingerprint(q + '\u0000' + (model || '') + '\u0000' + turns.map(t => t.role[0] + ':' + t.content).join('\u0001'));
 }
 
 /* ---------------- 短 TTL 内存缓存（防重复改写；进程内，多副本各自缓存无害） ---------------- */
@@ -135,7 +152,7 @@ async function _defaultImpl(raw, turns, opts = {}) {
     { role: 'user', content: `【对话历史】\n${histText}\n\n【最新问题】${raw}\n【改写查询】` },
   ];
   const r = await chatOnce(messages, {
-    model: opts.model,
+    model: resolveRewriteModel(opts.model),
     temperature: 0,
     // AI-Q1（2026-11-25）实测修正：reasoning 型网关（glm5.2/dsv4 全系）隐藏 ~900 token 思考后才
     // 输出正文——原 max_reply=200 下 content 恒空、full 装的是思考首行，sanitize 取首行即被
@@ -178,12 +195,13 @@ async function rewriteQuery(rawQuery, history = [], opts = {}) {
   const turns = normalizeHistory(history, opts.maxTurns || 4);
   if (!turns.length) return q; // 无历史 → 单轮查询无需指代消解
   const impl = typeof opts.impl === 'function' ? opts.impl : (_impl || _defaultImpl);
-  const key = cacheKey(q, turns);
+  const model = resolveRewriteModel(opts.model); // AI-R4：显式 > 配置项 > 网关默认
+  const key = cacheKey(q, turns, model);
   const hit = cacheGet(key);
   if (hit !== undefined) return hit;
   let out = q;
   try {
-    const r = await withTimeout(Promise.resolve(impl(q, turns, opts)), Number(opts.timeoutMs) || 8000);
+    const r = await withTimeout(Promise.resolve(impl(q, turns, { ...opts, model })), Number(opts.timeoutMs) || 8000);
     const cleaned = sanitize(r);
     if (cleaned) out = cleaned;
   } catch { out = q; } // 超时/模型异常 → 回落原 query（0 阻断）
@@ -194,6 +212,7 @@ async function rewriteQuery(rawQuery, history = [], opts = {}) {
 module.exports = {
   rewriteQuery,
   isEnabled,
+  resolveRewriteModel,
   normalizeHistory,
   sanitize,
   // 测试助手（下划线约定：生产代码不得调用）

@@ -90,12 +90,13 @@ function parseExpansion(raw, origQuery, wantHyde) {
 /** 默认实现：chatOnce 一次调用产出子查询（+可选 HyDE）；无真实模型 → null（回落单路） */
 async function _defaultImpl(rawQuery, wantHyde, opts = {}) {
   const { chatOnce } = require('./llm');
+  const { resolveRewriteModel } = require('./query-rewrite'); // AI-R4：与指代改写共用同一模型路由语义
   const messages = [
     { role: 'system', content: SYS_PROMPT + (wantHyde ? '\n' + HYPE_PROMPT : '') },
     { role: 'user', content: `【查询】${rawQuery}\n【扩写输出】` },
   ];
   const r = await chatOnce(messages, {
-    model: opts.model,
+    model: resolveRewriteModel(opts.model),
     temperature: 0,
     max_reply: 400,
     hardTimeoutMs: Number(opts.timeoutMs) || 2500,
@@ -116,14 +117,16 @@ async function expandQueries(rawQuery, opts = {}) {
   const q = String(rawQuery == null ? '' : rawQuery).trim();
   if (!q) return { queries: [] };
   const wantHyde = opts.hyde === true;
+  const { resolveRewriteModel } = require('./query-rewrite');
+  const model = resolveRewriteModel(opts.model); // AI-R4：显式 > 配置项 > 网关默认（缓存键随模型区分）
   const impl = typeof opts.impl === 'function' ? opts.impl : (_impl || _defaultImpl);
-  const key = crypto.createHash('sha1').update(q + '\u0000' + (wantHyde ? 'H' : 'M')).digest('hex').slice(0, 16);
+  const key = crypto.createHash('sha1').update(q + '\u0000' + (wantHyde ? 'H' : 'M') + '\u0000' + (model || '')).digest('hex').slice(0, 16);
   const hit = cacheGet(key);
   if (hit !== undefined) return hit;
   let out = { queries: [q] }; // 兜底：单路（原查询）
   try {
     const raw = await Promise.race([
-      Promise.resolve(impl(q, wantHyde, opts)),
+      Promise.resolve(impl(q, wantHyde, { ...opts, model })),
       new Promise((_, rej) => setTimeout(() => rej(new Error('multi-query timeout')), Number(opts.timeoutMs) || 2500)),
     ]);
     const parsed = parseExpansion(raw, q, wantHyde);

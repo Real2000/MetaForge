@@ -12711,6 +12711,98 @@ print('PY_OK')
     });
   }
 
+  // ==================== M12 · AI 增益收口（2026-11-26）AI-R2 资产固化 / AI-R4 改写模型路由 ====================
+  console.log('【M12 AI-R2/R4】评测资产固化（28 项资产 + 确定性生成 + 覆盖性自检）+ 改写模型路由配置化');
+  {
+    const A = require('../scripts/eval-assets');
+
+    await t('AI-R2：评测资产完整性——25 正检块 / 20 对指代 / 10 问近义 / 禁词表非空', () => {
+      assert.strictEqual(A.GOLD_CHUNKS.length, 25, '正检块应为 25（12 制度 + 13 产品）');
+      assert.strictEqual(A.AI01_PAIRS.length, 20, 'AI-01 对子应为 20（覆盖验收集）');
+      assert.strictEqual(A.AI10_QUERIES.length, 10, 'AI-10 用例应为 10');
+      assert.ok(A.FORBIDDEN.length >= 40, '禁词表应覆盖全部期望实体（实际 ' + A.FORBIDDEN.length + '）');
+      for (const p of A.AI01_PAIRS) assert.ok(p.expect instanceof RegExp, 'AI-01 expect 应为 RegExp：' + p.q);
+      for (const it of A.AI10_QUERIES) assert.ok(it.expect instanceof RegExp, 'AI-10 expect 应为 RegExp：' + it.q);
+    });
+
+    await t('AI-R2：覆盖性自检——每条用例 expect 均能命中至少一块正检金料（on 侧理论上限）', () => {
+      const misses = A.auditCoverage();
+      assert.deepStrictEqual(misses, [], '存在 expect 不命中任何金料的用例（on 侧上限受损）：' + JSON.stringify(misses));
+    });
+
+    await t('AI-R2：干扰块确定性 + 禁词零命中 + 规模 ≥500（防漂移核心）', () => {
+      const n1 = A.makeNoiseChunks();
+      const n2 = A.makeNoiseChunks();
+      assert.deepStrictEqual(n1, n2, '生成器应确定性（无随机）——两次调用输出必须一致');
+      const { kept, skipped } = A.filterNoiseForbidden(n1);
+      assert.ok(kept.length >= 500, `干扰块应 ≥500（实际 ${kept.length}）`);
+      const re = new RegExp(A.FORBIDDEN.join('|'));
+      const violations = kept.filter(n => re.test(n.content));
+      assert.deepStrictEqual(violations, [], '过滤后仍撞禁词：' + JSON.stringify(violations.slice(0, 3)));
+      assert.ok(skipped < 50, `禁词防御丢弃应为少量（实际 ${skipped}）`);
+    });
+
+    await t('AI-R2：构建/评分脚本入库且幂等口径（源码锚 + buildKb 可复用导出 + 用例不内嵌）', () => {
+      const buildSrc = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'eval-kb-build.js'), 'utf8');
+      assert.ok(/eval-assets/.test(buildSrc), '生成器应引用资产真相源');
+      assert.ok(/existChunks >= 500 && !force/.test(buildSrc), '幂等跳过口径应存在（≥500 块跳过，--force 重建）');
+      assert.ok(/module\.exports = \{ buildKb \}/.test(buildSrc), 'buildKb 应导出供 smoke/后续脚本复用');
+      const scoreSrc = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'eval-rerun.js'), 'utf8');
+      assert.ok(/AI01_PAIRS/.test(scoreSrc) && /AI10_QUERIES/.test(scoreSrc), '评分器应消费资产（不再内嵌用例）');
+      assert.ok(/--only=/.test(scoreSrc), '分段复跑参数应保留');
+      assert.ok(/query_rewrite_model/.test(scoreSrc), '评分器模型解析应接 AI-R4 配置项');
+    });
+
+    await t('AI-R4：query_rewrite_model 配置项定义（llm 组 / env / 默认空=零回归）', () => {
+      const cfg = require('../src-server/lib/config');
+      const def = cfg.CONFIG_DEFS.find(d => d.key === 'query_rewrite_model');
+      assert.ok(def, '配置项应定义');
+      assert.strictEqual(def.group, 'llm');
+      assert.strictEqual(def.env, 'AGENT_QUERY_REWRITE_MODEL');
+      assert.strictEqual(def.default, '', '默认空——不指定模型，历史路由零回归');
+    });
+
+    await t('AI-R4：resolveRewriteModel 三态——显式优先 / 配置项兜底 / 空回落 undefined', () => {
+      const qr = require('../src-server/lib/query-rewrite');
+      const cfg = require('../src-server/lib/config');
+      const prev = cfg.get('query_rewrite_model');
+      try {
+        cfg.set('query_rewrite_model', '');
+        assert.strictEqual(qr.resolveRewriteModel('explicit-m'), 'explicit-m', '显式值优先');
+        assert.strictEqual(qr.resolveRewriteModel(), undefined, '配置空 → undefined（网关默认）');
+        cfg.set('query_rewrite_model', 'cfg-m');
+        assert.strictEqual(qr.resolveRewriteModel(), 'cfg-m', '配置项兜底');
+        assert.strictEqual(qr.resolveRewriteModel('explicit-m'), 'explicit-m', '显式仍优先于配置');
+        assert.strictEqual(qr.resolveRewriteModel('  '), 'cfg-m', '空白显式值视为未指定');
+      } finally {
+        cfg.set('query_rewrite_model', prev || '');
+      }
+    });
+
+    await t('AI-R4：三模块接线——改写/扩写/元数据推断共用模型路由（源码锚）', () => {
+      const qrSrc = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'lib', 'query-rewrite.js'), 'utf8');
+      const mqSrc = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'lib', 'multi-query.js'), 'utf8');
+      const rtSrc = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'lib', 'retriever.js'), 'utf8');
+      assert.ok(/model: resolveRewriteModel\(opts\.model\)/.test(qrSrc), '改写默认实现应走 resolveRewriteModel');
+      assert.ok(/cacheKey\(q, turns, model\)/.test(qrSrc), '改写缓存键应含模型（切模型立即生效）');
+      assert.ok(/model: resolveRewriteModel\(opts\.model\)/.test(mqSrc), '多路扩写应走同一模型路由');
+      assert.ok(/\(model \|\| ''\)/.test(mqSrc), '扩写缓存键应含模型');
+      assert.ok(/model: resolveRewriteModel\(opts\.rewriteModel\)/.test(rtSrc), 'retriever 元数据推断应走同一路由');
+    });
+
+    await t('AI-R4：探测脚本口径——NON_TEXT 过滤与 llm.js 同源 / ≤8s + content 形态判据（防漂移）', () => {
+      const probe = require('../scripts/rewrite-model-probe');
+      const llmSrc = fs.readFileSync(path.join(__dirname, '..', 'src-server', 'lib', 'llm.js'), 'utf8');
+      const m = llmSrc.match(/const NON_TEXT_MODEL_RE = (\/.*\/i);/);
+      assert.ok(m, 'llm.js 应有 NON_TEXT_MODEL_RE 定义');
+      assert.strictEqual(String(probe.NON_TEXT_MODEL_RE), m[1], '探测脚本过滤正则须与 llm.js 完全一致（新增专用模型族两边同步）');
+      assert.strictEqual(probe.ELIGIBLE_MS, 8000, 'D-11 判据：单次改写 ≤8s');
+      const src = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'rewrite-model-probe.js'), 'utf8');
+      assert.ok(/form === 'content' && ms <= ELIGIBLE_MS/.test(src), '适格判据应为 content 形态 + 延迟线');
+      assert.ok(/--apply/.test(src), '应支持探测结果一键应用配置');
+    });
+  }
+
   // ==================== M9 · XC-2 达梦方言 upsert 降级（2026-11-25） ====================
   console.log('【M9 XC-2】跨方言 upsert 生成器（lib/upsert.js）三方言分支 + 8 处业务位清零');
   {

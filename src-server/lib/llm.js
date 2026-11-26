@@ -336,7 +336,9 @@ async function* callMock(messages, opts = {}) {
 // 非文本模型识别（TTS/图片/视频/向量等不能用于 chat/completions）
 // 注意：minimax h3 / Ref2VA 为文生视频模型（t2va），名称本身不含 video 字样，需显式匹配
 // 注意：VL 系列是多模态对话模型（Qwen-VL 纯文本对话可用），不在黑名单内
-const NON_TEXT_MODEL_RE = /tts|asr|speech|whisper|embedding|rerank|image|video|audio|voice|ocr|t2v|a2v|realtime|sensevoice|minimax[\s-]?h\d|ref2va/i;
+// 注意：bge 系列（bge-m3/bge-large/bge-reranker）为嵌入/重排模型，名称不含 embedding/rerank 关键词，
+//       需显式匹配——AI-R4 探测实测 bge-m3 混入 chat 候选后调用挂 45s 才降级（隐性延迟）
+const NON_TEXT_MODEL_RE = /tts|asr|speech|whisper|embedding|rerank|image|video|audio|voice|ocr|t2v|a2v|realtime|sensevoice|minimax[\s-]?h\d|ref2va|bge/i;
 
 /** 已配置供应商清单（默认优先，跨供应商路由用）。MT-12：传入 tenantId 时仅返回「平台基线(0) ∪ 本租户」*/
 function getConfiguredProviders(tenantId) {

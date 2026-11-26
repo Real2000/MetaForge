@@ -377,8 +377,9 @@ async function _resolveAiFilter(query, rows, kbId, opts, _trace) {
   let ai = null;
   try {
     const { inferMetadataFilter } = require('./metadata-infer');
+    const { resolveRewriteModel } = require('./query-rewrite'); // AI-R4：元数据推断与改写共用模型路由
     ai = await inferMetadataFilter(query, vocabObj, {
-      model: opts.rewriteModel, username: opts.username, tenantId: opts.tenantId,
+      model: resolveRewriteModel(opts.rewriteModel), username: opts.username, tenantId: opts.tenantId,
     });
   } catch { ai = null; }
   if (_trace) _trace.inferFilter = {

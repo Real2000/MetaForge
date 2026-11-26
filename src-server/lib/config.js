@@ -49,6 +49,7 @@ const CONFIG_DEFS = [
   { key: 's3_force_path_style', label: 'S3 强制路径风格', group: 'storage', type: 'boolean', env: 'S3_FORCE_PATH_STYLE', default: false, desc: 'MinIO/Ceph 等需设为 true（路径风格而非虚拟主机风格）' },
   // ---- LLM ----
   { key: 'llm_timeout_ms', label: 'LLM 超时（毫秒）', group: 'llm', type: 'number', env: 'LLM_TIMEOUT_MS', default: 60000, desc: 'LLM 接口调用超时（含重试）' },
+  { key: 'query_rewrite_model', label: '查询改写模型', group: 'llm', type: 'string', env: 'AGENT_QUERY_REWRITE_MODEL', default: '', desc: 'AI-R4：AI-01 指代改写 / AI-10 多路扩写 / 元数据推断共用的专用模型（留空=网关默认路由）。建议配非 reasoning 快模型——scripts/rewrite-model-probe.js 可按响应形态与延迟自动探测适格模型' },
   // ---- 系统 ----
   { key: 'page_size', label: '默认分页大小', group: 'system', type: 'number', default: 20, desc: '列表页默认每页条数' },
   // ---- 队列（N7 / U2-1） ----
