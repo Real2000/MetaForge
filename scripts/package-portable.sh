@@ -42,14 +42,20 @@ echo
 # ---------- 1. Node.js 运行时 ----------
 NODE_DIR="$PKG/node/bin"
 mkdir -p "$NODE_DIR"
+# IC-3（2026-11-26）：目标平台二进制注入——交叉打包时由 release-offline.sh 从目标架构镜像
+# （node:18-slim 系）提取 node 与 node_modules 后传入；缺省仍用宿主二进制（仅宿主可用包）
 NODE_BIN=$(command -v node 2>/dev/null || echo "")
-if [ -n "$NODE_BIN" ]; then
+if [ -n "${NODE_BIN_SRC:-}" ] && [ -x "$NODE_BIN_SRC" ]; then
+  echo "[package-portable] 使用注入的目标平台运行时：$NODE_BIN_SRC"
+  cp "$NODE_BIN_SRC" "$NODE_DIR/node"
+elif [ -n "$NODE_BIN" ]; then
   echo "[package-portable] 使用当前运行时：$(node -v) at $NODE_BIN"
   cp "$NODE_BIN" "$NODE_DIR/node"
 else
-  echo "[package-portable] ❌ 未找到 node 运行时（请先安装 Node.js）" >&2
+  echo "[package-portable] ❌ 未找到 node 运行时（请先安装 Node.js，或设 NODE_BIN_SRC）" >&2
   exit 1
 fi
+chmod +x "$NODE_DIR/node"
 
 # ---------- 2. 项目代码 ----------
 echo "[package-portable] 复制项目代码..."
@@ -65,9 +71,10 @@ mkdir -p "$APP_DIR/data"
 
 # ---------- 3. node_modules 全量预安装 ----------
 echo "[package-portable] 收录依赖（node_modules 全量，含 prebuilt native 扩展）..."
-if [ -d "$ROOT/node_modules" ]; then
-  cp -R "$ROOT/node_modules" "$PKG/node_modules"
-  echo "[package-portable] ✅ 使用现有 node_modules（$(du -sh "$PKG/node_modules" | cut -f1)）"
+NM_SRC="${NODE_MODULES_SRC:-$ROOT/node_modules}"
+if [ -d "$NM_SRC" ]; then
+  cp -R "$NM_SRC" "$PKG/node_modules"
+  echo "[package-portable] ✅ 使用 node_modules（来源：$NM_SRC，$(du -sh "$PKG/node_modules" | cut -f1)）"
 else
   ( cd "$APP_DIR" && npm install --omit=dev >/dev/null 2>&1 ) && cp -R "$APP_DIR/node_modules" "$PKG/node_modules" && rm -rf "$APP_DIR/node_modules"
   echo "[package-portable] ✅ npm install 完成（$(du -sh "$PKG/node_modules" | cut -f1)）"

@@ -1083,6 +1083,47 @@ function t(name, fn) {
         '锚点八表应与 runbook S7 验收口径一致');
       assert.ok(/require\.main === module/.test(sv), 'require 不得触发 main（守卫出口前提）');
     });
+    await t('IC-1：kingbase 轨道守卫——一键编排即用即删 + 复位差异适配 + 探针基线（静态）', () => {
+      const rd1 = (p) => fs.readFileSync(path.join(__dirname, '..', p), 'utf8');
+      // 编排器：--privileged 必需（XC-1 差异 #6，缺则 PAM 循环失败）、DB_MODE=pg、finally 即删、
+      // 镜像/端口前置检查（快速失败，不把问题留到 45s 冷启动后）
+      const track = rd1('scripts/kingbase-track.js');
+      assert.ok(/--privileged=true/.test(track) && /DB_MODE=pg/.test(track), '容器必须 --privileged + DB_MODE=pg（差异 #6）');
+      assert.ok(/finally\s*\{/.test(track) && /rm', '-f', CONTAINER/.test(track), '容器清理必须在 finally（成功/失败/异常都删）');
+      assert.ok(/image', 'inspect'/.test(track) && /:\$\{PORT\}->/.test(track), '前置检查：镜像在本地 + 端口占用检测');
+      // 复位脚本：差异 #2 适配（PG12 系 public 归超户，必须管理端 AUTHORIZATION 重建）+ owner 校验
+      const reset = rd1('scripts/kingbase-track-reset.js');
+      assert.ok(/DROP SCHEMA public CASCADE/.test(reset) && /CREATE SCHEMA public AUTHORIZATION mt7_app/.test(reset),
+        'kingbase public schema 必须由管理端 AUTHORIZATION 重建（差异 #2）');
+      assert.ok(/pg_get_userbyid\(nspowner\)/.test(reset) && /owner !== 'mt7_app'/.test(reset),
+        '复位后必须校验 schema owner=mt7_app（RLS 验收语义成立前提）');
+      // 探针：ENABLE+FORCE 双语句（XC-1 首轮踩坑锚定——FORCE 不隐含 ENABLE，漏则 RLS 完全不生效）
+      const probe = rd1('scripts/kingbase-rls-probe.js');
+      assert.ok(/ENABLE ROW LEVEL SECURITY/.test(probe) && /FORCE ROW LEVEL SECURITY/.test(probe),
+        '策略必须 ENABLE+FORCE 双语句');
+      assert.ok(/platform/.test(probe) && /WITH CHECK/.test(probe), '探针应覆盖 platform 逃逸与 WITH CHECK 写拦截');
+      // 入口注册 + 轨道文档
+      const pkg = JSON.parse(rd1('package.json'));
+      assert.strictEqual(pkg.scripts['test:tenant:kingbase'], 'node scripts/kingbase-track.js', 'package.json 一键入口');
+      assert.ok(fs.existsSync(path.join(__dirname, '..', 'docs', 'kingbase轨道.md')), '轨道文档应在位');
+    });
+    await t('IC-3：信创多架构交付守卫——真交叉注入 + sha256 链路（静态）', () => {
+      const rd3 = (p) => fs.readFileSync(path.join(__dirname, '..', p), 'utf8');
+      const rel = rd3('scripts/release-offline.sh');
+      // 真交叉 = 目标架构构建 → 镜像内提取 node/node_modules → 注入便携包脚本（非仅改名）
+      assert.ok(/buildx build --platform linux\/amd64/.test(rel) && /buildx build --platform linux\/arm64/.test(rel),
+        '双架构 buildx 构建（linux/amd64 + linux/arm64）');
+      assert.ok(/docker cp "\$CID:\/usr\/local\/bin\/node"/.test(rel) && /docker cp "\$CID:\/app\/node_modules"/.test(rel),
+        '目标架构 node/node_modules 必须从镜像内提取（原生模块按架构预编译）');
+      assert.ok(/NODE_BIN_SRC="\$STAGE\/\$ARCH\/node"/.test(rel) && /NODE_MODULES_SRC="\$STAGE\/\$ARCH\/node_modules"/.test(rel),
+        '便携包组装必须注入目标架构二进制');
+      assert.ok(/sha256_of/.test(rel) && /SHA256SUMS/.test(rel) && /RELEASE_MANIFEST/.test(rel),
+        'sha256 清单与发布清单生成（macOS/Linux 双环境 sha256_of）');
+      const pp = rd3('scripts/package-portable.sh');
+      assert.ok(/NODE_BIN_SRC:-/.test(pp) && /NODE_MODULES_SRC:-/.test(pp), '便携包脚本支持交叉注入且缺省宿主行为不变');
+      assert.ok(/^dist\/$/m.test(rd3('.gitignore')), 'dist/ 产物不入库（清单记录走 docs 报告）');
+      assert.ok(fs.existsSync(path.join(__dirname, '..', 'docs', 'IC-3信创多架构交付包.md')), '交付包说明文档应在位');
+    });
     await t('OPS-3：备份双轨守卫——PG pg_dump 补轨与 sqlite 轨零变化', () => {
       const fs6 = require('fs');
       const opsSrc = fs6.readFileSync(path.join(__dirname, '..', 'src-server', 'lib', 'ops.js'), 'utf8');

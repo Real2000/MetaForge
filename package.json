@@ -31,6 +31,7 @@
     "test:smoke": "node test/smoke.js",
     "test:tenant": "node test/tenant-e2e.js",
     "test:tenant:pg": "node scripts/pg-track-reset.js && AGENT_DB_DRIVER=pg PG_CONN=postgres://mt7_app:mt7_app_poc@localhost:5432/mt7_e2e node test/tenant-e2e.js",
+    "test:tenant:kingbase": "node scripts/kingbase-track.js",
     "lint:sql": "node scripts/lint-bare-prepare.js",
     "lint:sql:update": "node scripts/lint-bare-prepare.js --update",
     "lint:schema": "node scripts/lint-inline-schema.js",

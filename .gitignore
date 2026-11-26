@@ -28,6 +28,9 @@ public/downloads/
 
 # 备份归档与系统文件
 *.tar.gz
+
+# IC-3 离线交付产物（构建输出不入库；sha256 清单记录见 docs/IC-3信创多架构交付包.md）
+dist/
 .DS_Store
 __pycache__/
 
